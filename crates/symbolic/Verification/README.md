@@ -83,8 +83,17 @@ end_off − stride`, hence `o + stride ≤ end_off ≤ size`. With the guard `it
 end` (`o != end_off`) the moving load is in bounds. If a side-condition is
 unproved (e.g. the end pointer lies past the region), the offset is never
 installed and `iter` stays opaque — the access is not proved (no false PASS).
-This is the header-test `for x in s` walk; the rotated `-O` (bottom-test) form is
-the next step.
+
+The **rotated `-O` (bottom-test)** form — where the load precedes the `next ==
+end` check — uses the stronger invariant `o + stride ≤ end_off` (the load is
+unconditional, so there is no guard to combine with). That bound is sound only
+when the loop is entered non-empty, and rather than verify the `is_empty`
+preheader guard structurally, the engine **proves the base case** `b0 + stride ≤
+end_off` — which is provable exactly when the preheader guard `base != end` sits
+in this header's path condition. So the soundness-critical "non-empty entry"
+condition is *gate-checked*, not trusted: a rotated walk without the guard fails
+the base-case proof and is not verified (`ptr_walk_bottom_unguarded` → not PASS,
+where on an empty range the unconditional load would be out of bounds).
 
 ## Symbolic memory model
 A pointer is `provenance + symbolic offset + alignment` — **never a bare

@@ -37,17 +37,23 @@ pub struct EqExitIndVar {
 
 /// A recognized equality-exit **pointer** induction variable (`iter != end`):
 /// a pointer header-parameter that advances by a constant element step on the
-/// back-edge and exits when it equals `end`.
+/// back-edge and exits when it (or its stepped successor) equals `end`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtrIndVar {
     /// The pointer induction register (a header block-parameter).
     pub reg: RegId,
-    /// The end pointer the loop exits on (`iter == end`).
+    /// The end pointer the loop exits on.
     pub end: Operand,
     /// The element type stepped over (its size is the per-iteration byte stride).
     pub elem: Type,
     /// The per-iteration element step (`> 0`).
     pub stride_elems: i128,
+    /// `false`: the header tests `iter == end` *before* the body — the load is
+    /// guarded, sound even on an empty range. `true`: the rotated (`-O`) form,
+    /// where the header tests the *stepped* pointer `next == end` *after* the
+    /// load — so the bound holds only when the loop is entered non-empty, which
+    /// the engine establishes by proving the base case from the preheader guard.
+    pub bottom_test: bool,
 }
 
 /// Per-loop-header equality-exit induction variables (integer and pointer).
@@ -81,7 +87,8 @@ pub fn analyze_induction(f: &Function) -> InductionAnalysis {
         let header = cfg.block_id(l.header);
         if let Some(var) = recognize_int(f, &cfg, l) {
             by_header.entry(header).or_insert_with(Vec::new).push(var);
-        } else if let Some(var) = recognize_ptr(f, &cfg, l) {
+        } else if let Some(var) = recognize_ptr(f, &cfg, l).or_else(|| recognize_ptr_bottom(f, &cfg, l))
+        {
             ptr_by_header.entry(header).or_insert_with(Vec::new).push(var);
         }
     }
@@ -166,7 +173,8 @@ fn recognize_int(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<EqExi
     Some(EqExitIndVar { reg: s.reg, bound: s.bound, stride })
 }
 
-/// Try to recognize a pointer equality-exit induction variable (`iter != end`).
+/// Try to recognize a header-test pointer equality-exit induction (`iter !=
+/// end`, the load guarded by the header check).
 fn recognize_ptr(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<PtrIndVar> {
     let s = exit_shape(f, cfg, l)?;
     let nv = back_edge_next(f, cfg, l, &s)?;
@@ -174,7 +182,71 @@ fn recognize_ptr(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<PtrIn
     if stride_elems <= 0 {
         return None;
     }
-    Some(PtrIndVar { reg: s.reg, end: s.bound, elem, stride_elems })
+    Some(PtrIndVar { reg: s.reg, end: s.bound, elem, stride_elems, bottom_test: false })
+}
+
+/// Try to recognize the **rotated** (`-O`, bottom-test) pointer walk, where the
+/// header tests the *stepped* pointer `next == end` after an unconditional load:
+///   `head(iter): … load iter … next = iter + k ; condbr (next == end) -> exit / head`.
+/// The loop continues while `next != end`. Because the load precedes the exit
+/// check, the bound `iter + stride ≤ end` is sound only when the loop is entered
+/// non-empty — which the engine proves as a base case from the preheader guard
+/// (so no preheader analysis is needed here, only the structural recognition).
+fn recognize_ptr_bottom(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<PtrIndVar> {
+    let [latch] = l.latches[..] else { return None };
+    let header_id = cfg.block_id(l.header);
+    let header = f.block(header_id)?;
+    let Terminator::CondBr { cond: Operand::Reg(c), then_blk, else_blk, .. } = &header.term else {
+        return None;
+    };
+    let (op, lhs, rhs) = find_cmp(header, *c)?;
+    let then_in = cfg.index_of(*then_blk).is_some_and(|n| l.body.contains(&n));
+    let else_in = cfg.index_of(*else_blk).is_some_and(|n| l.body.contains(&n));
+    if then_in == else_in {
+        return None;
+    }
+    // The loop continues (stays in the body) exactly on the `next != end` edge.
+    let continue_is_true = match op {
+        CmpOp::Ne => true,
+        CmpOp::Eq => false,
+        _ => return None,
+    };
+    if then_in != continue_is_true {
+        return None;
+    }
+    // For a pointer header-parameter `iter`, the back-edge must carry
+    // `next = iter + k`, and the exit comparison must be `(next, end)`.
+    for (pos, (iter, ty)) in header.params.iter().enumerate() {
+        if !ty.is_ptr() {
+            continue;
+        }
+        let Some(next) = edge_arg(f.block(cfg.block_id(latch))?, header_id, pos)
+            .and_then(|a| if let Operand::Reg(r) = a { Some(r) } else { None })
+        else {
+            continue;
+        };
+        let Some((stride_elems, elem)) = self_increment_ptr(f, cfg, l, next, *iter) else {
+            continue;
+        };
+        if stride_elems <= 0 {
+            continue;
+        }
+        let next_op = Operand::Reg(next);
+        let end = if lhs == next_op {
+            rhs.clone()
+        } else if rhs == next_op {
+            lhs.clone()
+        } else {
+            continue;
+        };
+        if let Operand::Reg(r) = &end {
+            if defined_in_loop(f, cfg, l, *r) {
+                continue;
+            }
+        }
+        return Some(PtrIndVar { reg: *iter, end, elem, stride_elems, bottom_test: true });
+    }
+    None
 }
 
 /// Find the comparison a boolean register was assigned in `block` (SSA: one def).
@@ -423,10 +495,97 @@ mod tests {
                 end: Operand::Reg(RegId(1)),
                 elem: Type::int(32),
                 stride_elems: 1,
+                bottom_test: false,
             }]
         );
         // It is a pointer induction, not an integer one.
         assert!(a.eq_exit_indvars(BlockId(1)).is_empty());
+    }
+
+    /// The rotated (`-O`) bottom-test walk — one block, load then step then test:
+    ///   bb0: empty = (base == end); condbr empty -> bb2 / bb1(base)
+    ///   bb1(iter): x = load iter; nx = iter + 1; atend = (nx == end);
+    ///              condbr atend -> bb2 / bb1(nx)
+    ///   bb2: return
+    fn ptr_walk_bottom() -> Function {
+        let base = RegId(0);
+        let end = RegId(1);
+        let empty = RegId(2);
+        let iter = RegId(3);
+        let x = RegId(4);
+        let nx = RegId(5);
+        let atend = RegId(6);
+
+        let mut bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(empty),
+                then_blk: BlockId(2),
+                then_args: vec![],
+                else_blk: BlockId(1),
+                else_args: vec![Operand::Reg(base)],
+            },
+        );
+        bb0.insts.push(Inst::Assign {
+            dst: empty,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Eq, lhs: Operand::Reg(base), rhs: Operand::Reg(end) },
+        });
+
+        let mut bb1 = BasicBlock::new(
+            BlockId(1),
+            Terminator::CondBr {
+                cond: Operand::Reg(atend),
+                then_blk: BlockId(2),
+                then_args: vec![],
+                else_blk: BlockId(1),
+                else_args: vec![Operand::Reg(nx)],
+            },
+        );
+        bb1.params = vec![(iter, Type::ptr(Type::int(32)))];
+        bb1.insts.push(Inst::Load {
+            dst: x,
+            ty: Type::int(32),
+            ptr: Operand::Reg(iter),
+            align: 4,
+        });
+        bb1.insts.push(Inst::PtrOffset {
+            dst: nx,
+            base: Operand::Reg(iter),
+            index: Operand::int(64, 1),
+            elem: Type::int(32),
+        });
+        bb1.insts.push(Inst::Assign {
+            dst: atend,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Eq, lhs: Operand::Reg(nx), rhs: Operand::Reg(end) },
+        });
+
+        let bb2 = BasicBlock::new(BlockId(2), Terminator::Return(None));
+        Function {
+            id: FuncId(0),
+            name: "ptr_walk_bottom".into(),
+            params: vec![(base, Type::ptr(Type::int(32))), (end, Type::ptr(Type::int(32)))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn recognizes_bottom_test_pointer_walk() {
+        let a = analyze_induction(&ptr_walk_bottom());
+        let vars = a.eq_exit_ptr_indvars(BlockId(1));
+        assert_eq!(
+            vars,
+            &[PtrIndVar {
+                reg: RegId(3),
+                end: Operand::Reg(RegId(1)),
+                elem: Type::int(32),
+                stride_elems: 1,
+                bottom_test: true,
+            }]
+        );
     }
 
     #[test]

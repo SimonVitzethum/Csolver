@@ -54,6 +54,14 @@ after proving the side-conditions (`0 ≤ b0 ≤ end_off ≤ size ≤ isize::MAX
 `stride | (end_off − b0)`). Tested by
 `recognizes_pointer_equality_exit_induction`.
 
+The recogniser also handles the **rotated** (`-O`, bottom-test) walk, where the
+header tests the *stepped* pointer `next == end` after an unconditional load
+(`bottom_test = true`). The structural recognition is the same (back-edge step is
+`iter + k`), only the exit compares `next` (the back-edge value) rather than
+`iter`; the soundness-critical "entered non-empty" condition is left to the
+engine, which proves the base case from the preheader guard. Tested by
+`recognizes_bottom_test_pointer_walk`.
+
 ## Specification
 - `Interval` is `⊥ ∪ [lo,hi]` over `ℤ ∪ {±∞}`; arithmetic saturates at ±∞.
 - `widen`: bounds that grew jump to ±∞ (finite ascending chains collapse in ≤2

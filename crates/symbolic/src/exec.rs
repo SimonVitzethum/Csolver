@@ -380,6 +380,10 @@ struct PtrIndCapture {
     size: ExprId,
     /// The per-iteration byte stride (`elem size × element step`).
     stride_bytes: u64,
+    /// `true` for the rotated form (load precedes the `next == end` check): the
+    /// bound is `o + stride ≤ end_off` and its base case is proved from the
+    /// preheader guard. `false` for the header-test form (`o ≤ end_off`).
+    bottom_test: bool,
 }
 
 /// Where a loaded value comes from, per the store log (most-recent-first scan).
@@ -888,6 +892,7 @@ impl Explorer<'_> {
                     end_off: end.offset,
                     size,
                     stride_bytes,
+                    bottom_test: iv.bottom_test,
                 })
             })
             .collect();
@@ -990,19 +995,25 @@ impl Explorer<'_> {
         }
     }
 
-    /// Install the sound offset bound for a pointer equality-exit induction
-    /// (`iter != end`). The generic havoc made `iter` opaque; here — only after
-    /// **proving** the side-conditions — we restore its region provenance with a
-    /// fresh offset `o` constrained by `b0 ≤ o ≤ end_off ≤ size` and the
-    /// congruence `o ≡ b0 (mod stride)`. With those, the loop guard `iter != end`
-    /// (an offset `o != end_off` within the region) yields `o ≤ end_off − stride`,
-    /// so a `stride`-byte load at `o` is in bounds.
+    /// Install the sound offset bound for a pointer equality-exit induction. The
+    /// generic havoc made `iter` opaque; here — only after **proving** the
+    /// side-conditions — we restore its region provenance with a fresh offset `o`
+    /// constrained by `b0 ≤ o`, the congruence `o ≡ b0 (mod stride)`, and an upper
+    /// bound that depends on the loop form:
+    ///   - **header-test** (`bottom_test == false`): `o ≤ end_off`. The load is
+    ///     guarded, so with the guard `iter != end` (`o != end_off`) the
+    ///     congruence gives `o ≤ end_off − stride`, hence `o + stride ≤ end_off`.
+    ///   - **bottom-test / rotated** (`bottom_test == true`): `o + stride ≤
+    ///     end_off`. The load is unconditional, so this stronger invariant is
+    ///     needed directly; its base case (`b0 + stride ≤ end_off`) is provable
+    ///     only when the loop is entered non-empty — i.e. from the preheader
+    ///     guard `base != end`, which sits in this header's path condition.
     ///
-    /// The side-conditions: `0 ≤ b0 ≤ end_off ≤ size ≤ isize::MAX` and
-    /// `stride | (end_off − b0)` (so `end` lies on the walk's grid — otherwise
-    /// `iter` steps over `end`, never satisfies the `== end` exit, and the bound
-    /// would be unsound). Only power-of-two strides (the element sizes that
-    /// arise) get the exact bit-precise divisibility; others are skipped.
+    /// The common side-conditions: `0 ≤ b0`, `end_off ≤ size ≤ isize::MAX`, and
+    /// `stride | (end_off − b0)` (so `end` lies on the walk's grid — otherwise the
+    /// pointer steps over `end`, never satisfies the `== end` exit, and the bound
+    /// would be unsound). Only power-of-two strides (the element sizes that arise)
+    /// get the exact bit-precise divisibility; others are skipped.
     fn assert_ptr_walk_bound(&mut self, state: &mut PathState, cap: PtrIndCapture) {
         let stride = cap.stride_bytes;
         if stride == 0 || !(stride as u128).is_power_of_two() {
@@ -1011,21 +1022,33 @@ impl Explorer<'_> {
         let zero = self.ctx.int(PTR_WIDTH, 0);
         let isize_max = self.ctx.int(PTR_WIDTH, i64::MAX as u128);
         let mask = self.ctx.int(PTR_WIDTH, (stride as u128) - 1);
+        // `lo + d` is the largest accessed offset's lower witness: for the rotated
+        // form the load happens at the unincremented pointer, so the invariant is
+        // shifted by one stride (`d = stride`); the header-test form has `d = 0`.
+        let plus_d = |s: &mut Self, e: ExprId| -> ExprId {
+            if cap.bottom_test {
+                let d = s.ctx.int(PTR_WIDTH, stride as u128);
+                s.ctx.bin(BvOp::Add, e, d)
+            } else {
+                e
+            }
+        };
         // (end_off − b0) & mask == 0: end is on the walk's grid.
         let ediff = self.ctx.bin(BvOp::Sub, cap.end_off, cap.b0);
         let emask = self.ctx.bin(BvOp::And, ediff, mask);
         let end_on_grid = self.ctx.cmp(SCmp::Eq, emask, zero);
+        let b0_upper = plus_d(self, cap.b0);
         let gate = [
-            self.ctx.cmp(SCmp::Sle, zero, cap.b0),          // 0 ≤ b0
-            self.ctx.cmp(SCmp::Sle, cap.b0, cap.end_off),   // b0 ≤ end_off
-            self.ctx.cmp(SCmp::Sle, cap.end_off, cap.size), // end_off ≤ size
-            self.ctx.cmp(SCmp::Sle, cap.size, isize_max),   // size ≤ isize::MAX
+            self.ctx.cmp(SCmp::Sle, zero, cap.b0),           // 0 ≤ b0
+            self.ctx.cmp(SCmp::Sle, b0_upper, cap.end_off),  // b0 (+ stride) ≤ end_off
+            self.ctx.cmp(SCmp::Sle, cap.end_off, cap.size),  // end_off ≤ size
+            self.ctx.cmp(SCmp::Sle, cap.size, isize_max),    // size ≤ isize::MAX
             end_on_grid,
         ];
         // The region's no-wrap premise (`size = count·stride ≤ isize::MAX`) lets
-        // `size ≤ isize::MAX` be proved for a *symbolic* slice length. It is added
-        // only for the gate proof (kept off the permanent facts, which would slow
-        // every later proof) — exactly as the memory-OOB refutation does.
+        // `size ≤ isize::MAX` be proved for a *symbolic* slice length, and the
+        // preheader guard (already in `pathcond`) is what makes the rotated form's
+        // `b0 + stride ≤ end_off` provable. Both are read from the current state.
         let nowrap = state.regions.get(cap.region).and_then(|r| r.size_nowrap);
         let restore = state.facts.len();
         if let Some(nw) = nowrap {
@@ -1046,14 +1069,19 @@ impl Explorer<'_> {
                 align: gcd(cap.align, stride),
             }),
         );
+        let o_upper = plus_d(self, o);
         let odiff = self.ctx.bin(BvOp::Sub, o, cap.b0);
         let omask = self.ctx.bin(BvOp::And, odiff, mask);
         let ediff2 = self.ctx.bin(BvOp::Sub, cap.end_off, cap.b0);
         let emask2 = self.ctx.bin(BvOp::And, ediff2, mask);
         let facts = [
+            self.ctx.cmp(SCmp::Sle, zero, cap.b0),          // 0 ≤ b0
             self.ctx.cmp(SCmp::Sle, cap.b0, o),             // b0 ≤ o
-            self.ctx.cmp(SCmp::Sle, o, cap.end_off),        // o ≤ end_off
+            self.ctx.cmp(SCmp::Sle, zero, o_upper),         // 0 ≤ o (+ stride) (no wrap)
+            self.ctx.cmp(SCmp::Sle, o_upper, cap.end_off),  // o (+ stride) ≤ end_off
+            self.ctx.cmp(SCmp::Sle, o_upper, cap.size),     // o (+ stride) ≤ size
             self.ctx.cmp(SCmp::Sle, cap.end_off, cap.size), // end_off ≤ size
+            self.ctx.cmp(SCmp::Sle, cap.size, isize_max),   // size ≤ isize::MAX (no wrap)
             self.ctx.cmp(SCmp::Eq, omask, zero),            // o ≡ b0 (mod stride)
             self.ctx.cmp(SCmp::Eq, emask2, zero),           // end_off ≡ b0 (mod stride)
         ];

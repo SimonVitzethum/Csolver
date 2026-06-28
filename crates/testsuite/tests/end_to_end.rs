@@ -7,7 +7,8 @@ use csolver_testsuite::{
     dangling_store, eq_exit_loop, eq_exit_loop_oob, guarded_get, indirect_store, init_read,
     interproc_module, loop_array_store, masked_index_store, mixed_module, needs_solver,
     oob_dynamic_store, oob_index_store, oob_mask_check, provably_buggy, provably_safe,
-    ptr_walk_loop, ptr_walk_loop_oob, relational_loop, safe_buffer_store, uninit_read,
+    ptr_walk_bottom_loop, ptr_walk_bottom_unguarded, ptr_walk_loop, ptr_walk_loop_oob,
+    relational_loop, safe_buffer_store, uninit_read,
 };
 use csolver_verifier::{verify_function, verify_module, Config};
 
@@ -321,6 +322,31 @@ fn pointer_walk_past_the_end_is_not_pass() {
     m.functions.push(ptr_walk_loop_oob());
     let report = verify_module(&m, &Config::default());
     assert_ne!(report.verdict, Verdict::Pass, "a pointer walk past the end must not pass");
+}
+
+#[test]
+fn rotated_pointer_walk_is_proven_via_the_preheader_guard() {
+    // The rotated (`-O`) iterator shape over a *symbolic*-length buffer: the load
+    // precedes the `next == end` check, so the bound holds only because the loop
+    // is entered under the `is_empty` preheader guard. The engine proves the base
+    // case `0 + stride <= end` from that guard (in the path condition) → PASS.
+    let mut m = csolver_ir::Module::new("ptrwalkbottom");
+    m.functions.push(ptr_walk_bottom_loop());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.functions[0].outcomes.iter().all(|o| o.verdict() == Verdict::Pass));
+}
+
+#[test]
+fn rotated_pointer_walk_without_preheader_guard_is_not_pass() {
+    // Soundness: the same rotated walk WITHOUT the `is_empty` guard. On an empty
+    // range (`n == 0`) the unconditional load reads out of bounds. The base case
+    // `0 + stride <= end` is unprovable (nothing rules out `n == 0`), so the
+    // bounded offset is never installed and the load is not proved.
+    let mut m = csolver_ir::Module::new("ptrwalkbottomnoguard");
+    m.functions.push(ptr_walk_bottom_unguarded());
+    let report = verify_module(&m, &Config::default());
+    assert_ne!(report.verdict, Verdict::Pass, "rotated walk without an emptiness guard must not pass");
 }
 
 #[test]

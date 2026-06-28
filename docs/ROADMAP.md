@@ -117,10 +117,16 @@ whole tool, argued in each crate's `Verification/`.
   walk keeps `iter`'s region provenance with a fresh offset bounded by `0 ≤ o ≤
   end_off ≤ size` plus the **congruence** `o ≡ 0 (mod stride)` (so a `stride`-byte
   load at `o < end_off` is in bounds, which `o ≤ end_off − 1` alone is not). The
-  header-test `for x in s` walk now verifies (`ptr_walk_loop` → PASS; a walk past
-  the end → not PASS). Remaining (stage 3): the rotated `-O` (bottom-test) form,
-  where the exit compares the *stepped* pointer and the load precedes the check
-  (needs a preheader-guard analysis), and the LLVM front-end producing this shape.
+  header-test `for x in s` walk verifies (`ptr_walk_loop` → PASS; a walk past the
+  end → not PASS). **Stage 3 is in:** the rotated `-O` (bottom-test) form, where
+  the load precedes the `next == end` check, also verifies — the stronger bound
+  `iter + stride ≤ end` is sound only on a non-empty range, and rather than
+  analyse the `is_empty` preheader guard structurally the engine **proves the base
+  case** `b0 + stride ≤ end_off` from that guard in the path condition (so a
+  missing guard simply fails the proof: `ptr_walk_bottom_loop` → PASS,
+  `ptr_walk_bottom_unguarded` → not PASS). Remaining: the LLVM front-end emitting
+  these shapes from real `rustc -O` output (the phi-pointer walk), so the loop is
+  recognised from compiled Rust rather than hand-built MSIR.
 - **Relational loop invariants** — **in** (zone / difference-bound domain). A
   `Zone` DBM tracks `vⱼ − vᵢ ≤ c` between registers; the symbolic engine adds its
   header invariants as facts, so a loop whose safety is a *relation* (a second
