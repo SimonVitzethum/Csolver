@@ -17,6 +17,8 @@ csolver-ir.workspace = true
 csolver-verifier.workspace = true
 csolver-report.workspace = true
 csolver-llvm.workspace = true
+csolver-elf.workspace = true
+csolver-asm.workspace = true
 
 [lints]
 workspace = true

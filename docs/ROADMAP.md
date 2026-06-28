@@ -46,9 +46,14 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    to "verify compiled Rust" because `rustc` emits LLVM-IR.
 2. **Rust MIR** (`csolver-mir`): consume `rustc`'s MIR (stable-MIR or a driver),
    carrying borrow facts and panic edges that *sharpen* obligations.
-3. **Assembly** (`csolver-asm`) + **ELF/DWARF** (`csolver-elf`): decode x86-64 /
-   AArch64, recover the stack frame and types from DWARF, and lower to MSIR with
-   the flat-memory model. Needed for "prove a binary with no source".
+3. **Assembly** (`csolver-asm`) + **ELF/DWARF** (`csolver-elf`): **started.** A
+   pure-Rust ELF64 reader (`csolver-elf`) parses sections/symbols and recovers a
+   function's machine bytes; a minimal x86-64 decoder (`csolver-asm`
+   `x86::decode_function`) lowers a straight-line function to MSIR. The whole
+   binary pipeline runs end-to-end — a real ELF `xor eax,eax; ret` verifies PASS,
+   unprovable/undecoded functions are UNKNOWN (never a false PASS). Remaining:
+   control flow (jumps), the broad ISA, the stack frame + DWARF types, AArch64,
+   relocations/PLT, and PE/Mach-O.
 
 Each front-end owes a **refinement proof** (every concrete behaviour of the
 input is a concrete behaviour of the emitted MSIR) — the soundness hinge for the

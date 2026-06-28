@@ -8,10 +8,19 @@ completed **M0 — architecture + foundations**.
 `csolver-elf` now **parses real ELF64 objects** in pure Rust (no `object`/`gimli`):
 the header, the section table (names, vaddr/size/file-offset, R/W/X permissions),
 and the symbol table (functions and their sizes). `Image::function_code` recovers
-a function's exact machine bytes — the hand-off point to the (next) x86-64
-decoder. Parsing is bounds-checked throughout, so a malformed image is a clean
-`Error`, never a panic. This is the first layer of verifying a compiled binary
-with no source; DWARF, relocations, PE/Mach-O, and the decoder/lowering follow.
+a function's exact machine bytes. Parsing is bounds-checked throughout, so a
+malformed image is a clean `Error`, never a panic.
+
+`csolver-asm` then **decodes x86-64 machine code → MSIR** (`x86::decode_function`):
+a straight-line function's bytes become MSIR instructions (registers → `RegId`s,
+`[base]` memory operands → `Load`/`Store`). So the **whole binary pipeline now
+runs end-to-end**: a real ELF object's `xor eax,eax; ret` is loaded, decoded,
+lowered, and verified **PASS**; a raw-pointer store (`mov [rdi], rsi`) is
+`UNKNOWN` (nothing proves `rdi` valid); a `syscall` (undecoded) is `UNKNOWN` —
+never a false PASS (`tests/binary.rs`). The decoded subset is tiny but grows
+monotonically: any unrecognized opcode makes the function `unanalyzed`
+(`UNKNOWN`), never silently mis-modelled. DWARF, control flow, the full ISA, and
+PE/Mach-O follow.
 
 ## Bit-precise decision procedure (pure-Rust SAT)
 

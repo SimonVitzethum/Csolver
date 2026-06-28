@@ -11,6 +11,10 @@
 //! [`csolver_core::Error::Unsupported`] (planned milestone M4). The supported
 //! [`Architecture`] and [`Syntax`] enums fix the public surface.
 
+pub mod x86;
+
+pub use x86::decode_function;
+
 use csolver_core::{Error, Result};
 use csolver_ir::{Frontend, Module};
 
