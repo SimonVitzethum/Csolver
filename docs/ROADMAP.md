@@ -104,9 +104,18 @@ whole tool, argued in each crate's `Verification/`.
   ownership) and inferred per-region initialization ranges for symbolic offsets.
 - **Pointer-induction loops** — the fully-optimized `for x in s` lowers to a
   vectorized **pointer-walking** loop (`iter != end`, `end = base + len*sizeof`).
-  Verifying it soundly needs a relational pointer-offset abstract domain *plus*
-  congruence/modular reasoning (the `!=` end-pointer guard). Index-based slice
-  loops already verify; this is the remaining (research-level) loop shape.
+  **Stage 1 is in:** an *equality-exit induction* analysis (`csolver-absint`
+  `induction`) recognizes a counter `v` that steps by a constant stride and exits
+  on `v == bound`, and the symbolic engine asserts the sound invariant `start ≤ v
+  ≤ bound` — but only after **proving** the side-conditions (`0 ≤ start ≤ bound ≤
+  isize::MAX` and `stride | (bound − start)`, the divisibility that stops the
+  counter overshooting a `!=` bound). With the loop guard `v != bound` this gives
+  the strict `v < bound` the interval domain cannot derive from a `!=` exit, so an
+  **integer** `while i != n { buf[i] … }` loop now verifies (and an out-of-bounds
+  bound is still not proved). Remaining (stage 2): carry this to the **pointer**
+  offset itself (keep `iter`'s region provenance with a fresh bounded offset) and
+  add the **congruence** fact `offset ≡ 0 (mod stride)` so a load of `stride`
+  bytes at `offset < end` is in bounds — then the real `iter != end` walk verifies.
 - **Relational loop invariants** — **in** (zone / difference-bound domain). A
   `Zone` DBM tracks `vⱼ − vᵢ ≤ c` between registers; the symbolic engine adds its
   header invariants as facts, so a loop whose safety is a *relation* (a second

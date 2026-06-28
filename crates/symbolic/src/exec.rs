@@ -11,7 +11,10 @@
 //! reachable path, which the UNSAT-only solver cannot supply.
 
 use crate::ExecLimits;
-use csolver_absint::{analyze_intervals, analyze_zones, Bound, IntervalAnalysis, ZoneAnalysis};
+use csolver_absint::{
+    analyze_induction, analyze_intervals, analyze_zones, Bound, EqExitIndVar, InductionAnalysis,
+    IntervalAnalysis, ZoneAnalysis,
+};
 use csolver_cfg::{Dominators, Loops};
 use csolver_core::{Model, RegionKind, SafetyProperty};
 use crate::summary::{Affine, RetSummary, Summary};
@@ -143,6 +146,7 @@ fn discharge_inner(
 ) -> SymbolicReport {
     let analysis = analyze_intervals(f);
     let zones = analyze_zones(f);
+    let inductions = analyze_induction(f);
     let dominators = Dominators::new(analysis.cfg());
     let loops = Loops::detect(analysis.cfg(), &dominators);
 
@@ -188,6 +192,7 @@ fn discharge_inner(
         assumptions: HashSet::new(),
         analysis,
         zones,
+        inductions,
         dominators,
         headers,
         loop_modified,
@@ -461,6 +466,9 @@ struct Explorer<'f> {
     /// Relational (zone) invariants — difference constraints between registers
     /// that the per-register interval domain cannot express.
     zones: ZoneAnalysis,
+    /// Equality-exit induction variables (`while i != n`), whose `start ≤ i ≤ n`
+    /// bound the interval domain cannot derive from a `!=` guard.
+    inductions: InductionAnalysis,
     dominators: Dominators,
     /// Block ids that are loop headers.
     headers: HashSet<BlockId>,
@@ -813,6 +821,25 @@ impl Explorer<'_> {
         // over-approximation; loads then return fresh unknowns).
         state.heap.clear();
 
+        // Equality-exit induction variables (`while i != n { … i += c }`): capture
+        // each one's start (its pre-havoc value) and bound now, before the havoc
+        // below replaces it with a fresh symbol. The sound bound is asserted after
+        // the havoc (see `assert_eq_exit_bound`).
+        let inductions: Vec<(EqExitIndVar, ExprId, ExprId)> = self
+            .inductions
+            .eq_exit_indvars(header)
+            .to_vec()
+            .into_iter()
+            .filter_map(|iv| {
+                let start = match state.env.get(&iv.reg) {
+                    Some(SymValue::Scalar(e)) => *e,
+                    _ => return None,
+                };
+                let bound = self.eval_scalar(&iv.bound, state);
+                Some((iv, start, bound))
+            })
+            .collect();
+
         // If the loop body may free memory, then on any iteration after the
         // first a region could already be freed — so no region's liveness can
         // be proved inside (or after) the loop. Invalidate liveness
@@ -893,6 +920,62 @@ impl Explorer<'_> {
             let fact = self.ctx.cmp(SCmp::Sle, ea, rhs);
             state.facts.push(fact);
         }
+
+        // Equality-exit induction bounds: for each `while v != bound { … v += c }`
+        // recognized at this header, assert `start ≤ v ≤ bound` on the now-havoc'd
+        // `v` — after solver-checking the soundness side-conditions.
+        for (iv, start_e, bound_e) in inductions {
+            if let Some(SymValue::Scalar(v)) = state.env.get(&iv.reg).cloned() {
+                self.assert_eq_exit_bound(state, v, start_e, bound_e, iv.stride);
+            }
+        }
+    }
+
+    /// Assert the sound bound `start ≤ v ≤ bound` for an equality-exit induction
+    /// variable, but only after **proving** the side-conditions that make it a
+    /// true loop invariant: `0 ≤ start ≤ bound ≤ isize::MAX` (the counter starts
+    /// in range and the bound does not wrap), and `stride | (bound − start)` so
+    /// `bound` lies on the grid `{start + k·stride}` — otherwise `v` steps *over*
+    /// `bound`, never satisfies the `v == bound` exit, and could exceed `bound`
+    /// (making the bound unsound). If any condition is not proved, nothing is
+    /// asserted (sound fallback). The divisibility check is exact only for
+    /// power-of-two strides (the element sizes that arise); other strides are
+    /// skipped.
+    fn assert_eq_exit_bound(
+        &mut self,
+        state: &mut PathState,
+        v: ExprId,
+        start: ExprId,
+        bound: ExprId,
+        stride: i128,
+    ) {
+        if stride <= 0 {
+            return;
+        }
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let isize_max = self.ctx.int(PTR_WIDTH, i64::MAX as u128);
+        let mut gate = vec![
+            self.ctx.cmp(SCmp::Sle, zero, start),     // 0 ≤ start
+            self.ctx.cmp(SCmp::Sle, start, bound),    // start ≤ bound
+            self.ctx.cmp(SCmp::Sle, bound, isize_max), // bound ≤ isize::MAX
+        ];
+        if stride > 1 {
+            if !(stride as u128).is_power_of_two() {
+                return; // non-power-of-two stride: divisibility not encodable exactly
+            }
+            // (bound − start) & (stride − 1) == 0  ⟺  stride | (bound − start).
+            let mask = self.ctx.int(PTR_WIDTH, (stride as u128) - 1);
+            let diff = self.ctx.bin(BvOp::Sub, bound, start);
+            let masked = self.ctx.bin(BvOp::And, diff, mask);
+            gate.push(self.ctx.cmp(SCmp::Eq, masked, zero));
+        }
+        if !gate.into_iter().all(|g| self.prove(g, state)) {
+            return;
+        }
+        let f_lo = self.ctx.cmp(SCmp::Sle, start, v);
+        let f_hi = self.ctx.cmp(SCmp::Sle, v, bound);
+        state.facts.push(f_lo);
+        state.facts.push(f_hi);
     }
 
     fn step(&mut self, block: BlockId, idx: usize, inst: &Inst, state: &mut PathState) {

@@ -30,6 +30,22 @@ termination is immediate, while the *stable* difference bounds that loop inducti
 relations need are kept. The variable count is capped (`MAX_VARS`); past it the
 analysis yields no relations (sound).
 
+## Equality-exit induction (`induction`)
+Where the zone relates two variables, the `induction` analysis recognizes the
+*shape* of a single counter governing an **equality**-exit loop — `while v !=
+bound { … v += c }` — which neither the interval nor the zone domain can bound (a
+`!=` guard refines no order constraint). It is purely syntactic and
+**conservative**: for a natural loop with a single back-edge whose header
+branches on `cmp(Eq|Ne, v, bound)` with `v` a header parameter, it checks that
+the loop continues exactly on the `v != bound` edge, that the back-edge carries
+`v := v + c` for a constant `c > 0`, and that `bound` is loop-invariant — and
+only then reports `EqExitIndVar { v, bound, stride: c }`. It authorises no fact:
+the symbolic engine asserts the bound `start ≤ v ≤ bound` *only* after proving
+`0 ≤ start ≤ bound ≤ isize::MAX` and `stride | (bound − start)` (so `bound` is on
+the counter's grid and `v` cannot overshoot it). Anything unrecognised yields no
+induction variable. Tested by `recognizes_equality_exit_induction` /
+`ignores_a_less_than_exit`.
+
 ## Specification
 - `Interval` is `⊥ ∪ [lo,hi]` over `ℤ ∪ {±∞}`; arithmetic saturates at ±∞.
 - `widen`: bounds that grew jump to ±∞ (finite ascending chains collapse in ≤2

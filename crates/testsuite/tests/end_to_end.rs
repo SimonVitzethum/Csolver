@@ -4,9 +4,10 @@
 use csolver_core::{SafetyProperty, Verdict};
 use csolver_report::{render_json, render_text};
 use csolver_testsuite::{
-    dangling_store, guarded_get, indirect_store, init_read, interproc_module, loop_array_store,
-    masked_index_store, mixed_module, needs_solver, oob_dynamic_store, oob_index_store,
-    oob_mask_check, provably_buggy, provably_safe, relational_loop, safe_buffer_store, uninit_read,
+    dangling_store, eq_exit_loop, eq_exit_loop_oob, guarded_get, indirect_store, init_read,
+    interproc_module, loop_array_store, masked_index_store, mixed_module, needs_solver,
+    oob_dynamic_store, oob_index_store, oob_mask_check, provably_buggy, provably_safe,
+    relational_loop, safe_buffer_store, uninit_read,
 };
 use csolver_verifier::{verify_function, verify_module, Config};
 
@@ -271,6 +272,31 @@ fn read_after_write_is_initialized_and_passes() {
     let report = verify_module(&m, &Config::default());
     assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
     assert!(report.functions[0].outcomes.iter().all(|o| o.verdict() == Verdict::Pass));
+}
+
+#[test]
+fn equality_exit_loop_is_proven_via_induction_bounds() {
+    // `i = 0; while i != 8 { buf[i] = 0; i += 1 }` over `[i32; 8]`. The `!=` exit
+    // defeats the interval domain (it widens `i` to `[0, +∞]`); the equality-exit
+    // induction analysis supplies `0 ≤ i ≤ 8`, and with the guard `i != 8` this
+    // yields `i < 8`, so every access is in bounds. This is the integer precursor
+    // of the pointer-walk loop.
+    let mut m = csolver_ir::Module::new("eqexit");
+    m.functions.push(eq_exit_loop());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.functions[0].outcomes.iter().all(|o| o.verdict() == Verdict::Pass));
+}
+
+#[test]
+fn equality_exit_loop_out_of_bounds_is_not_pass() {
+    // Soundness: the same loop with exit bound 16 over a `[i32; 8]` accesses
+    // `buf[i]` for `i ∈ [8, 16)`. The induction bound `0 ≤ i ≤ 16` must NOT be
+    // mistaken for in-bounds — the access cannot be proved safe.
+    let mut m = csolver_ir::Module::new("eqexitoob");
+    m.functions.push(eq_exit_loop_oob());
+    let report = verify_module(&m, &Config::default());
+    assert_ne!(report.verdict, Verdict::Pass, "out-of-bounds equality-exit loop must not pass");
 }
 
 #[test]

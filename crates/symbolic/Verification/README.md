@@ -52,6 +52,22 @@ is discharged by the linear solver. Soundness rests on the interval invariant
 being a true over-approximation of the header state on every iteration (proved
 in `csolver-absint`).
 
+### Equality-exit induction bounds (`while i != n`)
+A loop that exits on an **equality** (`i == n`, continuing while `i != n`)
+defeats the interval domain — a `!=` guard refines no bound, so `i` widens to
+`[0, +∞]`. For such loops `csolver-absint::induction` recognizes the counter
+(start, stride, bound), and `assert_eq_exit_bound` adds the invariant `start ≤ i
+≤ bound` at the header **only after proving** the side-conditions that make it a
+true invariant: `0 ≤ start ≤ bound ≤ isize::MAX` and `stride | (bound − start)`
+(for power-of-two strides, the exact bit-precise `(bound − start) & (stride−1) ==
+0`). The divisibility is essential: if `bound` were off the counter's grid, `i`
+would step over it, never hit the `== bound` exit, and exceed `bound` — so the
+bound would be unsound. With these proved, the body (entered under `i != bound`)
+has `i ≤ bound ∧ i != bound`, i.e. the strict `i < bound` that proves `buf[i]` in
+bounds. If any side-condition is unproved, no fact is asserted (sound fallback),
+so an out-of-bounds exit bound never fakes safety. This is the integer stage of
+the pointer-walk (`iter != end`) loop.
+
 ## Symbolic memory model
 A pointer is `provenance + symbolic offset + alignment` — **never a bare
 integer**. A region carries a symbolic byte size, a lifetime state

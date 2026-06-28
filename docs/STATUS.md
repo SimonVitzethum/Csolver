@@ -3,6 +3,24 @@
 Milestone **M1 — symbolic execution + SMT (increment 1 done)**, on top of the
 completed **M0 — architecture + foundations**.
 
+## Equality-exit loops (`while i != n`): induction bounds
+
+The `!=`/`==`-exit loop — the integer precursor of the pointer-walk (`iter !=
+end`) — now verifies. The interval domain widens a counter governed by `i != n`
+to `[0, +∞]` (a `!=` guard refines no interval), so it cannot bound the access.
+A new **equality-exit induction** analysis (`csolver-absint::induction`)
+recognizes, purely syntactically and conservatively, a header counter `i` that
+steps by a constant positive stride and exits on `i == bound`. The symbolic
+engine then asserts the invariant `start ≤ i ≤ bound` — but **only after proving
+the soundness side-conditions**: `0 ≤ start ≤ bound ≤ isize::MAX`, and `stride |
+(bound − start)` so `bound` lies on the counter's grid (otherwise `i` steps
+*over* `bound`, never hits the `== bound` exit, and could exceed it — an unsound
+bound). With the loop guard `i != bound` this yields the strict `i < bound`, so
+`buf[i]` is proved in bounds (`eq_exit_loop` → PASS); an exit bound past the
+buffer is still not proved (`eq_exit_loop_oob` → not PASS). This is stage 1 of
+the pointer-walk loop; stage 2 carries the same reasoning to the pointer offset
+plus a congruence fact (`offset ≡ 0 mod stride`).
+
 ## Definedness: no read of uninitialized memory
 
 The symbolic engine now checks a new memory-safety property — **definedness** —
