@@ -7,11 +7,23 @@ pointer are explicit; DWARF (from `csolver-elf`) supplies frame layout.
 The **machine-code decoder** (`x86::decode_function`) lowers a straight-line
 x86-64 function — recovered from an ELF `.text` by `csolver-elf` — into MSIR, so
 the audited analysis core verifies a compiled binary with no source. x86 registers
-become MSIR `RegId`s (the encoding number); a memory operand `[base]` becomes a
-`Load`/`Store` through the base register (a flat-memory pointer). Currently
-decoded: the REX prefix, `ret`/`nop`, `mov r,imm`, the reg/reg ALU ops
-(`xor`/`add`/`sub`/`and`/`or`, with `xor r,r` recognised as zeroing), and
-`mov` reg↔reg / simple `[base]` load/store.
+become MSIR `RegId`s (the encoding number); a memory operand `[base + disp]`
+(including a SIB byte and an 8/32-bit displacement) lowers to a `PtrOffset` then a
+`Load`/`Store`. Currently decoded: the REX prefix, `ret`/`nop`, `mov r,imm`, the
+reg/reg ALU ops (`xor`/`add`/`sub`/`and`/`or`, with `xor r,r` recognised as
+zeroing), the group-1 `add`/`sub r, imm8`, and `mov` reg↔reg / `[base+disp]`
+load/store.
+
+### Stack frame model
+`sub rsp, N` is recognised as **allocating the function's frame**: it lowers to an
+`Alloc` of an `N`-byte `Stack` region with `rsp` as the pointer, so a subsequent
+`[rsp + disp]` access (via a SIB byte) is checked against the frame — `disp +
+size ≤ N` is in bounds. `add rsp, N` tears the frame down (a no-op for the
+analysis, as nothing accesses it after). This is what lets a binary's stack store
+be *proved* safe: `sub rsp,16 ; mov [rsp+8], eax` is `PASS`, while `mov [rsp+32]`
+into the same frame is `FAIL` (a definite out-of-bounds write). It is a sound
+over-approximation of the real `rsp` arithmetic for frame-local accesses (under
+`alloc-succeeds`, i.e. no stack overflow).
 
 ## Soundness by graceful degradation
 The decoded subset is intentionally tiny and **grows monotonically**: an

@@ -19,8 +19,15 @@ lowered, and verified **PASS**; a raw-pointer store (`mov [rdi], rsi`) is
 `UNKNOWN` (nothing proves `rdi` valid); a `syscall` (undecoded) is `UNKNOWN` —
 never a false PASS (`tests/binary.rs`). The decoded subset is tiny but grows
 monotonically: any unrecognized opcode makes the function `unanalyzed`
-(`UNKNOWN`), never silently mis-modelled. DWARF, control flow, the full ISA, and
-PE/Mach-O follow.
+(`UNKNOWN`), never silently mis-modelled.
+
+Crucially, the binary pipeline can now **prove a real memory access safe**, not
+just decode it: `sub rsp, N` is modelled as allocating an `N`-byte stack frame
+(with `rsp` the pointer), so a `[rsp + disp]` store (decoded through a SIB byte)
+is checked against the frame. `sub rsp,16 ; mov [rsp+8], eax ; ret` verifies
+**PASS** (the store is in the frame); the same with `[rsp+32]` is **FAIL** (a
+definite out-of-bounds write). DWARF, control flow, the full ISA, and PE/Mach-O
+follow.
 
 ## Bit-precise decision procedure (pure-Rust SAT)
 

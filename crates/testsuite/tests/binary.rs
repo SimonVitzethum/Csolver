@@ -95,6 +95,22 @@ fn raw_pointer_store_in_a_binary_is_unknown_not_pass() {
 }
 
 #[test]
+fn in_frame_stack_store_in_a_binary_is_proven_safe() {
+    // sub rsp,16 ; mov [rsp+8], eax ; add rsp,16 ; ret  — a store at offset 8
+    // into a 16-byte stack frame. The frame model proves it in bounds: PASS.
+    let code = [0x48, 0x83, 0xec, 0x10, 0x89, 0x44, 0x24, 0x08, 0x48, 0x83, 0xc4, 0x10, 0xc3];
+    assert_eq!(verify_binary(&code), Verdict::Pass);
+}
+
+#[test]
+fn out_of_frame_stack_store_in_a_binary_fails() {
+    // sub rsp,16 ; mov [rsp+32], eax ; add rsp,16 ; ret  — offset 32 is past the
+    // 16-byte frame: a definite out-of-bounds write. FAIL.
+    let code = [0x48, 0x83, 0xec, 0x10, 0x89, 0x44, 0x24, 0x20, 0x48, 0x83, 0xc4, 0x10, 0xc3];
+    assert_eq!(verify_binary(&code), Verdict::Fail);
+}
+
+#[test]
 fn an_undecodable_function_is_unknown() {
     // A syscall (`0f 05`) is outside the decoded subset, so the function is
     // `unanalyzed` and reported UNKNOWN — never silently treated as safe.
