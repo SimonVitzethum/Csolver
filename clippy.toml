@@ -1,0 +1,4 @@
+# `unwrap`/`expect` are idiomatic in tests; the strict workspace lints only
+# matter for production analysis code, where a panic is a denial-of-service.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

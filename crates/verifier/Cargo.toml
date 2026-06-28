@@ -1,0 +1,22 @@
+[package]
+name = "csolver-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Proof-obligation generation, discharge orchestration, and verdict roll-up over MSIR."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+csolver-cfg.workspace = true
+csolver-memory.workspace = true
+csolver-absint.workspace = true
+csolver-symbolic.workspace = true
+csolver-solver.workspace = true
+csolver-smt.workspace = true
+
+[lints]
+workspace = true

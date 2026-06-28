@@ -1,0 +1,26 @@
+[package]
+name = "csolver-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The `solver` command-line interface."
+
+[[bin]]
+name = "solver"
+path = "src/main.rs"
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+csolver-verifier.workspace = true
+csolver-report.workspace = true
+csolver-llvm.workspace = true
+csolver-mir.workspace = true
+csolver-asm.workspace = true
+csolver-elf.workspace = true
+
+[lints]
+workspace = true

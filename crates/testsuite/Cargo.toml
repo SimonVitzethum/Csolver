@@ -1,0 +1,22 @@
+[package]
+name = "csolver-testsuite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "End-to-end fixtures and integration tests across the CSolver pipeline."
+publish = false
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+
+[dev-dependencies]
+csolver-verifier.workspace = true
+csolver-report.workspace = true
+csolver-llvm.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "csolver-smt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SMT backend abstraction (Z3 / Bitwuzla / CVC5) with a portable internal fallback."
+
+[dependencies]
+csolver-core.workspace = true
+
+[lints]
+workspace = true

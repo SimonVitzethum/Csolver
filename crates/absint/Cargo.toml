@@ -1,0 +1,18 @@
+[package]
+name = "csolver-absint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Abstract-interpretation framework (lattices, fixpoint, widening) and numeric domains for MSIR."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+csolver-cfg.workspace = true
+csolver-memory.workspace = true
+
+[lints]
+workspace = true

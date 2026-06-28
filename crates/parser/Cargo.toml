@@ -1,0 +1,15 @@
+[package]
+name = "csolver-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared lexing/parsing infrastructure (cursor, spans, diagnostics) for the textual frontends."
+
+[dependencies]
+csolver-core.workspace = true
+
+[lints]
+workspace = true

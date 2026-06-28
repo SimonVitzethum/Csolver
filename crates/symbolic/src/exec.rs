@@ -1,0 +1,1903 @@
+//! The acyclic path-enumerating symbolic executor with a symbolic memory model.
+//!
+//! Each path carries a [`PathState`]: a symbolic register environment
+//! (scalars and pointers), a per-path region table (so allocate/free is
+//! path-sensitive), a path condition, and a set of assumed facts. At every
+//! memory operation the executor decides the canonical safety obligations using
+//! the path condition, the region table and the linear solver.
+//!
+//! This increment proves (`Proven`) or leaves open (`Unknown`) — it never
+//! refutes, because a sound refutation needs a satisfiable model on a provably
+//! reachable path, which the UNSAT-only solver cannot supply.
+
+use crate::ExecLimits;
+use csolver_absint::{analyze_intervals, Bound, IntervalAnalysis};
+use csolver_cfg::{Dominators, Loops};
+use csolver_core::{Model, RegionKind, SafetyProperty};
+use crate::summary::{Affine, RetSummary, Summary};
+use csolver_ir::{
+    BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FuncId, Function, Inst,
+    MemKind, Operand, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
+};
+use csolver_memory::{AliasResult, LifetimeState, Permissions};
+use csolver_solver::{
+    bitprecise, prove_implies_method, BvOp, CmpOp as SCmp, ExprCtx, ExprId, ProofMethod,
+};
+use std::collections::{HashMap, HashSet};
+
+const PTR_WIDTH: u32 = 64;
+const LAYOUT: DataLayout = DataLayout::LP64;
+
+/// Named assumptions a symbolic proof may rely on.
+const ALLOC_SUCCEEDS: &str = "alloc-succeeds";
+const LINEAR_NO_OVERFLOW: &str = "linear-no-overflow";
+const PARAM_CONTRACTS: &str = "param-contracts";
+const SLICE_ABI: &str = "slice-abi";
+
+/// Whether a scalar `SafetyCheck` was discharged symbolically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymOutcome {
+    /// Proved on every path that reaches it.
+    Proven,
+    /// Not proved.
+    Unknown,
+    /// Refuted: on an exact (genuinely reachable) path the property is *always*
+    /// violated, witnessed by the concrete model.
+    Refuted(Model),
+}
+
+/// The decision for one implied memory-op obligation.
+#[derive(Debug, Clone)]
+pub struct MemDecision {
+    /// Whether it was proved (on every reaching path).
+    pub proven: bool,
+    /// A concrete counterexample, when the obligation was *refuted* on an exact
+    /// path (a definite violation). `None` for proved or merely-undecided.
+    pub refutation: Option<Model>,
+    /// A human-readable rendering of what was (or would be) shown.
+    pub predicate: String,
+    /// Why it is not proved (empty when proved).
+    pub residual: String,
+}
+
+/// The result of symbolically discharging a function.
+#[derive(Debug, Clone, Default)]
+pub struct SymbolicReport {
+    /// Decisions for explicit `SafetyCheck` instructions, keyed by (block, idx).
+    pub decided: HashMap<(BlockId, usize), SymOutcome>,
+    /// Decisions for implied memory-op obligations, keyed by (block, idx, prop).
+    pub mem: HashMap<(BlockId, usize, SafetyProperty), MemDecision>,
+    /// Named assumptions the proofs depend on.
+    pub assumptions: Vec<String>,
+    /// Whether exploration was truncated (then no decisions are reported).
+    pub truncated: bool,
+}
+
+impl SymbolicReport {
+    /// The outcome for an explicit `SafetyCheck`.
+    pub fn outcome(&self, block: BlockId, index: usize) -> Option<SymOutcome> {
+        self.decided.get(&(block, index)).cloned()
+    }
+
+    /// The decision for an implied memory obligation.
+    pub fn mem_decision(
+        &self,
+        block: BlockId,
+        index: usize,
+        prop: SafetyProperty,
+    ) -> Option<&MemDecision> {
+        self.mem.get(&(block, index, prop))
+    }
+}
+
+/// Symbolically discharge the obligations of `f` (default limits, no
+/// interprocedural summaries — calls are havoc'd).
+pub fn discharge_function(f: &Function) -> SymbolicReport {
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[])
+}
+
+/// As [`discharge_function`], but using the given function summaries to reason
+/// about calls (provenance-preserving returns, effect-aware heap handling).
+pub fn discharge_with_summaries(
+    f: &Function,
+    summaries: &HashMap<FuncId, Summary>,
+) -> SymbolicReport {
+    discharge_inner(f, ExecLimits::default(), summaries, &[])
+}
+
+/// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
+/// contracted pointer parameter is modelled as a known live region of its
+/// `dereferenceable` size, so accesses through it can be proved (under the
+/// `param-contracts` assumption).
+pub fn discharge_full(
+    f: &Function,
+    summaries: &HashMap<FuncId, Summary>,
+    contracts: &[Option<PtrContract>],
+) -> SymbolicReport {
+    discharge_inner(f, ExecLimits::default(), summaries, contracts)
+}
+
+/// As [`discharge_function`], with explicit limits and no summaries.
+///
+/// Loops are handled by *cutting* back-edges and replacing each loop header's
+/// parameters with fresh symbols constrained by the sound interval invariant at
+/// that header (from `csolver-absint`). One symbolic pass over the loop body —
+/// under that invariant plus the loop guard (a path condition) — therefore
+/// covers every iteration.
+pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
+    discharge_inner(f, limits, &HashMap::new(), &[])
+}
+
+fn discharge_inner(
+    f: &Function,
+    limits: ExecLimits,
+    summaries: &HashMap<FuncId, Summary>,
+    contracts: &[Option<PtrContract>],
+) -> SymbolicReport {
+    let analysis = analyze_intervals(f);
+    let dominators = Dominators::new(analysis.cfg());
+    let loops = Loops::detect(analysis.cfg(), &dominators);
+
+    // Per loop header: the set of registers the loop body may redefine (so they
+    // can be havoc'd — not just the header's own parameters), and whether the
+    // body may free memory (so region lifetimes can be invalidated). These are
+    // what make a single body pass a *sound* over-approximation of all
+    // iterations.
+    let mut headers: HashSet<BlockId> = HashSet::new();
+    let mut loop_modified: HashMap<BlockId, Vec<RegId>> = HashMap::new();
+    let mut loop_frees: HashMap<BlockId, bool> = HashMap::new();
+    for l in loops.all() {
+        let header = analysis.cfg().block_id(l.header);
+        headers.insert(header);
+        let mut modified: HashSet<RegId> = HashSet::new();
+        let mut frees = false;
+        for &node in &l.body {
+            let bid = analysis.cfg().block_id(node);
+            if let Some(b) = f.block(bid) {
+                modified.extend(b.params.iter().map(|(r, _)| *r));
+                for inst in &b.insts {
+                    if let Some(r) = inst.defined_reg() {
+                        modified.insert(r);
+                    }
+                    if matches!(inst, Inst::Dealloc { .. }) {
+                        frees = true;
+                    }
+                }
+            }
+        }
+        loop_modified.insert(header, modified.into_iter().collect());
+        loop_frees.insert(header, frees);
+    }
+
+    let mut ex = Explorer {
+        ctx: ExprCtx::new(),
+        fresh: 0,
+        visits: 0,
+        truncated: false,
+        limits,
+        scalar: HashMap::new(),
+        mem: HashMap::new(),
+        assumptions: HashSet::new(),
+        analysis,
+        dominators,
+        headers,
+        loop_modified,
+        loop_frees,
+        summaries: summaries.clone(),
+        f,
+    };
+
+    let mut env: HashMap<RegId, SymValue> = HashMap::new();
+    let mut regions: Vec<SymRegion> = Vec::new();
+    let mut facts: Vec<ExprId> = Vec::new();
+    // Pass 1: every parameter without a pointer contract (so length parameters
+    // a slice contract refers to are available in pass 2).
+    for (i, (reg, ty)) in f.params.iter().enumerate() {
+        if contracts.get(i).and_then(|c| c.as_ref()).is_none() {
+            // Name scalar parameters `arg{i}` so a counterexample model is
+            // readable; pointer parameters get the usual opaque placeholder.
+            let v = if ty.is_ptr() {
+                ex.fresh_value(ty)
+            } else {
+                SymValue::Scalar(ex.ctx.symbol(format!("arg{i}"), type_width(ty)))
+            };
+            env.insert(*reg, v);
+        }
+    }
+    // Pass 2: contracted pointer parameters become known live regions.
+    for (i, (reg, _ty)) in f.params.iter().enumerate() {
+        let Some(c) = contracts.get(i).and_then(|c| c.as_ref()) else {
+            continue;
+        };
+        let (size, assumption) = match c.size {
+            SizeSpec::Bytes(n) => (ex.ctx.int(PTR_WIDTH, n as u128), PARAM_CONTRACTS),
+            SizeSpec::ParamElements { len_param, elem_size } => {
+                let len_reg = f.params[len_param as usize].0;
+                let len_e = match env.get(&len_reg) {
+                    Some(SymValue::Scalar(e)) => *e,
+                    _ => ex.fresh_scalar(PTR_WIDTH),
+                };
+                let es = ex.ctx.int(PTR_WIDTH, elem_size as u128);
+                (ex.ctx.bin(BvOp::Mul, len_e, es), SLICE_ABI)
+            }
+        };
+        let zero = ex.ctx.int(PTR_WIDTH, 0);
+        let nonneg = ex.ctx.cmp(SCmp::Sle, zero, size);
+        facts.push(nonneg);
+        let rid = regions.len();
+        regions.push(SymRegion {
+            kind: RegionKind::Heap,
+            size,
+            state: LifetimeState::Live,
+            perms: Permissions {
+                read: c.readable,
+                write: c.writable,
+                exec: false,
+            },
+            contract: Some(assumption),
+        });
+        env.insert(
+            *reg,
+            SymValue::Ptr(SymPointer {
+                prov: Prov::Region(rid),
+                offset: zero,
+                align: c.align.max(1) as u64,
+            }),
+        );
+    }
+    let state = PathState {
+        env,
+        regions,
+        pathcond: Vec::new(),
+        facts,
+        heap: Vec::new(),
+        exact: true,
+    };
+    ex.explore(f.entry, state);
+
+    if ex.truncated {
+        return SymbolicReport {
+            truncated: true,
+            ..Default::default()
+        };
+    }
+
+    let decided = ex
+        .scalar
+        .into_iter()
+        .map(|(k, agg)| {
+            let outcome = match agg.refutation {
+                Some(model) => SymOutcome::Refuted(model),
+                None if agg.all_proven => SymOutcome::Proven,
+                None => SymOutcome::Unknown,
+            };
+            (k, outcome)
+        })
+        .collect();
+    let mem = ex
+        .mem
+        .into_iter()
+        .map(|(k, agg)| {
+            (
+                k,
+                MemDecision {
+                    proven: agg.all_proven,
+                    refutation: agg.refutation,
+                    predicate: agg.predicate,
+                    residual: if agg.all_proven { String::new() } else { agg.residual },
+                },
+            )
+        })
+        .collect();
+    let mut assumptions: Vec<String> = ex.assumptions.into_iter().map(String::from).collect();
+    assumptions.sort();
+
+    SymbolicReport {
+        decided,
+        mem,
+        assumptions,
+        truncated: false,
+    }
+}
+
+/// Provenance of a symbolic pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prov {
+    Null,
+    Region(usize),
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct SymPointer {
+    prov: Prov,
+    offset: ExprId,
+    align: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SymRegion {
+    #[allow(dead_code)]
+    kind: RegionKind,
+    size: ExprId,
+    state: LifetimeState,
+    perms: Permissions,
+    /// If this region models a caller-guaranteed pointer parameter, the named
+    /// assumption its validity rests on (`param-contracts` / `slice-abi`);
+    /// `None` for a freshly-allocated region (which rests on `alloc-succeeds`).
+    contract: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+enum SymValue {
+    Scalar(ExprId),
+    Ptr(SymPointer),
+}
+
+/// A recorded store: "`size` bytes equal to `value` were written through
+/// `target`". Most-recent-last.
+#[derive(Clone)]
+struct StoreRecord {
+    target: SymPointer,
+    value: SymValue,
+    size: u64,
+}
+
+#[derive(Clone)]
+struct PathState {
+    env: HashMap<RegId, SymValue>,
+    regions: Vec<SymRegion>,
+    pathcond: Vec<ExprId>,
+    facts: Vec<ExprId>,
+    /// The symbolic store, in program order (for read-your-writes).
+    heap: Vec<StoreRecord>,
+    /// Whether this path is *exact*: no over-approximation (loop-header havoc,
+    /// opaque call, or non-determined load) has been introduced. A symbolic
+    /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
+    /// exact path, where the path condition characterizes genuinely reachable
+    /// states, so a violating model is a real execution. Proofs (`PASS`) do not
+    /// need this — over-approximation is sound for proving.
+    exact: bool,
+}
+
+/// Per-obligation aggregation across paths.
+struct MemAgg {
+    all_proven: bool,
+    /// A counterexample from any path that definitely violated the obligation.
+    refutation: Option<Model>,
+    predicate: String,
+    residual: String,
+}
+
+/// Per scalar-check aggregation across paths.
+struct ScalarAgg {
+    /// Proved on every path so far.
+    all_proven: bool,
+    /// A counterexample from any path that definitely violated the check.
+    refutation: Option<Model>,
+}
+
+/// The outcome of deciding a safety goal on one path.
+enum Decision {
+    /// Proved to hold.
+    Proven,
+    /// Neither proved nor (soundly) refuted.
+    Unknown,
+    /// Definitely violated on this exact path, witnessed by the model.
+    Refuted(Model),
+}
+
+struct Explorer<'f> {
+    ctx: ExprCtx,
+    fresh: u32,
+    visits: usize,
+    truncated: bool,
+    limits: ExecLimits,
+    /// Scalar `SafetyCheck` aggregation, keyed by (block, idx).
+    scalar: HashMap<(BlockId, usize), ScalarAgg>,
+    mem: HashMap<(BlockId, usize, SafetyProperty), MemAgg>,
+    assumptions: HashSet<&'static str>,
+    /// Sound interval invariants (the source of loop invariants).
+    analysis: IntervalAnalysis,
+    dominators: Dominators,
+    /// Block ids that are loop headers.
+    headers: HashSet<BlockId>,
+    /// Per loop header: registers the loop body may redefine (havoc set).
+    loop_modified: HashMap<BlockId, Vec<RegId>>,
+    /// Per loop header: whether the loop body may free memory.
+    loop_frees: HashMap<BlockId, bool>,
+    /// Interprocedural summaries, by callee id (empty = havoc all calls).
+    summaries: HashMap<FuncId, Summary>,
+    f: &'f Function,
+}
+
+impl Explorer<'_> {
+    fn fresh_scalar(&mut self, width: u32) -> ExprId {
+        let name = format!("?{}", self.fresh);
+        self.fresh += 1;
+        self.ctx.symbol(name, width)
+    }
+
+    fn fresh_value(&mut self, ty: &Type) -> SymValue {
+        if ty.is_ptr() {
+            SymValue::Ptr(SymPointer {
+                prov: Prov::Unknown,
+                offset: self.ctx.int(PTR_WIDTH, 0),
+                align: 1,
+            })
+        } else {
+            SymValue::Scalar(self.fresh_scalar(type_width(ty)))
+        }
+    }
+
+    fn explore(&mut self, block: BlockId, state: PathState) {
+        if self.truncated {
+            return;
+        }
+        self.visits += 1;
+        if self.visits > self.limits.max_visits {
+            self.truncated = true;
+            return;
+        }
+        let Some(b) = self.f.block(block) else {
+            return;
+        };
+
+        let mut state = state;
+        // At a loop header, over-approximate every iteration by replacing the
+        // loop-carried parameters with fresh symbols constrained by the sound
+        // interval invariant.
+        if self.headers.contains(&block) {
+            self.havoc_header(block, &mut state);
+        }
+
+        for (idx, inst) in b.insts.iter().enumerate() {
+            self.step(block, idx, inst, &mut state);
+        }
+
+        match &b.term {
+            Terminator::Return(_) | Terminator::Unreachable => {}
+            Terminator::Br { target, args } => {
+                if !self.is_back_edge(block, *target) {
+                    let next = self.bind_params(*target, args, &state);
+                    self.explore(*target, next);
+                }
+            }
+            Terminator::CondBr {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            } => {
+                let ce = self.eval_scalar(cond, &state);
+                if !self.is_back_edge(block, *then_blk) {
+                    let mut t = self.bind_params(*then_blk, then_args, &state);
+                    t.pathcond.push(ce);
+                    self.explore(*then_blk, t);
+                }
+                if !self.is_back_edge(block, *else_blk) {
+                    let nce = self.ctx.not(ce);
+                    let mut e = self.bind_params(*else_blk, else_args, &state);
+                    e.pathcond.push(nce);
+                    self.explore(*else_blk, e);
+                }
+            }
+            Terminator::Switch { value, cases, default } => {
+                let ve = self.eval_scalar(value, &state);
+                for (cv, target) in cases {
+                    if self.is_back_edge(block, *target) {
+                        continue;
+                    }
+                    let k = self.ctx.constant(*cv);
+                    let eq = self.ctx.cmp(SCmp::Eq, ve, k);
+                    let mut s = state.clone();
+                    s.pathcond.push(eq);
+                    self.explore(*target, s);
+                }
+                if !self.is_back_edge(block, *default) {
+                    self.explore(*default, state.clone());
+                }
+            }
+        }
+    }
+
+    /// Whether the edge `from -> to` is a loop back-edge (cut during
+    /// exploration). A back-edge targets a loop header that dominates its
+    /// source.
+    fn is_back_edge(&self, from: BlockId, to: BlockId) -> bool {
+        if !self.headers.contains(&to) {
+            return false;
+        }
+        let cfg = self.analysis.cfg();
+        let (Some(fi), Some(ti)) = (cfg.index_of(from), cfg.index_of(to)) else {
+            return false;
+        };
+        self.dominators.dominates(ti, fi)
+    }
+
+    /// Replace a loop header's parameters with fresh symbols constrained by the
+    /// interval invariant that holds at the header on every iteration.
+    fn havoc_header(&mut self, header: BlockId, state: &mut PathState) {
+        // Havocking introduces over-approximation, so this path is no longer
+        // exact: it may stand for unreachable states, so we must not refute on it.
+        state.exact = false;
+        // The loop may have written arbitrary memory across iterations, so the
+        // stored-value knowledge is no longer reliable: forget it (sound
+        // over-approximation; loads then return fresh unknowns).
+        state.heap.clear();
+
+        // If the loop body may free memory, then on any iteration after the
+        // first a region could already be freed — so no region's liveness can
+        // be proved inside (or after) the loop. Invalidate liveness
+        // conservatively. (Loops that never free are unaffected.)
+        if self.loop_frees.get(&header).copied().unwrap_or(false) {
+            for r in &mut state.regions {
+                if r.state == LifetimeState::Live {
+                    r.state = LifetimeState::Freed;
+                }
+            }
+        }
+
+        // Havoc *every* register the loop body may redefine — not just the
+        // header's own parameters. In strict SSA the loop-carried values are
+        // header parameters and the rest are recomputed before use, so this is
+        // usually redundant; but it makes the analysis robust to non-SSA input
+        // (a register reassigned in the body keeps no stale pre-loop value).
+        let modified = self
+            .loop_modified
+            .get(&header)
+            .cloned()
+            .unwrap_or_default();
+        for reg in modified {
+            match state.env.get(&reg) {
+                Some(SymValue::Ptr(_)) => {
+                    // A loop-modified pointer loses provenance (conservative).
+                    let offset = self.ctx.int(PTR_WIDTH, 0);
+                    state.env.insert(
+                        reg,
+                        SymValue::Ptr(SymPointer { prov: Prov::Unknown, offset, align: 1 }),
+                    );
+                }
+                Some(SymValue::Scalar(_)) => {
+                    let s = self.fresh_scalar(PTR_WIDTH);
+                    // Constrain by the sound interval invariant at the header
+                    // (only faithfully-encodable, non-negative bounds).
+                    let iv = self.analysis.entry_interval(header, reg);
+                    if let Some(Bound::Fin(lo)) = iv.lower() {
+                        if lo >= 0 {
+                            let k = self.ctx.int(PTR_WIDTH, lo as u128);
+                            let fact = self.ctx.cmp(SCmp::Sge, s, k);
+                            state.facts.push(fact);
+                        }
+                    }
+                    if let Some(Bound::Fin(hi)) = iv.upper() {
+                        if hi >= 0 {
+                            let k = self.ctx.int(PTR_WIDTH, hi as u128);
+                            let fact = self.ctx.cmp(SCmp::Sle, s, k);
+                            state.facts.push(fact);
+                        }
+                    }
+                    state.env.insert(reg, SymValue::Scalar(s));
+                }
+                None => {} // not live at the header; defined fresh in the body
+            }
+        }
+    }
+
+    fn step(&mut self, block: BlockId, idx: usize, inst: &Inst, state: &mut PathState) {
+        match inst {
+            Inst::Assign { dst, value, .. } => {
+                let v = self.eval_rvalue(value, state);
+                state.env.insert(*dst, v);
+            }
+            Inst::Alloc { dst, region, elem, count, align } => {
+                let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1).max(1);
+                let count_e = self.eval_scalar(count, state);
+                let stride_e = self.ctx.int(PTR_WIDTH, stride as u128);
+                let size = self.ctx.bin(BvOp::Mul, count_e, stride_e);
+                let perms = if *region == RegionKind::Global {
+                    Permissions::READ_ONLY
+                } else {
+                    Permissions::READ_WRITE
+                };
+                let rid = state.regions.len();
+                state.regions.push(SymRegion {
+                    kind: *region,
+                    size,
+                    state: LifetimeState::Live,
+                    perms,
+                    contract: None,
+                });
+                // The byte size is non-negative by construction.
+                let zero = self.ctx.int(PTR_WIDTH, 0);
+                let nonneg = self.ctx.cmp(SCmp::Sle, zero, size);
+                state.facts.push(nonneg);
+                state.env.insert(
+                    *dst,
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Region(rid),
+                        offset: zero,
+                        align: *align as u64,
+                    }),
+                );
+            }
+            Inst::PtrOffset { dst, base, index, elem } => {
+                let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1).max(1);
+                let base_ptr = self.eval_pointer(base, state);
+                let index_e = self.eval_scalar(index, state);
+                let stride_e = self.ctx.int(PTR_WIDTH, stride as u128);
+                let delta = self.ctx.bin(BvOp::Mul, index_e, stride_e);
+                let new_off = self.ctx.bin(BvOp::Add, base_ptr.offset, delta);
+                // Alignment after the offset: for a *constant* index use the
+                // concrete byte delta (so `buf(16-aligned) + 16` stays
+                // 16-aligned); for a symbolic index fall back to the stride.
+                let new_align = match self.ctx.as_const(index_e) {
+                    Some(c) => {
+                        let d = c.signed().wrapping_mul(stride as i128).unsigned_abs() as u64;
+                        gcd(base_ptr.align, d)
+                    }
+                    None => gcd(base_ptr.align, stride),
+                };
+                let result = SymPointer {
+                    prov: base_ptr.prov.clone(),
+                    offset: new_off,
+                    align: new_align,
+                };
+                self.check_ptr_arith(block, idx, &result, state);
+                state.env.insert(*dst, SymValue::Ptr(result));
+            }
+            Inst::Load { dst, ty, ptr, align } => {
+                let p = self.eval_pointer(ptr, state);
+                let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
+                self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidRead, state);
+                let value = self.load_value(&p, asize, ty, state);
+                state.env.insert(*dst, value);
+            }
+            Inst::Store { ty, ptr, value, align } => {
+                let p = self.eval_pointer(ptr, state);
+                let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
+                self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidWrite, state);
+                let v = self.eval_value(value, state);
+                state.heap.push(StoreRecord { target: p, value: v, size: asize });
+            }
+            Inst::Dealloc { ptr, .. } => {
+                let p = self.eval_pointer(ptr, state);
+                self.check_dealloc(block, idx, &p, state);
+            }
+            Inst::Call { dst, callee, args, ret_ty } => {
+                self.step_call(dst.as_ref(), callee, args, ret_ty, state);
+            }
+            Inst::Intrinsic { dst: Some(d), .. } => {
+                let s = self.fresh_scalar(PTR_WIDTH);
+                state.env.insert(*d, SymValue::Scalar(s));
+            }
+            Inst::SafetyCheck { condition, .. } => {
+                let goal = self.eval_condition(condition, state);
+                let decision = self.decide(&[goal], state, true);
+                self.record_scalar(block, idx, decision);
+            }
+            Inst::MemIntrinsic { kind, dst, src, len } => {
+                self.check_mem_intrinsic((block, idx), *kind, dst, src.as_ref(), len, state);
+                // A bulk write invalidates the symbolic heap's stored values.
+                state.heap.clear();
+            }
+            Inst::Intrinsic { dst: None, .. } | Inst::Asm { .. } => {}
+        }
+    }
+
+    /// Check a `memcpy`/`memmove`/`memset`: the destination must be writable and
+    /// in bounds for `len` bytes, and (for copy/move) the source readable and in
+    /// bounds for `len` bytes. Each property is recorded as the conjunction over
+    /// the touched pointers.
+    fn check_mem_intrinsic(
+        &mut self,
+        at: (BlockId, usize),
+        kind: MemKind,
+        dst_op: &Operand,
+        src_op: Option<&Operand>,
+        len_op: &Operand,
+        state: &PathState,
+    ) {
+        use SafetyProperty::*;
+        let (block, idx) = at;
+        let dst = self.eval_pointer(dst_op, state);
+        let len_e = self.eval_scalar(len_op, state);
+        let need_src = matches!(kind, MemKind::Copy | MemKind::Move);
+        let src = if need_src {
+            src_op.map(|s| self.eval_pointer(s, state))
+        } else {
+            None
+        };
+
+        // Snapshot region facts (copied out, so no borrow is held).
+        let dst_facts = region_facts(&dst, state);
+        let src_facts = src.as_ref().and_then(|p| region_facts(p, state));
+
+        let dst_nn = dst_facts.is_some();
+        let src_nn = !need_src || src_facts.is_some();
+        self.record(block, idx, NoNullDeref, dst_nn && src_nn, "memcpy pointers are non-null", "a memcpy pointer may be null or have opaque provenance");
+
+        let dst_live = dst_facts.is_some_and(|f| f.live);
+        let src_live = !need_src || src_facts.is_some_and(|f| f.live);
+        self.record(block, idx, NoUseAfterFree, dst_live && src_live, "memcpy regions are live", "a memcpy region may be freed");
+
+        let dst_inb = dst_facts.is_some_and(|f| self.prove_in_bounds_len(dst.offset, len_e, f.size, state));
+        let src_inb = match (need_src, &src, src_facts) {
+            (false, _, _) => true,
+            (true, Some(p), Some(f)) => self.prove_in_bounds_len(p.offset, len_e, f.size, state),
+            _ => false,
+        };
+        self.record(block, idx, InBounds, dst_inb && src_inb, "memcpy stays within both regions", "could not prove the copy stays in bounds");
+
+        let dst_w = dst_facts.is_some_and(|f| f.perms.write);
+        self.record(block, idx, ValidWrite, dst_w, "destination is writable", "destination is not writable");
+        if need_src {
+            let src_r = src_facts.is_some_and(|f| f.perms.read);
+            self.record(block, idx, ValidRead, src_r, "source is readable", "source is not readable");
+        }
+
+        // Surface the assumptions the touched regions rest on.
+        if dst_nn && src_nn && dst_live && src_live {
+            for f in [dst_facts, src_facts].into_iter().flatten() {
+                self.assumptions.insert(f.contract.unwrap_or(ALLOC_SUCCEEDS));
+            }
+        }
+    }
+
+    /// Prove `0 <= offset && offset + len <= size` (a `len`-byte access).
+    fn prove_in_bounds_len(&mut self, offset: ExprId, len: ExprId, size: ExprId, state: &PathState) -> bool {
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let end = self.ctx.bin(BvOp::Add, offset, len);
+        let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
+        let upper = self.ctx.cmp(SCmp::Sle, end, size);
+        self.prove(lower, state) && self.prove(upper, state)
+    }
+
+    /// Handle a call using the callee's summary: effect-aware heap handling and
+    /// a provenance-preserving return binding.
+    fn step_call(
+        &mut self,
+        dst: Option<&RegId>,
+        callee: &Callee,
+        args: &[Operand],
+        ret_ty: &Type,
+        state: &mut PathState,
+    ) {
+        // A call is an over-approximation point (havoc'd heap/return unless a
+        // precise summary applies); conservatively mark the path inexact so we
+        // never refute through a call. Proofs are unaffected (this only gates
+        // refutation, not PASS).
+        state.exact = false;
+        let argvals: Vec<SymValue> = args.iter().map(|a| self.eval_value(a, state)).collect();
+        let summary = match callee {
+            Callee::Direct(fid) => self.summaries.get(fid).cloned(),
+            _ => None,
+        };
+
+        // Effects: a writing or freeing callee invalidates the symbolic heap;
+        // a *freeing* callee additionally invalidates region liveness (we do
+        // not know which region it freed, so no region's liveness can be proved
+        // afterwards). Without this, a use after a freeing call would be a false
+        // PASS.
+        let (writes, frees) = summary.as_ref().map_or((true, true), |s| (s.writes, s.frees));
+        if writes || frees {
+            state.heap.clear();
+        }
+        if frees {
+            for r in &mut state.regions {
+                if r.state == LifetimeState::Live {
+                    r.state = LifetimeState::Freed;
+                }
+            }
+        }
+
+        if let Some(d) = dst {
+            let value = match summary.as_ref().map(|s| &s.ret) {
+                Some(RetSummary::PtrFromArg { arg, offset }) => {
+                    self.instantiate_ptr(*arg, offset, &argvals, ret_ty)
+                }
+                Some(RetSummary::Scalar(aff)) => {
+                    SymValue::Scalar(self.instantiate_affine(aff, &argvals))
+                }
+                _ => self.fresh_value(ret_ty),
+            };
+            state.env.insert(*d, value);
+        }
+    }
+
+    /// Rebuild a pointer return value `arg + offset(args)`, keeping `arg`'s
+    /// provenance.
+    fn instantiate_ptr(
+        &mut self,
+        arg: usize,
+        offset: &Affine,
+        argvals: &[SymValue],
+        ret_ty: &Type,
+    ) -> SymValue {
+        match argvals.get(arg) {
+            Some(SymValue::Ptr(base)) => {
+                let delta = self.instantiate_affine(offset, argvals);
+                let new_off = self.ctx.bin(BvOp::Add, base.offset, delta);
+                SymValue::Ptr(SymPointer {
+                    prov: base.prov.clone(),
+                    offset: new_off,
+                    align: base.align,
+                })
+            }
+            _ => self.fresh_value(ret_ty),
+        }
+    }
+
+    /// Build the expression `constant + Σ coeff_k · arg_k` in the solver context.
+    fn instantiate_affine(&mut self, aff: &Affine, argvals: &[SymValue]) -> ExprId {
+        let mut acc = self.const_expr(aff.constant);
+        for (&k, &coeff) in &aff.terms {
+            let arg = match argvals.get(k) {
+                Some(SymValue::Scalar(e)) => *e,
+                _ => self.fresh_scalar(PTR_WIDTH),
+            };
+            let c = self.const_expr(coeff);
+            let term = self.ctx.bin(BvOp::Mul, arg, c);
+            acc = self.ctx.bin(BvOp::Add, acc, term);
+        }
+        acc
+    }
+
+    /// A signed integer constant as a `PTR_WIDTH` expression (faithful for
+    /// negatives via subtraction).
+    fn const_expr(&mut self, v: i128) -> ExprId {
+        if v >= 0 {
+            self.ctx.int(PTR_WIDTH, v as u128)
+        } else {
+            let zero = self.ctx.int(PTR_WIDTH, 0);
+            let mag = self.ctx.int(PTR_WIDTH, (-v) as u128);
+            self.ctx.bin(BvOp::Sub, zero, mag)
+        }
+    }
+
+    // --- obligation decisions ----------------------------------------------
+
+    fn check_access(
+        &mut self,
+        at: (BlockId, usize),
+        p: &SymPointer,
+        asize: u64,
+        aalign: u64,
+        perm_prop: SafetyProperty,
+        state: &PathState,
+    ) {
+        use SafetyProperty::*;
+        let (block, idx) = at;
+        // Null.
+        let non_null = matches!(p.prov, Prov::Region(_));
+        self.record(block, idx, NoNullDeref, non_null, "pointer is non-null", "pointer may be null or have opaque provenance");
+
+        let Prov::Region(rid) = p.prov else {
+            for prop in [NoUseAfterFree, InBounds, Alignment, perm_prop] {
+                self.record(block, idx, prop, false, "requires known provenance", "pointer provenance is not tracked");
+            }
+            return;
+        };
+        let region = &state.regions[rid];
+        let rstate = region.state;
+        let rperms = region.perms;
+        let rsize = region.size;
+        let contract = region.contract;
+
+        // Use-after-free.
+        let live = rstate == LifetimeState::Live;
+        self.record(block, idx, NoUseAfterFree, live, "region is live", "region may be freed (use-after-free)");
+
+        // In-bounds: 0 <= offset && offset + asize <= size. Refutation is *not*
+        // attempted for memory accesses: a sound, clean OOB counterexample needs
+        // overflow/provenance-aware spatial reasoning (the byte offset
+        // `index * stride` can wrap, so a wrapped index spuriously lands back in
+        // range under pure modular arithmetic). That is a dedicated follow-up;
+        // here we only prove (Proven/Unknown).
+        let conjuncts = self.in_bounds_conjuncts(p.offset, asize, rsize);
+        let decision = self.decide(&conjuncts, state, false);
+        self.record_mem(block, idx, InBounds, decision, "access stays within the allocation", "could not prove the access stays in bounds");
+
+        // Alignment (concrete).
+        let aligned = aalign <= 1 || p.align.is_multiple_of(aalign);
+        self.record(block, idx, Alignment, aligned, "address meets the required alignment", "could not prove the required alignment");
+
+        // Permission.
+        let granted = match perm_prop {
+            ValidRead => rperms.read,
+            ValidWrite => rperms.write,
+            _ => true,
+        };
+        self.record(block, idx, perm_prop, granted, "region grants the access permission", "region does not grant the access permission");
+
+        if non_null && live {
+            self.assumptions.insert(contract.unwrap_or(ALLOC_SUCCEEDS));
+        }
+    }
+
+    fn check_ptr_arith(&mut self, block: BlockId, idx: usize, p: &SymPointer, state: &PathState) {
+        use SafetyProperty::ValidPointerArith;
+        let Prov::Region(rid) = p.prov else {
+            self.record(block, idx, ValidPointerArith, false, "requires known provenance", "pointer provenance is not tracked");
+            return;
+        };
+        let rsize = state.regions[rid].size;
+        let contract = state.regions[rid].contract;
+        // In-object or one-past-end: 0 <= offset <= size. (Refutation off for
+        // memory accesses; see `check_access`.)
+        let conjuncts = self.in_range_conjuncts(p.offset, rsize);
+        let decision = self.decide(&conjuncts, state, false);
+        let proven = matches!(decision, Decision::Proven);
+        self.record_mem(block, idx, ValidPointerArith, decision, "result stays within the object (or one-past-end)", "could not prove the offset stays in-object");
+        if proven {
+            self.assumptions.insert(contract.unwrap_or(ALLOC_SUCCEEDS));
+        }
+    }
+
+    fn check_dealloc(&mut self, block: BlockId, idx: usize, p: &SymPointer, state: &mut PathState) {
+        use SafetyProperty::NoDoubleFree;
+        let Prov::Region(rid) = p.prov else {
+            self.record(block, idx, NoDoubleFree, false, "requires known provenance", "freed pointer provenance is not tracked");
+            return;
+        };
+        if state.regions[rid].contract.is_some() {
+            // Freeing caller-owned (borrowed) memory is not ours to prove safe.
+            self.record(block, idx, NoDoubleFree, false, "caller-owned region", "freeing a borrowed (caller-owned) region is not provably valid");
+            return;
+        }
+        let rstate = state.regions[rid].state;
+        if rstate != LifetimeState::Live {
+            self.record(block, idx, NoDoubleFree, false, "region must be live to free", "region may already be freed (double free)");
+            return;
+        }
+        // Must free the base pointer (offset == 0).
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let goal = self.ctx.cmp(SCmp::Eq, p.offset, zero);
+        let at_base = self.prove(goal, state);
+        self.record(block, idx, NoDoubleFree, at_base, "frees the base of a live allocation exactly once", "could not prove the freed pointer is the live base");
+        if at_base {
+            self.assumptions.insert(ALLOC_SUCCEEDS);
+            state.regions[rid].state = LifetimeState::Freed;
+        }
+    }
+
+    /// The conjuncts of in-bounds: `0 <= offset` and `offset + asize <= size`.
+    fn in_bounds_conjuncts(&mut self, offset: ExprId, asize: u64, size: ExprId) -> [ExprId; 2] {
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let asize_e = self.ctx.int(PTR_WIDTH, asize as u128);
+        let end = self.ctx.bin(BvOp::Add, offset, asize_e);
+        let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
+        let upper = self.ctx.cmp(SCmp::Sle, end, size);
+        [lower, upper]
+    }
+
+    /// The conjuncts of in-range: `0 <= offset` and `offset <= size`
+    /// (one-past-end allowed).
+    fn in_range_conjuncts(&mut self, offset: ExprId, size: ExprId) -> [ExprId; 2] {
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
+        let upper = self.ctx.cmp(SCmp::Sle, offset, size);
+        [lower, upper]
+    }
+
+    /// Decide a (possibly conjunctive) safety goal on one path. Tries to **prove**
+    /// it (`A ⟹ P ∧ Q` by proving each conjunct — the linear procedure only takes
+    /// conjunctive goals); failing that, on an **exact** path, tries to **refute**
+    /// it (a definite violation) and return a concrete counterexample. `refutable`
+    /// lets a caller suppress refutation (e.g. when a region size is symbolic, so
+    /// witnesses stay faithful to a real allocation).
+    fn decide(&mut self, conjuncts: &[ExprId], state: &PathState, refutable: bool) -> Decision {
+        if conjuncts.iter().all(|&g| self.prove(g, state)) {
+            return Decision::Proven;
+        }
+        if refutable && state.exact {
+            if let Some(model) = self.try_refute(conjuncts, state) {
+                return Decision::Refuted(model);
+            }
+        }
+        Decision::Unknown
+    }
+
+    /// On an exact path, return a concrete witness iff the conjunctive goal is
+    /// *definitely* violated — `assumptions ⟹ ¬goal`, established **bit-precisely**
+    /// so the `FAIL` needs no arithmetic assumption. The counterexample is a model
+    /// of `assumptions ∧ ¬goal`; its existence also confirms the path is feasible
+    /// (genuinely reachable), so the violation is real.
+    fn try_refute(&mut self, conjuncts: &[ExprId], state: &PathState) -> Option<Model> {
+        let goal = if conjuncts.len() == 1 {
+            conjuncts[0]
+        } else {
+            self.ctx.and(conjuncts.to_vec())
+        };
+        let not_goal = self.ctx.not(goal);
+        let mut assumptions = state.pathcond.clone();
+        assumptions.extend_from_slice(&state.facts);
+        // Definite violation: the goal can never hold on this (feasible, exact)
+        // path, established bit-precisely so the FAIL needs no assumption.
+        if !bitprecise::prove_implies(&self.ctx, &assumptions, not_goal) {
+            return None;
+        }
+        bitprecise::find_counterexample(&self.ctx, &assumptions, goal)
+    }
+
+    /// Try to prove `goal` under the current path. Prefers the bit-precise
+    /// procedure (exact, no overflow assumption); only when the proof falls back
+    /// to the linear-integer model is `linear-no-overflow` recorded — so a goal
+    /// decided bit-precisely yields a `PASS` with one fewer assumption.
+    fn prove(&mut self, goal: ExprId, state: &PathState) -> bool {
+        let mut assumptions = state.pathcond.clone();
+        assumptions.extend_from_slice(&state.facts);
+        match prove_implies_method(&self.ctx, &assumptions, goal) {
+            Some(ProofMethod::BitPrecise) => true,
+            Some(ProofMethod::Linear) => {
+                self.assumptions.insert(LINEAR_NO_OVERFLOW);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resolve a load by scanning the symbolic store most-recent-first: a
+    /// must-aliasing store supplies the value, a may-aliasing store makes the
+    /// value ambiguous (fresh unknown), a no-aliasing store is skipped. This is
+    /// what preserves a pointer's provenance across a store/load round-trip.
+    fn load_value(&mut self, p: &SymPointer, asize: u64, ty: &Type, state: &mut PathState) -> SymValue {
+        for k in (0..state.heap.len()).rev() {
+            let rec_size = state.heap[k].size;
+            let target = state.heap[k].target.clone();
+            match self.alias_check(&target, p, rec_size, asize, state) {
+                AliasResult::No => continue,
+                AliasResult::Must => return state.heap[k].value.clone(),
+                AliasResult::May => break,
+            }
+        }
+        // The loaded value is not determined by a prior store: it becomes a
+        // fresh unknown (an over-approximation), so this path can no longer be
+        // refuted (a violating model might assign that unknown a value memory
+        // never actually holds).
+        state.exact = false;
+        self.fresh_value(ty)
+    }
+
+    /// Classify the alias relationship between two accesses `a` (`sizea` bytes)
+    /// and `b` (`sizeb` bytes) under the current path condition.
+    fn alias_check(
+        &mut self,
+        a: &SymPointer,
+        b: &SymPointer,
+        sizea: u64,
+        sizeb: u64,
+        state: &PathState,
+    ) -> AliasResult {
+        match (&a.prov, &b.prov) {
+            (Prov::Region(r1), Prov::Region(r2)) if r1 == r2 => {
+                // Same allocation: decide by offsets.
+                let eq = self.ctx.cmp(SCmp::Eq, a.offset, b.offset);
+                if sizea >= sizeb && self.prove(eq, state) {
+                    return AliasResult::Must;
+                }
+                let asz = self.ctx.int(PTR_WIDTH, sizea as u128);
+                let bsz = self.ctx.int(PTR_WIDTH, sizeb as u128);
+                let a_end = self.ctx.bin(BvOp::Add, a.offset, asz);
+                let b_end = self.ctx.bin(BvOp::Add, b.offset, bsz);
+                let a_before_b = self.ctx.cmp(SCmp::Sle, a_end, b.offset);
+                let b_before_a = self.ctx.cmp(SCmp::Sle, b_end, a.offset);
+                if self.prove(a_before_b, state) || self.prove(b_before_a, state) {
+                    return AliasResult::No;
+                }
+                AliasResult::May
+            }
+            // Distinct allocations never alias.
+            (Prov::Region(_), Prov::Region(_)) => AliasResult::No,
+            // Opaque or null provenance: be conservative.
+            _ => AliasResult::May,
+        }
+    }
+
+    fn record(
+        &mut self,
+        block: BlockId,
+        idx: usize,
+        prop: SafetyProperty,
+        proven: bool,
+        proven_desc: &str,
+        residual: &str,
+    ) {
+        let entry = self.mem.entry((block, idx, prop)).or_insert(MemAgg {
+            all_proven: true,
+            refutation: None,
+            predicate: proven_desc.to_string(),
+            residual: residual.to_string(),
+        });
+        entry.all_proven &= proven;
+    }
+
+    /// Record a memory obligation decided as [`Decision`] (carrying a refutation
+    /// model when definitely violated).
+    fn record_mem(
+        &mut self,
+        block: BlockId,
+        idx: usize,
+        prop: SafetyProperty,
+        decision: Decision,
+        proven_desc: &str,
+        residual: &str,
+    ) {
+        let entry = self.mem.entry((block, idx, prop)).or_insert(MemAgg {
+            all_proven: true,
+            refutation: None,
+            predicate: proven_desc.to_string(),
+            residual: residual.to_string(),
+        });
+        match decision {
+            Decision::Proven => {}
+            Decision::Unknown => entry.all_proven = false,
+            Decision::Refuted(model) => {
+                entry.all_proven = false;
+                entry.refutation.get_or_insert(model);
+            }
+        }
+    }
+
+    /// Aggregate a scalar `SafetyCheck` decision across paths.
+    fn record_scalar(&mut self, block: BlockId, idx: usize, decision: Decision) {
+        let entry = self.scalar.entry((block, idx)).or_insert(ScalarAgg {
+            all_proven: true,
+            refutation: None,
+        });
+        match decision {
+            Decision::Proven => {}
+            Decision::Unknown => entry.all_proven = false,
+            Decision::Refuted(model) => {
+                entry.all_proven = false;
+                entry.refutation.get_or_insert(model);
+            }
+        }
+    }
+
+    // --- expression evaluation ---------------------------------------------
+
+    fn bind_params(&mut self, target: BlockId, args: &[Operand], state: &PathState) -> PathState {
+        let mut out = state.clone();
+        if let Some(tb) = self.f.block(target) {
+            for (i, (param, _ty)) in tb.params.iter().enumerate() {
+                if let Some(arg) = args.get(i) {
+                    let v = self.eval_value(arg, state);
+                    out.env.insert(*param, v);
+                }
+            }
+        }
+        out
+    }
+
+    fn eval_value(&mut self, op: &Operand, state: &PathState) -> SymValue {
+        match op {
+            Operand::Reg(r) => match state.env.get(r) {
+                Some(v) => v.clone(),
+                None => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
+            },
+            Operand::Const(Const::Int(bv)) => SymValue::Scalar(self.ctx.constant(*bv)),
+            Operand::Const(Const::Null) => SymValue::Ptr(SymPointer {
+                prov: Prov::Null,
+                offset: self.ctx.int(PTR_WIDTH, 0),
+                align: 1,
+            }),
+            Operand::Const(Const::Undef) => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
+            Operand::Const(Const::Symbol(name)) => {
+                SymValue::Scalar(self.ctx.symbol(format!("@{name}"), PTR_WIDTH))
+            }
+        }
+    }
+
+    fn eval_scalar(&mut self, op: &Operand, state: &PathState) -> ExprId {
+        match self.eval_value(op, state) {
+            SymValue::Scalar(e) => e,
+            SymValue::Ptr(p) => match p.prov {
+                Prov::Null => self.ctx.int(PTR_WIDTH, 0),
+                _ => self.fresh_scalar(PTR_WIDTH),
+            },
+        }
+    }
+
+    fn eval_pointer(&mut self, op: &Operand, state: &PathState) -> SymPointer {
+        match self.eval_value(op, state) {
+            SymValue::Ptr(p) => p,
+            SymValue::Scalar(_) => SymPointer {
+                prov: Prov::Unknown,
+                offset: self.ctx.int(PTR_WIDTH, 0),
+                align: 1,
+            },
+        }
+    }
+
+    fn eval_rvalue(&mut self, rv: &RValue, state: &PathState) -> SymValue {
+        match rv {
+            RValue::Use(op) => self.eval_value(op, state),
+            RValue::Bin { op, lhs, rhs } => {
+                let a = self.eval_scalar(lhs, state);
+                let b = self.eval_scalar(rhs, state);
+                SymValue::Scalar(self.ctx.bin(map_binop(*op), a, b))
+            }
+            RValue::Cmp { op, lhs, rhs } => {
+                let a = self.eval_scalar(lhs, state);
+                let b = self.eval_scalar(rhs, state);
+                SymValue::Scalar(self.ctx.cmp(map_cmpop(*op), a, b))
+            }
+            RValue::Cast { op, operand, .. } => match op {
+                CastOp::Bitcast => self.eval_value(operand, state),
+                CastOp::IntToPtr => SymValue::Ptr(SymPointer {
+                    prov: Prov::Unknown,
+                    offset: self.ctx.int(PTR_WIDTH, 0),
+                    align: 1,
+                }),
+                CastOp::ZExt | CastOp::SExt => match self.eval_value(operand, state) {
+                    SymValue::Scalar(e) => SymValue::Scalar(e),
+                    SymValue::Ptr(_) => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
+                },
+                CastOp::Trunc | CastOp::PtrToInt => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
+            },
+        }
+    }
+
+    fn eval_condition(&mut self, cond: &Condition, state: &PathState) -> ExprId {
+        match cond {
+            Condition::True => self.ctx.boolean(true),
+            Condition::Cmp { op, lhs, rhs } => {
+                let a = self.eval_scalar(lhs, state);
+                let b = self.eval_scalar(rhs, state);
+                self.ctx.cmp(map_cmpop(*op), a, b)
+            }
+            Condition::And(cs) => {
+                let parts = cs.iter().map(|c| self.eval_condition(c, state)).collect();
+                self.ctx.and(parts)
+            }
+            Condition::Or(cs) => {
+                let parts = cs.iter().map(|c| self.eval_condition(c, state)).collect();
+                self.ctx.or(parts)
+            }
+            Condition::Not(c) => {
+                let inner = self.eval_condition(c, state);
+                self.ctx.not(inner)
+            }
+        }
+    }
+}
+
+fn type_width(ty: &Type) -> u32 {
+    match ty {
+        Type::Bool => 1,
+        Type::Int { bits } => *bits,
+        Type::Ptr { .. } => PTR_WIDTH,
+        _ => PTR_WIDTH,
+    }
+}
+
+/// The facts about the region a pointer points into (copied out so callers hold
+/// no borrow on the path state).
+#[derive(Clone, Copy)]
+struct RegionFacts {
+    live: bool,
+    size: ExprId,
+    perms: Permissions,
+    contract: Option<&'static str>,
+}
+
+fn region_facts(p: &SymPointer, state: &PathState) -> Option<RegionFacts> {
+    let Prov::Region(r) = p.prov else {
+        return None;
+    };
+    let reg = &state.regions[r];
+    Some(RegionFacts {
+        live: reg.state == LifetimeState::Live,
+        size: reg.size,
+        perms: reg.perms,
+        contract: reg.contract,
+    })
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+fn map_binop(op: BinOp) -> BvOp {
+    match op {
+        BinOp::Add => BvOp::Add,
+        BinOp::Sub => BvOp::Sub,
+        BinOp::Mul => BvOp::Mul,
+        BinOp::UDiv => BvOp::UDiv,
+        BinOp::SDiv => BvOp::SDiv,
+        BinOp::URem => BvOp::URem,
+        BinOp::SRem => BvOp::SRem,
+        BinOp::And => BvOp::And,
+        BinOp::Or => BvOp::Or,
+        BinOp::Xor => BvOp::Xor,
+        BinOp::Shl => BvOp::Shl,
+        BinOp::LShr => BvOp::LShr,
+        BinOp::AShr => BvOp::AShr,
+    }
+}
+
+fn map_cmpop(op: CmpOp) -> SCmp {
+    match op {
+        CmpOp::Eq => SCmp::Eq,
+        CmpOp::Ne => SCmp::Ne,
+        CmpOp::Ult => SCmp::Ult,
+        CmpOp::Ule => SCmp::Ule,
+        CmpOp::Ugt => SCmp::Ugt,
+        CmpOp::Uge => SCmp::Uge,
+        CmpOp::Slt => SCmp::Slt,
+        CmpOp::Sle => SCmp::Sle,
+        CmpOp::Sgt => SCmp::Sgt,
+        CmpOp::Sge => SCmp::Sge,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use csolver_ir::{BasicBlock, FuncId};
+
+    /// `guarded(i, len)`: scalar SafetyCheck `i < len` under guard `i < len`.
+    fn guarded() -> Function {
+        let i = RegId(0);
+        let len = RegId(1);
+        let c = RegId(2);
+        let mut bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(1),
+                then_args: vec![],
+                else_blk: BlockId(2),
+                else_args: vec![],
+            },
+        );
+        bb0.insts.push(Inst::Assign {
+            dst: c,
+            ty: Type::Bool,
+            value: RValue::Cmp {
+                op: CmpOp::Ult,
+                lhs: Operand::Reg(i),
+                rhs: Operand::Reg(len),
+            },
+        });
+        let mut bb1 = BasicBlock::new(BlockId(1), Terminator::Return(None));
+        bb1.insts.push(Inst::SafetyCheck {
+            property: SafetyProperty::InBounds,
+            condition: Condition::Cmp {
+                op: CmpOp::Ult,
+                lhs: Operand::Reg(i),
+                rhs: Operand::Reg(len),
+            },
+            note: "guard".into(),
+        });
+        let bb2 = BasicBlock::new(BlockId(2), Terminator::Return(None));
+        Function {
+            id: FuncId(0),
+            name: "guarded".into(),
+            params: vec![(i, Type::int(64)), (len, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn scalar_guarded_check_still_proven() {
+        let r = discharge_function(&guarded());
+        assert_eq!(r.outcome(BlockId(1), 0), Some(SymOutcome::Proven));
+    }
+
+    /// `masked(x)`: `j = x | 8; check j < 8` — always false (definite violation).
+    fn masked_check() -> Function {
+        let x = RegId(0);
+        let j = RegId(1);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Assign {
+            dst: j,
+            ty: Type::int(64),
+            value: RValue::Bin { op: BinOp::Or, lhs: Operand::Reg(x), rhs: Operand::int(64, 8) },
+        });
+        bb0.insts.push(Inst::SafetyCheck {
+            property: SafetyProperty::InBounds,
+            condition: Condition::Cmp { op: CmpOp::Ult, lhs: Operand::Reg(j), rhs: Operand::int(64, 8) },
+            note: "x|8 < 8".into(),
+        });
+        Function {
+            id: FuncId(0),
+            name: "masked".into(),
+            params: vec![(x, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn definite_violation_is_refuted_with_model() {
+        let r = discharge_function(&masked_check());
+        match r.outcome(BlockId(0), 1) {
+            Some(SymOutcome::Refuted(model)) => {
+                assert!(model.get("arg0").is_some(), "witness names the input: {model:?}");
+            }
+            other => panic!("expected Refuted, got {other:?}"),
+        }
+    }
+
+    /// `bare(x)`: `check x < 8` — satisfiable but not valid, so NOT refuted.
+    fn bare_check() -> Function {
+        let x = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::SafetyCheck {
+            property: SafetyProperty::InBounds,
+            condition: Condition::Cmp { op: CmpOp::Ult, lhs: Operand::Reg(x), rhs: Operand::int(64, 8) },
+            note: "x < 8".into(),
+        });
+        Function {
+            id: FuncId(0),
+            name: "bare".into(),
+            params: vec![(x, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn satisfiable_but_invalid_check_stays_unknown() {
+        // `x < 8` holds for some inputs and fails for others — never refuted.
+        let r = discharge_function(&bare_check());
+        assert_eq!(r.outcome(BlockId(0), 0), Some(SymOutcome::Unknown));
+    }
+
+    /// `store_buf(i, n)`: alloc n i32; if 0<=i { if i<n { store buf[i] } }.
+    fn store_buf() -> Function {
+        let i = RegId(0);
+        let n = RegId(1);
+        let buf = RegId(2);
+        let c0 = RegId(3);
+        let c1 = RegId(4);
+        let p = RegId(5);
+
+        let mut bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(c0),
+                then_blk: BlockId(1),
+                then_args: vec![],
+                else_blk: BlockId(3),
+                else_args: vec![],
+            },
+        );
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(32),
+            count: Operand::Reg(n),
+            align: 4,
+        });
+        bb0.insts.push(Inst::Assign {
+            dst: c0,
+            ty: Type::Bool,
+            value: RValue::Cmp {
+                op: CmpOp::Sle,
+                lhs: Operand::int(64, 0),
+                rhs: Operand::Reg(i),
+            },
+        });
+
+        let mut bb1 = BasicBlock::new(
+            BlockId(1),
+            Terminator::CondBr {
+                cond: Operand::Reg(c1),
+                then_blk: BlockId(2),
+                then_args: vec![],
+                else_blk: BlockId(3),
+                else_args: vec![],
+            },
+        );
+        bb1.insts.push(Inst::Assign {
+            dst: c1,
+            ty: Type::Bool,
+            value: RValue::Cmp {
+                op: CmpOp::Slt,
+                lhs: Operand::Reg(i),
+                rhs: Operand::Reg(n),
+            },
+        });
+
+        let mut bb2 = BasicBlock::new(BlockId(2), Terminator::Return(None));
+        bb2.insts.push(Inst::PtrOffset {
+            dst: p,
+            base: Operand::Reg(buf),
+            index: Operand::Reg(i),
+            elem: Type::int(32),
+        });
+        bb2.insts.push(Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(p),
+            value: Operand::int(32, 0),
+            align: 4,
+        });
+
+        let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+
+        Function {
+            id: FuncId(0),
+            name: "store_buf".into(),
+            params: vec![(i, Type::int(64)), (n, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2, bb3],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn guarded_store_proves_all_memory_checks() {
+        let f = store_buf();
+        let r = discharge_function(&f);
+        assert!(!r.truncated);
+        // The store is at bb2 index 1; all five obligations must be proven.
+        for prop in [
+            SafetyProperty::NoNullDeref,
+            SafetyProperty::NoUseAfterFree,
+            SafetyProperty::InBounds,
+            SafetyProperty::Alignment,
+            SafetyProperty::ValidWrite,
+        ] {
+            let d = r.mem_decision(BlockId(2), 1, prop).expect("decided");
+            assert!(d.proven, "{prop} should be proven, got residual: {}", d.residual);
+        }
+        // PtrOffset at bb2 index 0: valid pointer arithmetic.
+        let arith = r
+            .mem_decision(BlockId(2), 0, SafetyProperty::ValidPointerArith)
+            .expect("decided");
+        assert!(arith.proven, "pointer arithmetic: {}", arith.residual);
+    }
+
+    /// A use-after-free: alloc, free, then store through the freed pointer.
+    fn use_after_free() -> Function {
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        bb0.insts.push(Inst::Dealloc {
+            region: RegionKind::Heap,
+            ptr: Operand::Reg(buf),
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(8),
+            ptr: Operand::Reg(buf),
+            value: Operand::int(8, 0),
+            align: 1,
+        });
+        Function {
+            id: FuncId(0),
+            name: "uaf".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn use_after_free_is_not_proven() {
+        let f = use_after_free();
+        let r = discharge_function(&f);
+        // The free itself (index 1) is proven (base of a live region).
+        let free = r.mem_decision(BlockId(0), 1, SafetyProperty::NoDoubleFree).expect("free");
+        assert!(free.proven);
+        // The store after free (index 2) must NOT prove temporal safety.
+        let uaf = r
+            .mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree)
+            .expect("uaf");
+        assert!(!uaf.proven, "use-after-free must stay unproven");
+    }
+
+    /// A counting loop writing across an allocation:
+    ///   bb0: buf = alloc i32*n ; br bb1(0)
+    ///   bb1(i): c = i < n ; condbr c -> bb2(i) / bb3
+    ///   bb2(j): p = buf + j*4 ; store 0 -> p ; nj = j+1 ; br bb1(nj)
+    ///   bb3: return
+    fn loop_store() -> Function {
+        let n = RegId(0);
+        let buf = RegId(1);
+        let i = RegId(2);
+        let c = RegId(3);
+        let j = RegId(4);
+        let p = RegId(5);
+        let nj = RegId(6);
+
+        let mut bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::Br {
+                target: BlockId(1),
+                args: vec![Operand::int(64, 0)],
+            },
+        );
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(32),
+            count: Operand::Reg(n),
+            align: 4,
+        });
+
+        let mut bb1 = BasicBlock::new(
+            BlockId(1),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(2),
+                then_args: vec![Operand::Reg(i)],
+                else_blk: BlockId(3),
+                else_args: vec![],
+            },
+        );
+        bb1.params = vec![(i, Type::int(64))];
+        bb1.insts.push(Inst::Assign {
+            dst: c,
+            ty: Type::Bool,
+            value: RValue::Cmp {
+                op: CmpOp::Slt,
+                lhs: Operand::Reg(i),
+                rhs: Operand::Reg(n),
+            },
+        });
+
+        let mut bb2 = BasicBlock::new(
+            BlockId(2),
+            Terminator::Br {
+                target: BlockId(1),
+                args: vec![Operand::Reg(nj)],
+            },
+        );
+        bb2.params = vec![(j, Type::int(64))];
+        bb2.insts.push(Inst::PtrOffset {
+            dst: p,
+            base: Operand::Reg(buf),
+            index: Operand::Reg(j),
+            elem: Type::int(32),
+        });
+        bb2.insts.push(Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(p),
+            value: Operand::int(32, 0),
+            align: 4,
+        });
+        bb2.insts.push(Inst::Assign {
+            dst: nj,
+            ty: Type::int(64),
+            value: RValue::Bin {
+                op: BinOp::Add,
+                lhs: Operand::Reg(j),
+                rhs: Operand::int(64, 1),
+            },
+        });
+
+        let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+
+        Function {
+            id: FuncId(0),
+            name: "loop_store".into(),
+            params: vec![(n, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2, bb3],
+            entry: BlockId(0),
+        }
+    }
+
+    /// Store a pointer into a slot, load it back, dereference it. Without a
+    /// heap model the loaded pointer is opaque (deref → Unknown); with the
+    /// alias-aware heap, provenance survives the round-trip and the deref proves.
+    fn indirect_store() -> Function {
+        let buf = RegId(0);
+        let slot = RegId(1);
+        let p = RegId(2);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 16),
+            align: 1,
+        });
+        bb0.insts.push(Inst::Alloc {
+            dst: slot,
+            region: RegionKind::Heap,
+            elem: Type::ptr(Type::int(8)),
+            count: Operand::int(64, 1),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::ptr(Type::int(8)),
+            ptr: Operand::Reg(slot),
+            value: Operand::Reg(buf),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Load {
+            dst: p,
+            ty: Type::ptr(Type::int(8)),
+            ptr: Operand::Reg(slot),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(8),
+            ptr: Operand::Reg(p),
+            value: Operand::int(8, 0),
+            align: 1,
+        });
+        Function {
+            id: FuncId(0),
+            name: "indirect_store".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn pointer_survives_store_load_roundtrip() {
+        let f = indirect_store();
+        let r = discharge_function(&f);
+        // The final deref (store at index 4): provenance survived the load, so
+        // non-null and in-bounds are proven (they would be Unknown if the load
+        // had returned an opaque value).
+        for prop in [
+            SafetyProperty::NoNullDeref,
+            SafetyProperty::NoUseAfterFree,
+            SafetyProperty::InBounds,
+            SafetyProperty::ValidWrite,
+        ] {
+            let d = r.mem_decision(BlockId(0), 4, prop).expect("decided");
+            assert!(d.proven, "{prop} should be proven via heap/alias: {}", d.residual);
+        }
+    }
+
+    /// Regression (soundness): a `free` inside a loop body must NOT let an
+    /// access or the free itself be proved — later iterations are UAF/double-free.
+    #[test]
+    fn free_inside_loop_is_not_proven() {
+        let n = RegId(0);
+        let buf = RegId(1);
+        let i = RegId(2);
+        let c = RegId(3);
+        let j = RegId(4);
+        let nj = RegId(5);
+
+        let mut bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::Br { target: BlockId(1), args: vec![Operand::int(64, 0)] },
+        );
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        let mut bb1 = BasicBlock::new(
+            BlockId(1),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(2),
+                then_args: vec![Operand::Reg(i)],
+                else_blk: BlockId(3),
+                else_args: vec![],
+            },
+        );
+        bb1.params = vec![(i, Type::int(64))];
+        bb1.insts.push(Inst::Assign {
+            dst: c,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Slt, lhs: Operand::Reg(i), rhs: Operand::Reg(n) },
+        });
+        let mut bb2 = BasicBlock::new(
+            BlockId(2),
+            Terminator::Br { target: BlockId(1), args: vec![Operand::Reg(nj)] },
+        );
+        bb2.params = vec![(j, Type::int(64))];
+        bb2.insts.push(Inst::Store {
+            ty: Type::int(8),
+            ptr: Operand::Reg(buf),
+            value: Operand::int(8, 0),
+            align: 1,
+        });
+        bb2.insts.push(Inst::Dealloc { region: RegionKind::Heap, ptr: Operand::Reg(buf) });
+        bb2.insts.push(Inst::Assign {
+            dst: nj,
+            ty: Type::int(64),
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) },
+        });
+        let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+        let f = Function {
+            id: FuncId(0),
+            name: "loop_free".into(),
+            params: vec![(n, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2, bb3],
+            entry: BlockId(0),
+        };
+        let r = discharge_function(&f);
+        let uaf = r.mem_decision(BlockId(2), 0, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(!uaf.proven, "store in a freeing loop must not prove temporal safety");
+        let df = r.mem_decision(BlockId(2), 1, SafetyProperty::NoDoubleFree).expect("df");
+        assert!(!df.proven, "free in a loop must not prove no-double-free");
+    }
+
+    /// Regression (soundness): a call to a freeing function must invalidate
+    /// region liveness, so a use after it is not proved.
+    #[test]
+    fn use_after_freeing_call_is_not_proven() {
+        use std::collections::HashMap;
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        bb0.insts.push(Inst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Direct(FuncId(9)),
+            args: vec![Operand::Reg(buf)],
+            ret_ty: Type::Unit,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(8),
+            ptr: Operand::Reg(buf),
+            value: Operand::int(8, 0),
+            align: 1,
+        });
+        let f = Function {
+            id: FuncId(0),
+            name: "caller".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let mut summaries = HashMap::new();
+        summaries.insert(
+            FuncId(9),
+            crate::summary::Summary {
+                ret: crate::summary::RetSummary::Unknown,
+                writes: false,
+                frees: true,
+            },
+        );
+        let r = discharge_with_summaries(&f, &summaries);
+        let uaf = r.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(!uaf.proven, "use after a freeing call must not prove temporal safety");
+    }
+
+    #[test]
+    fn loop_body_access_is_proven_via_invariant() {
+        let f = loop_store();
+        let r = discharge_function(&f);
+        assert!(!r.truncated, "loop exploration must terminate");
+        // The store at bb2 index 1: in-bounds proved from the interval
+        // invariant (i >= 0) plus the loop guard (i < n).
+        let inb = r
+            .mem_decision(BlockId(2), 1, SafetyProperty::InBounds)
+            .expect("in-bounds decided");
+        assert!(inb.proven, "loop body access should be in bounds: {}", inb.residual);
+        // Pointer arithmetic too.
+        let arith = r
+            .mem_decision(BlockId(2), 0, SafetyProperty::ValidPointerArith)
+            .expect("ptr arith decided");
+        assert!(arith.proven, "pointer arithmetic: {}", arith.residual);
+    }
+}

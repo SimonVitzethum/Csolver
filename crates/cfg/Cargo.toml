@@ -1,0 +1,16 @@
+[package]
+name = "csolver-cfg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Control-flow graphs, dominator/post-dominator trees, and natural loop detection over MSIR."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+
+[lints]
+workspace = true

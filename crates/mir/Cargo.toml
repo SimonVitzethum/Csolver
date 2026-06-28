@@ -1,0 +1,17 @@
+[package]
+name = "csolver-mir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Rust MIR frontend: lowers MIR (with borrow/panic info) into MSIR."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+csolver-parser.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "csolver-elf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ELF/PE/Mach-O loader: sections, symbols, relocations, DWARF, PLT/GOT/TLS, exception tables."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+
+[lints]
+workspace = true

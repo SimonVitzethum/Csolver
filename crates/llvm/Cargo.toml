@@ -1,0 +1,17 @@
+[package]
+name = "csolver-llvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "LLVM-IR frontend: lowers textual LLVM IR (SSA, PHIs, intrinsics) into MSIR."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+csolver-parser.workspace = true
+
+[lints]
+workspace = true

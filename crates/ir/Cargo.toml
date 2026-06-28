@@ -1,0 +1,15 @@
+[package]
+name = "csolver-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MSIR: the common Memory-Safety IR that all CSolver frontends lower into."
+
+[dependencies]
+csolver-core.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/ir",
+    "crates/cfg",
+    "crates/parser",
+    "crates/mir",
+    "crates/llvm",
+    "crates/asm",
+    "crates/elf",
+    "crates/memory",
+    "crates/absint",
+    "crates/symbolic",
+    "crates/smt",
+    "crates/solver",
+    "crates/verifier",
+    "crates/report",
+    "crates/cli",
+    "crates/testsuite",
+]
+
+# A single source of truth for shared metadata. Every member crate inherits
+# these via `field.workspace = true`.
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+authors = ["CSolver contributors"]
+repository = "https://example.invalid/csolver"
+description = "A formal memory-safety verifier for Rust at the MIR / LLVM-IR / assembly / ELF level."
+
+# Internal crate versions are referenced by every member through the
+# `workspace = true` shorthand so we only bump versions in one place.
+[workspace.dependencies]
+csolver-core = { path = "crates/core", version = "0.0.1" }
+csolver-ir = { path = "crates/ir", version = "0.0.1" }
+csolver-cfg = { path = "crates/cfg", version = "0.0.1" }
+csolver-parser = { path = "crates/parser", version = "0.0.1" }
+csolver-mir = { path = "crates/mir", version = "0.0.1" }
+csolver-llvm = { path = "crates/llvm", version = "0.0.1" }
+csolver-asm = { path = "crates/asm", version = "0.0.1" }
+csolver-elf = { path = "crates/elf", version = "0.0.1" }
+csolver-memory = { path = "crates/memory", version = "0.0.1" }
+csolver-absint = { path = "crates/absint", version = "0.0.1" }
+csolver-symbolic = { path = "crates/symbolic", version = "0.0.1" }
+csolver-smt = { path = "crates/smt", version = "0.0.1" }
+csolver-solver = { path = "crates/solver", version = "0.0.1" }
+csolver-verifier = { path = "crates/verifier", version = "0.0.1" }
+csolver-report = { path = "crates/report", version = "0.0.1" }
+
+# Lints applied uniformly across the workspace. Soundness is the product's
+# whole reason to exist, so we are strict about the things that erode it.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Optimized but debuggable release profile: the analyses are CPU-bound and we
+# want good codegen, but we keep debug assertions in dev/test to catch our own
+# soundness-relevant invariant violations early.
+[profile.release]
+lto = "thin"
+codegen-units = 1

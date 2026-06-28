@@ -1,0 +1,16 @@
+[package]
+name = "csolver-report"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Human-readable and JSON rendering of verification reports, proofs and counterexamples."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-verifier.workspace = true
+
+[lints]
+workspace = true

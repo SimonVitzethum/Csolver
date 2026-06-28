@@ -1,0 +1,20 @@
+[package]
+name = "csolver-symbolic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Symbolic execution over MSIR: path splitting/merging, lazy init, interprocedural summaries."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+csolver-cfg.workspace = true
+csolver-absint.workspace = true
+csolver-memory.workspace = true
+csolver-solver.workspace = true
+
+[lints]
+workspace = true

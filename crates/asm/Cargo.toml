@@ -1,0 +1,17 @@
+[package]
+name = "csolver-asm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "x86-64 and AArch64 assembly frontend: disassembly and lowering into MSIR."
+
+[dependencies]
+csolver-core.workspace = true
+csolver-ir.workspace = true
+csolver-parser.workspace = true
+
+[lints]
+workspace = true
