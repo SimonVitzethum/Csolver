@@ -5,8 +5,8 @@ use csolver_core::{SafetyProperty, Verdict};
 use csolver_report::{render_json, render_text};
 use csolver_testsuite::{
     dangling_store, guarded_get, indirect_store, interproc_module, loop_array_store,
-    masked_index_store, mixed_module, needs_solver, oob_index_store, oob_mask_check, provably_buggy,
-    provably_safe, safe_buffer_store,
+    masked_index_store, mixed_module, needs_solver, oob_dynamic_store, oob_index_store,
+    oob_mask_check, provably_buggy, provably_safe, safe_buffer_store,
 };
 use csolver_verifier::{verify_function, verify_module, Config};
 
@@ -206,6 +206,34 @@ fn out_of_bounds_memory_access_is_refuted_with_a_counterexample() {
     let i = refuted.model.get("arg0").expect("the input is witnessed").unsigned() as u64;
     let off = i.wrapping_mul(4);
     assert!(off > 28, "witness offset {off} must be out of bounds (i = {i})");
+}
+
+#[test]
+fn dynamic_size_out_of_bounds_is_refuted_with_a_counterexample() {
+    // `buf[i] = 0` into a dynamically-sized `[i32; n]`, unguarded: out of bounds
+    // when `i >= n`. The symbolic byte size `n * 4` cannot wrap (a valid
+    // allocation has `n * 4 <= isize::MAX`), so the access is refuted with a
+    // concrete witness for both `n` and `i`.
+    let mut m = csolver_ir::Module::new("oobdyn");
+    m.functions.push(oob_dynamic_store());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Fail, "report: {report:?}");
+
+    let refuted = report.functions[0]
+        .outcomes
+        .iter()
+        .find_map(|o| match &o.result {
+            csolver_core::ObligationResult::Refuted(cx)
+                if o.obligation.property == csolver_core::SafetyProperty::InBounds =>
+            {
+                Some(cx)
+            }
+            _ => None,
+        })
+        .expect("the in-bounds obligation is refuted with a counterexample");
+    // Both the length and the index are witnessed.
+    assert!(refuted.model.get("arg0").is_some(), "length witnessed: {:?}", refuted.model);
+    assert!(refuted.model.get("arg1").is_some(), "index witnessed: {:?}", refuted.model);
 }
 
 #[test]

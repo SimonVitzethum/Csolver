@@ -80,20 +80,23 @@ Two refutation strengths are used (`RefuteMode`):
   `(x | 8) < 8` (opaque to intervals) is caught as a definite violation. A merely
   *satisfiable-but-not-valid* check (e.g. an unconstrained `i < 8`) stays
   `Unknown` — under-constrained obligations are not turned into FAILs.
-- **Possible** (memory-access **in-bounds**, concrete-size regions). Refuted when
-  *some* reaching input makes the access out of bounds. This is right for a
-  memory operation because the access **executes**: any reachable OOB input is a
-  real runtime violation, so `buf[i]` with an unconstrained `i` is `FAIL` with a
-  witness (e.g. `i = 8`). Soundness rests on (a) the exact path — the model is a
-  real input — and (b) a **concrete** region size — the only free variable is the
-  access offset, so a wrapped `count * stride` can't fabricate a too-small buffer
-  and a spurious witness. The signed in-bounds formula is faithful here: a
-  wrapped huge index that aliases back into range (byte offset wrapping to a
-  small value) correctly is *not* a violation, while a genuine past-the-end
-  offset is. A **symbolic** region size is left prove-only (`Off`) until
-  allocation-size-overflow reasoning lands. Pointer-arithmetic checks are also
-  prove-only; the access's in-bounds check is the one that carries the OOB
-  counterexample.
+- **Possible** (memory-access **in-bounds**). Refuted when *some* reaching input
+  makes the access out of bounds. This is right for a memory operation because
+  the access **executes**: any reachable OOB input is a real runtime violation,
+  so `buf[i]` with an unconstrained `i` is `FAIL` with a witness (e.g. `i = 8`).
+  Soundness rests on (a) the exact path — the model is a real input — and (b) the
+  region's byte size not wrapping. For a **concrete** size that is automatic; for
+  a **symbolic** size `count * stride` (a dynamic `alloc T * n`, or a `&[T]`
+  slice) it holds because a successful allocation / valid slice has
+  `count * stride <= isize::MAX`, recorded as a `count <= isize::MAX/stride`
+  premise. That premise is kept off the proving assumptions (it would slow every
+  proof) and added **only** to the refutation query, so the witness's size cannot
+  be a wrapped too-small value. The signed in-bounds formula is then faithful: a
+  wrapped huge index that aliases back into range correctly is *not* a violation,
+  while a genuine past-the-end offset is. So `buf[i]` into a dynamically-sized
+  `[i32; n]`, or `s.get_unchecked(i)` on a slice, is refuted with a witness for
+  the length *and* the index. Pointer-arithmetic checks are prove-only; the
+  access's in-bounds check carries the OOB counterexample.
 
 **Temporal** safety (use-after-free / double-free) is refuted too, but decided
 structurally from the region's lifetime rather than by the solver. On an **exact**

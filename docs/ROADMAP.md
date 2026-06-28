@@ -69,16 +69,16 @@ whole tool, argued in each crate's `Verification/`.
   symbolic shifts, array/heap theories, and — only if ever wanted — an *opt-in*
   external backend (Bitwuzla → Z3 → CVC5) behind the `SmtSolver` trait for very
   large queries.
-- **Counterexample model extraction** — **largely done.** The internal SAT layer
-  returns a satisfying model (`bitprecise::find_counterexample`), and the symbolic
-  engine emits a `FAIL` with a concrete witness (named `arg{i}`) for both a
-  *definitely-violated* scalar check and a **concrete-size memory access** that is
-  out of bounds for some reaching input (e.g. `buf[i]` with unconstrained `i`),
-  on an **exact** path, plus **temporal** counterexamples (use-after-free /
-  double-free, decided structurally from the region lifetime with a feasibility
-  witness). Remaining: OOB refutation for **symbolic-size** regions (needs
-  allocation-size-overflow reasoning so a wrapped `count * stride` cannot
-  fabricate a too-small buffer), and richer step traces.
+- **Counterexample model extraction** — **done** (for the current analysis). The
+  internal SAT layer returns a satisfying model (`bitprecise::find_counterexample`),
+  and the symbolic engine emits a `FAIL` with a concrete witness (named `arg{i}`)
+  for a *definitely-violated* scalar check, a memory access out of bounds for some
+  reaching input — **including dynamically-sized** buffers and slices, via the
+  `count * stride <= isize::MAX` no-wrap premise added only to the refutation
+  query — and **temporal** violations (use-after-free / double-free, from the
+  region lifetime with a feasibility witness), all on an **exact** path. Remaining:
+  richer step traces, and refutation through over-approximated (loop / call) paths
+  (needs path-precise reachability, not just the `exact` gate).
 - **Pointer-induction loops** — the fully-optimized `for x in s` lowers to a
   vectorized **pointer-walking** loop (`iter != end`, `end = base + len*sizeof`).
   Verifying it soundly needs a relational pointer-offset abstract domain *plus*

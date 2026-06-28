@@ -41,9 +41,12 @@ concrete witness (e.g. `i = 8`). This is sound on an **exact** path with a
 **concrete**-size region: the only free variable is the access offset, so a
 satisfying violation is a genuine reachable OOB and a wrapped `count * stride`
 cannot fabricate a too-small buffer. A safe access (`buf[x & 7]` into a `[i32;8]`)
-is still `PASS` — it is *proved* before any refutation is attempted. Symbolic-size
-regions (dynamic slices) remain prove-only until allocation-overflow reasoning
-lands.
+is still `PASS` — it is *proved* before any refutation is attempted. This reaches
+**dynamically-sized** buffers too: `buf[i]` into an `alloc [i32; n]`, or
+`s.get_unchecked(i)` on a slice `&[i32]`, is `FAIL` with a witness for the length
+*and* the index, because a valid allocation/slice has `n * 4 <= isize::MAX` (so
+the symbolic size cannot wrap) — a premise added only to the refutation query so
+proofs stay fast.
 
 **Temporal** violations (use-after-free, double-free) are refuted as well: on an
 exact path a region only reaches `Freed` through an explicit deallocation, so an

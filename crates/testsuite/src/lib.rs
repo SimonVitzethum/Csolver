@@ -602,6 +602,54 @@ pub fn oob_index_store() -> Function {
     }
 }
 
+/// `oob_dynamic_store(n, i)`: the unguarded write `buf[i] = 0` into a freshly
+/// allocated `[i32; n]` of **dynamic** length `n`. Out of bounds whenever
+/// `i >= n`. The region's byte size `n * 4` is symbolic, but a successful
+/// allocation guarantees `n * 4 <= isize::MAX` (so it does not wrap); with that
+/// premise the symbolic engine refutes the access with a concrete witness for
+/// both `n` and `i` (e.g. `n = 0, i = 0`). The verdict is FAIL — OOB
+/// counterexamples now reach dynamically-sized buffers, not just fixed arrays.
+///
+/// ```text
+///   buf = alloc i32 * n        // symbolic size n*4 (<= isize::MAX)
+///   p   = buf + i*4            // out of bounds when i >= n
+///   store 0 -> p
+/// ```
+pub fn oob_dynamic_store() -> Function {
+    let n = RegId(0);
+    let i = RegId(1);
+    let buf = RegId(2);
+    let p = RegId(3);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(32),
+        count: Operand::Reg(n),
+        align: 4,
+    });
+    bb0.insts.push(Inst::PtrOffset {
+        dst: p,
+        base: Operand::Reg(buf),
+        index: Operand::Reg(i),
+        elem: Type::int(32),
+    });
+    bb0.insts.push(Inst::Store {
+        ty: Type::int(32),
+        ptr: Operand::Reg(p),
+        value: Operand::int(32, 0),
+        align: 4,
+    });
+    Function {
+        id: FuncId(0),
+        name: "oob_dynamic_store".into(),
+        params: vec![(n, Type::int(64)), (i, Type::int(64))],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
 /// `dangling_store()`: allocate, free, then write through the freed pointer —
 /// a use-after-free. The free itself is fine; the later store cannot be proved
 /// temporally safe, so it stays UNKNOWN (this increment never refutes).

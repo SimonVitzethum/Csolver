@@ -27,6 +27,13 @@ use std::collections::{HashMap, HashSet};
 
 const PTR_WIDTH: u32 = 64;
 const LAYOUT: DataLayout = DataLayout::LP64;
+/// The largest valid allocation/offset magnitude: `isize::MAX`. A successful
+/// allocation (or a valid Rust slice/reference) has a byte size in
+/// `[0, isize::MAX]` — the allocator and `Layout` guarantee it — so its element
+/// count times the element size does not wrap. Recording this lets a memory-OOB
+/// counterexample over a *symbolic*-size region stay faithful (no wrapped
+/// `count * stride` fabricating a too-small buffer).
+const ISIZE_MAX: u128 = i64::MAX as u128;
 
 /// Named assumptions a symbolic proof may rely on.
 const ALLOC_SUCCEEDS: &str = "alloc-succeeds";
@@ -209,8 +216,12 @@ fn discharge_inner(
         let Some(c) = contracts.get(i).and_then(|c| c.as_ref()) else {
             continue;
         };
-        let (size, assumption) = match c.size {
-            SizeSpec::Bytes(n) => (ex.ctx.int(PTR_WIDTH, n as u128), PARAM_CONTRACTS),
+        let (size, assumption, nowrap) = match c.size {
+            // A concrete byte size cannot wrap; nothing extra is needed (`true`).
+            SizeSpec::Bytes(n) => {
+                let truth = ex.ctx.boolean(true);
+                (ex.ctx.int(PTR_WIDTH, n as u128), PARAM_CONTRACTS, truth)
+            }
             SizeSpec::ParamElements { len_param, elem_size } => {
                 let len_reg = f.params[len_param as usize].0;
                 let len_e = match env.get(&len_reg) {
@@ -218,7 +229,11 @@ fn discharge_inner(
                     _ => ex.fresh_scalar(PTR_WIDTH),
                 };
                 let es = ex.ctx.int(PTR_WIDTH, elem_size as u128);
-                (ex.ctx.bin(BvOp::Mul, len_e, es), SLICE_ABI)
+                let size = ex.ctx.bin(BvOp::Mul, len_e, es);
+                // A valid slice has `len * size_of::<T>() <= isize::MAX`, so the
+                // length times the element size does not wrap (`slice-abi`).
+                let nowrap = ex.size_no_wrap_fact(len_e, elem_size);
+                (size, SLICE_ABI, nowrap)
             }
         };
         let zero = ex.ctx.int(PTR_WIDTH, 0);
@@ -235,6 +250,7 @@ fn discharge_inner(
                 exec: false,
             },
             contract: Some(assumption),
+            size_nowrap: Some(nowrap),
         });
         env.insert(
             *reg,
@@ -326,6 +342,12 @@ struct SymRegion {
     /// assumption its validity rests on (`param-contracts` / `slice-abi`);
     /// `None` for a freshly-allocated region (which rests on `alloc-succeeds`).
     contract: Option<&'static str>,
+    /// `Some(fact)` when the byte size is known not to wrap (`fact` is the
+    /// `count <= isize::MAX/stride` premise, trivially `true` for a concrete
+    /// size). Then a memory-OOB obligation over the region is **refutable** with
+    /// a faithful witness, with `fact` added to the refutation query only (not to
+    /// the proving assumptions, to keep proofs cheap). `None` ⇒ not refutable.
+    size_nowrap: Option<ExprId>,
 }
 
 #[derive(Debug, Clone)]
@@ -613,6 +635,11 @@ impl Explorer<'_> {
                 } else {
                     Permissions::READ_WRITE
                 };
+                // A successful allocation has size <= isize::MAX, so the element
+                // count times the stride does not wrap (`alloc-succeeds`). Kept
+                // off `facts` (it would slow every proof) and used only to make a
+                // memory-OOB counterexample faithful.
+                let nowrap = self.size_no_wrap_fact(count_e, stride);
                 let rid = state.regions.len();
                 state.regions.push(SymRegion {
                     kind: *region,
@@ -620,6 +647,7 @@ impl Explorer<'_> {
                     state: LifetimeState::Live,
                     perms,
                     contract: None,
+                    size_nowrap: Some(nowrap),
                 });
                 // The byte size is non-negative by construction.
                 let zero = self.ctx.int(PTR_WIDTH, 0);
@@ -686,7 +714,7 @@ impl Explorer<'_> {
             }
             Inst::SafetyCheck { condition, .. } => {
                 let goal = self.eval_condition(condition, state);
-                let decision = self.decide(&[goal], state, RefuteMode::Definite);
+                let decision = self.decide(&[goal], state, RefuteMode::Definite, &[]);
                 self.record_scalar(block, idx, decision);
             }
             Inst::MemIntrinsic { kind, dst, src, len } => {
@@ -896,6 +924,7 @@ impl Explorer<'_> {
         let rperms = region.perms;
         let rsize = region.size;
         let contract = region.contract;
+        let size_nowrap = region.size_nowrap;
 
         // Use-after-free: on an exact path a `Freed` region was definitely
         // deallocated, so the access is a certain UAF — refuted with a witness.
@@ -903,18 +932,17 @@ impl Explorer<'_> {
         self.record_temporal((block, idx), NoUseAfterFree, !live, state, "region is live", "region may be freed (use-after-free)");
 
         // In-bounds: 0 <= offset && offset + asize <= size. Refutable (a real
-        // OOB witness) only when the region size is **concrete**: then the only
-        // free variable is the access offset, so a satisfying violation is a
-        // genuine reachable OOB. A symbolic size is left prove-only — a wrapped
-        // `count * stride` could otherwise fabricate a too-small buffer and a
-        // spurious witness.
+        // OOB witness) whenever the region's byte size is known not to wrap
+        // (concrete, or a symbolic `count * stride` with the recorded
+        // `count <= isize::MAX/stride` bound): then a satisfying violation is a
+        // genuine reachable OOB, since the only remaining free variable is the
+        // access offset and the size cannot be a wrapped too-small value.
         let conjuncts = self.in_bounds_conjuncts(p.offset, asize, rsize);
-        let mode = if self.ctx.as_const(rsize).is_some() {
-            RefuteMode::Possible
-        } else {
-            RefuteMode::Off
+        let (mode, extra) = match size_nowrap {
+            Some(fact) => (RefuteMode::Possible, vec![fact]),
+            None => (RefuteMode::Off, vec![]),
         };
-        let decision = self.decide(&conjuncts, state, mode);
+        let decision = self.decide(&conjuncts, state, mode, &extra);
         self.record_mem(block, idx, InBounds, decision, "access stays within the allocation", "could not prove the access stays in bounds");
 
         // Alignment (concrete).
@@ -947,7 +975,7 @@ impl Explorer<'_> {
         // carries the OOB counterexample; the intermediate pointer arithmetic is
         // only proved.
         let conjuncts = self.in_range_conjuncts(p.offset, rsize);
-        let decision = self.decide(&conjuncts, state, RefuteMode::Off);
+        let decision = self.decide(&conjuncts, state, RefuteMode::Off, &[]);
         let proven = matches!(decision, Decision::Proven);
         self.record_mem(block, idx, ValidPointerArith, decision, "result stays within the object (or one-past-end)", "could not prove the offset stays in-object");
         if proven {
@@ -994,6 +1022,15 @@ impl Explorer<'_> {
         [lower, upper]
     }
 
+    /// The fact `count <=u isize::MAX / stride`, so `count * stride` does not
+    /// wrap and the byte size is faithful. Sound under `alloc-succeeds` /
+    /// `slice-abi` (a successful allocation / valid slice has a size that fits).
+    fn size_no_wrap_fact(&mut self, count: ExprId, stride: u64) -> ExprId {
+        let max_count = ISIZE_MAX / (stride.max(1) as u128);
+        let bound = self.ctx.int(PTR_WIDTH, max_count);
+        self.ctx.cmp(SCmp::Ule, count, bound)
+    }
+
     /// The conjuncts of in-range: `0 <= offset` and `offset <= size`
     /// (one-past-end allowed).
     fn in_range_conjuncts(&mut self, offset: ExprId, size: ExprId) -> [ExprId; 2] {
@@ -1006,13 +1043,21 @@ impl Explorer<'_> {
     /// Decide a (possibly conjunctive) safety goal on one path. Tries to **prove**
     /// it (`A ⟹ P ∧ Q` by proving each conjunct — the linear procedure only takes
     /// conjunctive goals); failing that, on an **exact** path, tries to **refute**
-    /// it per `mode` and return a concrete counterexample.
-    fn decide(&mut self, conjuncts: &[ExprId], state: &PathState, mode: RefuteMode) -> Decision {
+    /// it per `mode` and return a concrete counterexample. `extra` adds premises
+    /// used *only* for the refutation query (e.g. a region's no-wrap bound) — not
+    /// for proving, which stays cheap.
+    fn decide(
+        &mut self,
+        conjuncts: &[ExprId],
+        state: &PathState,
+        mode: RefuteMode,
+        extra: &[ExprId],
+    ) -> Decision {
         if conjuncts.iter().all(|&g| self.prove(g, state)) {
             return Decision::Proven;
         }
         if mode != RefuteMode::Off && state.exact {
-            if let Some(model) = self.try_refute(conjuncts, state, mode) {
+            if let Some(model) = self.try_refute(conjuncts, state, mode, extra) {
                 return Decision::Refuted(model);
             }
         }
@@ -1040,6 +1085,7 @@ impl Explorer<'_> {
         conjuncts: &[ExprId],
         state: &PathState,
         mode: RefuteMode,
+        extra: &[ExprId],
     ) -> Option<Model> {
         let goal = if conjuncts.len() == 1 {
             conjuncts[0]
@@ -1049,6 +1095,7 @@ impl Explorer<'_> {
         let not_goal = self.ctx.not(goal);
         let mut assumptions = state.pathcond.clone();
         assumptions.extend_from_slice(&state.facts);
+        assumptions.extend_from_slice(extra);
         // For a *definite* refutation, first require that the goal can never hold
         // on this (feasible, exact) path — proved bit-precisely. A *possible*
         // refutation skips this: any satisfiable violation is a real one.
