@@ -358,6 +358,19 @@ enum SymValue {
     Ptr(SymPointer),
 }
 
+/// Where a loaded value comes from, per the store log (most-recent-first scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadOrigin {
+    /// A prior store definitely determines the value (`Must` alias).
+    Stored,
+    /// A prior store *might* determine it (`May` alias) — value is unknown.
+    Uncertain,
+    /// No store reaches this location (every record is `No` alias): the bytes
+    /// are whatever the region held at allocation. For a freshly-allocated
+    /// region that is *uninitialized* memory.
+    Unwritten,
+}
+
 /// A recorded store: "`size` bytes equal to `value` were written through
 /// `target`". Most-recent-last.
 #[derive(Clone)]
@@ -954,7 +967,25 @@ impl Explorer<'_> {
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidRead, state);
-                let value = self.load_value(&p, asize, ty, state);
+                let exact_before = state.exact;
+                let (value, origin) = self.load_value(&p, asize, ty, state);
+                match origin {
+                    LoadOrigin::Stored => {}
+                    LoadOrigin::Uncertain => state.exact = false,
+                    LoadOrigin::Unwritten => {
+                        // No store reaches this location. For a freshly-allocated
+                        // region that is a read of uninitialized memory (UB). On
+                        // an exact path it is a definite violation, refutable with
+                        // a faithful witness. (Compute the witness before dropping
+                        // `exact` for the unknown value below.)
+                        if exact_before && self.is_fresh_alloc(&p, state) {
+                            if let Some(model) = self.feasibility_witness(state) {
+                                self.record_uninit_read(block, idx, model);
+                            }
+                        }
+                        state.exact = false;
+                    }
+                }
                 state.env.insert(*dst, value);
             }
             Inst::Store { ty, ptr, value, align } => {
@@ -1436,22 +1467,56 @@ impl Explorer<'_> {
     /// must-aliasing store supplies the value, a may-aliasing store makes the
     /// value ambiguous (fresh unknown), a no-aliasing store is skipped. This is
     /// what preserves a pointer's provenance across a store/load round-trip.
-    fn load_value(&mut self, p: &SymPointer, asize: u64, ty: &Type, state: &mut PathState) -> SymValue {
+    /// Resolve a load against the store log, reporting both the value and its
+    /// [`LoadOrigin`]. A value not pinned by a `Must`-aliasing store is a fresh
+    /// unknown (an over-approximation); the caller drops `exact` for it, since a
+    /// violating model could assign that unknown a value memory never holds.
+    fn load_value(
+        &mut self,
+        p: &SymPointer,
+        asize: u64,
+        ty: &Type,
+        state: &PathState,
+    ) -> (SymValue, LoadOrigin) {
         for k in (0..state.heap.len()).rev() {
             let rec_size = state.heap[k].size;
             let target = state.heap[k].target.clone();
             match self.alias_check(&target, p, rec_size, asize, state) {
                 AliasResult::No => continue,
-                AliasResult::Must => return state.heap[k].value.clone(),
-                AliasResult::May => break,
+                AliasResult::Must => return (state.heap[k].value.clone(), LoadOrigin::Stored),
+                AliasResult::May => return (self.fresh_value(ty), LoadOrigin::Uncertain),
             }
         }
-        // The loaded value is not determined by a prior store: it becomes a
-        // fresh unknown (an over-approximation), so this path can no longer be
-        // refuted (a violating model might assign that unknown a value memory
-        // never actually holds).
-        state.exact = false;
-        self.fresh_value(ty)
+        (self.fresh_value(ty), LoadOrigin::Unwritten)
+    }
+
+    /// Does `p` point into a freshly-allocated region (one with no caller
+    /// contract)? Such a region's bytes are *uninitialized* until written.
+    fn is_fresh_alloc(&self, p: &SymPointer, state: &PathState) -> bool {
+        match &p.prov {
+            Prov::Region(rid) => state.regions.get(*rid).is_some_and(|r| r.contract.is_none()),
+            _ => false,
+        }
+    }
+
+    /// Record a definite read of uninitialized memory as a `ValidRead`
+    /// refutation (UB: reading never-written allocated bytes). Overwrites any
+    /// permission-worded predicate from `check_access` so the report names the
+    /// real cause.
+    fn record_uninit_read(&mut self, block: BlockId, idx: usize, model: Model) {
+        let entry = self
+            .mem
+            .entry((block, idx, SafetyProperty::ValidRead))
+            .or_insert(MemAgg {
+                all_proven: true,
+                refutation: None,
+                predicate: String::new(),
+                residual: String::new(),
+            });
+        entry.all_proven = false;
+        entry.refutation.get_or_insert(model);
+        entry.predicate = "reads initialized memory".to_string();
+        entry.residual = "reads uninitialized (never-written) freshly-allocated memory".to_string();
     }
 
     /// Classify the alias relationship between two accesses `a` (`sizea` bytes)
@@ -1807,6 +1872,83 @@ mod tests {
             }
             other => panic!("expected Refuted, got {other:?}"),
         }
+    }
+
+    /// `uninit()`: `buf = alloc i32*4; v = load buf` — read before any write.
+    fn uninit() -> Function {
+        let buf = RegId(0);
+        let v = RegId(1);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(32),
+            count: Operand::int(64, 4),
+            align: 4,
+        });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 });
+        Function {
+            id: FuncId(0),
+            name: "uninit".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn uninitialized_read_is_refuted() {
+        // The load (block 0, idx 1) reads a freshly-allocated, never-written
+        // region: a definite read of uninitialized memory, refuted as ValidRead.
+        let r = discharge_function(&uninit());
+        let d = r
+            .mem_decision(BlockId(0), 1, SafetyProperty::ValidRead)
+            .expect("ValidRead obligation for the load");
+        assert!(!d.proven, "an uninitialized read must not be proven");
+        assert!(d.refutation.is_some(), "it is refuted with a witness: {d:?}");
+    }
+
+    /// `init()`: `buf = alloc i32*4; store 7 -> buf; v = load buf` — read after
+    /// write, so the load reads an initialized value.
+    fn init() -> Function {
+        let buf = RegId(0);
+        let v = RegId(1);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(32),
+            count: Operand::int(64, 4),
+            align: 4,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(buf),
+            value: Operand::int(32, 7),
+            align: 4,
+        });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 });
+        Function {
+            id: FuncId(0),
+            name: "init".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn initialized_read_is_not_flagged() {
+        // The store `Must`-aliases the load, so the value is determined and the
+        // definedness check does not fire (no refutation).
+        let r = discharge_function(&init());
+        let d = r
+            .mem_decision(BlockId(0), 2, SafetyProperty::ValidRead)
+            .expect("ValidRead obligation for the load");
+        assert!(d.proven, "a read after write is proven: {d:?}");
+        assert!(d.refutation.is_none(), "no refutation for an initialized read: {d:?}");
     }
 
     /// `bare(x)`: `check x < 8` — satisfiable but not valid, so NOT refuted.

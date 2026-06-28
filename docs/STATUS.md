@@ -3,6 +3,24 @@
 Milestone **M1 — symbolic execution + SMT (increment 1 done)**, on top of the
 completed **M0 — architecture + foundations**.
 
+## Definedness: no read of uninitialized memory
+
+The symbolic engine now checks a new memory-safety property — **definedness** —
+annotation-free: a freshly-allocated region (one with no caller contract) holds
+*uninitialized* bytes until written, and reading them is undefined behaviour in
+Rust. Resolving a `Load` against the store log now reports its origin (`Stored` /
+`Uncertain` / `Unwritten`); an `Unwritten` load from a fresh allocation on an
+**exact** path is a *definite* read of never-written memory and is **refuted** as
+a `ValidRead` violation with a feasibility witness. The check is **sound and
+additive**: it fires only when the path is exact (complete store log), the scan
+saw no may-aliasing store (so the bytes are provably unwritten), and the region
+is a fresh allocation (a contracted `&[T]`/`&mut [T;N]` parameter is
+caller-initialized, hence never flagged) — so it adds new `FAIL`s for
+uninitialized reads without turning any initialized read into `UNKNOWN`
+(`uninit_read` → FAIL, `init_read` → PASS). This is the first piece of the
+shape/ownership analysis: the validity *state* of allocated bytes, inferred
+without any per-code annotation.
+
 ## Toward real binaries: ELF loader
 
 `csolver-elf` now **parses real ELF64 objects** in pure Rust (no `object`/`gimli`):
@@ -208,6 +226,7 @@ coverage is in [ROADMAP.md](ROADMAP.md).
 
 
 ### Increments 1–2 (symbolic foundation + memory)
+sicherheit?
 
 A sound symbolic-execution engine that **turns whole classes of UNKNOWN into
 PASS** without weakening soundness:

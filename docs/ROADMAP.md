@@ -88,10 +88,18 @@ whole tool, argued in each crate's `Verification/`.
   for a *definitely-violated* scalar check, a memory access out of bounds for some
   reaching input — **including dynamically-sized** buffers and slices, via the
   `count * stride <= isize::MAX` no-wrap premise added only to the refutation
-  query — and **temporal** violations (use-after-free / double-free, from the
-  region lifetime with a feasibility witness), all on an **exact** path. Remaining:
+  query — **temporal** violations (use-after-free / double-free, from the
+  region lifetime with a feasibility witness), and **definedness** violations (a
+  read of *uninitialized* memory: an `Unwritten` load from a freshly-allocated
+  region with no caller contract), all on an **exact** path. Remaining:
   richer step traces, and refutation through over-approximated (loop / call) paths
   (needs path-precise reachability, not just the `exact` gate).
+- **Definedness / shape (ownership) analysis** — **started.** The first shape
+  fact is the *validity state* of allocated bytes: fresh allocations are
+  uninitialized until written, so a provably-unwritten read is refuted
+  (annotation-free, sound, additive). Next toward annotation-free heap reasoning:
+  a separation/ownership domain (disjointness of sub-regions, exclusive `&mut`
+  ownership) and inferred per-region initialization ranges for symbolic offsets.
 - **Pointer-induction loops** — the fully-optimized `for x in s` lowers to a
   vectorized **pointer-walking** loop (`iter != end`, `end = base + len*sizeof`).
   Verifying it soundly needs a relational pointer-offset abstract domain *plus*

@@ -4,9 +4,9 @@
 use csolver_core::{SafetyProperty, Verdict};
 use csolver_report::{render_json, render_text};
 use csolver_testsuite::{
-    dangling_store, guarded_get, indirect_store, interproc_module, loop_array_store,
+    dangling_store, guarded_get, indirect_store, init_read, interproc_module, loop_array_store,
     masked_index_store, mixed_module, needs_solver, oob_dynamic_store, oob_index_store,
-    oob_mask_check, provably_buggy, provably_safe, relational_loop, safe_buffer_store,
+    oob_mask_check, provably_buggy, provably_safe, relational_loop, safe_buffer_store, uninit_read,
 };
 use csolver_verifier::{verify_function, verify_module, Config};
 
@@ -234,6 +234,43 @@ fn dynamic_size_out_of_bounds_is_refuted_with_a_counterexample() {
     // Both the length and the index are witnessed.
     assert!(refuted.model.get("arg0").is_some(), "length witnessed: {:?}", refuted.model);
     assert!(refuted.model.get("arg1").is_some(), "index witnessed: {:?}", refuted.model);
+}
+
+#[test]
+fn uninitialized_read_is_refuted_with_a_counterexample() {
+    // `buf = alloc i32*4; v = load buf` — reading a freshly-allocated buffer
+    // before any write reads uninitialized memory (UB in Rust). On this exact
+    // path the violation is definite: the engine refutes the `ValidRead`
+    // obligation with a feasibility witness. This is a memory-safety property
+    // (definedness) the bounds/temporal checks alone do not cover.
+    let mut m = csolver_ir::Module::new("uninit");
+    m.functions.push(uninit_read());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Fail, "report: {report:?}");
+
+    let refuted = report.functions[0]
+        .outcomes
+        .iter()
+        .find(|o| o.obligation.property == SafetyProperty::ValidRead)
+        .expect("a ValidRead obligation exists for the load");
+    assert!(
+        matches!(refuted.result, csolver_core::ObligationResult::Refuted(_)),
+        "the uninitialized read is refuted: {:?}",
+        refuted.result
+    );
+}
+
+#[test]
+fn read_after_write_is_initialized_and_passes() {
+    // The safe counterpart: the same buffer is written before it is read, so the
+    // load reads an initialized value (the store `Must`-aliases it). No
+    // uninitialized-read obligation fires; the function verifies PASS. This
+    // guards against the definedness check over-firing on initialized reads.
+    let mut m = csolver_ir::Module::new("init");
+    m.functions.push(init_read());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.functions[0].outcomes.iter().all(|o| o.verdict() == Verdict::Pass));
 }
 
 #[test]

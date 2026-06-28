@@ -538,6 +538,84 @@ pub fn indirect_store() -> Function {
     }
 }
 
+/// `uninit_read()`: allocate a buffer and *read* it before any write. A fresh
+/// allocation holds uninitialized bytes, so the load is a read of uninitialized
+/// memory (undefined behaviour in Rust). On this exact, straight-line path the
+/// violation is definite and is refuted (`ValidRead` FAIL) with a witness.
+///
+/// ```text
+///   buf = alloc i32 * 4    // uninitialized
+///   v   = load buf         // UB: reads never-written memory
+/// ```
+pub fn uninit_read() -> Function {
+    let buf = RegId(0);
+    let v = RegId(1);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(32),
+        count: Operand::int(64, 4),
+        align: 4,
+    });
+    bb0.insts.push(Inst::Load {
+        dst: v,
+        ty: Type::int(32),
+        ptr: Operand::Reg(buf),
+        align: 4,
+    });
+    Function {
+        id: FuncId(0),
+        name: "uninit_read".into(),
+        params: vec![],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
+/// `init_read()`: the safe counterpart — the same buffer is *written* before it
+/// is read, so the load reads an initialized value (the store `Must`-aliases it)
+/// and the function verifies PASS.
+///
+/// ```text
+///   buf = alloc i32 * 4
+///   store 7 -> buf         // initializes [0, 4)
+///   v   = load buf         // reads the stored value
+/// ```
+pub fn init_read() -> Function {
+    let buf = RegId(0);
+    let v = RegId(1);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(32),
+        count: Operand::int(64, 4),
+        align: 4,
+    });
+    bb0.insts.push(Inst::Store {
+        ty: Type::int(32),
+        ptr: Operand::Reg(buf),
+        value: Operand::int(32, 7),
+        align: 4,
+    });
+    bb0.insts.push(Inst::Load {
+        dst: v,
+        ty: Type::int(32),
+        ptr: Operand::Reg(buf),
+        align: 4,
+    });
+    Function {
+        id: FuncId(0),
+        name: "init_read".into(),
+        params: vec![],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
 /// `masked_index_store(x)`: write `buf[x & 7]` into a `[i8; 8]`. The masked
 /// index is provably in `[0, 7]`, so every access is in bounds — but *only*
 /// bit-precisely: the linear decision procedure abstracts the bitwise `&` as an

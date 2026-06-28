@@ -86,6 +86,23 @@ raw-pointer-in-memory patterns (slots, linked structures, `Box<*T>`) verify. At
 loop headers the heap is cleared (sound over-approximation of loop-modified
 memory).
 
+## Definedness — no read of uninitialized memory
+A freshly-allocated region (a `Heap`/`Stack` allocation, i.e. one with **no
+caller contract**) holds **uninitialized** bytes until written; reading them is
+undefined behaviour in Rust. The store scan classifies each `Load`'s origin:
+**`Stored`** (a `Must`-aliasing store determines the value), **`Uncertain`** (a
+`May`-aliasing store might), or **`Unwritten`** (every record is `No`-alias — no
+store reaches the location). On an **exact** path an `Unwritten` load from a
+fresh allocation is a *definite* read of never-written memory: it is refuted as a
+`ValidRead` violation with a feasibility witness. The check is **sound and
+additive** — it only fires when (a) the path is `exact` (so the store log is
+complete; any call/loop havoc drops `exact` and suppresses it), (b) the scan saw
+**no** `May`-aliasing store (so the bytes are provably unwritten, not merely
+unknown), and (c) the region is a fresh allocation (a contracted pointer
+parameter is caller-initialized, so it is never flagged). It therefore adds new
+`FAIL`s for uninitialized reads without turning any initialized read into an
+`UNKNOWN`. (Tested by `uninitialized_read_is_refuted` / `initialized_read_is_not_flagged`.)
+
 ## Path feasibility pruning (scaling)
 At each conditional branch, a successor whose guard is **bit-precisely**
 unsatisfiable under the current path condition (`pathcond ∧ facts ⟹ ¬guard`) is
