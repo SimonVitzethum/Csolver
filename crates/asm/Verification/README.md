@@ -12,7 +12,17 @@ operand `[base + disp]` (including a SIB byte and an 8/32-bit displacement) lowe
 to a `PtrOffset` then a `Load`/`Store`. Currently decoded: the REX prefix,
 `ret`/`nop`, `mov r,imm`, the reg/reg ALU ops (`xor`/`add`/`sub`/`and`/`or`, with
 `xor r,r` recognised as zeroing), the group-1 `add`/`sub r, imm8`, `mov` reg↔reg /
-`[base+disp]` load/store, `cmp`/`test`, and the branches `jmp`/`jcc`.
+`[base + index*scale + disp]` load/store, `lea`, `cmp`/`test`, and the branches
+`jmp`/`jcc`. **Indexed addressing** (a SIB index register with a 1/2/4/8 scale)
+lowers to a `PtrOffset` by `index * scale` (then the displacement), so an array
+access `[rsp + rcx*4]` is modelled exactly.
+
+### Argument registers as parameters
+The x86-64 System V integer argument registers (`rdi, rsi, rdx, rcx, r8, r9`) are
+modelled as the function's **parameters**, so each is a *stable* symbol: a value
+read before it is written (a function input) refers to one symbol across all its
+uses. This is what lets a guard (`cmp rcx, 16`) constrain a later indexed access
+(`[rsp + rcx*4]`) — without it, each use would be an independent unknown.
 
 ### Control flow
 The body is decoded linearly, then split into basic blocks at the leaders — the

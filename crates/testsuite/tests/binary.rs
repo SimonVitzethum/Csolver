@@ -151,6 +151,40 @@ fn a_binary_loop_is_handled() {
 }
 
 #[test]
+fn guarded_array_store_in_a_binary_is_proven_safe() {
+    //   sub rsp, 64            ; a 16-element i32 stack array
+    //   cmp ecx, 16
+    //   jae .end               ; bounds check: skip if ecx >= 16
+    //   mov [rsp + rcx*4], eax  ; arr[rcx] = eax   (indexed addressing)
+    // .end:
+    //   add rsp, 64 ; ret
+    // The guard `rcx < 16` bounds the indexed access to the 64-byte frame: PASS.
+    let code = [
+        0x48, 0x83, 0xec, 0x40, // sub rsp, 64
+        0x83, 0xf9, 0x10, // cmp ecx, 16
+        0x73, 0x03, // jae +3 (.end)
+        0x89, 0x04, 0x8c, // mov [rsp + rcx*4], eax
+        0x48, 0x83, 0xc4, 0x40, // add rsp, 64
+        0xc3, // ret
+    ];
+    assert_eq!(verify_binary(&code), Verdict::Pass);
+}
+
+#[test]
+fn unguarded_array_store_in_a_binary_fails() {
+    //   sub rsp, 64 ; mov [rsp + rcx*4], eax ; add rsp, 64 ; ret
+    // No bound on `rcx`, so `rcx = 16` writes one element past the 16-element
+    // frame: a definite out-of-bounds write. FAIL.
+    let code = [
+        0x48, 0x83, 0xec, 0x40, // sub rsp, 64
+        0x89, 0x04, 0x8c, // mov [rsp + rcx*4], eax
+        0x48, 0x83, 0xc4, 0x40, // add rsp, 64
+        0xc3, // ret
+    ];
+    assert_eq!(verify_binary(&code), Verdict::Fail);
+}
+
+#[test]
 fn an_undecodable_function_is_unknown() {
     // A syscall (`0f 05`) is outside the decoded subset, so the function is
     // `unanalyzed` and reported UNKNOWN — never silently treated as safe.

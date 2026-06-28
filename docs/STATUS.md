@@ -33,8 +33,15 @@ blocks at branch targets and lowers `jmp`→`Br`, `jcc`→`CondBr` (with the con
 taken from the preceding `cmp`/`test`), and backward branches into back-edges. So
 a *branchy* binary verifies end-to-end — a guarded stack store
 (`cmp edi,0 ; jne .skip ; mov [rsp+8],eax`) is **PASS** (the state-merging engine
-joins the paths), and a counting loop is handled (cut + interval invariant). DWARF,
-the full ISA, AArch64, and PE/Mach-O follow.
+joins the paths), and a counting loop is handled (cut + interval invariant).
+
+**Indexed addressing** (`[rsp + rcx*4]`, a SIB index×scale) and `lea` are decoded
+too, and the SysV argument registers (`rdi…r9`) are modelled as parameters (stable
+symbols). So a *binary array access with a bounds check* now verifies: `sub rsp,64
+; cmp ecx,16 ; jae .end ; mov [rsp+rcx*4], eax` is **PASS** (the guard `rcx < 16`
+bounds the index into the 16-element frame), while the same without the check is
+**FAIL** (a definite out-of-bounds write). DWARF, the full ISA, AArch64, and
+PE/Mach-O follow.
 
 ## Bit-precise decision procedure (pure-Rust SAT)
 

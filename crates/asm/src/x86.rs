@@ -31,7 +31,7 @@ pub fn decode_function(name: &str, code: &[u8]) -> Module {
         Ok((blocks, entry)) => m.functions.push(Function {
             id: FuncId(0),
             name: name.into(),
-            params: Vec::new(),
+            params: arg_registers(),
             ret_ty: Type::Unit,
             blocks,
             entry,
@@ -39,6 +39,16 @@ pub fn decode_function(name: &str, code: &[u8]) -> Module {
         Err(reason) => m.unanalyzed.push((name.into(), reason)),
     }
     m
+}
+
+/// The x86-64 System V integer argument registers, modelled as the function's
+/// parameters so each is a *stable* symbol: a value read before it is written
+/// (an input) then refers to one symbol across all its uses, which is what lets a
+/// guard (`cmp rcx, 16`) constrain a later access (`[rsp + rcx*4]`). The order is
+/// the SysV order (`rdi, rsi, rdx, rcx, r8, r9`), so the model names them
+/// `arg0..arg5`.
+fn arg_registers() -> Vec<(RegId, Type)> {
+    [7u8, 6, 2, 1, 8, 9].iter().map(|&r| (reg(r), Type::int(64))).collect()
 }
 
 /// The control-flow effect of an instruction.
@@ -246,18 +256,13 @@ fn decode_one(
                 )
             } else {
                 let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
-                let tmp = temp_reg(pos);
-                done(
-                    vec![
-                        mem.ptr_offset(tmp),
-                        Inst::Store { ty, ptr: Operand::Reg(tmp), value: Operand::Reg(reg(m.reg)), align: 1 },
-                    ],
-                    mem.next,
-                )
+                let (mut insts, ptr) = mem.lower(pos);
+                insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::Reg(reg(m.reg)), align: 1 });
+                done(insts, mem.next)
             }
         }
         0x8b => {
-            // mov r, r/m — register move (mod 11) or load [base+disp].
+            // mov r, r/m — register move (mod 11) or load [base+...].
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
             if m.mode == 0b11 {
@@ -271,15 +276,22 @@ fn decode_one(
                 )
             } else {
                 let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
-                let tmp = temp_reg(pos);
-                done(
-                    vec![
-                        mem.ptr_offset(tmp),
-                        Inst::Load { dst: reg(m.reg), ty, ptr: Operand::Reg(tmp), align: 1 },
-                    ],
-                    mem.next,
-                )
+                let (mut insts, ptr) = mem.lower(pos);
+                insts.push(Inst::Load { dst: reg(m.reg), ty, ptr: Operand::Reg(ptr), align: 1 });
+                done(insts, mem.next)
             }
+        }
+        // lea r, [mem] — compute the effective address into r (no memory access).
+        0x8d => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode == 0b11 {
+                return Err("x86: lea requires a memory operand".into());
+            }
+            let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+            let (mut insts, ptr) = mem.lower(pos);
+            insts.push(Inst::Assign { dst: reg(m.reg), ty, value: RValue::Use(Operand::Reg(ptr)) });
+            done(insts, mem.next)
         }
         // group 1: <op> r/m, imm8 — register target (mod 11) only.
         0x83 => {
@@ -465,39 +477,65 @@ fn cc_cmpop(cc: u8) -> Option<CmpOp> {
     })
 }
 
-/// A decoded `[base + disp]` memory operand.
+/// A decoded `[base + index*scale + disp]` memory operand.
 struct MemOperand {
     base: RegId,
+    /// `(index register, scale in bytes ∈ {1,2,4,8})`, if an index is present.
+    index: Option<(RegId, u8)>,
     disp: i64,
     next: usize,
 }
 
 impl MemOperand {
-    /// `dst = base + disp` (byte offset, `i8` stride).
-    fn ptr_offset(&self, dst: RegId) -> Inst {
-        Inst::PtrOffset {
-            dst,
-            base: Operand::Reg(self.base),
-            index: Operand::int(64, self.disp as u64 as u128),
-            elem: Type::int(8),
+    /// Emit the `PtrOffset` chain computing the address and return the register
+    /// holding it: `base (+ index*scale) (+ disp)`.
+    fn lower(&self, pos: usize) -> (Vec<Inst>, RegId) {
+        let mut insts = Vec::new();
+        let mut ptr = self.base;
+        if let Some((index, scale)) = self.index {
+            let dst = temp_reg(pos);
+            insts.push(Inst::PtrOffset {
+                dst,
+                base: Operand::Reg(ptr),
+                index: Operand::Reg(index),
+                elem: Type::int(8 * scale as u32),
+            });
+            ptr = dst;
         }
+        // A bare `[base]` or any displacement needs a final byte offset (also so
+        // the result is a pointer when there was no index).
+        if self.index.is_none() || self.disp != 0 {
+            let dst = RegId(1500 + pos as u32);
+            insts.push(Inst::PtrOffset {
+                dst,
+                base: Operand::Reg(ptr),
+                index: Operand::int(64, self.disp as u64 as u128),
+                elem: Type::int(8),
+            });
+            ptr = dst;
+        }
+        (insts, ptr)
     }
 }
 
-/// Decode the `[base + disp]` memory operand of a ModR/M (mode ≠ 11), including a
-/// SIB byte. Only a base register with no index is supported; an index register,
-/// RIP-relative, or base-less disp32 forms are a clean `Err`.
+/// Decode the `[base + index*scale + disp]` memory operand of a ModR/M
+/// (mode ≠ 11), including a SIB byte. RIP-relative and base-less disp32 forms are
+/// a clean `Err`.
 fn mem_operand(code: &[u8], p: usize, m: &ModRm, rex_x: bool, rex_b: bool) -> Result<MemOperand, String> {
     let mut p = p;
     let mut base = m.rm; // low 3 bits + REX.B (from `modrm`)
+    let mut index = None;
     let rm_low = m.rm & 7;
     if rm_low == 4 {
         let sib = *code.get(p).ok_or("x86: truncated SIB")?;
         p += 1;
-        let index = ((sib >> 3) & 7) + if rex_x { 8 } else { 0 };
+        let scale = 1u8 << (sib >> 6);
+        let index_field = (sib >> 3) & 7;
         let base_field = (sib & 7) + if rex_b { 8 } else { 0 };
-        if index & 7 != 4 {
-            return Err("x86: indexed addressing is unsupported".into());
+        // index field 100 with REX.X clear means "no index"; otherwise it is a
+        // register (r12 when REX.X is set).
+        if index_field != 4 || rex_x {
+            index = Some((reg(index_field + if rex_x { 8 } else { 0 }), scale));
         }
         if m.mode == 0b00 && base_field & 7 == 5 {
             return Err("x86: base-less disp32 is unsupported".into());
@@ -520,7 +558,7 @@ fn mem_operand(code: &[u8], p: usize, m: &ModRm, rex_x: bool, rex_b: bool) -> Re
         }
         _ => return Err("x86: register operand has no memory form".into()),
     };
-    Ok(MemOperand { base: reg(base), disp, next: p })
+    Ok(MemOperand { base: reg(base), index, disp, next: p })
 }
 
 fn modrm(code: &[u8], at: usize, rex_r: bool, rex_b: bool) -> Result<ModRm, String> {
@@ -625,5 +663,21 @@ mod tests {
             loop_body.term,
             Terminator::CondBr { then_blk, .. } if then_blk == loop_body.id
         ));
+    }
+
+    #[test]
+    fn decodes_indexed_addressing_and_lea() {
+        // mov [rsp + rcx*4], eax  = 89 04 8c   (SIB scale 4, index rcx, base rsp)
+        let m = decode_function("f", &[0x89, 0x04, 0x8c, 0xc3]);
+        assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+        let insts = &m.functions[0].blocks[0].insts;
+        assert!(matches!(insts[0], Inst::PtrOffset { .. }), "index*scale offset");
+        assert!(matches!(insts[1], Inst::Store { .. }));
+
+        // lea rax, [rsp + rcx*4]  = 48 8d 04 8c   (compute address, no access)
+        let m2 = decode_function("g", &[0x48, 0x8d, 0x04, 0x8c, 0xc3]);
+        assert!(m2.unanalyzed.is_empty(), "{:?}", m2.unanalyzed);
+        let insts = &m2.functions[0].blocks[0].insts;
+        assert!(matches!(insts.last(), Some(Inst::Assign { .. })), "lea assigns the address");
     }
 }
