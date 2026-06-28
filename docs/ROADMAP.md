@@ -74,10 +74,11 @@ whole tool, argued in each crate's `Verification/`.
   engine emits a `FAIL` with a concrete witness (named `arg{i}`) for both a
   *definitely-violated* scalar check and a **concrete-size memory access** that is
   out of bounds for some reaching input (e.g. `buf[i]` with unconstrained `i`),
-  on an **exact** path. Remaining: OOB refutation for **symbolic-size** regions
-  (needs allocation-size-overflow reasoning so a wrapped `count * stride` cannot
-  fabricate a too-small buffer), temporal (use-after-free / double-free)
-  counterexamples, and richer step traces.
+  on an **exact** path, plus **temporal** counterexamples (use-after-free /
+  double-free, decided structurally from the region lifetime with a feasibility
+  witness). Remaining: OOB refutation for **symbolic-size** regions (needs
+  allocation-size-overflow reasoning so a wrapped `count * stride` cannot
+  fabricate a too-small buffer), and richer step traces.
 - **Pointer-induction loops** — the fully-optimized `for x in s` lowers to a
   vectorized **pointer-walking** loop (`iter != end`, `end = base + len*sizeof`).
   Verifying it soundly needs a relational pointer-offset abstract domain *plus*

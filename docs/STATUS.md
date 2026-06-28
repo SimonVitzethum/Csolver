@@ -45,6 +45,13 @@ is still `PASS` — it is *proved* before any refutation is attempted. Symbolic-
 regions (dynamic slices) remain prove-only until allocation-overflow reasoning
 lands.
 
+**Temporal** violations (use-after-free, double-free) are refuted as well: on an
+exact path a region only reaches `Freed` through an explicit deallocation, so an
+unconditional `buf = alloc; free(buf); *buf = 0` (or a second free) is `FAIL` with
+a feasibility witness, while a *maybe*-freed region (after a freeing call or loop)
+stays `UNKNOWN`. So the verifier now produces counterexamples for both spatial and
+temporal safety.
+
 ## First real front-end: LLVM-IR
 
 `csolver-llvm` now **parses and lowers textual LLVM IR** (a practical subset) to

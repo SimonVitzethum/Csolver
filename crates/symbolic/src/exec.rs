@@ -897,9 +897,10 @@ impl Explorer<'_> {
         let rsize = region.size;
         let contract = region.contract;
 
-        // Use-after-free.
+        // Use-after-free: on an exact path a `Freed` region was definitely
+        // deallocated, so the access is a certain UAF — refuted with a witness.
         let live = rstate == LifetimeState::Live;
-        self.record(block, idx, NoUseAfterFree, live, "region is live", "region may be freed (use-after-free)");
+        self.record_temporal((block, idx), NoUseAfterFree, !live, state, "region is live", "region may be freed (use-after-free)");
 
         // In-bounds: 0 <= offset && offset + asize <= size. Refutable (a real
         // OOB witness) only when the region size is **concrete**: then the only
@@ -967,7 +968,9 @@ impl Explorer<'_> {
         }
         let rstate = state.regions[rid].state;
         if rstate != LifetimeState::Live {
-            self.record(block, idx, NoDoubleFree, false, "region must be live to free", "region may already be freed (double free)");
+            // On an exact path the region was definitely freed already, so this
+            // is a certain double free — refuted with a witness.
+            self.record_temporal((block, idx), NoDoubleFree, true, state, "region must be live to free", "region may already be freed (double free)");
             return;
         }
         // Must free the base pointer (offset == 0).
@@ -1057,6 +1060,49 @@ impl Explorer<'_> {
         // The witness is a model of `assumptions ∧ ¬goal`: it satisfies the path
         // condition (reachable) and falsifies the goal (violating).
         bitprecise::find_counterexample(&self.ctx, &assumptions, goal)
+    }
+
+    /// On an exact, **feasible** path, a model of the path condition — a witness
+    /// that this program point is genuinely reached. `None` if the path is
+    /// over-approximated or infeasible. Used to witness a *definite* temporal
+    /// violation (use-after-free / double-free): the violation holds for every
+    /// reaching input, so the reachability witness *is* the counterexample.
+    fn feasibility_witness(&mut self, state: &PathState) -> Option<Model> {
+        if !state.exact {
+            return None;
+        }
+        let mut assumptions = state.pathcond.clone();
+        assumptions.extend_from_slice(&state.facts);
+        let never = self.ctx.boolean(false);
+        bitprecise::find_counterexample(&self.ctx, &assumptions, never)
+    }
+
+    /// Record a temporal obligation (use-after-free / no-double-free) decided
+    /// structurally from the region's lifetime state. On an **exact** path a
+    /// region only reaches `Freed` through an explicit `Dealloc`, so a violating
+    /// state there is a *definite* violation for every reaching input — `Refuted`
+    /// with the feasibility witness. Off an exact path (a freeing call/loop only
+    /// *may* have freed) it degrades to `Unknown`; a safe state is `Proven`.
+    fn record_temporal(
+        &mut self,
+        at: (BlockId, usize),
+        prop: SafetyProperty,
+        violated: bool,
+        state: &PathState,
+        desc: &str,
+        residual: &str,
+    ) {
+        let (block, idx) = at;
+        if !violated {
+            self.record(block, idx, prop, true, desc, residual);
+            return;
+        }
+        match self.feasibility_witness(state) {
+            Some(model) => {
+                self.record_mem(block, idx, prop, Decision::Refuted(model), desc, residual)
+            }
+            None => self.record(block, idx, prop, false, desc, residual),
+        }
     }
 
     /// Try to prove `goal` under the current path. Prefers the bit-precise
@@ -1686,6 +1732,45 @@ mod tests {
             .mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree)
             .expect("uaf");
         assert!(!uaf.proven, "use-after-free must stay unproven");
+        // On this exact path the region is definitely freed, so the UAF is
+        // refuted with a (here input-free) witness.
+        assert!(uaf.refutation.is_some(), "definite use-after-free is refuted");
+    }
+
+    /// `double_free()`: `buf = alloc; free buf; free buf` — the second free is a
+    /// definite double free.
+    fn double_free() -> Function {
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        bb0.insts.push(Inst::Dealloc { region: RegionKind::Heap, ptr: Operand::Reg(buf) });
+        bb0.insts.push(Inst::Dealloc { region: RegionKind::Heap, ptr: Operand::Reg(buf) });
+        Function {
+            id: FuncId(0),
+            name: "double_free".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn double_free_is_refuted() {
+        let r = discharge_function(&double_free());
+        // First free (index 1) is proven safe.
+        let first = r.mem_decision(BlockId(0), 1, SafetyProperty::NoDoubleFree).expect("first free");
+        assert!(first.proven);
+        // Second free (index 2) is a definite double free — refuted.
+        let second = r.mem_decision(BlockId(0), 2, SafetyProperty::NoDoubleFree).expect("second free");
+        assert!(!second.proven);
+        assert!(second.refutation.is_some(), "double free is refuted with a witness");
     }
 
     /// A counting loop writing across an allocation:

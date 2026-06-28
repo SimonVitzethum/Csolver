@@ -237,20 +237,21 @@ fn interprocedural_call_preserves_provenance() {
 }
 
 #[test]
-fn use_after_free_is_unknown_never_pass() {
+fn use_after_free_is_refuted_with_a_counterexample() {
     let mut m = csolver_ir::Module::new("uaf");
     m.functions.push(dangling_store());
     let report = verify_module(&m, &Config::default());
 
-    // Soundness: a use-after-free must never be reported PASS.
-    assert_eq!(report.verdict, Verdict::Unknown);
-    // The temporal-safety obligation on the post-free store is open.
+    // `buf = alloc; free(buf); *buf = 0` is an unconditional use-after-free on
+    // an exact path: every execution hits it, so it is a definite violation —
+    // reported FAIL (never, ever PASS).
+    assert_eq!(report.verdict, Verdict::Fail, "report: {report:?}");
     let func = &report.functions[0];
-    let uaf_open = func.outcomes.iter().any(|o| {
+    let uaf_refuted = func.outcomes.iter().any(|o| {
         o.obligation.property == SafetyProperty::NoUseAfterFree
-            && matches!(o.result, csolver_core::ObligationResult::Open { .. })
+            && matches!(o.result, csolver_core::ObligationResult::Refuted(_))
     });
-    assert!(uaf_open, "use-after-free must be reported as open/unknown");
+    assert!(uaf_refuted, "use-after-free must be refuted with a counterexample");
 }
 
 #[test]

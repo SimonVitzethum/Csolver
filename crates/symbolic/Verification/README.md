@@ -95,6 +95,15 @@ Two refutation strengths are used (`RefuteMode`):
   prove-only; the access's in-bounds check is the one that carries the OOB
   counterexample.
 
+**Temporal** safety (use-after-free / double-free) is refuted too, but decided
+structurally from the region's lifetime rather than by the solver. On an **exact**
+path a region only becomes `Freed` through an explicit `Dealloc` (a freeing call
+or loop sets `exact = false`), so a `Freed` region at an access — or a second
+free — is a *definite* violation for every reaching input. It is `Refuted` with a
+**feasibility witness** (a model of the path condition, confirming the point is
+reached; input-free for a straight-line `alloc; free; use`). Off an exact path,
+where a region was only *maybe* freed, it degrades to `Unknown`.
+
 ## Specification
 - A check is `Proven` iff it is proved on **every** path that reaches it.
 - A check is `Refuted` (with a counterexample) iff, on some **exact** path, a
