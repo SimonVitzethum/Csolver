@@ -58,6 +58,21 @@ raw-pointer-in-memory patterns (slots, linked structures, `Box<*T>`) verify. At
 loop headers the heap is cleared (sound over-approximation of loop-modified
 memory).
 
+## Path feasibility pruning (scaling)
+At each conditional branch, a successor whose guard is **bit-precisely**
+unsatisfiable under the current path condition (`pathcond ∧ facts ⟹ ¬guard`) is
+**pruned** — it has no concrete execution, so skipping it preserves every real
+behaviour. This spends the exploration budget only on reachable paths, so
+correlated branches (whose contradictory combinations are dead) do not explode
+the path count or trip the visit budget into a `truncated` run. The check is
+deliberately **bit-precise**, not linear: pruning on a
+`linear-no-overflow`-dependent implication could discard a branch that is in fact
+reachable only through wraparound and so hide a real violation (a false PASS); a
+bit-precise `⟹ ¬guard` holds for *every* machine value, so the branch is
+genuinely dead. Missing a linear-only infeasibility merely keeps a redundant
+path — never unsound. (Tested by `infeasible_branch_is_pruned` /
+`feasible_branch_is_explored`.)
+
 ## Refutation + counterexamples (FAIL with a witness)
 A check can be **refuted**: on an **exact** path the engine exhibits a concrete
 input that violates it. The proving step always runs first, so a provable check

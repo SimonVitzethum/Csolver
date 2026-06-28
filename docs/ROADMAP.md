@@ -96,8 +96,13 @@ whole tool, argued in each crate's `Verification/`.
   bytes); the remaining piece is modelling the *content* transfer (so a value
   copied by `memcpy` is then known on a subsequent load) and full Must/May/No
   alias for aggregate operations.
-- **Path merging** (dominator-based) and **incremental + parallel** analysis to
-  spend the compute budget without path explosion.
+- **Path feasibility pruning** is **in**: a conditional branch whose guard is
+  bit-precisely unsatisfiable under the path condition is pruned, so the budget is
+  spent only on reachable paths (correlated dead branches no longer explode the
+  path count or force a truncated run). Still ahead: **dominator-based path
+  merging** (process each join once, via PHI-style ITE on block parameters) for
+  the *independent*-branch explosion that pruning cannot help, and **incremental +
+  parallel** analysis.
 
 ## Bucket C — `unsafe` / FFI / machine reality (explicit assumptions)
 

@@ -505,13 +505,17 @@ impl Explorer<'_> {
                 else_args,
             } => {
                 let ce = self.eval_scalar(cond, &state);
-                if !self.is_back_edge(block, *then_blk) {
+                let nce = self.ctx.not(ce);
+                // Prune a branch whose guard is unreachable under the current
+                // path condition (a sound over-approximation only skips paths
+                // with no concrete execution), so the budget is spent on
+                // reachable paths.
+                if !self.is_back_edge(block, *then_blk) && !self.branch_infeasible(ce, &state) {
                     let mut t = self.bind_params(*then_blk, then_args, &state);
                     t.pathcond.push(ce);
                     self.explore(*then_blk, t);
                 }
-                if !self.is_back_edge(block, *else_blk) {
-                    let nce = self.ctx.not(ce);
+                if !self.is_back_edge(block, *else_blk) && !self.branch_infeasible(nce, &state) {
                     let mut e = self.bind_params(*else_blk, else_args, &state);
                     e.pathcond.push(nce);
                     self.explore(*else_blk, e);
@@ -525,6 +529,9 @@ impl Explorer<'_> {
                     }
                     let k = self.ctx.constant(*cv);
                     let eq = self.ctx.cmp(SCmp::Eq, ve, k);
+                    if self.branch_infeasible(eq, &state) {
+                        continue;
+                    }
                     let mut s = state.clone();
                     s.pathcond.push(eq);
                     self.explore(*target, s);
@@ -534,6 +541,23 @@ impl Explorer<'_> {
                 }
             }
         }
+    }
+
+    /// Whether `cond` is **bit-precisely** unsatisfiable under the current path,
+    /// i.e. `pathcond ∧ facts ⟹ ¬cond` holds *exactly*. Then the branch guarded
+    /// by `cond` has no concrete execution and is soundly pruned.
+    ///
+    /// The check is deliberately **bit-precise**, not linear: pruning on a
+    /// `linear-no-overflow`-dependent implication could discard a branch that is
+    /// actually reachable only through wraparound and so hide a real violation
+    /// (a false PASS). A bit-precise `⟹ ¬cond` holds for *every* machine value,
+    /// so the branch is genuinely dead. Missing a (linear-only) infeasibility
+    /// just keeps a redundant path — never unsound.
+    fn branch_infeasible(&mut self, cond: ExprId, state: &PathState) -> bool {
+        let not_cond = self.ctx.not(cond);
+        let mut assumptions = state.pathcond.clone();
+        assumptions.extend_from_slice(&state.facts);
+        bitprecise::prove_implies(&self.ctx, &assumptions, not_cond)
     }
 
     /// Whether the edge `from -> to` is a loop back-edge (cut during
@@ -1806,6 +1830,75 @@ mod tests {
             blocks: vec![bb0],
             entry: BlockId(0),
         }
+    }
+
+    /// `branch_fixture(K)`: `if i < K { if i >= 1 { check } }`. The inner branch
+    /// `i >= 1` is unreachable exactly when `K == 1` (`i < 1 ∧ i >= 1`).
+    fn branch_fixture(c_bound: u128, name: &'static str) -> Function {
+        let i = RegId(0);
+        let c = RegId(1);
+        let d = RegId(2);
+        let mut bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(1),
+                then_args: vec![],
+                else_blk: BlockId(3),
+                else_args: vec![],
+            },
+        );
+        bb0.insts.push(Inst::Assign {
+            dst: c,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Ult, lhs: Operand::Reg(i), rhs: Operand::int(64, c_bound) },
+        });
+        let mut bb1 = BasicBlock::new(
+            BlockId(1),
+            Terminator::CondBr {
+                cond: Operand::Reg(d),
+                then_blk: BlockId(2),
+                then_args: vec![],
+                else_blk: BlockId(3),
+                else_args: vec![],
+            },
+        );
+        bb1.insts.push(Inst::Assign {
+            dst: d,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Uge, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) },
+        });
+        let mut bb2 = BasicBlock::new(BlockId(2), Terminator::Return(None));
+        bb2.insts.push(Inst::SafetyCheck {
+            property: SafetyProperty::InBounds,
+            condition: Condition::Cmp { op: CmpOp::Ult, lhs: Operand::Reg(i), rhs: Operand::int(64, 8) },
+            note: "inner check".into(),
+        });
+        let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+        Function {
+            id: FuncId(0),
+            name: name.into(),
+            params: vec![(i, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2, bb3],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn infeasible_branch_is_pruned() {
+        // `if i < 1 { if i >= 1 { check } }` — the inner block is unreachable, so
+        // its check is never explored (absent from the report).
+        let r = discharge_function(&branch_fixture(1, "dead"));
+        assert!(r.outcome(BlockId(2), 0).is_none(), "the dead inner check is pruned");
+    }
+
+    #[test]
+    fn feasible_branch_is_explored() {
+        // `if i < 8 { if i >= 1 { check } }` — the inner block is reachable
+        // (e.g. i = 5), so its check IS explored.
+        let r = discharge_function(&branch_fixture(8, "live"));
+        assert!(r.outcome(BlockId(2), 0).is_some(), "the reachable inner check is explored");
     }
 
     #[test]

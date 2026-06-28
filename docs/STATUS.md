@@ -55,6 +55,16 @@ a feasibility witness, while a *maybe*-freed region (after a freeing call or loo
 stays `UNKNOWN`. So the verifier now produces counterexamples for both spatial and
 temporal safety.
 
+## Path feasibility pruning (scaling)
+
+The symbolic engine now **prunes** a conditional branch whose guard is
+bit-precisely unsatisfiable under the current path condition — a dead branch with
+no concrete execution. This spends the exploration budget only on reachable paths,
+so correlated branches (whose contradictory combinations are unreachable) do not
+explode the path count or trip the visit budget into a truncated, all-`UNKNOWN`
+run. The check is bit-precise (not linear), so it can never discard a branch that
+is reachable only through wraparound and hide a real bug.
+
 ## First real front-end: LLVM-IR
 
 `csolver-llvm` now **parses and lowers textual LLVM IR** (a practical subset) to
