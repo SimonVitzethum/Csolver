@@ -55,15 +55,23 @@ a feasibility witness, while a *maybe*-freed region (after a freeing call or loo
 stays `UNKNOWN`. So the verifier now produces counterexamples for both spatial and
 temporal safety.
 
-## Path feasibility pruning (scaling)
+## Scaling: path-feasibility pruning + state merging
 
-The symbolic engine now **prunes** a conditional branch whose guard is
-bit-precisely unsatisfiable under the current path condition — a dead branch with
-no concrete execution. This spends the exploration budget only on reachable paths,
-so correlated branches (whose contradictory combinations are unreachable) do not
-explode the path count or trip the visit budget into a truncated, all-`UNKNOWN`
-run. The check is bit-precise (not linear), so it can never discard a branch that
-is reachable only through wraparound and hide a real bug.
+Two changes stop path explosion from forcing truncated, all-`UNKNOWN` runs.
+
+**Pruning** drops a conditional branch whose guard is bit-precisely unsatisfiable
+under the current path condition — a dead branch with no concrete execution. The
+check is bit-precise (not linear), so it can never discard a branch that is
+reachable only through wraparound and hide a real bug.
+
+**State merging** processes the (back-edge-cut) CFG in reverse postorder, visiting
+**each block once**: a join's incoming edge-states are merged into one entry state
+— block parameters (PHIs) become an `ITE` keyed on each edge's path condition (so
+an access on a merged value stays precise), regions keep the common prefix with a
+conservative lifetime, and the path condition/facts weaken to the common
+prefix/intersection. So a CFG with *N* independent branches is analysed in
+*O(blocks)* instead of *O(2^N)* paths — a 256-path function verifies under a
+40-visit budget — while single-predecessor (branch) blocks stay fully precise.
 
 ## First real front-end: LLVM-IR
 

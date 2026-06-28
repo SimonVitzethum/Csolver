@@ -1,16 +1,44 @@
 # Verification — csolver-symbolic
 
 ## Design
-Path-sensitive symbolic discharge over MSIR (M1, increments 1–3). The executor
-enumerates paths from the entry, accumulating a path condition, a symbolic
-register environment (scalars **and pointers**, over `csolver-solver`
-expressions) and a **per-path region table** (so allocate/free is
-path-sensitive). For each `SafetyCheck` it asks the linear procedure whether the
-path condition implies the condition; for each **memory operation**
-(`Load`/`Store`/`PtrOffset`/`Dealloc`) it decides the canonical obligations
-(non-null, no-use-after-free, in-bounds, alignment, read/write permission,
-valid pointer arithmetic, no-double-free) from the region table + path
-condition + solver.
+Path-sensitive symbolic discharge over MSIR. The executor walks the
+(back-edge-cut) CFG in **reverse postorder**, processing **each block once**: a
+block's incoming edges are all available when it is reached and are **merged**
+into one entry state (see *State merging* below). It carries a symbolic register
+environment (scalars **and pointers**, over `csolver-solver` expressions), a path
+condition, and a **region table** (so allocate/free is path-sensitive). For each
+`SafetyCheck` it asks the solver whether the path condition implies the condition;
+for each **memory operation** (`Load`/`Store`/`PtrOffset`/`Dealloc`) it decides
+the canonical obligations (non-null, no-use-after-free, in-bounds, alignment,
+read/write permission, valid pointer arithmetic, no-double-free) from the region
+table + path condition + solver.
+
+## State merging (scaling — process each block once)
+The old executor enumerated paths recursively, so a CFG with *N* independent
+branches forked into *2^N* paths and could trip the visit budget into a
+truncated, all-`UNKNOWN` run. Now blocks are processed in reverse postorder and a
+join's incoming edge-states are **merged** into one:
+
+- **Single predecessor** → applied precisely (its guard pushed, its block-param
+  args bound). Branch blocks keep their exact path condition, so in-branch
+  accesses lose no precision.
+- **Multiple predecessors (a join)** → over-approximated soundly:
+  - **Block parameters (PHIs)** become an `ITE` keyed on each edge's
+    discriminator (its path condition), i.e. exactly the φ-value — so an access
+    on a merged value is still precise (e.g. `p = if c {3} else {5}; p < 8` is
+    proved). Same-provenance pointers merge by `ITE` on the offset; differing
+    provenance degrades to opaque (sound).
+  - **Regions** keep the common prefix (identical byte size) with a conservative
+    lifetime (`Live` only if live on every edge); a pointer into a dropped region
+    is made opaque.
+  - The **path condition** is the longest common prefix and the **facts** their
+    intersection (both weaker, hence sound); the **heap** is forgotten and the
+    merged path is no longer `exact` (so it is never refuted).
+
+Each block is thus visited once: a 256-path CFG verifies under a 40-visit budget
+(`wide_cfg_is_processed_once_per_block_not_per_path`). The merge relies on SSA
+(values live past a join are either block parameters, merged here, or defined
+before the split, hence equal on every edge).
 
 ## Loops (increment 3)
 Loops are handled without unbounded unrolling: back-edges are **cut**, and each

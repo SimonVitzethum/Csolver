@@ -16,8 +16,8 @@ use csolver_cfg::{Dominators, Loops};
 use csolver_core::{Model, RegionKind, SafetyProperty};
 use crate::summary::{Affine, RetSummary, Summary};
 use csolver_ir::{
-    BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FuncId, Function, Inst,
-    MemKind, Operand, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
+    BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FuncId,
+    Function, Inst, MemKind, Operand, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
 };
 use csolver_memory::{AliasResult, LifetimeState, Permissions};
 use csolver_solver::{
@@ -269,7 +269,7 @@ fn discharge_inner(
         heap: Vec::new(),
         exact: true,
     };
-    ex.explore(f.entry, state);
+    ex.run_merged(state);
 
     if ex.truncated {
         return SymbolicReport {
@@ -382,6 +382,16 @@ struct PathState {
     exact: bool,
 }
 
+/// One incoming control-flow edge into a block, queued during the reverse-
+/// postorder walk: the predecessor's post-state, the edge's guard (the branch
+/// condition under which it is taken; `None` for an unconditional `Br`), and the
+/// block-parameter arguments it supplies.
+struct EdgeState {
+    pred_state: PathState,
+    guard: Option<ExprId>,
+    args: Vec<Operand>,
+}
+
 /// Per-obligation aggregation across paths.
 struct MemAgg {
     all_proven: bool,
@@ -464,61 +474,94 @@ impl Explorer<'_> {
         }
     }
 
-    fn explore(&mut self, block: BlockId, state: PathState) {
-        if self.truncated {
-            return;
-        }
-        self.visits += 1;
-        if self.visits > self.limits.max_visits {
-            self.truncated = true;
-            return;
-        }
-        let Some(b) = self.f.block(block) else {
-            return;
+    /// Drive the analysis over the (back-edge-cut) CFG in **reverse postorder**,
+    /// processing **each block exactly once**. Every non-back-edge predecessor is
+    /// processed before a block, so its incoming edge-states are all available and
+    /// **merged** into one entry state (see [`Explorer::merge_edges`]). This
+    /// collapses the per-path explosion of the old recursive walk: a join with N
+    /// predecessors is analysed once instead of once per path, so wide CFGs no
+    /// longer blow up the path count (or trip the visit budget into truncation).
+    fn run_merged(&mut self, entry_state: PathState) {
+        let rpo: Vec<BlockId> = {
+            let cfg = self.analysis.cfg();
+            cfg.reverse_postorder().into_iter().map(|n| cfg.block_id(n)).collect()
         };
+        let mut incoming: HashMap<BlockId, Vec<EdgeState>> = HashMap::new();
+        incoming.insert(
+            self.f.entry,
+            vec![EdgeState { pred_state: entry_state, guard: None, args: Vec::new() }],
+        );
 
-        let mut state = state;
-        // At a loop header, over-approximate every iteration by replacing the
-        // loop-carried parameters with fresh symbols constrained by the sound
-        // interval invariant.
-        if self.headers.contains(&block) {
-            self.havoc_header(block, &mut state);
+        for block in rpo {
+            if self.truncated {
+                return;
+            }
+            let Some(edges) = incoming.remove(&block) else {
+                continue; // unreachable in the DAG (or all incoming edges pruned)
+            };
+            if edges.is_empty() {
+                continue;
+            }
+            self.visits += 1;
+            if self.visits > self.limits.max_visits {
+                self.truncated = true;
+                return;
+            }
+
+            let mut state = self.merge_edges(block, edges);
+            // At a loop header, over-approximate every iteration by replacing the
+            // loop-carried parameters with fresh symbols constrained by the sound
+            // interval invariant.
+            if self.headers.contains(&block) {
+                self.havoc_header(block, &mut state);
+            }
+            let Some(b) = self.f.block(block) else {
+                continue;
+            };
+            for (idx, inst) in b.insts.iter().enumerate() {
+                self.step(block, idx, inst, &mut state);
+            }
+            self.propagate_edges(block, b, state, &mut incoming);
         }
+    }
 
-        for (idx, inst) in b.insts.iter().enumerate() {
-            self.step(block, idx, inst, &mut state);
-        }
-
+    /// Push the out-edges of `block` (with their guards / block-parameter args) to
+    /// the successors' incoming sets. Back-edges are cut; a branch whose guard is
+    /// bit-precisely unreachable is pruned (see [`Explorer::branch_infeasible`]).
+    fn propagate_edges(
+        &mut self,
+        block: BlockId,
+        b: &BasicBlock,
+        state: PathState,
+        incoming: &mut HashMap<BlockId, Vec<EdgeState>>,
+    ) {
         match &b.term {
             Terminator::Return(_) | Terminator::Unreachable => {}
             Terminator::Br { target, args } => {
                 if !self.is_back_edge(block, *target) {
-                    let next = self.bind_params(*target, args, &state);
-                    self.explore(*target, next);
+                    incoming.entry(*target).or_default().push(EdgeState {
+                        pred_state: state,
+                        guard: None,
+                        args: args.clone(),
+                    });
                 }
             }
-            Terminator::CondBr {
-                cond,
-                then_blk,
-                then_args,
-                else_blk,
-                else_args,
-            } => {
+            Terminator::CondBr { cond, then_blk, then_args, else_blk, else_args } => {
                 let ce = self.eval_scalar(cond, &state);
                 let nce = self.ctx.not(ce);
-                // Prune a branch whose guard is unreachable under the current
-                // path condition (a sound over-approximation only skips paths
-                // with no concrete execution), so the budget is spent on
-                // reachable paths.
                 if !self.is_back_edge(block, *then_blk) && !self.branch_infeasible(ce, &state) {
-                    let mut t = self.bind_params(*then_blk, then_args, &state);
-                    t.pathcond.push(ce);
-                    self.explore(*then_blk, t);
+                    incoming.entry(*then_blk).or_default().push(EdgeState {
+                        pred_state: state.clone(),
+                        guard: Some(ce),
+                        args: then_args.clone(),
+                    });
                 }
                 if !self.is_back_edge(block, *else_blk) && !self.branch_infeasible(nce, &state) {
-                    let mut e = self.bind_params(*else_blk, else_args, &state);
-                    e.pathcond.push(nce);
-                    self.explore(*else_blk, e);
+                    incoming.entry(*else_blk).or_default().push(EdgeState {
+                        pred_state: state,
+                        guard: Some(nce),
+                        args: else_args.clone(),
+                    });
                 }
             }
             Terminator::Switch { value, cases, default } => {
@@ -532,14 +575,181 @@ impl Explorer<'_> {
                     if self.branch_infeasible(eq, &state) {
                         continue;
                     }
-                    let mut s = state.clone();
-                    s.pathcond.push(eq);
-                    self.explore(*target, s);
+                    incoming.entry(*target).or_default().push(EdgeState {
+                        pred_state: state.clone(),
+                        guard: Some(eq),
+                        args: Vec::new(),
+                    });
                 }
                 if !self.is_back_edge(block, *default) {
-                    self.explore(*default, state.clone());
+                    incoming.entry(*default).or_default().push(EdgeState {
+                        pred_state: state,
+                        guard: None,
+                        args: Vec::new(),
+                    });
                 }
             }
+        }
+    }
+
+    /// Merge the incoming edge-states of a block into one entry state. A single
+    /// predecessor is applied precisely (its guard and block-param args); multiple
+    /// predecessors are joined by [`Explorer::merge_multi`].
+    fn merge_edges(&mut self, block: BlockId, mut edges: Vec<EdgeState>) -> PathState {
+        if edges.len() == 1 {
+            let e = edges.swap_remove(0);
+            let mut s = e.pred_state;
+            if let Some(g) = e.guard {
+                s.pathcond.push(g);
+            }
+            self.bind_params_into(block, &e.args, &mut s);
+            return s;
+        }
+        self.merge_multi(block, edges)
+    }
+
+    /// Bind a block's parameters from the incoming `args`, evaluated in `s`.
+    fn bind_params_into(&mut self, block: BlockId, args: &[Operand], s: &mut PathState) {
+        let params = self.f.block(block).map(|b| b.params.clone()).unwrap_or_default();
+        let vals: Vec<SymValue> = (0..params.len())
+            .map(|j| match args.get(j) {
+                Some(a) => self.eval_value(a, s),
+                None => self.fresh_value(&params[j].1),
+            })
+            .collect();
+        for ((preg, _), v) in params.iter().zip(vals) {
+            s.env.insert(*preg, v);
+        }
+    }
+
+    /// Join several incoming edge-states. Block parameters (PHIs) are merged with
+    /// an `ITE` keyed on each edge's discriminating condition (its full path
+    /// condition); the rest is over-approximated by [`Explorer::merge_core`].
+    fn merge_multi(&mut self, block: BlockId, edges: Vec<EdgeState>) -> PathState {
+        // Each edge's discriminator: the conjunction of its path condition (plus
+        // its branch guard) — the condition under which control arrives by it.
+        let discs: Vec<ExprId> = edges
+            .iter()
+            .map(|e| {
+                let mut conds = e.pred_state.pathcond.clone();
+                if let Some(g) = e.guard {
+                    conds.push(g);
+                }
+                self.ctx.and(conds)
+            })
+            .collect();
+
+        let mut merged = self.merge_core(&edges);
+
+        let params = self.f.block(block).map(|b| b.params.clone()).unwrap_or_default();
+        for (j, (preg, pty)) in params.iter().enumerate() {
+            let vals: Vec<(ExprId, SymValue)> = edges
+                .iter()
+                .zip(&discs)
+                .map(|(e, &d)| {
+                    let v = match e.args.get(j) {
+                        Some(a) => self.eval_value(a, &e.pred_state),
+                        None => self.fresh_value(pty),
+                    };
+                    (d, v)
+                })
+                .collect();
+            let mv = self.merge_values(&vals, pty);
+            merged.env.insert(*preg, mv);
+        }
+        merged
+    }
+
+    /// The non-parameter part of a multi-predecessor merge: a sound
+    /// over-approximation of all incoming states. Regions keep the common prefix
+    /// (identical byte size) with a conservative lifetime (`Live` only if live on
+    /// every edge); the register environment is taken from the first edge (in SSA
+    /// the registers live past a join are defined before the split, hence equal),
+    /// sanitizing any pointer into a dropped region; the path condition is the
+    /// longest common prefix and the facts their intersection (both sound,
+    /// weaker); the heap is forgotten and the path is no longer `exact`.
+    fn merge_core(&self, edges: &[EdgeState]) -> PathState {
+        let first = &edges[0].pred_state;
+
+        let mut regions = Vec::new();
+        'prefix: for i in 0..first.regions.len() {
+            let size = first.regions[i].size;
+            for e in edges {
+                match e.pred_state.regions.get(i) {
+                    Some(r) if r.size == size => {}
+                    _ => break 'prefix,
+                }
+            }
+            let live_all = edges
+                .iter()
+                .all(|e| e.pred_state.regions[i].state == LifetimeState::Live);
+            let mut r = first.regions[i].clone();
+            r.state = if live_all { LifetimeState::Live } else { LifetimeState::Freed };
+            regions.push(r);
+        }
+        let rcount = regions.len();
+
+        let mut env = first.env.clone();
+        for v in env.values_mut() {
+            if let SymValue::Ptr(p) = v {
+                if let Prov::Region(rid) = p.prov {
+                    if rid >= rcount {
+                        p.prov = Prov::Unknown;
+                    }
+                }
+            }
+        }
+
+        let mut pathcond = Vec::new();
+        for k in 0..first.pathcond.len() {
+            let c = first.pathcond[k];
+            if edges.iter().all(|e| e.pred_state.pathcond.get(k) == Some(&c)) {
+                pathcond.push(c);
+            } else {
+                break;
+            }
+        }
+
+        let facts: Vec<ExprId> = first
+            .facts
+            .iter()
+            .copied()
+            .filter(|f| edges.iter().all(|e| e.pred_state.facts.contains(f)))
+            .collect();
+
+        PathState { env, regions, pathcond, facts, heap: Vec::new(), exact: false }
+    }
+
+    /// Merge per-edge values into one, as a right-folded `ITE` over the edge
+    /// discriminators (the last edge is the final `else`).
+    fn merge_values(&mut self, vals: &[(ExprId, SymValue)], ty: &Type) -> SymValue {
+        let Some((_, last)) = vals.last().cloned() else {
+            return self.fresh_value(ty);
+        };
+        let mut acc = last;
+        for (d, v) in vals[..vals.len() - 1].iter().rev() {
+            acc = self.select(*d, v.clone(), acc, ty);
+        }
+        acc
+    }
+
+    /// `select(d, a, b)` = `if d then a else b`, structurally: `ITE` on scalars
+    /// and on same-provenance pointer offsets; differing provenance degrades to an
+    /// opaque pointer (sound over-approximation).
+    fn select(&mut self, d: ExprId, a: SymValue, b: SymValue, ty: &Type) -> SymValue {
+        match (a, b) {
+            (SymValue::Scalar(ea), SymValue::Scalar(eb)) => SymValue::Scalar(self.ctx.ite(d, ea, eb)),
+            (SymValue::Ptr(pa), SymValue::Ptr(pb)) if pa.prov == pb.prov => SymValue::Ptr(SymPointer {
+                prov: pa.prov,
+                offset: self.ctx.ite(d, pa.offset, pb.offset),
+                align: gcd(pa.align, pb.align),
+            }),
+            (SymValue::Ptr(_), SymValue::Ptr(_)) => SymValue::Ptr(SymPointer {
+                prov: Prov::Unknown,
+                offset: self.ctx.int(PTR_WIDTH, 0),
+                align: 1,
+            }),
+            _ => self.fresh_value(ty),
         }
     }
 
@@ -1313,19 +1523,6 @@ impl Explorer<'_> {
 
     // --- expression evaluation ---------------------------------------------
 
-    fn bind_params(&mut self, target: BlockId, args: &[Operand], state: &PathState) -> PathState {
-        let mut out = state.clone();
-        if let Some(tb) = self.f.block(target) {
-            for (i, (param, _ty)) in tb.params.iter().enumerate() {
-                if let Some(arg) = args.get(i) {
-                    let v = self.eval_value(arg, state);
-                    out.env.insert(*param, v);
-                }
-            }
-        }
-        out
-    }
-
     fn eval_value(&mut self, op: &Operand, state: &PathState) -> SymValue {
         match op {
             Operand::Reg(r) => match state.env.get(r) {
@@ -1899,6 +2096,116 @@ mod tests {
         // (e.g. i = 5), so its check IS explored.
         let r = discharge_function(&branch_fixture(8, "live"));
         assert!(r.outcome(BlockId(2), 0).is_some(), "the reachable inner check is explored");
+    }
+
+    /// `diamond_phi(sel)`: `p = if sel < 1 { 3 } else { 5 }; check p < 8`. The
+    /// join block has a PHI (`p`) merged via `ITE`; the check holds on the merged
+    /// value (both arms are < 8).
+    fn diamond_phi() -> Function {
+        let sel = RegId(0);
+        let c = RegId(1);
+        let p = RegId(2);
+        let mut bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(1),
+                then_args: vec![],
+                else_blk: BlockId(2),
+                else_args: vec![],
+            },
+        );
+        bb0.insts.push(Inst::Assign {
+            dst: c,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Ult, lhs: Operand::Reg(sel), rhs: Operand::int(64, 1) },
+        });
+        let bb1 = BasicBlock::new(BlockId(1), Terminator::Br { target: BlockId(3), args: vec![Operand::int(64, 3)] });
+        let bb2 = BasicBlock::new(BlockId(2), Terminator::Br { target: BlockId(3), args: vec![Operand::int(64, 5)] });
+        let mut bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+        bb3.params = vec![(p, Type::int(64))];
+        bb3.insts.push(Inst::SafetyCheck {
+            property: SafetyProperty::InBounds,
+            condition: Condition::Cmp { op: CmpOp::Ult, lhs: Operand::Reg(p), rhs: Operand::int(64, 8) },
+            note: "merged p < 8".into(),
+        });
+        Function {
+            id: FuncId(0),
+            name: "diamond_phi".into(),
+            params: vec![(sel, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2, bb3],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn merged_phi_value_is_proven_at_the_join() {
+        // The join is analysed once with `p = ite(sel<1, 3, 5)`, and the check
+        // `p < 8` is proved bit-precisely on the merged value.
+        let r = discharge_function(&diamond_phi());
+        assert_eq!(r.outcome(BlockId(3), 0), Some(SymOutcome::Proven));
+    }
+
+    /// `n` independent diamonds in sequence — `2^n` distinct paths, but only
+    /// `4n + 1` blocks. Each diamond `i` branches on bit `i` of `sel`.
+    fn wide_diamonds(n: usize) -> Function {
+        let sel = RegId(0);
+        let final_id = BlockId((4 * n) as u32);
+        let mut blocks = Vec::new();
+        for i in 0..n {
+            let h = BlockId((4 * i) as u32);
+            let t = BlockId((4 * i + 1) as u32);
+            let e = BlockId((4 * i + 2) as u32);
+            let m = BlockId((4 * i + 3) as u32);
+            let next = if i + 1 < n { BlockId((4 * (i + 1)) as u32) } else { final_id };
+            let tmask = RegId((1 + 2 * i) as u32);
+            let creg = RegId((2 + 2 * i) as u32);
+            let mut hb = BasicBlock::new(
+                h,
+                Terminator::CondBr { cond: Operand::Reg(creg), then_blk: t, then_args: vec![], else_blk: e, else_args: vec![] },
+            );
+            hb.insts.push(Inst::Assign {
+                dst: tmask,
+                ty: Type::int(64),
+                value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(sel), rhs: Operand::int(64, 1u128 << i) },
+            });
+            hb.insts.push(Inst::Assign {
+                dst: creg,
+                ty: Type::Bool,
+                value: RValue::Cmp { op: CmpOp::Ne, lhs: Operand::Reg(tmask), rhs: Operand::int(64, 0) },
+            });
+            blocks.push(hb);
+            blocks.push(BasicBlock::new(t, Terminator::Br { target: m, args: vec![] }));
+            blocks.push(BasicBlock::new(e, Terminator::Br { target: m, args: vec![] }));
+            blocks.push(BasicBlock::new(m, Terminator::Br { target: next, args: vec![] }));
+        }
+        let mut fb = BasicBlock::new(final_id, Terminator::Return(None));
+        fb.insts.push(Inst::SafetyCheck {
+            property: SafetyProperty::InBounds,
+            condition: Condition::Cmp { op: CmpOp::Ult, lhs: Operand::int(64, 3), rhs: Operand::int(64, 8) },
+            note: "final".into(),
+        });
+        blocks.push(fb);
+        Function {
+            id: FuncId(0),
+            name: "wide".into(),
+            params: vec![(sel, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks,
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn wide_cfg_is_processed_once_per_block_not_per_path() {
+        // 8 independent diamonds = 256 distinct paths, but only 33 blocks. With a
+        // budget far below the path count, merging still verifies — each block is
+        // processed once (the old per-path walk would truncate).
+        let f = wide_diamonds(8);
+        let r = discharge_with(&f, crate::ExecLimits { max_visits: 40 });
+        assert!(!r.truncated, "merging keeps visits linear in blocks, not exponential in paths");
+        assert_eq!(r.outcome(BlockId(32), 0), Some(SymOutcome::Proven), "final check verified");
     }
 
     #[test]
