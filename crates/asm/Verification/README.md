@@ -24,6 +24,18 @@ read before it is written (a function input) refers to one symbol across all its
 uses. This is what lets a guard (`cmp rcx, 16`) constrain a later indexed access
 (`[rsp + rcx*4]`) — without it, each use would be an independent unknown.
 
+## AArch64
+A second decoder (`arm64::decode_function`) handles **ARM64** binaries. AArch64
+instructions are fixed 32-bit little-endian words decoded by field extraction (no
+prefixes/ModR/M). Currently decoded: `ret`, `add`/`sub` immediate (with
+`sub sp, sp, #N` modelling the stack frame exactly as on x86), and `ldr`/`str`
+with an unsigned scaled offset (`[base, #off]` → `PtrOffset` + `Load`/`Store`).
+The PCS argument registers `x0..x7` are the parameters. So the same proofs hold
+on ARM: an AArch64 `sub sp,sp,#16 ; str w0,[sp,#8] ; ret` verifies **PASS**, while
+`str w0,[sp,#32]` into the same frame is **FAIL**. Unrecognized encodings make the
+function `unanalyzed` (never guessed). Control flow, the broader ISA, and the
+`sp`-vs-`xzr` (register 31) corner cases follow.
+
 ### Control flow
 The body is decoded linearly, then split into basic blocks at the leaders — the
 entry, every branch target, and the instruction after every branch/return.

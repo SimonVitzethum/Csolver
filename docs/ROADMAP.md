@@ -57,8 +57,11 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    PASS; unprovable/undecoded functions are UNKNOWN (never a false PASS). The
    decoder **reconstructs control flow** too (`jmp`/`jcc`/`cmp` → MSIR blocks with
    `Br`/`CondBr`, backward branches → back-edges), so a *guarded* stack store and
-   a *loop* in a binary verify end-to-end via the state-merging engine. Remaining:
-   the broad ISA, DWARF types, AArch64, relocations/PLT, and PE/Mach-O.
+   a *loop* in a binary verify end-to-end via the state-merging engine. A second
+   decoder handles **AArch64** (fixed 32-bit instructions: `ret`, `add`/`sub`
+   immediate incl. the stack frame, `ldr`/`str`), so the same stack-safety proofs
+   hold on ARM binaries. Remaining: the broad ISA (and ARM control flow), DWARF
+   types, relocations/PLT, and PE/Mach-O.
 
 Each front-end owes a **refinement proof** (every concrete behaviour of the
 input is a concrete behaviour of the emitted MSIR) — the soundness hinge for the

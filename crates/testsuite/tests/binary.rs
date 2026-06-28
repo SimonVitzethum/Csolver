@@ -184,6 +184,41 @@ fn unguarded_array_store_in_a_binary_fails() {
     assert_eq!(verify_binary(&code), Verdict::Fail);
 }
 
+/// As [`verify_binary`], but decoding the recovered code as AArch64.
+fn verify_arm_binary(code: &[u8]) -> Verdict {
+    let image = elf_with_code(code);
+    let img = csolver_elf::load(&image).expect("valid ELF");
+    let func = img.functions().next().expect("one function symbol");
+    let bytes = img.function_code(func, &image).expect("function code");
+    let module = csolver_asm::arm64::decode_function(&func.name, bytes);
+    verify_module(&module, &Config::default()).verdict
+}
+
+#[test]
+fn in_frame_arm_stack_store_is_proven_safe() {
+    // AArch64: sub sp,sp,#16 ; str w0,[sp,#8] ; add sp,sp,#16 ; ret
+    // A store at offset 8 into a 16-byte stack frame: PASS.
+    let code = [
+        0xff, 0x43, 0x00, 0xd1, // sub sp, sp, #16
+        0xe0, 0x0b, 0x00, 0xb9, // str w0, [sp, #8]
+        0xff, 0x43, 0x00, 0x91, // add sp, sp, #16
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    assert_eq!(verify_arm_binary(&code), Verdict::Pass);
+}
+
+#[test]
+fn out_of_frame_arm_stack_store_fails() {
+    // AArch64: str w0,[sp,#32] is past the 16-byte frame — a definite OOB write.
+    let code = [
+        0xff, 0x43, 0x00, 0xd1, // sub sp, sp, #16
+        0xe0, 0x23, 0x00, 0xb9, // str w0, [sp, #32]
+        0xff, 0x43, 0x00, 0x91, // add sp, sp, #16
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    assert_eq!(verify_arm_binary(&code), Verdict::Fail);
+}
+
 #[test]
 fn an_undecodable_function_is_unknown() {
     // A syscall (`0f 05`) is outside the decoded subset, so the function is

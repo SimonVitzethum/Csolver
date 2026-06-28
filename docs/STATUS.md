@@ -40,8 +40,14 @@ too, and the SysV argument registers (`rdi…r9`) are modelled as parameters (st
 symbols). So a *binary array access with a bounds check* now verifies: `sub rsp,64
 ; cmp ecx,16 ; jae .end ; mov [rsp+rcx*4], eax` is **PASS** (the guard `rcx < 16`
 bounds the index into the 16-element frame), while the same without the check is
-**FAIL** (a definite out-of-bounds write). DWARF, the full ISA, AArch64, and
-PE/Mach-O follow.
+**FAIL** (a definite out-of-bounds write).
+
+A second decoder handles **AArch64 (ARM64)** binaries (fixed 32-bit instructions):
+`ret`, `add`/`sub` immediate (incl. the `sub sp, sp, #N` frame), and `ldr`/`str`
+with a scaled offset. So the same proofs hold on ARM — `sub sp,sp,#16 ;
+str w0,[sp,#8] ; ret` is **PASS** and `str w0,[sp,#32]` is **FAIL**. The verifier
+now proves stack memory safety of compiled **x86-64 *and* ARM64** functions.
+DWARF, the full ISA, and PE/Mach-O follow.
 
 ## Bit-precise decision procedure (pure-Rust SAT)
 
