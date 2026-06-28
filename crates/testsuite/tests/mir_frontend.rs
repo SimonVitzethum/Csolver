@@ -143,6 +143,123 @@ fn mir_slice_index_loop_verifies_pass() {
     assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
 }
 
+/// **Real** `rustc 1.94.1 --emit=mir` output for `fn get(s: &[i32], i: usize)
+/// -> i32 { s[i] }` (frozen verbatim). It exercises the actual shape: the slice
+/// length via `PtrMetadata(copy _1)`, `copy`-prefixed operands and index places,
+/// the `assert(Lt(i, len))` bounds check, and a `debug`/`let` preamble. Verifies
+/// PASS — validating the frontend against genuine compiler output, not just
+/// hand-written fixtures.
+const REAL_GET: &str = r#"
+fn get(_1: &[i32], _2: usize) -> i32 {
+    debug s => _1;
+    debug i => _2;
+    let mut _0: i32;
+    let mut _3: usize;
+    let mut _4: bool;
+
+    bb0: {
+        _3 = PtrMetadata(copy _1);
+        _4 = Lt(copy _2, copy _3);
+        assert(move _4, "index out of bounds: the length is {} but the index is {}", move _3, copy _2) -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = copy (*_1)[_2];
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_rustc_slice_get_verifies_pass() {
+    let module = lower(REAL_GET, "real_get");
+    assert!(module.unanalyzed.is_empty());
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.assumptions.iter().any(|a| a.id == "slice-abi"));
+}
+
+/// **Real** `rustc 1.94.1 --emit=mir` output (debug build) for
+/// `fn sum(s: &[i32]) -> i32 { let mut acc=0; let mut i=0; while i < s.len() {
+/// acc += s[i]; i += 1 } acc }` (frozen verbatim). Beyond the slice loop it has
+/// `AddWithOverflow` checked-arithmetic tuples, type-ascribed field places
+/// (`(_11.1: bool)`), `switchInt`, and nested `scope`s. The indexed load is
+/// proved in bounds via the bounds-check `assert`; the overflow checks are
+/// modelled opaquely (arithmetic, not memory). Verifies PASS.
+const REAL_SUM_LOOP: &str = r#"
+fn sum(_1: &[i32]) -> i32 {
+    debug s => _1;
+    let mut _0: i32;
+    let mut _2: i32;
+    let mut _4: bool;
+    let mut _5: usize;
+    let mut _6: usize;
+    let mut _7: i32;
+    let _8: usize;
+    let mut _9: usize;
+    let mut _10: bool;
+    let mut _11: (i32, bool);
+    let mut _12: (usize, bool);
+    scope 1 {
+        debug acc => _2;
+        let mut _3: usize;
+        scope 2 {
+            debug i => _3;
+        }
+    }
+
+    bb0: {
+        _2 = const 0_i32;
+        _3 = const 0_usize;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _5 = copy _3;
+        _6 = PtrMetadata(copy _1);
+        _4 = Lt(move _5, move _6);
+        switchInt(move _4) -> [0: bb6, otherwise: bb2];
+    }
+
+    bb2: {
+        _8 = copy _3;
+        _9 = PtrMetadata(copy _1);
+        _10 = Lt(copy _8, copy _9);
+        assert(move _10, "index out of bounds: the length is {} but the index is {}", move _9, copy _8) -> [success: bb3, unwind continue];
+    }
+
+    bb3: {
+        _7 = copy (*_1)[_8];
+        _11 = AddWithOverflow(copy _2, copy _7);
+        assert(!move (_11.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _2, move _7) -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _2 = move (_11.0: i32);
+        _12 = AddWithOverflow(copy _3, const 1_usize);
+        assert(!move (_12.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _3, const 1_usize) -> [success: bb5, unwind continue];
+    }
+
+    bb5: {
+        _3 = move (_12.0: usize);
+        goto -> bb1;
+    }
+
+    bb6: {
+        _0 = copy _2;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_rustc_debug_loop_verifies_pass() {
+    let module = lower(REAL_SUM_LOOP, "real_sum");
+    assert!(module.unanalyzed.is_empty(), "lowers despite overflow checks: {:?}", module.unanalyzed);
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
 /// A function using a construct outside the modelled subset (a `drop`
 /// terminator) is recorded as unanalyzed rather than mis-lowered — and a sound
 /// function in the same dump still verifies.

@@ -142,6 +142,7 @@ fn detect_level(path: &Path) -> Result<SourceLevel, String> {
     }
     match path.extension().and_then(|e| e.to_str()) {
         Some("ll") => Ok(SourceLevel::Llvm),
+        Some("mir") => Ok(SourceLevel::Mir),
         Some("s" | "asm" | "S") => Ok(SourceLevel::Asm),
         _ => {
             // Sniff the ELF magic number.

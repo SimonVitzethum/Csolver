@@ -31,9 +31,12 @@ index `s[i]` is preceded by `assert(Lt(i, len), "index out of bounds…") ->
 - **Places**: `_N`, `(*_N)`, `(*_N)[_M]` (→ `PtrOffset` + `Load`/`Store`); a
   `Field` projection is opaque.
 - **Rvalues**: `Use`/`copy`/`move`/`const`, the integer binops and comparisons
-  (`Lt`/`Le`/… as **unsigned** — index/length checks are over `usize`),
-  `Len(&[T; N])` → the constant `N`, `&place` (element address / inner pointer),
-  `as` casts (value-preserving).
+  (`Lt`/`Le`/… as **unsigned** — index/length checks are over `usize`), `Len(&[T;
+  N])` → the constant `N` and `PtrMetadata(slice_ref)` → the synthetic slice
+  length (modern rustc emits `PtrMetadata`, not `Len`), `&place` (element
+  address / inner pointer), `as` casts (value-preserving); checked-arithmetic
+  (`AddWithOverflow`, …) and other aggregate rvalues are opaque.
+- **Places** also tolerate a type ascription (`(_11.1: bool)`, `(*_1: &[i32])`).
 - **Terminators**: `goto`, `return`, `switchInt` (→ `CondBr`/`Switch`),
   `assert` (→ guarded `CondBr` + panic pad), the assignment-form **call**
   `_d = f(args) -> [return: bb, …]` (→ an MSIR `Call` + a `Br` to the return
@@ -74,5 +77,10 @@ is **not** proved; an **interprocedural** module (`caller` calling a checked
 `helper`) lowers the call to a `Direct` MSIR `Call` and verifies **PASS** via the
 helper's summary, while a dereference of an **external** call's unknown result is
 not proved; and a `drop`-using function is recovered as `UNKNOWN` while a sound
-sibling still verifies. Next: a real multi-block `rustc --emit=mir` corpus,
-aggregates/fields, and call return-type tracking.
+sibling still verifies. **Real-output validation**: two functions captured
+verbatim from `rustc 1.94.1 --emit=mir` — a slice `get` (with `PtrMetadata`,
+`copy`-prefixed operands) and a debug-build `sum` loop (with `AddWithOverflow`
+tuples, type-ascribed field places, `switchInt`, nested `scope`s) — both verify
+**PASS**, validating the frontend against genuine compiler output (this is what
+surfaced the `copy (place)` and `(_n: T)` ascription cases). Next: a larger
+real-output corpus, aggregates/fields, and call return-type tracking.

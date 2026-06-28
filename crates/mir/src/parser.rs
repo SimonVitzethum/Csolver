@@ -555,12 +555,16 @@ impl Parser {
 
     fn place(&mut self) -> Result<Place> {
         let mut base = if self.eat_punct('(') {
-            // `(*PLACE)` or a parenthesised place.
+            // `(*PLACE)` or a parenthesised place, optionally with a type
+            // ascription (`(_11.1: bool)`, `(*_1: &[i32])`).
             let inner = if self.eat_punct('*') {
                 Place::Deref(Box::new(self.place()?))
             } else {
                 self.place()?
             };
+            if self.eat_punct(':') {
+                let _ = self.ty()?;
+            }
             self.expect_punct(')')?;
             inner
         } else if self.eat_punct('*') {
@@ -613,8 +617,23 @@ impl Parser {
                 self.expect_punct(')')?;
                 return Ok(Rvalue::Len(p));
             }
-            // `<BinKind>(a, b)`.
-            if self.peek2() == &Tok::Punct('(') {
+            // `PtrMetadata(OPERAND)`: for a slice/array reference the pointer
+            // metadata *is* the length, so it lowers like `Len` of that place
+            // (modern rustc emits this instead of `Len((*_1))`).
+            if w == "PtrMetadata" && self.peek2() == &Tok::Punct('(') {
+                self.pos += 1;
+                self.expect_punct('(')?;
+                let op = self.operand()?;
+                self.expect_punct(')')?;
+                return Ok(match op {
+                    Operand::Copy(p) | Operand::Move(p) => Rvalue::Len(p),
+                    Operand::Const(_) => Rvalue::Other,
+                });
+            }
+            // `<BinKind>(a, b)` — but not an operand prefix `copy (…)` / `move (…)`
+            // (where the `(` opens a parenthesised place, not an operator's args).
+            let is_operand_prefix = matches!(w.as_str(), "copy" | "move" | "const");
+            if self.peek2() == &Tok::Punct('(') && !is_operand_prefix {
                 if let Some(kind) = bin_kind(&w) {
                     self.pos += 1;
                     self.expect_punct('(')?;

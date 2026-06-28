@@ -237,7 +237,13 @@ f(args) -> [return: bb, …]` becomes an MSIR `Call` (resolved to `Direct` for a
 in-module callee, else `Symbol`/`Indirect`) + a branch to the return block, so an
 interprocedural `caller`→`helper` module verifies **PASS** via the helper's
 summary, while a dereference of an external call's unknown result is correctly
-not proved. Remaining: drops, aggregates/fields, call return-type tracking.
+not proved. **Validated against real compiler output**: two functions captured
+verbatim from `rustc 1.94.1 --emit=mir` — a slice `get` (using `PtrMetadata` for
+the length and `copy`-prefixed operands) and a debug-build `sum` loop (with
+`AddWithOverflow` checked-arithmetic tuples, type-ascribed field places,
+`switchInt`, nested `scope`s) — both verify **PASS**, having surfaced and fixed
+two real parser gaps (the `copy (place)` prefix and the `(_n: T)` ascription).
+Remaining: drops, aggregates/fields, call return-type tracking.
 
 ## First real front-end: LLVM-IR
 
