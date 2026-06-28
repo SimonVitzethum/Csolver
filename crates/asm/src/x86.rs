@@ -14,12 +14,9 @@
 //! verifier must never produce. So this layer can only ever be incomplete, never
 //! unsound.
 
+use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use csolver_core::RegionKind;
-use csolver_ir::{
-    BasicBlock, BinOp, BlockId, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId,
-    Terminator, Type,
-};
-use std::collections::BTreeMap;
+use csolver_ir::{BinOp, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
 
 /// Decode an x86-64 function from its machine bytes into a one-function
 /// [`Module`], reconstructing its control-flow graph (branches/loops). On any
@@ -51,28 +48,6 @@ fn arg_registers() -> Vec<(RegId, Type)> {
     [7u8, 6, 2, 1, 8, 9].iter().map(|&r| (reg(r), Type::int(64))).collect()
 }
 
-/// The control-flow effect of an instruction.
-#[derive(Debug, Clone, Copy)]
-enum Ctrl {
-    /// Falls through to the next instruction.
-    Fall,
-    /// `ret`.
-    Ret,
-    /// `jmp` to a byte offset.
-    Jmp(usize),
-    /// `jcc cond` to a byte offset (else falls through); `cond` is the MSIR
-    /// register holding the branch condition.
-    Jcc(usize, RegId),
-}
-
-/// One decoded instruction: its MSIR, its byte span, and its control-flow effect.
-struct DecodedInsn {
-    offset: usize,
-    next: usize,
-    insts: Vec<Inst>,
-    ctrl: Ctrl,
-}
-
 /// The result of decoding one instruction (before block assembly).
 struct Decoded {
     insts: Vec<Inst>,
@@ -93,82 +68,6 @@ fn decode_cfg(code: &[u8]) -> Result<Vec<DecodedInsn>, String> {
         pos = d.next;
     }
     Ok(out)
-}
-
-/// Assemble decoded instructions into MSIR basic blocks. Block leaders are the
-/// entry, every branch target, and the instruction after every branch/return.
-/// A jump target that is not an instruction boundary makes the function
-/// `unanalyzed` (sound: we do not guess at mid-instruction or data targets).
-fn build_blocks(decoded: Vec<DecodedInsn>) -> Result<(Vec<BasicBlock>, BlockId), String> {
-    if decoded.is_empty() {
-        // An empty body is a vacuously-safe single `ret` block.
-        return Ok((vec![BasicBlock::new(BlockId(0), Terminator::Return(None))], BlockId(0)));
-    }
-    let offsets: std::collections::HashSet<usize> = decoded.iter().map(|d| d.offset).collect();
-
-    // Leaders.
-    let mut leaders: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    leaders.insert(decoded[0].offset);
-    for d in &decoded {
-        match d.ctrl {
-            Ctrl::Jmp(t) | Ctrl::Jcc(t, _) => {
-                if !offsets.contains(&t) {
-                    return Err("x86: branch target is not an instruction boundary".into());
-                }
-                leaders.insert(t);
-                leaders.insert(d.next); // the fall-through after a branch
-            }
-            Ctrl::Ret => {
-                leaders.insert(d.next);
-            }
-            Ctrl::Fall => {}
-        }
-    }
-    // Keep only leaders that begin an actual instruction.
-    let leaders: Vec<usize> = leaders.into_iter().filter(|o| offsets.contains(o)).collect();
-    let block_of: BTreeMap<usize, BlockId> =
-        leaders.iter().enumerate().map(|(i, &o)| (o, BlockId(i as u32))).collect();
-
-    // Each instruction belongs to the block of the greatest leader ≤ its offset.
-    let mut blocks: Vec<BasicBlock> = leaders
-        .iter()
-        .map(|&o| BasicBlock::new(block_of[&o], Terminator::Return(None)))
-        .collect();
-    let mut cur = 0usize; // index into `leaders`
-    for d in &decoded {
-        // Advance to this instruction's block.
-        while cur + 1 < leaders.len() && leaders[cur + 1] <= d.offset {
-            cur += 1;
-        }
-        let block = &mut blocks[cur];
-        block.insts.extend(d.insts.iter().cloned());
-        // This is the block's last instruction when the next instruction starts a
-        // new block (its offset is a leader) or there is no next instruction.
-        let is_block_end = !offsets.contains(&d.next) || block_of.contains_key(&d.next);
-        if is_block_end {
-            block.term = terminator_for(d, &block_of)?;
-        }
-    }
-    Ok((blocks, BlockId(0)))
-}
-
-/// The MSIR terminator for a block ending at `d`.
-fn terminator_for(d: &DecodedInsn, block_of: &BTreeMap<usize, BlockId>) -> Result<Terminator, String> {
-    let target = |off: usize| block_of.get(&off).copied().ok_or("x86: dangling branch target".to_string());
-    Ok(match d.ctrl {
-        Ctrl::Ret => Terminator::Return(None),
-        Ctrl::Jmp(t) => Terminator::Br { target: target(t)?, args: Vec::new() },
-        Ctrl::Jcc(t, cond) => Terminator::CondBr {
-            cond: Operand::Reg(cond),
-            then_blk: target(t)?,
-            then_args: Vec::new(),
-            else_blk: target(d.next)?,
-            else_args: Vec::new(),
-        },
-        // A block that ends only because its successor is a branch target falls
-        // through to it.
-        Ctrl::Fall => Terminator::Br { target: target(d.next)?, args: Vec::new() },
-    })
 }
 
 fn reg(num: u8) -> RegId {
@@ -584,6 +483,7 @@ fn read_imm(code: &[u8], at: usize, len: usize) -> Result<u128, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use csolver_ir::Terminator;
 
     #[test]
     fn decodes_xor_eax_eax_ret() {

@@ -27,14 +27,22 @@ uses. This is what lets a guard (`cmp rcx, 16`) constrain a later indexed access
 ## AArch64
 A second decoder (`arm64::decode_function`) handles **ARM64** binaries. AArch64
 instructions are fixed 32-bit little-endian words decoded by field extraction (no
-prefixes/ModR/M). Currently decoded: `ret`, `add`/`sub` immediate (with
-`sub sp, sp, #N` modelling the stack frame exactly as on x86), and `ldr`/`str`
-with an unsigned scaled offset (`[base, #off]` → `PtrOffset` + `Load`/`Store`).
-The PCS argument registers `x0..x7` are the parameters. So the same proofs hold
-on ARM: an AArch64 `sub sp,sp,#16 ; str w0,[sp,#8] ; ret` verifies **PASS**, while
-`str w0,[sp,#32]` into the same frame is **FAIL**. Unrecognized encodings make the
-function `unanalyzed` (never guessed). Control flow, the broader ISA, and the
-`sp`-vs-`xzr` (register 31) corner cases follow.
+prefixes/ModR/M). Decoded: `ret`, `add`/`sub` immediate (with `sub sp, sp, #N`
+modelling the stack frame exactly as on x86; the `S` bit disambiguates register
+31 = `sp` from the zero register), `ldr`/`str` with an unsigned scaled offset
+(`[base, #off]` → `PtrOffset` + `Load`/`Store`), `cmp` (`SUBS xzr`), and the
+branches `b`/`b.cond`. The PCS argument registers `x0..x7` are the parameters.
+
+**Control flow** is reconstructed by the *same* architecture-independent block
+assembler the x86 decoder uses (`blocks::build_blocks`): both produce a linear
+list of `(offset, MSIR, control effect)` and share the leader-finding and block
+splitting. A `b.cond`'s condition comes from the preceding `cmp` (the AArch64
+condition codes map to the same comparisons). So the same proofs hold on ARM and
+extend to *branchy* ARM functions: `sub sp,sp,#16 ; str w0,[sp,#8] ; ret` is
+**PASS**, `str w0,[sp,#32]` is **FAIL**, and a guarded store
+(`cmp w0,#0 ; b.ne .skip ; str w1,[sp,#8]`) is **PASS**. Unrecognized encodings
+make the function `unanalyzed` (never guessed). The broader ISA, register-offset
+addressing, and `cbz`/`tbz` follow.
 
 ### Control flow
 The body is decoded linearly, then split into basic blocks at the leaders — the

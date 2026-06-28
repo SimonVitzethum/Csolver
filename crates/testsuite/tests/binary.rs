@@ -220,6 +220,27 @@ fn out_of_frame_arm_stack_store_fails() {
 }
 
 #[test]
+fn guarded_arm_stack_store_in_a_branchy_binary_is_proven_safe() {
+    //   sub sp, sp, #16
+    //   cmp w0, #0
+    //   b.ne .skip          ; conditionally skip the store
+    //   str w1, [sp, #8]    ; store, within the 16-byte frame
+    // .skip:
+    //   add sp, sp, #16 ; ret
+    // The AArch64 decoder reconstructs the CFG (cmp + b.cond) and the store
+    // verifies PASS.
+    let code = [
+        0xff, 0x43, 0x00, 0xd1, // sub sp, sp, #16
+        0x1f, 0x00, 0x00, 0x71, // cmp w0, #0
+        0x41, 0x00, 0x00, 0x54, // b.ne +8 (.skip)
+        0xe1, 0x0b, 0x00, 0xb9, // str w1, [sp, #8]
+        0xff, 0x43, 0x00, 0x91, // add sp, sp, #16
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    assert_eq!(verify_arm_binary(&code), Verdict::Pass);
+}
+
+#[test]
 fn an_undecodable_function_is_unknown() {
     // A syscall (`0f 05`) is outside the decoded subset, so the function is
     // `unanalyzed` and reported UNKNOWN — never silently treated as safe.

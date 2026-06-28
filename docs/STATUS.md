@@ -43,11 +43,14 @@ bounds the index into the 16-element frame), while the same without the check is
 **FAIL** (a definite out-of-bounds write).
 
 A second decoder handles **AArch64 (ARM64)** binaries (fixed 32-bit instructions):
-`ret`, `add`/`sub` immediate (incl. the `sub sp, sp, #N` frame), and `ldr`/`str`
-with a scaled offset. So the same proofs hold on ARM — `sub sp,sp,#16 ;
-str w0,[sp,#8] ; ret` is **PASS** and `str w0,[sp,#32]` is **FAIL**. The verifier
-now proves stack memory safety of compiled **x86-64 *and* ARM64** functions.
-DWARF, the full ISA, and PE/Mach-O follow.
+`ret`, `add`/`sub` immediate (incl. the `sub sp, sp, #N` frame), `ldr`/`str` with
+a scaled offset, `cmp`, and `b`/`b.cond` — control flow reconstructed by the *same*
+architecture-independent block assembler the x86 decoder uses. So the same proofs
+hold on ARM, including *branchy* functions: `str w0,[sp,#8]` in a frame is **PASS**,
+`str w0,[sp,#32]` is **FAIL**, and a guarded `cmp w0,#0 ; b.ne .skip ;
+str w1,[sp,#8]` is **PASS**. The verifier now proves stack memory safety of
+compiled **x86-64 *and* ARM64** functions, branchy or not. DWARF, the full ISA,
+and PE/Mach-O follow.
 
 ## Bit-precise decision procedure (pure-Rust SAT)
 
