@@ -39,11 +39,13 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
 
 1. **LLVM-IR** (`csolver-llvm`): **started** — a pure-Rust parser + lowerer for a
    practical subset (functions, `iN`/`ptr`/`[N x T]` types, `alloca`/`load`/
-   `store`/`getelementptr`/`icmp`/binops/casts/`call`/`phi`/`ret`/`br`) already
-   verifies real `.ll` end-to-end, including `phi`-based loops. Remaining:
-   broaden toward raw `rustc` output (auto-numbering, metadata stripping,
-   `switch`, intrinsics like `memcpy`/`llvm.lifetime`). This is the shortest path
-   to "verify compiled Rust" because `rustc` emits LLVM-IR.
+   `store`/`getelementptr`/`icmp`/binops/casts/`call`/`phi`/`ret`/`br`/`switch`,
+   the `memcpy`/`memset`/`llvm.lifetime` intrinsics, and `rustc`-style metadata)
+   already verifies real `.ll` end-to-end, including `phi`-based loops and
+   `match`/enum-dispatch `switch`es (each case is an exact edge guard, the
+   default a sound over-approximation). Remaining: broaden toward raw `rustc`
+   output (`select`, `extractvalue`/aggregates, more intrinsics). This is the
+   shortest path to "verify compiled Rust" because `rustc` emits LLVM-IR.
 2. **Rust MIR** (`csolver-mir`): consume `rustc`'s MIR (stable-MIR or a driver),
    carrying borrow facts and panic edges that *sharpen* obligations.
 3. **Assembly** (`csolver-asm`) + **ELF/DWARF** (`csolver-elf`): **started.** A

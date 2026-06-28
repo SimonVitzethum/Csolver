@@ -160,7 +160,11 @@ unchanged. `solver verify file.ll` works end-to-end: a guarded `[8 x i32]`
 store, a `phi`-based `for i in 0..16` loop, and an out-of-bounds store verify to
 PASS / PASS / not-PASS respectively (`tests/llvm_frontend.rs`). PHIs are lowered
 to MSIR block parameters; unsupported constructs degrade to `UNKNOWN` (never a
-silent PASS). The parser tolerates real `rustc --emit=llvm-ir` shape (mangled
+silent PASS). Multi-way **`switch`** (Rust `match` / enum-discriminant dispatch)
+lowers to MSIR's native `Switch` — each case is an exact edge guard
+(`value == cⱼ`), the default a sound over-approximation — so a `match` that
+stores into a local buffer per arm verifies **PASS** and an out-of-bounds arm is
+correctly not proved. The parser tolerates real `rustc --emit=llvm-ir` shape (mangled
 names, attributes, metadata, `!dbg`, `; preds` comments) and **imports pointer-
 parameter contracts** (`dereferenceable(N)`/`align`/`readonly`/`writeonly`): a
 real `rustc -O` function taking `&mut [i32; 8]` and writing `buf[i]` under a

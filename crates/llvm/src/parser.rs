@@ -154,6 +154,17 @@ pub enum LTerm {
     Br(String),
     /// `br i1 c, label %t, label %f`.
     CondBr(LValue, String, String),
+    /// `switch iN %v, label %default [ iN c0, label %d0 ... ]`.
+    Switch {
+        /// The scrutinee.
+        value: LValue,
+        /// Bit width of the scrutinee (and every case constant).
+        width: u32,
+        /// The default destination.
+        default: String,
+        /// `(case constant, destination)` pairs.
+        cases: Vec<(i128, String)>,
+    },
     /// `unreachable`.
     Unreachable,
 }
@@ -580,6 +591,34 @@ impl Parser {
                     let f = self.local()?;
                     Ok(Some(LTerm::CondBr(cond, t, f)))
                 }
+            }
+            "switch" => {
+                self.pos += 1;
+                let LType::Int(width) = self.ltype()? else {
+                    return Err(Error::unsupported("switch on a non-integer scrutinee"));
+                };
+                let value = self.value()?;
+                self.expect_punct(',')?;
+                self.expect_word("label")?;
+                let default = self.local()?;
+                self.expect_punct('[')?;
+                let mut cases = Vec::new();
+                while !matches!(self.peek(), Tok::Punct(']')) {
+                    let _cty = self.ltype()?; // each case repeats the scrutinee's int type
+                    let cv = match self.value()? {
+                        LValue::Int(n) => n,
+                        other => {
+                            return Err(Error::unsupported(format!(
+                                "non-constant switch case value {other:?}"
+                            )))
+                        }
+                    };
+                    self.expect_punct(',')?;
+                    self.expect_word("label")?;
+                    cases.push((cv, self.local()?));
+                }
+                self.expect_punct(']')?;
+                Ok(Some(LTerm::Switch { value, width, default, cases }))
             }
             "unreachable" => {
                 self.pos += 1;

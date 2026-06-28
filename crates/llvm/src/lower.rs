@@ -8,7 +8,7 @@
 use crate::parser::{
     LBin, LBlock, LCast, LFunc, LInst, LModule, LPred, LTerm, LType, LValue,
 };
-use csolver_core::{Error, RegionKind, Result};
+use csolver_core::{BitVector, Error, RegionKind, Result};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Const, DataLayout, FuncId, Function, Inst,
     MemKind, Module, Operand, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
@@ -341,6 +341,22 @@ fn lower_term(ctx: &Ctx, from: &str, term: &LTerm) -> Result<Terminator> {
             else_blk: ctx.block(f)?,
             else_args: branch_args(ctx, from, f)?,
         },
+        LTerm::Switch { value, width, default, cases } => {
+            // MSIR `Switch` carries no per-target arguments. A case/default
+            // target that has phis referencing this block therefore receives
+            // fresh (havoc'd) parameters in the engine — a sound
+            // over-approximation, precise for the common discriminant dispatch
+            // whose arms have no such phis.
+            let cases = cases
+                .iter()
+                .map(|(cv, dest)| Ok((BitVector::new(*width, *cv as u128), ctx.block(dest)?)))
+                .collect::<Result<Vec<_>>>()?;
+            Terminator::Switch {
+                value: ctx.operand(value, *width)?,
+                cases,
+                default: ctx.block(default)?,
+            }
+        }
         LTerm::Unreachable => Terminator::Unreachable,
     })
 }

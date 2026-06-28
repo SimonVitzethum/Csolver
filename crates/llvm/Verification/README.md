@@ -12,7 +12,18 @@ matching incoming values as branch arguments.
 `define`d functions; `void`/`iN`/`ptr`/`[N x T]` types (and legacy `T*`);
 `alloca`, `load`, `store`, `getelementptr` (pointer-arith and `[N x T]` array
 forms), the integer binary ops, `icmp`, the integer/pointer casts, `call`,
-`phi`; and `ret`/`br`/`unreachable`.
+`phi`; and `ret`/`br`/`switch`/`unreachable`.
+
+## `switch` (multi-way dispatch)
+A `switch iN %v, label %def [ iN c₀, label %d₀ … ]` (Rust `match` / enum
+discriminant) lowers to MSIR's native `Terminator::Switch` — the scrutinee, the
+`(cⱼ, dⱼ)` case pairs, and the default. The analysis core treats each case as an
+**exact** edge guard (`%v == cⱼ`) and the default as a **sound
+over-approximation** (it is explored without the `%v ∉ {cⱼ}` condition, i.e. a
+weaker path condition — never unsound). MSIR `Switch` carries no per-target
+arguments, so a case/default block that has `phi`s referencing the switch block
+receives **fresh** (havoc'd) parameters — again a sound over-approximation, and
+precise for the common discriminant dispatch whose arms have no such `phi`s.
 
 ## Specification (refinement obligation)
 The lowering must over-approximate LLVM semantics: every concrete `.ll`
@@ -72,9 +83,9 @@ proved.
 
 ## Assumptions / limits
 - **Sound by construction on unsupported input:** anything still outside the
-  subset (exceptions/`invoke`, `switch`, `memcpy`/`memset` safety, multi-index/
-  struct GEPs, named struct types) is reported as `Unsupported`, so the caller
-  degrades to `UNKNOWN` — never silently mis-modelled into a `PASS`.
+  subset (exceptions/`invoke`, `select`, `indirectbr`, `extractvalue`/aggregates,
+  multi-index/struct GEPs, named struct types) is reported as `Unsupported`, so
+  the caller degrades to `UNKNOWN` — never silently mis-modelled into a `PASS`.
 - **Per-function recovery:** a function with an unsupported construct does not
   fail the whole module — it is skipped during parsing/lowering and recorded in
   `Module.unanalyzed`, which the verifier reports as a dedicated `UNKNOWN`

@@ -252,7 +252,7 @@ fn llvm_vectorized_function_verifies_pass() {
 }
 
 /// A module with a verifiable function plus one using an unsupported construct
-/// (`switch`). The good one is still verified PASS; the unsupported one is
+/// (`select`). The good one is still verified PASS; the unsupported one is
 /// reported UNKNOWN (not silently dropped), so the module is UNKNOWN.
 const MIXED: &str = r#"
 define void @good(i64 %i) {
@@ -271,15 +271,10 @@ done:
   ret void
 }
 
-define void @uses_switch(i64 %x) {
+define i32 @uses_select(i1 %c, i32 %a, i32 %b) {
 entry:
-  switch i64 %x, label %d [ i64 0, label %a i64 1, label %b ]
-a:
-  ret void
-b:
-  ret void
-d:
-  ret void
+  %r = select i1 %c, i32 %a, i32 %b
+  ret i32 %r
 }
 "#;
 
@@ -295,15 +290,82 @@ fn llvm_per_function_recovery() {
     // The supported function lowered; the other is recorded as unanalyzed.
     assert_eq!(module.functions.len(), 1);
     assert_eq!(module.functions[0].name, "good");
-    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_switch"));
+    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_select"));
 
     let report = verify_module(&module, &Config::default());
     // Module is UNKNOWN (one function not analyzed), but `good` is PASS.
     assert_eq!(report.verdict, Verdict::Unknown);
     let good = report.functions.iter().find(|f| f.function == "good").unwrap();
     assert_eq!(good.verdict, Verdict::Pass);
-    let bad = report.functions.iter().find(|f| f.function == "uses_switch").unwrap();
+    let bad = report.functions.iter().find(|f| f.function == "uses_select").unwrap();
     assert_eq!(bad.verdict, Verdict::Unknown);
+}
+
+/// A `switch` dispatch (`match x { 0 => …, 1 => …, _ => … }`) over a local
+/// `[4 x i32]`: each arm does an in-bounds store, and the three edges merge at
+/// the return block. Exercises the frontend's `switch` lowering end-to-end
+/// through the unchanged analysis core. Every access is in bounds → PASS.
+const SWITCH_DISPATCH: &str = r#"
+define void @classify(i64 %x) {
+entry:
+  %buf = alloca [4 x i32], align 4
+  switch i64 %x, label %def [ i64 0, label %a i64 1, label %b ]
+a:
+  %pa = getelementptr inbounds i32, ptr %buf, i64 0
+  store i32 10, ptr %pa, align 4
+  br label %def
+b:
+  %pb = getelementptr inbounds i32, ptr %buf, i64 1
+  store i32 20, ptr %pb, align 4
+  br label %def
+def:
+  %pd = getelementptr inbounds i32, ptr %buf, i64 3
+  store i32 30, ptr %pd, align 4
+  ret void
+}
+"#;
+
+#[test]
+fn llvm_switch_dispatch_verifies_pass() {
+    let module = LlvmFrontend
+        .lower(LlvmInput {
+            source: SWITCH_DISPATCH.into(),
+            name: "switch".into(),
+        })
+        .expect("frontend lowers the switch .ll");
+    assert!(module.unanalyzed.is_empty(), "switch function is analyzed, not dropped");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.functions[0].outcomes.iter().all(|o| o.verdict() == Verdict::Pass));
+}
+
+/// Soundness: an out-of-bounds store inside a `switch` arm must not be proved
+/// PASS — `switch` lowering must not weaken the bounds check. The arm writes
+/// `buf[7]` into a `[4 x i32]`.
+const SWITCH_OOB: &str = r#"
+define void @bad_arm(i64 %x) {
+entry:
+  %buf = alloca [4 x i32], align 4
+  switch i64 %x, label %def [ i64 0, label %a ]
+a:
+  %pa = getelementptr inbounds i32, ptr %buf, i64 7
+  store i32 10, ptr %pa, align 4
+  br label %def
+def:
+  ret void
+}
+"#;
+
+#[test]
+fn llvm_switch_arm_out_of_bounds_is_not_pass() {
+    let module = LlvmFrontend
+        .lower(LlvmInput {
+            source: SWITCH_OOB.into(),
+            name: "switchoob".into(),
+        })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    assert_ne!(report.verdict, Verdict::Pass, "OOB store in a switch arm must not pass");
 }
 
 /// Real `rustc -O` shape of `get(s: &[i32], i) -> if i < s.len() { s[i] } else
