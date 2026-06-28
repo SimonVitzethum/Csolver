@@ -59,38 +59,47 @@ loop headers the heap is cleared (sound over-approximation of loop-modified
 memory).
 
 ## Refutation + counterexamples (FAIL with a witness)
-A scalar `SafetyCheck` can also be **refuted**: on an **exact** path the engine
-shows the check is *definitely* violated and returns a concrete counterexample.
+A check can be **refuted**: on an **exact** path the engine exhibits a concrete
+input that violates it. The proving step always runs first, so a provable check
+is never refuted.
 
 - **Exact path.** Each `PathState` carries an `exact` flag, set false by any
   over-approximation — a loop-header havoc, an opaque call, or a non-determined
   load (a fresh unknown). Refutation is attempted only while `exact`, so the
-  path condition characterizes genuinely reachable states (a violating model is
-  a real execution).
-- **Definite violation.** The check is refuted only when `assumptions ⟹ ¬goal`
-  is proved **bit-precisely** (`csolver-solver/bitprecise`) — i.e. *no* reaching
-  input satisfies it. This mirrors the interval `False` verdict but with
-  bit-precision, so e.g. `(x | 8) < 8` (which intervals cannot see through) is
-  caught as a definite OOB. A merely *satisfiable-but-not-valid* check (e.g. an
-  unconstrained `i < 8`) is **not** refuted — it stays `Unknown` (this avoids
-  turning under-constrained helpers into spurious FAILs).
-- **Witness.** `bitprecise::find_counterexample` returns a model of
-  `assumptions ∧ ¬goal`; its existence also confirms the path is feasible. Scalar
-  inputs are named `arg{i}`, so the counterexample reads directly.
-- **No assumption.** Because the violation proof is bit-precise, a refutation
-  carries no `linear-no-overflow` caveat, and the model is a genuine machine
-  witness.
+  path condition characterizes genuinely reachable states and a violating model
+  is a real execution. The witness (`bitprecise::find_counterexample`, a model of
+  `assumptions ∧ ¬goal`) also confirms the path is feasible; scalar inputs are
+  named `arg{i}` so it reads directly. Being bit-precise, a refutation carries no
+  `linear-no-overflow` caveat.
 
-Memory-access (in-bounds / pointer-arithmetic) refutation is intentionally *not*
-attempted yet: a sound, clean OOB witness needs overflow/provenance-aware spatial
-reasoning (the byte offset `index * stride` can wrap, so a wrapped index would
-spuriously land back in range under pure modular arithmetic). Memory checks are
-still proved (`Proven`/`Unknown`) only; refuting them is a dedicated follow-up.
+Two refutation strengths are used (`RefuteMode`):
+
+- **Definite** (scalar `SafetyCheck`s). Refuted only when `assumptions ⟹ ¬goal`
+  is proved **bit-precisely** — i.e. *no* reaching input satisfies it. This
+  mirrors the interval `False` verdict but with bit-precision, so e.g.
+  `(x | 8) < 8` (opaque to intervals) is caught as a definite violation. A merely
+  *satisfiable-but-not-valid* check (e.g. an unconstrained `i < 8`) stays
+  `Unknown` — under-constrained obligations are not turned into FAILs.
+- **Possible** (memory-access **in-bounds**, concrete-size regions). Refuted when
+  *some* reaching input makes the access out of bounds. This is right for a
+  memory operation because the access **executes**: any reachable OOB input is a
+  real runtime violation, so `buf[i]` with an unconstrained `i` is `FAIL` with a
+  witness (e.g. `i = 8`). Soundness rests on (a) the exact path — the model is a
+  real input — and (b) a **concrete** region size — the only free variable is the
+  access offset, so a wrapped `count * stride` can't fabricate a too-small buffer
+  and a spurious witness. The signed in-bounds formula is faithful here: a
+  wrapped huge index that aliases back into range (byte offset wrapping to a
+  small value) correctly is *not* a violation, while a genuine past-the-end
+  offset is. A **symbolic** region size is left prove-only (`Off`) until
+  allocation-size-overflow reasoning lands. Pointer-arithmetic checks are also
+  prove-only; the access's in-bounds check is the one that carries the OOB
+  counterexample.
 
 ## Specification
 - A check is `Proven` iff it is proved on **every** path that reaches it.
-- A scalar check is `Refuted` (with a counterexample) iff it is *definitely*
-  violated on some **exact** path; otherwise an undecided check is `Unknown`.
+- A check is `Refuted` (with a counterexample) iff, on some **exact** path, a
+  scalar check is *definitely* violated or a concrete-size memory access is
+  violated by *some* reaching input; otherwise an undecided check is `Unknown`.
   Soundness is one-sided in both directions: never an unsound PASS, never an
   unsound FAIL.
 - If exploration exceeds its visit budget it is *truncated* and reports **no**

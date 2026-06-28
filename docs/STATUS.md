@@ -30,11 +30,20 @@ violated — `assumptions ⟹ ¬goal`, proved **bit-precisely** — becomes a `F
 whose `Model` names the violating inputs (`bitprecise::find_counterexample`). This
 mirrors the interval `False` verdict but with bit-precision: e.g. `(x | 8) < 8`,
 which interval analysis cannot see through, is reported `FAIL` with a witness
-(e.g. `arg0 = 0`), whereas a merely under-constrained check like an unconstrained
-`i < 8` stays `UNKNOWN` (only *definite* violations are refuted, so
-under-specified helpers are not turned into spurious failures). Memory-access OOB
-refutation (which needs overflow/provenance-aware spatial reasoning) is a
-documented follow-up; memory checks remain proof-only for now.
+(e.g. `arg0 = 0`), whereas a merely under-constrained scalar check like an
+unconstrained `i < 8` stays `UNKNOWN` (only *definite* violations are refuted, so
+under-specified helpers are not turned into spurious failures).
+
+**Memory-access OOB** is refuted too: because a memory access *executes*, any
+reachable out-of-bounds input is a real runtime violation, so the unguarded
+write `buf[i]` into a `[i32; 8]` with an unconstrained `i` is `FAIL` with a
+concrete witness (e.g. `i = 8`). This is sound on an **exact** path with a
+**concrete**-size region: the only free variable is the access offset, so a
+satisfying violation is a genuine reachable OOB and a wrapped `count * stride`
+cannot fabricate a too-small buffer. A safe access (`buf[x & 7]` into a `[i32;8]`)
+is still `PASS` — it is *proved* before any refutation is attempted. Symbolic-size
+regions (dynamic slices) remain prove-only until allocation-overflow reasoning
+lands.
 
 ## First real front-end: LLVM-IR
 

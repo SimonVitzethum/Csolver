@@ -5,8 +5,8 @@ use csolver_core::{SafetyProperty, Verdict};
 use csolver_report::{render_json, render_text};
 use csolver_testsuite::{
     dangling_store, guarded_get, indirect_store, interproc_module, loop_array_store,
-    masked_index_store, mixed_module, needs_solver, oob_mask_check, provably_buggy, provably_safe,
-    safe_buffer_store,
+    masked_index_store, mixed_module, needs_solver, oob_index_store, oob_mask_check, provably_buggy,
+    provably_safe, safe_buffer_store,
 };
 use csolver_verifier::{verify_function, verify_module, Config};
 
@@ -176,6 +176,36 @@ fn definite_violation_is_refuted_with_a_counterexample() {
         "the input arg0 is witnessed: {:?}",
         refuted.model
     );
+}
+
+#[test]
+fn out_of_bounds_memory_access_is_refuted_with_a_counterexample() {
+    // The unguarded write `buf[i] = 0` into a `[i32; 8]`: out of bounds for any
+    // `i >= 8`. The access executes, so a reachable OOB input is a real bug; the
+    // symbolic engine refutes the in-bounds obligation with a concrete witness.
+    let mut m = csolver_ir::Module::new("oobmem");
+    m.functions.push(oob_index_store());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Fail, "report: {report:?}");
+
+    let refuted = report.functions[0]
+        .outcomes
+        .iter()
+        .find_map(|o| match &o.result {
+            csolver_core::ObligationResult::Refuted(cx)
+                if o.obligation.property == csolver_core::SafetyProperty::InBounds =>
+            {
+                Some(cx)
+            }
+            _ => None,
+        })
+        .expect("the in-bounds obligation is refuted with a counterexample");
+    // The witnessed index genuinely makes the access out of bounds: its byte
+    // offset `i * 4` lands at or past the 32-byte allocation (valid offsets are
+    // 0..=28 for a 4-byte write).
+    let i = refuted.model.get("arg0").expect("the input is witnessed").unsigned() as u64;
+    let off = i.wrapping_mul(4);
+    assert!(off > 28, "witness offset {off} must be out of bounds (i = {i})");
 }
 
 #[test]

@@ -383,8 +383,20 @@ enum Decision {
     Proven,
     /// Neither proved nor (soundly) refuted.
     Unknown,
-    /// Definitely violated on this exact path, witnessed by the model.
+    /// Violated on this exact path, witnessed by the model.
     Refuted(Model),
+}
+
+/// How aggressively a goal may be refuted (see [`Explorer::try_refute`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefuteMode {
+    /// Never refute (prove-only).
+    Off,
+    /// Refute only a goal that is *always* violated on the path.
+    Definite,
+    /// Refute a goal violated by *some* reaching input (the operation executes,
+    /// so any such input is a real runtime violation).
+    Possible,
 }
 
 struct Explorer<'f> {
@@ -674,7 +686,7 @@ impl Explorer<'_> {
             }
             Inst::SafetyCheck { condition, .. } => {
                 let goal = self.eval_condition(condition, state);
-                let decision = self.decide(&[goal], state, true);
+                let decision = self.decide(&[goal], state, RefuteMode::Definite);
                 self.record_scalar(block, idx, decision);
             }
             Inst::MemIntrinsic { kind, dst, src, len } => {
@@ -889,14 +901,19 @@ impl Explorer<'_> {
         let live = rstate == LifetimeState::Live;
         self.record(block, idx, NoUseAfterFree, live, "region is live", "region may be freed (use-after-free)");
 
-        // In-bounds: 0 <= offset && offset + asize <= size. Refutation is *not*
-        // attempted for memory accesses: a sound, clean OOB counterexample needs
-        // overflow/provenance-aware spatial reasoning (the byte offset
-        // `index * stride` can wrap, so a wrapped index spuriously lands back in
-        // range under pure modular arithmetic). That is a dedicated follow-up;
-        // here we only prove (Proven/Unknown).
+        // In-bounds: 0 <= offset && offset + asize <= size. Refutable (a real
+        // OOB witness) only when the region size is **concrete**: then the only
+        // free variable is the access offset, so a satisfying violation is a
+        // genuine reachable OOB. A symbolic size is left prove-only — a wrapped
+        // `count * stride` could otherwise fabricate a too-small buffer and a
+        // spurious witness.
         let conjuncts = self.in_bounds_conjuncts(p.offset, asize, rsize);
-        let decision = self.decide(&conjuncts, state, false);
+        let mode = if self.ctx.as_const(rsize).is_some() {
+            RefuteMode::Possible
+        } else {
+            RefuteMode::Off
+        };
+        let decision = self.decide(&conjuncts, state, mode);
         self.record_mem(block, idx, InBounds, decision, "access stays within the allocation", "could not prove the access stays in bounds");
 
         // Alignment (concrete).
@@ -924,10 +941,12 @@ impl Explorer<'_> {
         };
         let rsize = state.regions[rid].size;
         let contract = state.regions[rid].contract;
-        // In-object or one-past-end: 0 <= offset <= size. (Refutation off for
-        // memory accesses; see `check_access`.)
+        // In-object or one-past-end: 0 <= offset <= size. Refutation off here:
+        // the *access* in-bounds check (in `check_access`) is the one that
+        // carries the OOB counterexample; the intermediate pointer arithmetic is
+        // only proved.
         let conjuncts = self.in_range_conjuncts(p.offset, rsize);
-        let decision = self.decide(&conjuncts, state, false);
+        let decision = self.decide(&conjuncts, state, RefuteMode::Off);
         let proven = matches!(decision, Decision::Proven);
         self.record_mem(block, idx, ValidPointerArith, decision, "result stays within the object (or one-past-end)", "could not prove the offset stays in-object");
         if proven {
@@ -984,27 +1003,41 @@ impl Explorer<'_> {
     /// Decide a (possibly conjunctive) safety goal on one path. Tries to **prove**
     /// it (`A ⟹ P ∧ Q` by proving each conjunct — the linear procedure only takes
     /// conjunctive goals); failing that, on an **exact** path, tries to **refute**
-    /// it (a definite violation) and return a concrete counterexample. `refutable`
-    /// lets a caller suppress refutation (e.g. when a region size is symbolic, so
-    /// witnesses stay faithful to a real allocation).
-    fn decide(&mut self, conjuncts: &[ExprId], state: &PathState, refutable: bool) -> Decision {
+    /// it per `mode` and return a concrete counterexample.
+    fn decide(&mut self, conjuncts: &[ExprId], state: &PathState, mode: RefuteMode) -> Decision {
         if conjuncts.iter().all(|&g| self.prove(g, state)) {
             return Decision::Proven;
         }
-        if refutable && state.exact {
-            if let Some(model) = self.try_refute(conjuncts, state) {
+        if mode != RefuteMode::Off && state.exact {
+            if let Some(model) = self.try_refute(conjuncts, state, mode) {
                 return Decision::Refuted(model);
             }
         }
         Decision::Unknown
     }
 
-    /// On an exact path, return a concrete witness iff the conjunctive goal is
-    /// *definitely* violated — `assumptions ⟹ ¬goal`, established **bit-precisely**
-    /// so the `FAIL` needs no arithmetic assumption. The counterexample is a model
-    /// of `assumptions ∧ ¬goal`; its existence also confirms the path is feasible
-    /// (genuinely reachable), so the violation is real.
-    fn try_refute(&mut self, conjuncts: &[ExprId], state: &PathState) -> Option<Model> {
+    /// On an exact path, return a concrete witness of a violation, or `None`.
+    ///
+    /// - [`RefuteMode::Definite`] refutes only a **definite** violation
+    ///   (`assumptions ⟹ ¬goal`, proved bit-precisely): the goal can never hold
+    ///   on this path. Used for scalar `SafetyCheck`s, so a merely
+    ///   *satisfiable-but-not-valid* check (e.g. an unconstrained `i < 8`) stays
+    ///   `Unknown` rather than becoming a FAIL.
+    /// - [`RefuteMode::Possible`] refutes whenever **some** reaching input
+    ///   violates the goal (`assumptions ∧ ¬goal` is satisfiable). Used for
+    ///   memory accesses: the access *executes*, so any reachable input that
+    ///   makes it out of bounds is a definite runtime violation. Sound because
+    ///   the model satisfies the (exact) path condition, hence is genuinely
+    ///   reachable, and callers restrict it to concrete-size regions (so a
+    ///   wrapped allocation size can't fabricate a too-small buffer).
+    ///
+    /// Either way the witness existing also confirms the path is feasible.
+    fn try_refute(
+        &mut self,
+        conjuncts: &[ExprId],
+        state: &PathState,
+        mode: RefuteMode,
+    ) -> Option<Model> {
         let goal = if conjuncts.len() == 1 {
             conjuncts[0]
         } else {
@@ -1013,11 +1046,16 @@ impl Explorer<'_> {
         let not_goal = self.ctx.not(goal);
         let mut assumptions = state.pathcond.clone();
         assumptions.extend_from_slice(&state.facts);
-        // Definite violation: the goal can never hold on this (feasible, exact)
-        // path, established bit-precisely so the FAIL needs no assumption.
-        if !bitprecise::prove_implies(&self.ctx, &assumptions, not_goal) {
+        // For a *definite* refutation, first require that the goal can never hold
+        // on this (feasible, exact) path — proved bit-precisely. A *possible*
+        // refutation skips this: any satisfiable violation is a real one.
+        if mode == RefuteMode::Definite
+            && !bitprecise::prove_implies(&self.ctx, &assumptions, not_goal)
+        {
             return None;
         }
+        // The witness is a model of `assumptions ∧ ¬goal`: it satisfies the path
+        // condition (reachable) and falsifies the goal (violating).
         bitprecise::find_counterexample(&self.ctx, &assumptions, goal)
     }
 
@@ -1452,6 +1490,52 @@ mod tests {
         // `x < 8` holds for some inputs and fails for others — never refuted.
         let r = discharge_function(&bare_check());
         assert_eq!(r.outcome(BlockId(0), 0), Some(SymOutcome::Unknown));
+    }
+
+    /// `unguarded(i)`: `buf = alloc i32*8; store 0 -> buf+i` — OOB for i >= 8.
+    fn unguarded_store() -> Function {
+        let i = RegId(0);
+        let buf = RegId(1);
+        let p = RegId(2);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(32),
+            count: Operand::int(64, 8),
+            align: 4,
+        });
+        bb0.insts.push(Inst::PtrOffset {
+            dst: p,
+            base: Operand::Reg(buf),
+            index: Operand::Reg(i),
+            elem: Type::int(32),
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(p),
+            value: Operand::int(32, 0),
+            align: 4,
+        });
+        Function {
+            id: FuncId(0),
+            name: "unguarded".into(),
+            params: vec![(i, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn concrete_size_oob_memory_access_is_refuted() {
+        let r = discharge_function(&unguarded_store());
+        let d = r
+            .mem_decision(BlockId(0), 2, SafetyProperty::InBounds)
+            .expect("in-bounds obligation exists");
+        assert!(!d.proven, "an unguarded OOB write is not provable");
+        let model = d.refutation.as_ref().expect("refuted with a counterexample");
+        assert!(model.get("arg0").is_some(), "witness names the index: {model:?}");
     }
 
     /// `store_buf(i, n)`: alloc n i32; if 0<=i { if i<n { store buf[i] } }.

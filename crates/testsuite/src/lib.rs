@@ -556,6 +556,52 @@ pub fn oob_mask_check() -> Function {
     }
 }
 
+/// `oob_index_store(i)`: the unguarded write `buf[i] = 0` into a `[i32; 8]`,
+/// with `i` an unconstrained parameter. The access executes for every input, so
+/// any `i >= 8` is a genuine out-of-bounds write. The symbolic engine cannot
+/// prove the access in bounds and, on this exact path with a concrete-size
+/// region, refutes it with a concrete counterexample (e.g. `i = 8`). The verdict
+/// is FAIL with a witness — the memory-access analogue of [`provably_buggy`].
+///
+/// ```text
+///   buf = alloc i32 * 8        // size 32 bytes
+///   p   = buf + i*4            // out of bounds when i >= 8
+///   store 0 -> p
+/// ```
+pub fn oob_index_store() -> Function {
+    let i = RegId(0);
+    let buf = RegId(1);
+    let p = RegId(2);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(32),
+        count: Operand::int(64, 8),
+        align: 4,
+    });
+    bb0.insts.push(Inst::PtrOffset {
+        dst: p,
+        base: Operand::Reg(buf),
+        index: Operand::Reg(i),
+        elem: Type::int(32),
+    });
+    bb0.insts.push(Inst::Store {
+        ty: Type::int(32),
+        ptr: Operand::Reg(p),
+        value: Operand::int(32, 0),
+        align: 4,
+    });
+    Function {
+        id: FuncId(0),
+        name: "oob_index_store".into(),
+        params: vec![(i, Type::int(64))],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
 /// `dangling_store()`: allocate, free, then write through the freed pointer —
 /// a use-after-free. The free itself is fine; the later store cannot be proved
 /// temporally safe, so it stays UNKNOWN (this increment never refutes).

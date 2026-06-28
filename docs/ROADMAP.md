@@ -69,13 +69,15 @@ whole tool, argued in each crate's `Verification/`.
   symbolic shifts, array/heap theories, and — only if ever wanted — an *opt-in*
   external backend (Bitwuzla → Z3 → CVC5) behind the `SmtSolver` trait for very
   large queries.
-- **Counterexample model extraction** — **started.** The internal SAT layer now
-  returns a satisfying model (`bitprecise::find_counterexample`), and the
-  symbolic engine refutes a *definitely-violated* scalar check on an **exact**
-  path, emitting a `FAIL` with a concrete witness (named `arg{i}`). Remaining:
-  sound memory-access (OOB / pointer-arithmetic) refutation, which needs
-  overflow/provenance-aware spatial reasoning (a wrapped `index * stride` must
-  not spuriously land back in range), and richer traces.
+- **Counterexample model extraction** — **largely done.** The internal SAT layer
+  returns a satisfying model (`bitprecise::find_counterexample`), and the symbolic
+  engine emits a `FAIL` with a concrete witness (named `arg{i}`) for both a
+  *definitely-violated* scalar check and a **concrete-size memory access** that is
+  out of bounds for some reaching input (e.g. `buf[i]` with unconstrained `i`),
+  on an **exact** path. Remaining: OOB refutation for **symbolic-size** regions
+  (needs allocation-size-overflow reasoning so a wrapped `count * stride` cannot
+  fabricate a too-small buffer), temporal (use-after-free / double-free)
+  counterexamples, and richer step traces.
 - **Pointer-induction loops** — the fully-optimized `for x in s` lowers to a
   vectorized **pointer-walking** loop (`iter != end`, `end = base + len*sizeof`).
   Verifying it soundly needs a relational pointer-offset abstract domain *plus*
