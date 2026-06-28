@@ -3,6 +3,16 @@
 Milestone **M1 — symbolic execution + SMT (increment 1 done)**, on top of the
 completed **M0 — architecture + foundations**.
 
+## Toward real binaries: ELF loader
+
+`csolver-elf` now **parses real ELF64 objects** in pure Rust (no `object`/`gimli`):
+the header, the section table (names, vaddr/size/file-offset, R/W/X permissions),
+and the symbol table (functions and their sizes). `Image::function_code` recovers
+a function's exact machine bytes — the hand-off point to the (next) x86-64
+decoder. Parsing is bounds-checked throughout, so a malformed image is a clean
+`Error`, never a panic. This is the first layer of verifying a compiled binary
+with no source; DWARF, relocations, PE/Mach-O, and the decoder/lowering follow.
+
 ## Bit-precise decision procedure (pure-Rust SAT)
 
 `csolver-solver` now carries a self-contained **bit-precise** decision procedure
