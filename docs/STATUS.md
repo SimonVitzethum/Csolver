@@ -36,6 +36,15 @@ guard (`ptr_walk_bottom_loop` → PASS) and is correctly not proved **without** 
 (`ptr_walk_bottom_unguarded` → not PASS), where on an empty range the
 unconditional load would read out of bounds.
 
+**End-to-end from compiled Rust.** This is not only a hand-built-MSIR result: the
+real `rustc -O` `for x in s` over `&[i32]` — the rotated phi-pointer walk emitted
+as `.ll` — lowers through the LLVM front-end (phi → block parameter,
+`getelementptr` → `PtrOffset`, pointer `icmp` → comparison, the slice ABI → a
+region of size `len·4`) and verifies **PASS** with the unchanged analysis
+(`llvm_pointer_walk_loop_verifies_pass`); the unguarded variant is correctly not
+proved. So the fully-optimized iterator loop is verified from source-compiled
+Rust, the canonical case that motivated the pointer-induction work.
+
 ## Equality-exit loops (`while i != n`): induction bounds
 
 The `!=`/`==`-exit loop — the integer precursor of the pointer-walk (`iter !=

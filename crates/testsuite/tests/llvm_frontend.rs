@@ -484,6 +484,72 @@ fn llvm_call_with_align_global_arg_parses() {
     assert!(module.unanalyzed.is_empty());
 }
 
+/// The fully-optimized `for x in s { … }` over `s: &[i32]` as `rustc -O` emits
+/// it after loop rotation: a **pointer-walking** loop (`iter != end`, bottom-test
+/// — load before the exit check), guarded by an `is_empty` preheader test. This
+/// is the real compiled shape the equality-exit pointer-induction analysis is for.
+const PTR_WALK: &str = r#"
+define void @walk(ptr noalias noundef nonnull readonly align 4 %s.0, i64 noundef %s.1) unnamed_addr #0 {
+start:
+  %end = getelementptr inbounds i32, ptr %s.0, i64 %s.1
+  %empty = icmp eq ptr %s.0, %end
+  br i1 %empty, label %done, label %body
+body:
+  %iter = phi ptr [ %s.0, %start ], [ %next, %body ]
+  %x = load i32, ptr %iter, align 4
+  %next = getelementptr inbounds i32, ptr %iter, i64 1
+  %atend = icmp eq ptr %next, %end
+  br i1 %atend, label %done, label %body
+done:
+  ret void
+}
+"#;
+
+#[test]
+fn llvm_pointer_walk_loop_verifies_pass() {
+    let module = LlvmFrontend
+        .lower(LlvmInput {
+            source: PTR_WALK.into(),
+            name: "walk".into(),
+        })
+        .expect("lower the pointer-walk .ll");
+    assert!(module.unanalyzed.is_empty(), "the walk lowers, not dropped");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.assumptions.iter().any(|a| a.id == "slice-abi"));
+}
+
+/// Soundness: the same pointer walk WITHOUT the `is_empty` preheader guard. On an
+/// empty slice the unconditional first load reads out of bounds, so it must not
+/// be proved PASS — the rotated-walk base case is unprovable without the guard.
+const PTR_WALK_NOGUARD: &str = r#"
+define void @walk_noguard(ptr noalias noundef nonnull readonly align 4 %s.0, i64 noundef %s.1) unnamed_addr #0 {
+start:
+  %end = getelementptr inbounds i32, ptr %s.0, i64 %s.1
+  br label %body
+body:
+  %iter = phi ptr [ %s.0, %start ], [ %next, %body ]
+  %x = load i32, ptr %iter, align 4
+  %next = getelementptr inbounds i32, ptr %iter, i64 1
+  %atend = icmp eq ptr %next, %end
+  br i1 %atend, label %done, label %body
+done:
+  ret void
+}
+"#;
+
+#[test]
+fn llvm_pointer_walk_without_guard_is_not_pass() {
+    let module = LlvmFrontend
+        .lower(LlvmInput {
+            source: PTR_WALK_NOGUARD.into(),
+            name: "walknoguard".into(),
+        })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    assert_ne!(report.verdict, Verdict::Pass, "an unguarded pointer walk must not pass");
+}
+
 /// `memcpy`/`memset` safety: a copy/fill of `len` bytes is proved when both the
 /// destination (write) and source (read) are valid for `len` bytes. A copy of
 /// 16 bytes between `dereferenceable(16)` pointers verifies; copying 32 does not.

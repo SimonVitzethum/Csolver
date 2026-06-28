@@ -98,8 +98,14 @@ proved.
 Per-opcode lowering is small and inspectable; PHI elimination is the only
 non-local step and is validated end-to-end: a guarded `[8 x i32]` store, a
 `phi`-based `for i in 0..16` loop, and an out-of-bounds store all verify to the
-expected verdict (`csolver-testsuite/tests/llvm_frontend.rs`). Per-opcode
-differential testing against `lli`-observed behaviour is the next hardening.
+expected verdict (`csolver-testsuite/tests/llvm_frontend.rs`). The
+fully-optimized iterator loop — `rustc -O`'s rotated **pointer walk** (`phi ptr`
+header, `getelementptr` step, pointer `icmp eq … %end`) over a `&[i32]` slice —
+also lowers and verifies **PASS** unchanged, with the analysis recognising it as
+a pointer-induction loop; its unguarded variant is correctly not proved. So the
+lowering carries a real compiled iterator all the way to a sound verdict.
+Per-opcode differential testing against `lli`-observed behaviour is the next
+hardening.
 
 ## Test strategy
 Unit tests for the lexer and parser; end-to-end `.ll` → verify tests in

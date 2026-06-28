@@ -124,9 +124,13 @@ whole tool, argued in each crate's `Verification/`.
   analyse the `is_empty` preheader guard structurally the engine **proves the base
   case** `b0 + stride ≤ end_off` from that guard in the path condition (so a
   missing guard simply fails the proof: `ptr_walk_bottom_loop` → PASS,
-  `ptr_walk_bottom_unguarded` → not PASS). Remaining: the LLVM front-end emitting
-  these shapes from real `rustc -O` output (the phi-pointer walk), so the loop is
-  recognised from compiled Rust rather than hand-built MSIR.
+  `ptr_walk_bottom_unguarded` → not PASS). **End-to-end from compiled Rust:** the
+  real `rustc -O` `for x in s` over `&[i32]` — the rotated phi-pointer walk in
+  `.ll` — lowers through the LLVM front-end (phi → block parameter, `getelementptr`
+  → `PtrOffset`, pointer `icmp` → comparison, slice ABI → region) and verifies
+  **PASS** unchanged (`llvm_pointer_walk_loop_verifies_pass`), with the unguarded
+  variant correctly not proved. The fully-optimized iterator loop is thus verified
+  from source-compiled Rust, not just hand-built MSIR.
 - **Relational loop invariants** — **in** (zone / difference-bound domain). A
   `Zone` DBM tracks `vⱼ − vᵢ ≤ c` between registers; the symbolic engine adds its
   header invariants as facts, so a loop whose safety is a *relation* (a second
