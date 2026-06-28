@@ -106,8 +106,10 @@ fn verify_path(path: &Path, json: bool) -> Result<ExitCode, String> {
         }
         SourceLevel::Mir => {
             use csolver_ir::Frontend;
+            let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
             csolver_mir::MirFrontend.lower(csolver_mir::MirInput {
-                path: path.display().to_string(),
+                source,
+                name: path.display().to_string(),
             })
         }
     };

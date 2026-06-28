@@ -1,0 +1,139 @@
+//! A tokenizer for textual Rust MIR (as emitted by `rustc --emit=mir` /
+//! `-Zunpretty=mir`).
+//!
+//! It recognizes the lexical classes the parser needs: bare words (keywords,
+//! locals `_N`, blocks `bbN`, type names, rvalue/operator names), integer
+//! literals (with Rust's `_` digit separators and type suffixes), string
+//! literals (assert messages), the `->` and `=>` arrows, and single-character
+//! punctuation. Line (`//`) comments and whitespace are skipped.
+
+use csolver_core::{Error, Result};
+
+/// A single MIR token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Tok {
+    /// A bare word: keyword, local (`_1`), block (`bb0`), type, or operator name.
+    Word(String),
+    /// An integer literal (suffix and `_` separators stripped).
+    Int(i128),
+    /// A string literal's contents (e.g. an assert message).
+    Str(String),
+    /// A single punctuation character: one of `(){}[],;:=.*&<>+%`.
+    Punct(char),
+    /// `->` (terminator edge).
+    Arrow,
+    /// `=>` (debug binding).
+    FatArrow,
+    /// End of input.
+    Eof,
+}
+
+/// Tokenize the whole input, or report the first lexical error.
+pub(crate) fn lex(src: &str) -> Result<Vec<Tok>> {
+    let b = src.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'>') => {
+                out.push(Tok::Arrow);
+                i += 2;
+            }
+            b'=' if b.get(i + 1) == Some(&b'>') => {
+                out.push(Tok::FatArrow);
+                i += 2;
+            }
+            b'"' => {
+                let (s, ni) = lex_string(b, i)?;
+                i = ni;
+                out.push(Tok::Str(s));
+            }
+            b'0'..=b'9' => {
+                let (v, ni) = lex_number(b, i);
+                i = ni;
+                out.push(Tok::Int(v));
+            }
+            _ if is_ident_start(c) => {
+                let start = i;
+                while i < b.len() && is_ident_byte(b[i]) {
+                    i += 1;
+                }
+                out.push(Tok::Word(str_of(&b[start..i])));
+            }
+            b'(' | b')' | b'{' | b'}' | b'[' | b']' | b',' | b';' | b':' | b'=' | b'.' | b'*'
+            | b'&' | b'<' | b'>' | b'+' | b'-' | b'%' | b'!' => {
+                out.push(Tok::Punct(c as char));
+                i += 1;
+            }
+            // Skip anything else (e.g. stray sigils in annotations) defensively.
+            _ => i += 1,
+        }
+    }
+    out.push(Tok::Eof);
+    Ok(out)
+}
+
+/// Read a number with Rust `_` digit separators and an optional type suffix
+/// (`8_usize`, `1_000`, `0i32`): the value with separators removed, ignoring the
+/// suffix.
+fn lex_number(b: &[u8], mut i: usize) -> (i128, usize) {
+    let mut digits = String::new();
+    while i < b.len() {
+        match b[i] {
+            d @ b'0'..=b'9' => {
+                digits.push(d as char);
+                i += 1;
+            }
+            b'_' => i += 1, // separator, or start of a `_usize`-style suffix
+            // A trailing type suffix (`usize`, `i32`, …): consume and drop it.
+            c if c.is_ascii_alphabetic() => {
+                while i < b.len() && is_ident_byte(b[i]) {
+                    i += 1;
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    (digits.parse().unwrap_or(0), i)
+}
+
+/// Read a double-quoted string (with simple `\"` / `\\` escapes), returning its
+/// contents and the index past the closing quote.
+fn lex_string(b: &[u8], mut i: usize) -> Result<(String, usize)> {
+    i += 1; // opening quote
+    let mut s = String::new();
+    while i < b.len() {
+        match b[i] {
+            b'"' => return Ok((s, i + 1)),
+            b'\\' if i + 1 < b.len() => {
+                s.push(b[i + 1] as char);
+                i += 2;
+            }
+            c => {
+                s.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    Err(Error::parse("unterminated string literal"))
+}
+
+fn is_ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_'
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+fn str_of(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}

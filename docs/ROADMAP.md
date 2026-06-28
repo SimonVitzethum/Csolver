@@ -46,8 +46,17 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    default a sound over-approximation). Remaining: broaden toward raw `rustc`
    output (`select`, `extractvalue`/aggregates, more intrinsics). This is the
    shortest path to "verify compiled Rust" because `rustc` emits LLVM-IR.
-2. **Rust MIR** (`csolver-mir`): consume `rustc`'s MIR (stable-MIR or a driver),
-   carrying borrow facts and panic edges that *sharpen* obligations.
+2. **Rust MIR** (`csolver-mir`): **started** — a pure-Rust lexer + parser +
+   lowerer for a practical subset of **textual** MIR (`rustc --emit=mir`), no
+   `rustc` linkage (mirroring the `.ll` approach). Its point is that the
+   bounds/overflow checks rustc inserts are *explicit*: `assert(Lt(i, len)) ->
+   [success: bb, …]` lowers to a `CondBr` whose success edge carries the guard
+   (failure → an `unreachable` panic pad), so a checked `s[i]` over `&[i32; N]`
+   verifies **PASS** precisely because the check is present, while the unchecked
+   index is not proved. Sized references become region contracts; index/deref
+   places become `PtrOffset` + `Load`/`Store`; unmodelled constructs (`call`,
+   slice length) degrade per-function to `UNKNOWN`. Remaining: slice `&[T]`
+   length modelling, calls/drops, aggregates, and a real multi-block corpus.
 3. **Assembly** (`csolver-asm`) + **ELF/DWARF** (`csolver-elf`): **started.** A
    pure-Rust ELF64 reader (`csolver-elf`) parses sections/symbols and recovers a
    function's machine bytes; a minimal x86-64 decoder (`csolver-asm`

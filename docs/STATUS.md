@@ -212,6 +212,24 @@ prefix/intersection. So a CFG with *N* independent branches is analysed in
 *O(blocks)* instead of *O(2^N)* paths — a 256-path function verifies under a
 40-visit budget — while single-predecessor (branch) blocks stay fully precise.
 
+## Second front-end: Rust MIR (explicit bounds checks)
+
+`csolver-mir` now lowers a practical subset of **textual Rust MIR** (`rustc
+--emit=mir`) to MSIR in pure Rust — no `rustc` linkage, mirroring the `.ll`
+approach. MIR's advantage for memory safety is that the checks rustc inserts are
+**explicit terminators**: `s[i]` is preceded by `assert(Lt(i, len), "index out
+of bounds…") -> [success: bbN, …]`. The lowering turns that `assert` into a
+`CondBr` whose **success edge carries the guard** and whose failure edge diverges
+to an `unreachable` panic pad, so the indexed load is *proved* in bounds exactly
+because the check is present. A sized reference (`&[T; N]`, `&T`, `&mut T`)
+becomes a region contract (`&` is read-only, `&mut` writable); an index/deref
+place becomes `PtrOffset` + `Load`/`Store`; `Len(&[T; N])` is the constant `N`.
+The canonical `fn get(s: &[i32; 8], i: usize) -> i32 { s[i] }` MIR verifies
+**PASS** (under `param-contracts`); the same index *without* the assert is
+correctly **not** proved; and a function using an unmodelled construct (a `call`)
+is recorded `UNKNOWN` per-function while a sound sibling still verifies. Remaining:
+slice `&[T]` length modelling (fixed arrays are done), calls/drops, aggregates.
+
 ## First real front-end: LLVM-IR
 
 `csolver-llvm` now **parses and lowers textual LLVM IR** (a practical subset) to

@@ -1,0 +1,463 @@
+//! Lower a parsed MIR body into MSIR.
+//!
+//! The translation is deliberately conservative: a reference parameter of known
+//! pointee size (`&[T; N]`, `&T`, `&mut T`) becomes a contracted region; the
+//! bounds-check `assert` becomes a `CondBr` whose success edge carries the guard
+//! (and whose failure edge goes to an `unreachable` panic block), so the checked
+//! index `s[i]` is *proved* in bounds exactly because rustc inserted the check.
+//! Anything outside the modelled subset (a `call`, an unmodelled rvalue/place)
+//! is surfaced — the function is recorded unanalyzed rather than mis-lowered.
+
+use crate::parser::{BinKind, MBlock, MConst, MStmt, MTerm, MType, MirBody, Operand, Place, Rvalue};
+use csolver_core::{Error, Result};
+use csolver_ir::{
+    BasicBlock, BinOp, BlockId, CmpOp, Const, DataLayout, FuncId, Function, Inst, Module, Operand as IrOp,
+    PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
+};
+use std::collections::HashMap;
+
+const LAYOUT: DataLayout = DataLayout::LP64;
+
+/// Lower every parsed MIR body into one MSIR module (per-function recovery).
+pub(crate) fn lower_module(bodies: &[MirBody], name: &str) -> Module {
+    let mut module = Module::new(name);
+    for (i, body) in bodies.iter().enumerate() {
+        let fid = FuncId(i as u32);
+        match lower_function(body, fid) {
+            Ok((func, contracts)) => {
+                for (idx, c) in contracts {
+                    module.param_contracts.insert((fid, idx), c);
+                }
+                module.functions.push(func);
+            }
+            Err(e) => module.unanalyzed.push((body.name.clone(), e.to_string())),
+        }
+    }
+    module
+}
+
+struct Ctx {
+    local_types: HashMap<u32, MType>,
+    next_temp: u32,
+    panic_id: u32,
+    panic_used: bool,
+}
+
+/// Lower one MIR body into an MSIR function plus its parameter contracts.
+fn lower_function(body: &MirBody, id: FuncId) -> Result<(Function, Vec<(u32, PtrContract)>)> {
+    let local_types: HashMap<u32, MType> =
+        body.params.iter().map(|(l, t)| (*l, t.clone())).collect();
+
+    // Temporaries (for `PtrOffset` results, loaded operands) get registers above
+    // every MIR local so they never collide.
+    let max_local = body
+        .params
+        .iter()
+        .map(|(l, _)| *l)
+        .chain(body.blocks.iter().flat_map(block_locals))
+        .max()
+        .unwrap_or(0);
+    let panic_id = body.blocks.iter().map(|b| b.id as u32).max().unwrap_or(0) + 1;
+
+    let mut ctx = Ctx { local_types, next_temp: max_local + 1, panic_id, panic_used: false };
+
+    // Parameters and their contracts (by position).
+    let mut params = Vec::new();
+    let mut contracts = Vec::new();
+    for (idx, (local, mty)) in body.params.iter().enumerate() {
+        let (ir_ty, contract) = ctx.param_lowering(mty);
+        params.push((RegId(*local), ir_ty));
+        if let Some(c) = contract {
+            contracts.push((idx as u32, c));
+        }
+    }
+
+    let mut blocks = Vec::new();
+    for b in &body.blocks {
+        blocks.push(ctx.lower_block(b)?);
+    }
+    if ctx.panic_used {
+        // A diverging panic landing pad: an aborting check never returns, so the
+        // continuation is unreachable for the purpose of memory safety.
+        blocks.push(BasicBlock::new(BlockId(panic_id), Terminator::Unreachable));
+    }
+
+    let function = Function {
+        id,
+        name: body.name.clone(),
+        params,
+        ret_ty: mtype_to_ir(&body.ret),
+        blocks,
+        entry: BlockId(0),
+    };
+    Ok((function, contracts))
+}
+
+impl Ctx {
+    fn fresh(&mut self) -> RegId {
+        let r = RegId(self.next_temp);
+        self.next_temp += 1;
+        r
+    }
+
+    /// The MSIR parameter type and (for a sized reference) the region contract.
+    fn param_lowering(&self, mty: &MType) -> (Type, Option<PtrContract>) {
+        match mty {
+            MType::Ref(pointee, mutable) | MType::Ptr(pointee, mutable) => {
+                let ir_pointee = mtype_to_ir(pointee);
+                let ty = Type::ptr(ir_pointee.clone());
+                let contract = pointee_size(pointee).map(|size| PtrContract {
+                    size: SizeSpec::Bytes(size),
+                    align: pointee_align(pointee),
+                    readable: true,
+                    writable: *mutable,
+                });
+                (ty, contract)
+            }
+            other => (mtype_to_ir(other), None),
+        }
+    }
+
+    fn lower_block(&mut self, b: &MBlock) -> Result<BasicBlock> {
+        let mut insts = Vec::new();
+        for s in &b.stmts {
+            self.lower_stmt(s, &mut insts)?;
+        }
+        let term = self.lower_term(&b.term)?;
+        let mut block = BasicBlock::new(BlockId(b.id as u32), term);
+        block.insts = insts;
+        Ok(block)
+    }
+
+    fn lower_stmt(&mut self, s: &MStmt, out: &mut Vec<Inst>) -> Result<()> {
+        let MStmt::Assign(place, rv) = s else {
+            return Ok(()); // Nop
+        };
+        match place {
+            // Register destination: `_d = rvalue`.
+            Place::Local(d) => self.lower_rvalue_into(RegId(*d), rv, out),
+            // Memory destination: `(*_p)[..] = operand` / `*_p = operand`.
+            Place::Deref(_) | Place::Index(_, _) => {
+                let Rvalue::Use(op) = rv else {
+                    // A non-`Use` store (e.g. a binop result written straight to
+                    // memory) is rare in MIR; not modelled — skip soundly (the
+                    // location keeps an unknown value).
+                    return Ok(());
+                };
+                if let Some((ptr, elem)) = self.place_access(place, out) {
+                    let value = self.operand_value(op, out);
+                    out.push(Inst::Store {
+                        ty: elem.clone(),
+                        ptr: IrOp::Reg(ptr),
+                        value,
+                        align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32,
+                    });
+                }
+                Ok(())
+            }
+            // Field stores are not modelled (aggregates are opaque): skip.
+            Place::Field(_, _) => Ok(()),
+        }
+    }
+
+    /// Lower an rvalue, writing its value into register `dst`.
+    fn lower_rvalue_into(&mut self, dst: RegId, rv: &Rvalue, out: &mut Vec<Inst>) -> Result<()> {
+        match rv {
+            Rvalue::Use(op) => {
+                // A memory operand (`copy (*_1)[_2]`) is a load.
+                if let Operand::Copy(p) | Operand::Move(p) = op {
+                    if is_memory_place(p) {
+                        if let Some((ptr, elem)) = self.place_access(p, out) {
+                            out.push(Inst::Load {
+                                dst,
+                                ty: elem.clone(),
+                                ptr: IrOp::Reg(ptr),
+                                align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32,
+                            });
+                        } else {
+                            out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
+                        }
+                        return Ok(());
+                    }
+                }
+                let v = self.operand_value(op, out);
+                out.push(assign(dst, RValue::Use(v)));
+                Ok(())
+            }
+            Rvalue::Bin(kind, a, b) => {
+                let av = self.operand_value(a, out);
+                let bv = self.operand_value(b, out);
+                let value = match bin_rvalue(*kind, av, bv) {
+                    Some(rv) => rv,
+                    None => RValue::Use(IrOp::Const(Const::Undef)),
+                };
+                out.push(assign(dst, value));
+                Ok(())
+            }
+            Rvalue::Len(place) => {
+                // The length of `&[T; N]` / `[T; N]` is the constant `N`.
+                let value = match self.array_len(place) {
+                    Some(n) => IrOp::int(64, n as u128),
+                    None => IrOp::Const(Const::Undef), // slice length not modelled
+                };
+                out.push(assign(dst, RValue::Use(value)));
+                Ok(())
+            }
+            Rvalue::Ref(place) => {
+                // `&(*_p)[i]` is the element address; `&(*_p)` is the pointer
+                // itself; other refs (a stack local's address) are opaque.
+                match place {
+                    Place::Index(_, _) => {
+                        if let Some((ptr, _)) = self.place_access(place, out) {
+                            out.push(assign(dst, RValue::Use(IrOp::Reg(ptr))));
+                        } else {
+                            out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
+                        }
+                    }
+                    Place::Deref(inner) => {
+                        if let Place::Local(p) = inner.as_ref() {
+                            out.push(assign(dst, RValue::Use(IrOp::Reg(RegId(*p)))));
+                        } else {
+                            out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
+                        }
+                    }
+                    _ => out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef)))),
+                }
+                Ok(())
+            }
+            // A cast keeps the value (width changes are abstracted); an unmodelled
+            // rvalue yields a fresh unknown.
+            Rvalue::Cast(op) => {
+                let v = self.operand_value(op, out);
+                out.push(assign(dst, RValue::Use(v)));
+                Ok(())
+            }
+            Rvalue::Other => {
+                out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
+                Ok(())
+            }
+        }
+    }
+
+    fn lower_term(&mut self, t: &MTerm) -> Result<Terminator> {
+        Ok(match t {
+            MTerm::Return => Terminator::Return(None),
+            MTerm::Goto(n) => Terminator::Br { target: BlockId(*n as u32), args: vec![] },
+            MTerm::Unreachable => Terminator::Unreachable,
+            MTerm::Assert { cond, expected, target } => {
+                self.panic_used = true;
+                let c = self.operand_value(cond, &mut Vec::new());
+                let cont = BlockId(*target as u32);
+                let panic = BlockId(self.panic_id);
+                let (then_blk, else_blk) = if *expected { (cont, panic) } else { (panic, cont) };
+                Terminator::CondBr {
+                    cond: c,
+                    then_blk,
+                    then_args: vec![],
+                    else_blk,
+                    else_args: vec![],
+                }
+            }
+            MTerm::SwitchInt(op, cases, otherwise) => {
+                let value = self.operand_value(op, &mut Vec::new());
+                // A two-way `[0: f, otherwise: t]` is a boolean branch.
+                if let [(0, false_bb)] = cases[..] {
+                    Terminator::CondBr {
+                        cond: value,
+                        then_blk: BlockId(*otherwise as u32),
+                        then_args: vec![],
+                        else_blk: BlockId(false_bb as u32),
+                        else_args: vec![],
+                    }
+                } else {
+                    let cases = cases
+                        .iter()
+                        .map(|(v, bb)| {
+                            (csolver_core::BitVector::new(64, *v as u128), BlockId(*bb as u32))
+                        })
+                        .collect();
+                    Terminator::Switch { value, cases, default: BlockId(*otherwise as u32) }
+                }
+            }
+            MTerm::Unsupported => {
+                return Err(Error::unsupported("MIR terminator outside the modelled subset"))
+            }
+        })
+    }
+
+    /// Materialise an operand as an MSIR scalar operand (loading a memory place
+    /// into a fresh register if needed).
+    fn operand_value(&mut self, op: &Operand, out: &mut Vec<Inst>) -> IrOp {
+        match op {
+            Operand::Const(MConst::Int(n)) => IrOp::int(64, *n as u128),
+            Operand::Const(MConst::Bool(b)) => IrOp::int(1, *b as u128),
+            Operand::Copy(p) | Operand::Move(p) => match p {
+                Place::Local(n) => IrOp::Reg(RegId(*n)),
+                _ if is_memory_place(p) => {
+                    if let Some((ptr, elem)) = self.place_access(p, out) {
+                        let dst = self.fresh();
+                        out.push(Inst::Load {
+                            dst,
+                            ty: elem.clone(),
+                            ptr: IrOp::Reg(ptr),
+                            align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32,
+                        });
+                        IrOp::Reg(dst)
+                    } else {
+                        IrOp::Const(Const::Undef)
+                    }
+                }
+                _ => IrOp::Const(Const::Undef),
+            },
+        }
+    }
+
+    /// Emit the pointer to a memory `place` and return `(pointer reg, elem type)`.
+    fn place_access(&mut self, place: &Place, out: &mut Vec<Inst>) -> Option<(RegId, Type)> {
+        match place {
+            // `(*_p)[i]`: base pointer `_p`, indexed by `i` with the array elem.
+            Place::Index(base, idx) => {
+                let Place::Deref(inner) = base.as_ref() else { return None };
+                let Place::Local(p) = inner.as_ref() else { return None };
+                let elem = self.index_elem(*p)?;
+                let dst = self.fresh();
+                out.push(Inst::PtrOffset {
+                    dst,
+                    base: IrOp::Reg(RegId(*p)),
+                    index: IrOp::Reg(RegId(*idx)),
+                    elem: elem.clone(),
+                });
+                Some((dst, elem))
+            }
+            // `*_p`: the pointer is `_p`; the access is at offset 0.
+            Place::Deref(inner) => {
+                let Place::Local(p) = inner.as_ref() else { return None };
+                let elem = self.deref_elem(*p)?;
+                Some((RegId(*p), elem))
+            }
+            _ => None,
+        }
+    }
+
+    /// The element type for indexing through local `p` (an `&[T; N]`/`&[T]`).
+    fn index_elem(&self, p: u32) -> Option<Type> {
+        match self.local_types.get(&p)? {
+            MType::Ref(inner, _) | MType::Ptr(inner, _) => match inner.as_ref() {
+                MType::Array(e, _) | MType::Slice(e) => Some(mtype_to_ir(e)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The pointee type for dereferencing local `p` (an `&T`/`*T`).
+    fn deref_elem(&self, p: u32) -> Option<Type> {
+        match self.local_types.get(&p)? {
+            MType::Ref(inner, _) | MType::Ptr(inner, _) => Some(mtype_to_ir(inner)),
+            _ => None,
+        }
+    }
+
+    /// The constant length `N` of the array `place` refers to (`&[T; N]`).
+    fn array_len(&self, place: &Place) -> Option<u64> {
+        let local = match place {
+            Place::Deref(inner) => match inner.as_ref() {
+                Place::Local(p) => *p,
+                _ => return None,
+            },
+            Place::Local(p) => *p,
+            _ => return None,
+        };
+        match self.local_types.get(&local)? {
+            MType::Ref(inner, _) | MType::Ptr(inner, _) => match inner.as_ref() {
+                MType::Array(_, n) => Some(*n),
+                _ => None,
+            },
+            MType::Array(_, n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+fn assign(dst: RegId, value: RValue) -> Inst {
+    Inst::Assign { dst, ty: Type::int(64), value }
+}
+
+/// Map a MIR binary op to an MSIR rvalue (`None` ⇒ unmodelled, opaque result).
+/// Comparisons are unsigned — the index/length bounds checks that motivate the
+/// MIR frontend are over `usize`.
+fn bin_rvalue(kind: BinKind, lhs: IrOp, rhs: IrOp) -> Option<RValue> {
+    let cmp = |op| Some(RValue::Cmp { op, lhs: lhs.clone(), rhs: rhs.clone() });
+    let bin = |op| Some(RValue::Bin { op, lhs: lhs.clone(), rhs: rhs.clone() });
+    match kind {
+        BinKind::Lt => cmp(CmpOp::Ult),
+        BinKind::Le => cmp(CmpOp::Ule),
+        BinKind::Gt => cmp(CmpOp::Ugt),
+        BinKind::Ge => cmp(CmpOp::Uge),
+        BinKind::Eq => cmp(CmpOp::Eq),
+        BinKind::Ne => cmp(CmpOp::Ne),
+        BinKind::Add => bin(BinOp::Add),
+        BinKind::Sub => bin(BinOp::Sub),
+        BinKind::Mul => bin(BinOp::Mul),
+        BinKind::BitAnd => bin(BinOp::And),
+        BinKind::BitOr => bin(BinOp::Or),
+        BinKind::BitXor => bin(BinOp::Xor),
+        BinKind::Other => None,
+    }
+}
+
+/// Whether a place denotes a memory access (a deref/index projection) rather
+/// than a plain register.
+fn is_memory_place(p: &Place) -> bool {
+    matches!(p, Place::Deref(_) | Place::Index(_, _))
+}
+
+/// The locals a block mentions (params plus any `_N` in index/assign positions),
+/// used only to size the temporary-register counter.
+fn block_locals(b: &MBlock) -> Vec<u32> {
+    let mut out = Vec::new();
+    let visit_place = |p: &Place, out: &mut Vec<u32>| {
+        let mut cur = p;
+        loop {
+            match cur {
+                Place::Local(n) => {
+                    out.push(*n);
+                    break;
+                }
+                Place::Deref(inner) | Place::Field(inner, _) => cur = inner,
+                Place::Index(inner, idx) => {
+                    out.push(*idx);
+                    cur = inner;
+                }
+            }
+        }
+    };
+    for s in &b.stmts {
+        if let MStmt::Assign(p, _) = s {
+            visit_place(p, &mut out);
+        }
+    }
+    out
+}
+
+/// Convert a MIR type to an MSIR type.
+fn mtype_to_ir(mty: &MType) -> Type {
+    match mty {
+        MType::Int { width, .. } => Type::int(*width),
+        MType::Bool => Type::Bool,
+        MType::Unit | MType::Other => Type::Unit,
+        MType::Ref(inner, _) | MType::Ptr(inner, _) => Type::ptr(mtype_to_ir(inner)),
+        MType::Array(elem, n) => Type::Array { elem: Box::new(mtype_to_ir(elem)), len: *n },
+        // A bare slice is never a value type here; only its element is used.
+        MType::Slice(elem) => mtype_to_ir(elem),
+    }
+}
+
+/// The byte size of a reference's pointee, when statically known.
+fn pointee_size(pointee: &MType) -> Option<u64> {
+    mtype_to_ir(pointee).size_bytes(&LAYOUT).filter(|&s| s > 0)
+}
+
+fn pointee_align(pointee: &MType) -> u32 {
+    mtype_to_ir(pointee).align_bytes(&LAYOUT).unwrap_or(1) as u32
+}

@@ -1,27 +1,36 @@
-//! # csolver-mir — Rust MIR frontend (M0 stub)
+//! # csolver-mir — Rust MIR frontend
 //!
-//! Lowers Rust MIR into MSIR. MIR is the richest input: it still carries
-//! borrow-checker facts, panic edges, and precise types, all of which sharpen
-//! the obligations CSolver generates.
+//! Lowers a practical subset of **textual Rust MIR** (as emitted by `rustc
+//! --emit=mir` / `-Zunpretty=mir`) into MSIR, in pure Rust — no `rustc` linkage,
+//! mirroring how [`csolver_llvm`] consumes `.ll` text rather than linking LLVM.
 //!
-//! ## Status
+//! MIR is the richest input for memory safety: the bounds/overflow checks rustc
+//! inserts are **explicit terminators** (`assert(Lt(i, len)) -> success: bb`),
+//! so a checked index `s[i]` is *proved* in bounds precisely because the check
+//! is present — the panic edge sharpens the obligation. The lowering turns an
+//! `assert` into a `CondBr` whose success edge carries the guard and whose
+//! failure edge diverges to an `unreachable` panic block; a sized reference
+//! parameter (`&[T; N]`, `&T`, `&mut T`) becomes a contracted region; and an
+//! index/deref place becomes a `PtrOffset` + `Load`/`Store`.
 //!
-//! Interface only. [`MirFrontend::lower`] currently reports
-//! [`csolver_core::Error::Unsupported`]; the real lowering (planned milestone
-//! M5) will consume `rustc`'s MIR (via a `rustc_driver` callback or the
-//! `-Zunpretty=mir`/stable-MIR surface) and translate statements/terminators
-//! into [`csolver_ir::Inst`]s, attaching the canonical safety checks plus extra
-//! ones derived from borrow facts.
+//! Anything outside the modelled subset (a `call`, an unmodelled rvalue, a
+//! slice's symbolic length) is surfaced — the affected function is recorded as
+//! unanalyzed (reported `UNKNOWN`) rather than silently mis-modelled.
 
-use csolver_core::{Error, Result};
+mod lexer;
+mod lower;
+mod parser;
+
+use csolver_core::Result;
 use csolver_ir::{Frontend, Module};
 
-/// Placeholder input: a path to a crate or a MIR dump. The real type will be a
-/// structured handle to rustc's MIR.
+/// Input to the MIR frontend: a textual MIR dump and a module name.
 #[derive(Debug, Clone)]
 pub struct MirInput {
-    /// Path to the crate root or MIR dump.
-    pub path: String,
+    /// The MIR source text (`rustc --emit=mir` output).
+    pub source: String,
+    /// A name for the resulting module.
+    pub name: String,
 }
 
 /// The Rust MIR frontend.
@@ -35,9 +44,49 @@ impl Frontend for MirFrontend {
         "mir"
     }
 
-    fn lower(&self, _input: MirInput) -> Result<Module> {
-        Err(Error::unsupported(
-            "MIR lowering is not implemented yet (planned milestone M5)",
-        ))
+    fn lower(&self, input: MirInput) -> Result<Module> {
+        let bodies = parser::parse_module(&input.source)?;
+        Ok(lower::lower_module(&bodies, &input.name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real `rustc`-MIR shape of `fn get(s: &[i32; 8], i: usize) -> i32 { s[i] }`:
+    /// the bounds-check `assert` guards the indexed load.
+    const GET: &str = r#"
+fn get(_1: &[i32; 8], _2: usize) -> i32 {
+    debug s => _1;
+    debug i => _2;
+    let mut _0: i32;
+    let mut _3: bool;
+    bb0: {
+        _3 = Lt(_2, const 8_usize);
+        assert(move _3, "index out of bounds: the length is {} but the index is {}", const 8_usize, _2) -> [success: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = (*_1)[_2];
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn parses_and_lowers_a_checked_index() {
+        let module = MirFrontend
+            .lower(MirInput { source: GET.into(), name: "get".into() })
+            .expect("the MIR frontend lowers the body");
+        assert_eq!(module.functions.len(), 1);
+        assert!(module.unanalyzed.is_empty());
+        let f = &module.functions[0];
+        assert_eq!(f.name, "get");
+        // A region contract was recorded for the `&[i32; 8]` parameter.
+        assert!(module.param_contracts.contains_key(&(csolver_ir::FuncId(0), 0)));
+        // The indexed load lowered to a PtrOffset + Load in bb1.
+        let bb1 = f.block(csolver_ir::BlockId(1)).expect("bb1");
+        assert!(bb1.insts.iter().any(|i| matches!(i, csolver_ir::Inst::PtrOffset { .. })));
+        assert!(bb1.insts.iter().any(|i| matches!(i, csolver_ir::Inst::Load { .. })));
     }
 }
