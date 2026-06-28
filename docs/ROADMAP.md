@@ -58,9 +58,12 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    the fat-pointer length (exposed via `Len((*_1))`) becomes a synthetic `usize`
    length parameter with a `ParamElements` contract (region size `len·elem`), so
    a checked slice index *and* an index-based slice loop `for i in 0..s.len()`
-   verify **PASS** from MIR. Unmodelled constructs (`call`, aggregates) degrade
-   per-function to `UNKNOWN`. Remaining: calls/drops (interprocedural), aggregates,
-   and a real multi-block corpus.
+   verify **PASS** from MIR. **Calls** lower too: the assignment-form `_d =
+   f(args) -> [return: bb, …]` becomes an MSIR `Call` (resolved to `Direct` for an
+   in-module callee, else `Symbol`/`Indirect`) + a branch to the return block, so
+   an interprocedural module verifies via the callee's summary. Unmodelled
+   constructs (`drop`, aggregates) degrade per-function to `UNKNOWN`. Remaining:
+   aggregates/fields, call return-type tracking, and a real multi-block corpus.
 3. **Assembly** (`csolver-asm`) + **ELF/DWARF** (`csolver-elf`): **started.** A
    pure-Rust ELF64 reader (`csolver-elf`) parses sections/symbols and recovers a
    function's machine bytes; a minimal x86-64 decoder (`csolver-asm`

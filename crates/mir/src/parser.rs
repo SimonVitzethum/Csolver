@@ -88,6 +88,15 @@ pub(crate) enum Rvalue {
     Other,
 }
 
+/// Who an assignment-form call invokes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CalleeSpec {
+    /// A named function/path (the last path segment is the resolution key).
+    Named(String),
+    /// An indirect call through a function-pointer local.
+    Indirect(Local),
+}
+
 /// A MIR statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MStmt {
@@ -106,6 +115,9 @@ pub(crate) enum MTerm {
     /// `assert(<!?>cond, …) -> bb`: the bounds/overflow check. `expected` is the
     /// value `cond` must take to *continue* (true unless negated with `!`).
     Assert { cond: Operand, expected: bool, target: usize },
+    /// `_d = callee(args) -> [return: bb, …]`: a function call (`target` is
+    /// `None` for a diverging call with no return edge).
+    Call { dst: Place, callee: CalleeSpec, args: Vec<Operand>, target: Option<usize> },
     Unreachable,
     /// A terminator outside the modelled subset (`call`, `drop`, …): the whole
     /// function is rejected (recorded unanalyzed) rather than mis-modelled.
@@ -275,12 +287,12 @@ impl Parser {
             if let Some(t) = self.try_terminator()? {
                 break t;
             }
-            // An assignment-form terminator (a `call`: `_0 = f(args) -> [return:
-            // bb, …]`) reads like a statement but ends in `->` rather than `;`.
-            // It is not modelled — reject the function.
+            // An assignment-form terminator (`_0 = f(args) -> [return: bb, …]`)
+            // reads like a statement but ends in `->` rather than `;`: a call.
             if self.stmt_is_terminator() {
-                self.skip_to_block_close();
-                break MTerm::Unsupported;
+                let t = self.call_terminator()?;
+                let _ = self.eat_punct(';');
+                break t;
             }
             stmts.push(self.statement()?);
         };
@@ -308,20 +320,6 @@ impl Parser {
         false
     }
 
-    /// Consume tokens up to (not including) the block's closing `}`.
-    fn skip_to_block_close(&mut self) {
-        let mut depth = 0i32;
-        loop {
-            match self.peek() {
-                Tok::Punct('(') | Tok::Punct('[') => depth += 1,
-                Tok::Punct(')') | Tok::Punct(']') => depth -= 1,
-                Tok::Punct('}') if depth <= 0 => break,
-                Tok::Eof => break,
-                _ => {}
-            }
-            self.pos += 1;
-        }
-    }
 
     /// Parse a terminator if the cursor is at one, else `None` (a statement).
     fn try_terminator(&mut self) -> Result<Option<MTerm>> {
@@ -364,6 +362,78 @@ impl Parser {
         }
         let w = self.word()?;
         bb_index(&w).ok_or_else(|| Error::parse(format!("expected a block after `->`, found `{w}`")))
+    }
+
+    /// `_dst = callee(args) -> [return: bb, …]`.
+    fn call_terminator(&mut self) -> Result<MTerm> {
+        let dst = self.place()?;
+        self.expect_punct('=')?;
+        let callee = self.callee_spec()?;
+        self.expect_punct('(')?;
+        let mut args = Vec::new();
+        while !self.eat_punct(')') {
+            args.push(self.operand()?);
+            let _ = self.eat_punct(',');
+        }
+        let target = self.return_edge()?;
+        Ok(MTerm::Call { dst, callee, args, target })
+    }
+
+    /// The callee of a call: an indirect function-pointer local (`move _N`), or
+    /// a named path whose last identifier is the resolution key.
+    fn callee_spec(&mut self) -> Result<CalleeSpec> {
+        if self.eat_word("move") || self.eat_word("copy") {
+            return Ok(match self.place()? {
+                Place::Local(n) => CalleeSpec::Indirect(n),
+                _ => CalleeSpec::Named(String::new()),
+            });
+        }
+        let _ = self.eat_word("const");
+        // Consume the path up to the argument `(`, keeping the last identifier
+        // (the function name) and balancing `<…>` / `[…]` in qualified paths.
+        let mut last = String::new();
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                Tok::Punct('(') if depth == 0 => break,
+                Tok::Eof => break,
+                Tok::Punct('<') | Tok::Punct('[') => depth += 1,
+                Tok::Punct('>') | Tok::Punct(']') => depth -= 1,
+                Tok::Word(w) => last = w.clone(),
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        Ok(CalleeSpec::Named(last))
+    }
+
+    /// The `return`/`success` target of a call's edges (`None` ⇒ diverging).
+    fn return_edge(&mut self) -> Result<Option<usize>> {
+        if self.peek() == &Tok::Arrow {
+            self.pos += 1;
+        }
+        if self.eat_punct('[') {
+            let mut target = None;
+            while !self.eat_punct(']') {
+                let key = self.word()?;
+                if self.eat_punct(':') {
+                    let bb = self.arrow_block_bare()?;
+                    if key == "return" || key == "success" {
+                        target = Some(bb);
+                    }
+                } else if matches!(self.peek(), Tok::Word(_)) {
+                    self.pos += 1; // an unwind action without a block
+                    if self.eat_punct('(') {
+                        self.skip_balanced_paren();
+                    }
+                }
+                let _ = self.eat_punct(',');
+            }
+            Ok(target)
+        } else {
+            let w = self.word()?;
+            Ok(bb_index(&w))
+        }
     }
 
     fn switch_int(&mut self) -> Result<MTerm> {

@@ -232,7 +232,12 @@ is recorded `UNKNOWN` per-function while a sound sibling still verifies.
 `Len((*_1))`) becomes a synthetic `usize` length parameter with a `ParamElements`
 contract (region size `len·elem`), so a checked slice index `get(s: &[i32], i)`
 *and* an index-based slice loop `for i in 0..s.len() { s[i] }` verify **PASS**
-from MIR (under `slice-abi`). Remaining: calls/drops, aggregates.
+from MIR (under `slice-abi`). **Calls** lower too: the assignment-form `_d =
+f(args) -> [return: bb, …]` becomes an MSIR `Call` (resolved to `Direct` for an
+in-module callee, else `Symbol`/`Indirect`) + a branch to the return block, so an
+interprocedural `caller`→`helper` module verifies **PASS** via the helper's
+summary, while a dereference of an external call's unknown result is correctly
+not proved. Remaining: drops, aggregates/fields, call return-type tracking.
 
 ## First real front-end: LLVM-IR
 

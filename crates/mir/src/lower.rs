@@ -10,9 +10,10 @@
 
 use crate::parser::{BinKind, MBlock, MConst, MStmt, MTerm, MType, MirBody, Operand, Place, Rvalue};
 use csolver_core::{Error, Result};
+use crate::parser::CalleeSpec;
 use csolver_ir::{
-    BasicBlock, BinOp, BlockId, CmpOp, Const, DataLayout, FuncId, Function, Inst, Module, Operand as IrOp,
-    PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
+    BasicBlock, BinOp, BlockId, Callee, CmpOp, Const, DataLayout, FuncId, Function, Inst, Module,
+    Operand as IrOp, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
 };
 use std::collections::HashMap;
 
@@ -20,10 +21,12 @@ const LAYOUT: DataLayout = DataLayout::LP64;
 
 /// Lower every parsed MIR body into one MSIR module (per-function recovery).
 pub(crate) fn lower_module(bodies: &[MirBody], name: &str) -> Module {
+    let func_ids: HashMap<String, FuncId> =
+        bodies.iter().enumerate().map(|(i, b)| (b.name.clone(), FuncId(i as u32))).collect();
     let mut module = Module::new(name);
     for (i, body) in bodies.iter().enumerate() {
         let fid = FuncId(i as u32);
-        match lower_function(body, fid) {
+        match lower_function(body, fid, &func_ids) {
             Ok((func, contracts)) => {
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
@@ -44,10 +47,16 @@ struct Ctx {
     /// For a slice parameter `_k: &[T]`, the synthetic length parameter's
     /// register (so `Len((*_k))` resolves to it).
     slice_len: HashMap<u32, RegId>,
+    /// Module function names → ids, for resolving direct calls.
+    func_ids: HashMap<String, FuncId>,
 }
 
 /// Lower one MIR body into an MSIR function plus its parameter contracts.
-fn lower_function(body: &MirBody, id: FuncId) -> Result<(Function, Vec<(u32, PtrContract)>)> {
+fn lower_function(
+    body: &MirBody,
+    id: FuncId,
+    func_ids: &HashMap<String, FuncId>,
+) -> Result<(Function, Vec<(u32, PtrContract)>)> {
     let local_types: HashMap<u32, MType> =
         body.params.iter().map(|(l, t)| (*l, t.clone())).collect();
 
@@ -62,8 +71,14 @@ fn lower_function(body: &MirBody, id: FuncId) -> Result<(Function, Vec<(u32, Ptr
         .unwrap_or(0);
     let panic_id = body.blocks.iter().map(|b| b.id as u32).max().unwrap_or(0) + 1;
 
-    let mut ctx =
-        Ctx { local_types, next_temp: max_local + 1, panic_id, panic_used: false, slice_len: HashMap::new() };
+    let mut ctx = Ctx {
+        local_types,
+        next_temp: max_local + 1,
+        panic_id,
+        panic_used: false,
+        slice_len: HashMap::new(),
+        func_ids: func_ids.clone(),
+    };
 
     // Parameters and their contracts (by position). A reference parameter
     // becomes a pointer; a *sized* reference (`&[T; N]`, `&T`) gets a `Bytes`
@@ -145,7 +160,7 @@ impl Ctx {
         for s in &b.stmts {
             self.lower_stmt(s, &mut insts)?;
         }
-        let term = self.lower_term(&b.term)?;
+        let term = self.lower_term(&b.term, &mut insts)?;
         let mut block = BasicBlock::new(BlockId(b.id as u32), term);
         block.insts = insts;
         Ok(block)
@@ -266,14 +281,14 @@ impl Ctx {
         }
     }
 
-    fn lower_term(&mut self, t: &MTerm) -> Result<Terminator> {
+    fn lower_term(&mut self, t: &MTerm, out: &mut Vec<Inst>) -> Result<Terminator> {
         Ok(match t {
             MTerm::Return => Terminator::Return(None),
             MTerm::Goto(n) => Terminator::Br { target: BlockId(*n as u32), args: vec![] },
             MTerm::Unreachable => Terminator::Unreachable,
             MTerm::Assert { cond, expected, target } => {
                 self.panic_used = true;
-                let c = self.operand_value(cond, &mut Vec::new());
+                let c = self.operand_value(cond, out);
                 let cont = BlockId(*target as u32);
                 let panic = BlockId(self.panic_id);
                 let (then_blk, else_blk) = if *expected { (cont, panic) } else { (panic, cont) };
@@ -285,8 +300,37 @@ impl Ctx {
                     else_args: vec![],
                 }
             }
+            MTerm::Call { dst, callee, args, target } => {
+                // A call is an MSIR *instruction* followed by an edge to the
+                // return block (or divergence if the call cannot return). The
+                // verifier applies a known function's summary or havocs an
+                // unknown/external one — both sound.
+                let ir_dst = match dst {
+                    Place::Local(d) => Some(RegId(*d)),
+                    _ => None,
+                };
+                let ir_callee = match callee {
+                    CalleeSpec::Named(n) if !n.is_empty() => match self.func_ids.get(n) {
+                        Some(fid) => Callee::Direct(*fid),
+                        None => Callee::Symbol(n.clone()),
+                    },
+                    CalleeSpec::Named(_) => Callee::Symbol(String::new()),
+                    CalleeSpec::Indirect(local) => Callee::Indirect(IrOp::Reg(RegId(*local))),
+                };
+                let ir_args = args.iter().map(|a| self.operand_value(a, out)).collect();
+                out.push(Inst::Call {
+                    dst: ir_dst,
+                    callee: ir_callee,
+                    args: ir_args,
+                    ret_ty: Type::int(64),
+                });
+                match target {
+                    Some(t) => Terminator::Br { target: BlockId(*t as u32), args: vec![] },
+                    None => Terminator::Unreachable,
+                }
+            }
             MTerm::SwitchInt(op, cases, otherwise) => {
-                let value = self.operand_value(op, &mut Vec::new());
+                let value = self.operand_value(op, out);
                 // A two-way `[0: f, otherwise: t]` is a boolean branch.
                 if let [(0, false_bb)] = cases[..] {
                     Terminator::CondBr {

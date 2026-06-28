@@ -35,7 +35,10 @@ index `s[i]` is preceded by `assert(Lt(i, len), "index out of bounds…") ->
   `Len(&[T; N])` → the constant `N`, `&place` (element address / inner pointer),
   `as` casts (value-preserving).
 - **Terminators**: `goto`, `return`, `switchInt` (→ `CondBr`/`Switch`),
-  `assert` (→ guarded `CondBr` + panic pad), `unreachable`.
+  `assert` (→ guarded `CondBr` + panic pad), the assignment-form **call**
+  `_d = f(args) -> [return: bb, …]` (→ an MSIR `Call` + a `Br` to the return
+  block; the callee resolves to `Direct` for an in-module function, else
+  `Symbol`/`Indirect`), and `unreachable`.
 
 ## Soundness (refinement obligation)
 Every concrete MIR execution must be a concrete MSIR execution. The mapping is
@@ -43,15 +46,20 @@ local and conservative; in particular:
 - the `assert` **only adds** a guard on the success path (the panic path
   diverges), so it never weakens an obligation — it strengthens the success path
   exactly as rustc's runtime check does;
-- an unmodelled terminator (`call`, `drop`, `yield`), rvalue, or unsized-slice
-  length is **surfaced**: the affected function is recorded in `Module.unanalyzed`
-  and reported `UNKNOWN` (per-function recovery), never mis-lowered into a
-  sound-looking shape;
+- a **call** lowers to an MSIR `Call`, on whose return edge the verifier applies
+  the callee's summary (`Direct`) or havocs an unknown/external one (`Symbol`/
+  `Indirect`) — both sound; the call's **unwind** edge (cleanup) is not analysed,
+  which is incomplete but never unsound for the return path;
+- an unmodelled terminator (`drop`, `yield`), rvalue, or place is **surfaced**:
+  the affected function is recorded in `Module.unanalyzed` and reported `UNKNOWN`
+  (per-function recovery), never mis-lowered into a sound-looking shape;
 - comparisons are lowered unsigned, matching the `usize` index/length domain;
 - a reference parameter is `writable` only when `&mut`/`*mut`.
 
 ## Limits (this increment)
-- **Calls/drops** reject the function (no interprocedural lowering yet).
+- **Drops** reject the function; a call's **unwind/cleanup** path is not analysed
+  (the return path is); call **return types** default to a 64-bit scalar (local
+  decls are not yet parsed for the dst type).
 - **Aggregates/fields**, checked-arithmetic tuples, and constant-index
   projections are opaque.
 - Integer constants are lowered at 64-bit width.
@@ -62,6 +70,9 @@ Unit test: the `get(&[i32; 8], usize)` body parses and lowers to a `PtrOffset` +
 mir_frontend.rs`): the checked array index verifies **PASS** (`param-contracts`);
 a checked **slice** index `get(&[i32], usize)` and an index-based slice **loop**
 `for i in 0..s.len() { s[i] }` verify **PASS** (`slice-abi`); the unchecked index
-is **not** proved; and a call-using function is recovered as `UNKNOWN` while a
-sound sibling still verifies. Next: a real multi-block `rustc --emit=mir` corpus,
-calls (interprocedural summaries), and aggregates.
+is **not** proved; an **interprocedural** module (`caller` calling a checked
+`helper`) lowers the call to a `Direct` MSIR `Call` and verifies **PASS** via the
+helper's summary, while a dereference of an **external** call's unknown result is
+not proved; and a `drop`-using function is recovered as `UNKNOWN` while a sound
+sibling still verifies. Next: a real multi-block `rustc --emit=mir` corpus,
+aggregates/fields, and call return-type tracking.

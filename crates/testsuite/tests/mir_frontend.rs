@@ -143,9 +143,9 @@ fn mir_slice_index_loop_verifies_pass() {
     assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
 }
 
-/// A function using a construct outside the modelled subset (a `call`) is
-/// recorded as unanalyzed rather than mis-lowered — and a sound function in the
-/// same dump still verifies.
+/// A function using a construct outside the modelled subset (a `drop`
+/// terminator) is recorded as unanalyzed rather than mis-lowered — and a sound
+/// function in the same dump still verifies.
 const MIXED: &str = r#"
 fn good(_1: &[i32; 8], _2: usize) -> i32 {
     let mut _0: i32;
@@ -160,10 +160,10 @@ fn good(_1: &[i32; 8], _2: usize) -> i32 {
     }
 }
 
-fn uses_call(_1: i32) -> i32 {
-    let mut _0: i32;
+fn uses_drop(_1: i32) -> () {
+    let mut _0: ();
     bb0: {
-        _0 = foo(move _1) -> [return: bb1, unwind continue];
+        drop(_1) -> [return: bb1, unwind continue];
     }
     bb1: {
         return;
@@ -174,13 +174,95 @@ fn uses_call(_1: i32) -> i32 {
 #[test]
 fn mir_per_function_recovery() {
     let module = lower(MIXED, "mixed");
-    // The good function lowered; the call-using one is recorded unanalyzed.
+    // The good function lowered; the drop-using one is recorded unanalyzed.
     assert_eq!(module.functions.len(), 1);
     assert_eq!(module.functions[0].name, "good");
-    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_call"));
+    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_drop"));
 
     let report = verify_module(&module, &Config::default());
     assert_eq!(report.verdict, Verdict::Unknown);
     let good = report.functions.iter().find(|f| f.function == "good").unwrap();
     assert_eq!(good.verdict, Verdict::Pass);
+}
+
+/// An interprocedural module: `caller` calls a verified `helper` (a checked
+/// array index). The call's assignment-form terminator lowers to an MSIR `Call`
+/// resolved to the in-module `helper` (`Callee::Direct`), and the whole module
+/// verifies via the helper's summary.
+const INTERPROC: &str = r#"
+fn helper(_1: &[i32; 8], _2: usize) -> i32 {
+    let mut _0: i32;
+    let mut _3: bool;
+    bb0: {
+        _3 = Lt(_2, const 8_usize);
+        assert(move _3, "oob", const 8_usize, _2) -> [success: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = (*_1)[_2];
+        return;
+    }
+}
+
+fn caller(_1: &[i32; 8]) -> i32 {
+    let mut _0: i32;
+    let mut _2: i32;
+    bb0: {
+        _2 = helper(move _1, const 0_usize) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = move _2;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_interprocedural_call_lowers_and_verifies() {
+    let module = lower(INTERPROC, "interproc");
+    assert!(module.unanalyzed.is_empty(), "both functions lower: {:?}", module.unanalyzed);
+    assert_eq!(module.functions.len(), 2);
+
+    // The call resolved to the in-module helper (a direct call).
+    let caller = module.functions.iter().find(|f| f.name == "caller").unwrap();
+    let helper_id = module.functions.iter().position(|f| f.name == "helper").unwrap();
+    let has_direct_call = caller.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(i, csolver_ir::Inst::Call { callee: csolver_ir::Callee::Direct(id), .. }
+                 if *id == csolver_ir::FuncId(helper_id as u32))
+    });
+    assert!(has_direct_call, "the call resolves to the in-module helper");
+
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
+/// Soundness: a call to an *external* function (an unresolved symbol) lowers but
+/// its result is an unknown — so dereferencing the returned pointer is not
+/// proved safe. The function still lowers (it is not dropped).
+const EXTERN_CALL: &str = r#"
+fn uses_extern(_1: usize) -> i32 {
+    let mut _0: i32;
+    let mut _2: *mut i32;
+    let mut _3: i32;
+    bb0: {
+        _2 = make_ptr(move _1) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        _3 = (*_2);
+        _0 = move _3;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_external_call_result_is_unknown() {
+    let module = lower(EXTERN_CALL, "ext");
+    assert!(module.unanalyzed.is_empty(), "the function lowers despite the extern call");
+    let report = verify_module(&module, &Config::default());
+    // Dereferencing the unknown returned pointer must not be proved in bounds.
+    let deref_proved = report.functions[0].outcomes.iter().any(|o| {
+        o.obligation.property == SafetyProperty::InBounds
+            && matches!(o.result, csolver_core::ObligationResult::Proven(_))
+    });
+    assert!(!deref_proved, "deref of an external call's result must not be proved");
 }
