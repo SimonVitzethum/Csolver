@@ -111,6 +111,46 @@ fn out_of_frame_stack_store_in_a_binary_fails() {
 }
 
 #[test]
+fn guarded_stack_store_in_a_branchy_binary_is_proven_safe() {
+    //   sub rsp, 16
+    //   cmp edi, 0
+    //   jne .skip          ; conditionally skip the store
+    //   mov [rsp+8], eax   ; store, always within the 16-byte frame
+    // .skip:
+    //   add rsp, 16 ; ret
+    // The decoder reconstructs the CFG (a conditional branch + a join), and the
+    // state-merging engine verifies the guarded store PASS.
+    let code = [
+        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+        0x83, 0xff, 0x00, // cmp edi, 0
+        0x75, 0x04, // jne +4 (.skip)
+        0x89, 0x44, 0x24, 0x08, // mov [rsp+8], eax
+        0x48, 0x83, 0xc4, 0x10, // add rsp, 16
+        0xc3, // ret
+    ];
+    assert_eq!(verify_binary(&code), Verdict::Pass);
+}
+
+#[test]
+fn a_binary_loop_is_handled() {
+    //   xor eax, eax
+    // .loop:
+    //   add eax, 1 ; cmp eax, 4 ; jne .loop
+    //   ret
+    // A backward branch (loop). The decoder reconstructs the back-edge and the
+    // symbolic engine handles it (cut + interval invariant); no memory is
+    // touched, so it verifies PASS.
+    let code = [
+        0x31, 0xc0, // xor eax, eax
+        0x83, 0xc0, 0x01, // add eax, 1   (.loop)
+        0x83, 0xf8, 0x04, // cmp eax, 4
+        0x75, 0xf8, // jne -8 (.loop)
+        0xc3, // ret
+    ];
+    assert_eq!(verify_binary(&code), Verdict::Pass);
+}
+
+#[test]
 fn an_undecodable_function_is_unknown() {
     // A syscall (`0f 05`) is outside the decoded subset, so the function is
     // `unanalyzed` and reported UNKNOWN — never silently treated as safe.

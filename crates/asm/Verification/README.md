@@ -4,15 +4,29 @@
 x86-64 (and later AArch64) → MSIR frontend. Registers, flags and the stack
 pointer are explicit; DWARF (from `csolver-elf`) supplies frame layout.
 
-The **machine-code decoder** (`x86::decode_function`) lowers a straight-line
-x86-64 function — recovered from an ELF `.text` by `csolver-elf` — into MSIR, so
-the audited analysis core verifies a compiled binary with no source. x86 registers
-become MSIR `RegId`s (the encoding number); a memory operand `[base + disp]`
-(including a SIB byte and an 8/32-bit displacement) lowers to a `PtrOffset` then a
-`Load`/`Store`. Currently decoded: the REX prefix, `ret`/`nop`, `mov r,imm`, the
-reg/reg ALU ops (`xor`/`add`/`sub`/`and`/`or`, with `xor r,r` recognised as
-zeroing), the group-1 `add`/`sub r, imm8`, and `mov` reg↔reg / `[base+disp]`
-load/store.
+The **machine-code decoder** (`x86::decode_function`) lowers an x86-64 function —
+recovered from an ELF `.text` by `csolver-elf` — into MSIR, **reconstructing its
+control-flow graph**, so the audited analysis core verifies a compiled binary with
+no source. x86 registers become MSIR `RegId`s (the encoding number); a memory
+operand `[base + disp]` (including a SIB byte and an 8/32-bit displacement) lowers
+to a `PtrOffset` then a `Load`/`Store`. Currently decoded: the REX prefix,
+`ret`/`nop`, `mov r,imm`, the reg/reg ALU ops (`xor`/`add`/`sub`/`and`/`or`, with
+`xor r,r` recognised as zeroing), the group-1 `add`/`sub r, imm8`, `mov` reg↔reg /
+`[base+disp]` load/store, `cmp`/`test`, and the branches `jmp`/`jcc`.
+
+### Control flow
+The body is decoded linearly, then split into basic blocks at the leaders — the
+entry, every branch target, and the instruction after every branch/return.
+`jmp`→`Br`, `ret`→`Return`, and `jcc`→`CondBr`. A `jcc`'s condition is taken from
+the preceding `cmp`/`test` (the condition code maps `cmp a,b` to `a <op> b`: `je`→
+`a==b`, `jl`→`a<ₛb`, `jb`→`a<ᵤb`, …); with no preceding compare or an unmodelled
+code the condition is an unconstrained boolean, so the engine soundly explores
+both arms. Backward branches become back-edges, which the symbolic engine already
+handles (cut + interval invariant), so **binary loops** work. A branch target that
+is not an instruction boundary (into the middle of an instruction, or data) makes
+the function `unanalyzed` — never a guessed CFG. So a guarded stack store
+(`cmp edi,0 ; jne .skip ; mov [rsp+8],eax`) verifies **PASS**, and a counting loop
+is handled end-to-end.
 
 ### Stack frame model
 `sub rsp, N` is recognised as **allocating the function's frame**: it lowers to an

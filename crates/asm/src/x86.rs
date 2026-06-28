@@ -16,61 +16,162 @@
 
 use csolver_core::RegionKind;
 use csolver_ir::{
-    BasicBlock, BinOp, BlockId, FuncId, Function, Inst, Module, Operand, RValue, RegId, Terminator,
-    Type,
+    BasicBlock, BinOp, BlockId, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId,
+    Terminator, Type,
 };
+use std::collections::BTreeMap;
 
-/// Decode a single straight-line x86-64 function from its machine bytes into a
-/// one-function [`Module`]. On any unsupported construct the function is recorded
-/// as `unanalyzed` (⇒ `UNKNOWN`), never silently mis-modelled.
+/// Decode an x86-64 function from its machine bytes into a one-function
+/// [`Module`], reconstructing its control-flow graph (branches/loops). On any
+/// unsupported construct the function is recorded as `unanalyzed` (⇒ `UNKNOWN`),
+/// never silently mis-modelled.
 pub fn decode_function(name: &str, code: &[u8]) -> Module {
     let mut m = Module::new("bin");
-    match decode_block(code) {
-        Ok(insts) => {
-            let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
-            bb.insts = insts;
-            m.functions.push(Function {
-                id: FuncId(0),
-                name: name.into(),
-                params: Vec::new(),
-                ret_ty: Type::Unit,
-                blocks: vec![bb],
-                entry: BlockId(0),
-            });
-        }
+    match decode_cfg(code).and_then(build_blocks) {
+        Ok((blocks, entry)) => m.functions.push(Function {
+            id: FuncId(0),
+            name: name.into(),
+            params: Vec::new(),
+            ret_ty: Type::Unit,
+            blocks,
+            entry,
+        }),
         Err(reason) => m.unanalyzed.push((name.into(), reason)),
     }
     m
 }
 
-/// Decode a straight-line instruction sequence up to the first `ret`.
-fn decode_block(code: &[u8]) -> Result<Vec<Inst>, String> {
-    let mut insts = Vec::new();
-    let mut pos = 0;
-    while pos < code.len() {
-        let decoded = decode_one(code, pos)?;
-        insts.extend(decoded.insts);
-        pos = decoded.next;
-        if decoded.is_ret {
-            break;
-        }
-    }
-    Ok(insts)
+/// The control-flow effect of an instruction.
+#[derive(Debug, Clone, Copy)]
+enum Ctrl {
+    /// Falls through to the next instruction.
+    Fall,
+    /// `ret`.
+    Ret,
+    /// `jmp` to a byte offset.
+    Jmp(usize),
+    /// `jcc cond` to a byte offset (else falls through); `cond` is the MSIR
+    /// register holding the branch condition.
+    Jcc(usize, RegId),
 }
 
-/// The result of decoding one instruction.
+/// One decoded instruction: its MSIR, its byte span, and its control-flow effect.
+struct DecodedInsn {
+    offset: usize,
+    next: usize,
+    insts: Vec<Inst>,
+    ctrl: Ctrl,
+}
+
+/// The result of decoding one instruction (before block assembly).
 struct Decoded {
     insts: Vec<Inst>,
     next: usize,
-    is_ret: bool,
+    ctrl: Ctrl,
+}
+
+/// Linearly decode every instruction of the function body, threading the
+/// `flags` state (the last `cmp`/`test` operands) so a following `jcc` knows its
+/// condition.
+fn decode_cfg(code: &[u8]) -> Result<Vec<DecodedInsn>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut flags: Option<(Operand, Operand)> = None;
+    while pos < code.len() {
+        let d = decode_one(code, pos, &mut flags)?;
+        out.push(DecodedInsn { offset: pos, next: d.next, insts: d.insts, ctrl: d.ctrl });
+        pos = d.next;
+    }
+    Ok(out)
+}
+
+/// Assemble decoded instructions into MSIR basic blocks. Block leaders are the
+/// entry, every branch target, and the instruction after every branch/return.
+/// A jump target that is not an instruction boundary makes the function
+/// `unanalyzed` (sound: we do not guess at mid-instruction or data targets).
+fn build_blocks(decoded: Vec<DecodedInsn>) -> Result<(Vec<BasicBlock>, BlockId), String> {
+    if decoded.is_empty() {
+        // An empty body is a vacuously-safe single `ret` block.
+        return Ok((vec![BasicBlock::new(BlockId(0), Terminator::Return(None))], BlockId(0)));
+    }
+    let offsets: std::collections::HashSet<usize> = decoded.iter().map(|d| d.offset).collect();
+
+    // Leaders.
+    let mut leaders: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    leaders.insert(decoded[0].offset);
+    for d in &decoded {
+        match d.ctrl {
+            Ctrl::Jmp(t) | Ctrl::Jcc(t, _) => {
+                if !offsets.contains(&t) {
+                    return Err("x86: branch target is not an instruction boundary".into());
+                }
+                leaders.insert(t);
+                leaders.insert(d.next); // the fall-through after a branch
+            }
+            Ctrl::Ret => {
+                leaders.insert(d.next);
+            }
+            Ctrl::Fall => {}
+        }
+    }
+    // Keep only leaders that begin an actual instruction.
+    let leaders: Vec<usize> = leaders.into_iter().filter(|o| offsets.contains(o)).collect();
+    let block_of: BTreeMap<usize, BlockId> =
+        leaders.iter().enumerate().map(|(i, &o)| (o, BlockId(i as u32))).collect();
+
+    // Each instruction belongs to the block of the greatest leader ≤ its offset.
+    let mut blocks: Vec<BasicBlock> = leaders
+        .iter()
+        .map(|&o| BasicBlock::new(block_of[&o], Terminator::Return(None)))
+        .collect();
+    let mut cur = 0usize; // index into `leaders`
+    for d in &decoded {
+        // Advance to this instruction's block.
+        while cur + 1 < leaders.len() && leaders[cur + 1] <= d.offset {
+            cur += 1;
+        }
+        let block = &mut blocks[cur];
+        block.insts.extend(d.insts.iter().cloned());
+        // This is the block's last instruction when the next instruction starts a
+        // new block (its offset is a leader) or there is no next instruction.
+        let is_block_end = !offsets.contains(&d.next) || block_of.contains_key(&d.next);
+        if is_block_end {
+            block.term = terminator_for(d, &block_of)?;
+        }
+    }
+    Ok((blocks, BlockId(0)))
+}
+
+/// The MSIR terminator for a block ending at `d`.
+fn terminator_for(d: &DecodedInsn, block_of: &BTreeMap<usize, BlockId>) -> Result<Terminator, String> {
+    let target = |off: usize| block_of.get(&off).copied().ok_or("x86: dangling branch target".to_string());
+    Ok(match d.ctrl {
+        Ctrl::Ret => Terminator::Return(None),
+        Ctrl::Jmp(t) => Terminator::Br { target: target(t)?, args: Vec::new() },
+        Ctrl::Jcc(t, cond) => Terminator::CondBr {
+            cond: Operand::Reg(cond),
+            then_blk: target(t)?,
+            then_args: Vec::new(),
+            else_blk: target(d.next)?,
+            else_args: Vec::new(),
+        },
+        // A block that ends only because its successor is a branch target falls
+        // through to it.
+        Ctrl::Fall => Terminator::Br { target: target(d.next)?, args: Vec::new() },
+    })
 }
 
 fn reg(num: u8) -> RegId {
     RegId(num as u32)
 }
 
-/// Decode one instruction starting at `pos`.
-fn decode_one(code: &[u8], pos: usize) -> Result<Decoded, String> {
+/// Decode one instruction starting at `pos`. `flags` carries the last
+/// `cmp`/`test` operands so a following `jcc` can form its condition.
+fn decode_one(
+    code: &[u8],
+    pos: usize,
+    flags: &mut Option<(Operand, Operand)>,
+) -> Result<Decoded, String> {
     let mut p = pos;
     // Optional REX prefix (0x40..0x4F): W=wide(64), R=reg ext, X=index ext,
     // B=rm/base ext.
@@ -86,11 +187,11 @@ fn decode_one(code: &[u8], pos: usize) -> Result<Decoded, String> {
     let width = if rex_w { 64 } else { 32 };
     let ty = Type::int(width);
 
-    let done = |insts: Vec<Inst>, next: usize| Ok(Decoded { insts, next, is_ret: false });
+    let done = |insts: Vec<Inst>, next: usize| Ok(Decoded { insts, next, ctrl: Ctrl::Fall });
 
     match op {
-        0x90 => done(vec![], p),                                  // nop
-        0xc3 => Ok(Decoded { insts: vec![], next: p, is_ret: true }), // ret
+        0x90 => done(vec![], p),                                          // nop
+        0xc3 => Ok(Decoded { insts: vec![], next: p, ctrl: Ctrl::Ret }),  // ret
         0xb8..=0xbf => {
             // mov r, imm
             let r = reg(op - 0xb8 + if rex_b { 8 } else { 0 });
@@ -210,8 +311,78 @@ fn decode_one(code: &[u8], pos: usize) -> Result<Decoded, String> {
                 0 if m.rm == 4 => done(vec![], p),
                 0 => done(vec![add_imm(target, ty, BinOp::Add, imm, width)], p),
                 5 => done(vec![add_imm(target, ty, BinOp::Sub, imm, width)], p),
-                7 => done(vec![], p), // cmp: sets flags only (no branch modelled yet)
+                7 => {
+                    // cmp r, imm — record the operands for a following `jcc`.
+                    *flags = Some((Operand::Reg(target), Operand::int(width, imm)));
+                    done(vec![], p)
+                }
                 _ => Err("x86: unsupported group-1 operation".into()),
+            }
+        }
+        // cmp r/m, r — record operands for a following `jcc` (reg/reg form).
+        0x39 => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode != 0b11 {
+                return Err("x86: cmp with a memory operand is unsupported".into());
+            }
+            *flags = Some((Operand::Reg(reg(m.rm)), Operand::Reg(reg(m.reg))));
+            done(vec![], p)
+        }
+        // cmp r, r/m (reg/reg form).
+        0x3b => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode != 0b11 {
+                return Err("x86: cmp with a memory operand is unsupported".into());
+            }
+            *flags = Some((Operand::Reg(reg(m.reg)), Operand::Reg(reg(m.rm))));
+            done(vec![], p)
+        }
+        // cmp eax, imm32.
+        0x3d => {
+            let imm = read_imm(code, p, 4)?;
+            *flags = Some((Operand::Reg(reg(0)), Operand::int(width, imm)));
+            done(vec![], p + 4)
+        }
+        // test r/m, r — `test r, r` tests whether `r` is zero.
+        0x85 => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            *flags = if m.mode == 0b11 && m.rm == m.reg {
+                Some((Operand::Reg(reg(m.rm)), Operand::int(width, 0)))
+            } else {
+                None
+            };
+            done(vec![], p)
+        }
+        // jmp rel8 / rel32.
+        0xeb => {
+            let rel = read_imm(code, p, 1)? as u8 as i8 as i64;
+            let np = p + 1;
+            Ok(Decoded { insts: vec![], next: np, ctrl: Ctrl::Jmp(branch_target(np, rel)?) })
+        }
+        0xe9 => {
+            let rel = read_imm(code, p, 4)? as u32 as i32 as i64;
+            let np = p + 4;
+            Ok(Decoded { insts: vec![], next: np, ctrl: Ctrl::Jmp(branch_target(np, rel)?) })
+        }
+        // jcc rel8.
+        0x70..=0x7f => {
+            let rel = read_imm(code, p, 1)? as u8 as i8 as i64;
+            let np = p + 1;
+            jcc(pos, np, branch_target(np, rel)?, op - 0x70, flags)
+        }
+        // Two-byte opcodes: jcc rel32 (0F 80..8F); everything else unsupported.
+        0x0f => {
+            let op2 = *code.get(p).ok_or("x86: truncated 0F opcode")?;
+            p += 1;
+            if (0x80..=0x8f).contains(&op2) {
+                let rel = read_imm(code, p, 4)? as u32 as i32 as i64;
+                let np = p + 4;
+                jcc(pos, np, branch_target(np, rel)?, op2 - 0x80, flags)
+            } else {
+                Err(format!("x86: unsupported opcode 0f {op2:#04x}"))
             }
         }
         other => Err(format!("x86: unsupported opcode {other:#04x}")),
@@ -239,6 +410,59 @@ fn add_imm(target: RegId, ty: Type, op: BinOp, imm: u128, width: u32) -> Inst {
         ty,
         value: RValue::Bin { op, lhs: Operand::Reg(target), rhs: Operand::int(width, imm) },
     }
+}
+
+/// The absolute byte offset a relative branch (`rel`, measured from `np`, the end
+/// of the branch instruction) targets; an error if it falls before the function.
+fn branch_target(np: usize, rel: i64) -> Result<usize, String> {
+    let t = np as i64 + rel;
+    if t < 0 {
+        Err("x86: branch target before the function".into())
+    } else {
+        Ok(t as usize)
+    }
+}
+
+/// Lower a `jcc` to a condition assignment plus a `Jcc` control effect. With a
+/// known `cmp`/`test` and a modelled condition code the condition is exact;
+/// otherwise it is an unconstrained boolean (so the engine explores both arms).
+fn jcc(
+    pos: usize,
+    np: usize,
+    target: usize,
+    cc: u8,
+    flags: &Option<(Operand, Operand)>,
+) -> Result<Decoded, String> {
+    let cond = temp_reg(pos);
+    let (op, lhs, rhs) = match (cc_cmpop(cc), flags) {
+        (Some(op), Some((a, b))) => (op, a.clone(), b.clone()),
+        // Unknown flags / condition code: compare a never-defined register with
+        // 0, an unconstrained boolean.
+        _ => (CmpOp::Ne, Operand::Reg(RegId(2000 + pos as u32)), Operand::int(64, 0)),
+    };
+    Ok(Decoded {
+        insts: vec![Inst::Assign { dst: cond, ty: Type::Bool, value: RValue::Cmp { op, lhs, rhs } }],
+        next: np,
+        ctrl: Ctrl::Jcc(target, cond),
+    })
+}
+
+/// The comparison a condition code tests: `cmp a, b` then `jcc` jumps iff
+/// `a <op> b`. `None` for codes we do not model (parity / sign / overflow).
+fn cc_cmpop(cc: u8) -> Option<CmpOp> {
+    Some(match cc {
+        0x2 => CmpOp::Ult, // jb / jc
+        0x3 => CmpOp::Uge, // jae / jnc
+        0x4 => CmpOp::Eq,  // je / jz
+        0x5 => CmpOp::Ne,  // jne / jnz
+        0x6 => CmpOp::Ule, // jbe
+        0x7 => CmpOp::Ugt, // ja
+        0xc => CmpOp::Slt, // jl
+        0xd => CmpOp::Sge, // jge
+        0xe => CmpOp::Sle, // jle
+        0xf => CmpOp::Sgt, // jg
+        _ => return None,
+    })
 }
 
 /// A decoded `[base + disp]` memory operand.
@@ -366,5 +590,40 @@ mod tests {
         assert!(matches!(insts[0], Inst::Alloc { region: RegionKind::Stack, .. }));
         assert!(matches!(insts[1], Inst::PtrOffset { .. }));
         assert!(matches!(insts[2], Inst::Store { .. }));
+    }
+
+    #[test]
+    fn reconstructs_a_conditional_branch() {
+        // sub rsp,16 ; cmp edi,0 ; jne +4 ; mov [rsp+8],eax ; add rsp,16 ; ret
+        let code = [
+            0x48, 0x83, 0xec, 0x10, 0x83, 0xff, 0x00, 0x75, 0x04, 0x89, 0x44, 0x24, 0x08, 0x48,
+            0x83, 0xc4, 0x10, 0xc3,
+        ];
+        let m = decode_function("f", &code);
+        assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+        let f = &m.functions[0];
+        assert_eq!(f.blocks.len(), 3, "entry + store + join");
+        assert!(matches!(f.blocks[0].term, Terminator::CondBr { .. }), "entry branches");
+    }
+
+    #[test]
+    fn reconstructs_a_loop_back_edge() {
+        // xor eax,eax ; .loop: add eax,1 ; cmp eax,4 ; jne .loop ; ret
+        let code = [
+            0x31, 0xc0, // xor eax, eax
+            0x83, 0xc0, 0x01, // add eax, 1   (.loop)
+            0x83, 0xf8, 0x04, // cmp eax, 4
+            0x75, 0xf8, // jne -8 (.loop)
+            0xc3, // ret
+        ];
+        let m = decode_function("f", &code);
+        assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+        let f = &m.functions[0];
+        // The loop body block branches back to itself (a back-edge).
+        let loop_body = &f.blocks[1];
+        assert!(matches!(
+            loop_body.term,
+            Terminator::CondBr { then_blk, .. } if then_blk == loop_body.id
+        ));
     }
 }

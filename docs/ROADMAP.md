@@ -54,9 +54,11 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    `[rsp+disp]` accesses are bounds-checked against the frame). The whole binary
    pipeline runs end-to-end and now *proves real memory safety*: a stack store
    inside the frame is PASS, an out-of-frame store FAIL, and a `xor eax,eax; ret`
-   PASS; unprovable/undecoded functions are UNKNOWN (never a false PASS).
-   Remaining: control flow (jumps), the broad ISA, DWARF types, AArch64,
-   relocations/PLT, and PE/Mach-O.
+   PASS; unprovable/undecoded functions are UNKNOWN (never a false PASS). The
+   decoder **reconstructs control flow** too (`jmp`/`jcc`/`cmp` → MSIR blocks with
+   `Br`/`CondBr`, backward branches → back-edges), so a *guarded* stack store and
+   a *loop* in a binary verify end-to-end via the state-merging engine. Remaining:
+   the broad ISA, DWARF types, AArch64, relocations/PLT, and PE/Mach-O.
 
 Each front-end owes a **refinement proof** (every concrete behaviour of the
 input is a concrete behaviour of the emitted MSIR) — the soundness hinge for the

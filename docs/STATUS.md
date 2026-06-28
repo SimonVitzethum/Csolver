@@ -26,8 +26,15 @@ just decode it: `sub rsp, N` is modelled as allocating an `N`-byte stack frame
 (with `rsp` the pointer), so a `[rsp + disp]` store (decoded through a SIB byte)
 is checked against the frame. `sub rsp,16 ; mov [rsp+8], eax ; ret` verifies
 **PASS** (the store is in the frame); the same with `[rsp+32]` is **FAIL** (a
-definite out-of-bounds write). DWARF, control flow, the full ISA, and PE/Mach-O
-follow.
+definite out-of-bounds write).
+
+The decoder also **reconstructs control flow**: it splits the body into basic
+blocks at branch targets and lowers `jmp`→`Br`, `jcc`→`CondBr` (with the condition
+taken from the preceding `cmp`/`test`), and backward branches into back-edges. So
+a *branchy* binary verifies end-to-end — a guarded stack store
+(`cmp edi,0 ; jne .skip ; mov [rsp+8],eax`) is **PASS** (the state-merging engine
+joins the paths), and a counting loop is handled (cut + interval invariant). DWARF,
+the full ISA, AArch64, and PE/Mach-O follow.
 
 ## Bit-precise decision procedure (pure-Rust SAT)
 
