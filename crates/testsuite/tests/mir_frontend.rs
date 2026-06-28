@@ -260,6 +260,79 @@ fn mir_real_rustc_debug_loop_verifies_pass() {
     assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
 }
 
+/// **Real** `rustc --emit=mir` for `fn write_slice(s: &mut [i32], i, v) { s[i] =
+/// v }` (frozen). The slice **write** takes the length via a fake raw borrow
+/// (`_4 = &raw const (fake) (*_1); _5 = PtrMetadata(move _4)`), so the synthetic
+/// length must flow through the pointer copy. The bounds-checked store verifies
+/// PASS.
+const REAL_WRITE_SLICE: &str = r#"
+fn write_slice(_1: &mut [i32], _2: usize, _3: i32) -> () {
+    debug s => _1;
+    debug i => _2;
+    debug v => _3;
+    let mut _0: ();
+    let mut _4: *const [i32];
+    let mut _5: usize;
+    let mut _6: bool;
+
+    bb0: {
+        _4 = &raw const (fake) (*_1);
+        _5 = PtrMetadata(move _4);
+        _6 = Lt(copy _2, copy _5);
+        assert(move _6, "index out of bounds: the length is {} but the index is {}", move _5, copy _2) -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        (*_1)[_2] = copy _3;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_slice_write_verifies_pass() {
+    let module = lower(REAL_WRITE_SLICE, "real_write");
+    assert!(module.unanalyzed.is_empty());
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
+/// **Soundness** against real output: `fn unchecked(s: &[i32], i) -> i32 {
+/// unsafe { *s.get_unchecked(i) } }` (frozen). There is **no** bounds check — the
+/// deref goes through the (opaque) result of a `get_unchecked` call. It must NOT
+/// be proved PASS: dropping the unmodelled deref would be an unsound vacuous
+/// PASS, so the access is emitted through the opaque pointer and stays UNKNOWN.
+const REAL_UNCHECKED: &str = r#"
+fn unchecked(_1: &[i32], _2: usize) -> i32 {
+    debug s => _1;
+    debug i => _2;
+    let mut _0: i32;
+    let mut _3: &i32;
+
+    bb0: {
+        _3 = core::slice::<impl [i32]>::get_unchecked::<usize>(copy _1, copy _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = copy (*_3);
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_unchecked_deref_is_not_pass() {
+    let module = lower(REAL_UNCHECKED, "real_unchecked");
+    let report = verify_module(&module, &Config::default());
+    // Must not be a (vacuous) PASS — the unchecked deref is not proved safe.
+    assert_ne!(report.verdict, Verdict::Pass, "an unchecked deref must not vacuously pass");
+    // And it genuinely emitted an obligation (the deref was not silently dropped).
+    assert!(
+        !report.functions[0].outcomes.is_empty(),
+        "the unmodelled deref must emit an (unprovable) obligation, not vanish"
+    );
+}
+
 /// A function using a construct outside the modelled subset (a `drop`
 /// terminator) is recorded as unanalyzed rather than mis-lowered — and a sound
 /// function in the same dump still verifies.

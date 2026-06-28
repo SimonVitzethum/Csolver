@@ -45,8 +45,8 @@ impl Frontend for MirFrontend {
     }
 
     fn lower(&self, input: MirInput) -> Result<Module> {
-        let bodies = parser::parse_module(&input.source)?;
-        Ok(lower::lower_module(&bodies, &input.name))
+        let (bodies, failed) = parser::parse_module(&input.source)?;
+        Ok(lower::lower_module(&bodies, &failed, &input.name))
     }
 }
 

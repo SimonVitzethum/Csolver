@@ -53,9 +53,19 @@ local and conservative; in particular:
   the callee's summary (`Direct`) or havocs an unknown/external one (`Symbol`/
   `Indirect`) — both sound; the call's **unwind** edge (cleanup) is not analysed,
   which is incomplete but never unsound for the return path;
+- **no memory access is ever silently dropped** (which would be an unsound
+  vacuous `PASS`): a deref/index whose element type is unknown still emits the
+  access through its real pointer with a one-byte fallback (so an opaque pointer
+  — e.g. a `get_unchecked` result — yields `UNKNOWN`, not `PASS`); a memory
+  access whose pointer cannot be recovered at all (a field through a pointer
+  without struct layout, a double-deref) **rejects the whole function**
+  (`UNKNOWN`);
 - an unmodelled terminator (`drop`, `yield`), rvalue, or place is **surfaced**:
   the affected function is recorded in `Module.unanalyzed` and reported `UNKNOWN`
-  (per-function recovery), never mis-lowered into a sound-looking shape;
+  — at **both** the parse and the lower stage (a body that fails to parse does
+  not abort the module: parsing resumes at the next `fn`), never mis-lowered;
+- a slice's synthetic length flows through pointer copies/borrows (`_4 = &raw
+  const (*_1); PtrMetadata(_4)`), so a checked write `s[i] = v` is proved too;
 - comparisons are lowered unsigned, matching the `usize` index/length domain;
 - a reference parameter is `writable` only when `&mut`/`*mut`.
 
@@ -78,9 +88,11 @@ is **not** proved; an **interprocedural** module (`caller` calling a checked
 helper's summary, while a dereference of an **external** call's unknown result is
 not proved; and a `drop`-using function is recovered as `UNKNOWN` while a sound
 sibling still verifies. **Real-output validation**: two functions captured
-verbatim from `rustc 1.94.1 --emit=mir` — a slice `get` (with `PtrMetadata`,
-`copy`-prefixed operands) and a debug-build `sum` loop (with `AddWithOverflow`
-tuples, type-ascribed field places, `switchInt`, nested `scope`s) — both verify
-**PASS**, validating the frontend against genuine compiler output (this is what
-surfaced the `copy (place)` and `(_n: T)` ascription cases). Next: a larger
-real-output corpus, aggregates/fields, and call return-type tracking.
+verbatim from `rustc 1.94.1 --emit=mir`: a slice `get`/`write_slice`, a
+debug-build `sum` loop (with `AddWithOverflow` tuples, type-ascribed field
+places, `switchInt`, nested `scope`s), and — for soundness — an
+`unsafe get_unchecked` deref that is correctly **not** proved. Validating against
+genuine compiler output surfaced and fixed the `copy (place)` prefix, the `(_n:
+T)` / `(x as Variant)` place forms, the `&raw const (fake)` borrow, `assume`, and
+crucially the **silently-dropped-memory-access** soundness hole. Next: struct
+layout for field accesses, the iterator/enum-downcast shape, and a larger corpus.

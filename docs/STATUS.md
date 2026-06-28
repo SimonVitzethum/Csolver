@@ -242,8 +242,16 @@ verbatim from `rustc 1.94.1 --emit=mir` — a slice `get` (using `PtrMetadata` f
 the length and `copy`-prefixed operands) and a debug-build `sum` loop (with
 `AddWithOverflow` checked-arithmetic tuples, type-ascribed field places,
 `switchInt`, nested `scope`s) — both verify **PASS**, having surfaced and fixed
-two real parser gaps (the `copy (place)` prefix and the `(_n: T)` ascription).
-Remaining: drops, aggregates/fields, call return-type tracking.
+several real parser gaps (the `copy (place)` prefix, the `(_n: T)` / `(x as
+Variant)` place forms, the `&raw const (fake)` borrow, `assume`). A **larger real
+corpus** (slice read/write, fixed array, two slices, conditional, bounded loop)
+all verify **PASS**; an `unsafe get_unchecked` deref is correctly **not** proved.
+This run also closed a **soundness hole**: an unmodelled memory access (an
+unchecked deref, a field through a pointer) was being silently dropped into a
+vacuous `PASS` — now it is emitted through its (opaque) pointer and stays
+`UNKNOWN`, or rejects the function; and a parse error is recovered per-function
+(it no longer aborts the module). Remaining: struct layout for field accesses,
+the iterator/enum-downcast shape, call return-type tracking.
 
 ## First real front-end: LLVM-IR
 

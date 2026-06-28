@@ -141,15 +141,35 @@ pub(crate) struct MirBody {
     pub(crate) blocks: Vec<MBlock>,
 }
 
-/// Parse every `fn` body in a MIR dump.
-pub(crate) fn parse_module(src: &str) -> Result<Vec<MirBody>> {
+/// The successfully-parsed bodies plus the `(name, reason)` of any that failed.
+pub(crate) type ParsedModule = (Vec<MirBody>, Vec<(String, String)>);
+
+/// Parse every `fn` body in a MIR dump. A body that fails to parse does not
+/// abort the whole module: its name is recorded (so the lowerer can report it
+/// `UNKNOWN`) and parsing resumes at the next `fn` — per-function recovery, like
+/// the lowerer's.
+pub(crate) fn parse_module(src: &str) -> Result<ParsedModule> {
     let toks = lex(src)?;
     let mut p = Parser { toks, pos: 0 };
     let mut bodies = Vec::new();
+    let mut failed = Vec::new();
     while p.skip_to_fn() {
-        bodies.push(p.body()?);
+        let name = match p.peek() {
+            Tok::Word(w) => w.clone(),
+            _ => String::new(),
+        };
+        let start = p.pos;
+        match p.body() {
+            Ok(b) => bodies.push(b),
+            Err(e) => {
+                failed.push((name, e.to_string()));
+                if p.pos <= start {
+                    p.pos = start + 1; // guarantee progress before the next `fn`
+                }
+            }
+        }
     }
-    Ok(bodies)
+    Ok((bodies, failed))
 }
 
 struct Parser {
@@ -529,7 +549,8 @@ impl Parser {
             if matches!(
                 w.as_str(),
                 "StorageLive" | "StorageDead" | "nop" | "FakeRead" | "AscribeUserType" | "Retag"
-                    | "PlaceMention" | "Coverage" | "ConstEvalCounter" | "Deinit"
+                    | "PlaceMention" | "Coverage" | "ConstEvalCounter" | "Deinit" | "assume"
+                    | "BackwardIncompatibleDropHint"
             ) {
                 self.skip_statement();
                 return Ok(MStmt::Nop);
@@ -555,13 +576,16 @@ impl Parser {
 
     fn place(&mut self) -> Result<Place> {
         let mut base = if self.eat_punct('(') {
-            // `(*PLACE)` or a parenthesised place, optionally with a type
-            // ascription (`(_11.1: bool)`, `(*_1: &[i32])`).
+            // `(*PLACE)` or a parenthesised place, optionally a variant downcast
+            // (`(_5 as Some)`) and/or a type ascription (`(_11.1: bool)`).
             let inner = if self.eat_punct('*') {
                 Place::Deref(Box::new(self.place()?))
             } else {
                 self.place()?
             };
+            if self.eat_word("as") {
+                let _ = self.word(); // the variant name (downcast is opaque here)
+            }
             if self.eat_punct(':') {
                 let _ = self.ty()?;
             }
@@ -600,11 +624,19 @@ impl Parser {
     }
 
     fn rvalue(&mut self) -> Result<Rvalue> {
-        // `&PLACE` / `&mut PLACE` / `&raw const PLACE`.
+        // `&PLACE` / `&mut PLACE` / `&raw const PLACE` / `&raw const (fake) PLACE`.
         if self.eat_punct('&') {
             let _ = self.eat_word("mut");
             if self.eat_word("raw") {
                 let _ = self.eat_word("const") || self.eat_word("mut");
+            }
+            // Skip a parenthesised borrow-kind annotation `(fake)` / `(shallow)`
+            // — distinguished from the place `(*_p)` by its leading keyword.
+            if self.peek() == &Tok::Punct('(')
+                && matches!(self.peek2(), Tok::Word(w) if matches!(w.as_str(), "fake" | "shallow" | "shared" | "two_phase"))
+            {
+                self.pos += 1;
+                self.skip_balanced_paren();
             }
             return Ok(Rvalue::Ref(self.place()?));
         }

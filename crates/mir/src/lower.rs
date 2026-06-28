@@ -20,10 +20,14 @@ use std::collections::HashMap;
 const LAYOUT: DataLayout = DataLayout::LP64;
 
 /// Lower every parsed MIR body into one MSIR module (per-function recovery).
-pub(crate) fn lower_module(bodies: &[MirBody], name: &str) -> Module {
+pub(crate) fn lower_module(bodies: &[MirBody], failed: &[(String, String)], name: &str) -> Module {
     let func_ids: HashMap<String, FuncId> =
         bodies.iter().enumerate().map(|(i, b)| (b.name.clone(), FuncId(i as u32))).collect();
     let mut module = Module::new(name);
+    // Functions the parser could not parse are reported `UNKNOWN`, not dropped.
+    for (fname, reason) in failed {
+        module.unanalyzed.push((fname.clone(), reason.clone()));
+    }
     for (i, body) in bodies.iter().enumerate() {
         let fid = FuncId(i as u32);
         match lower_function(body, fid, &func_ids) {
@@ -49,6 +53,10 @@ struct Ctx {
     slice_len: HashMap<u32, RegId>,
     /// Module function names → ids, for resolving direct calls.
     func_ids: HashMap<String, FuncId>,
+    /// Set when a memory access cannot be lowered to a real pointer: the whole
+    /// function is then rejected (reported `UNKNOWN`) rather than silently
+    /// dropping the access — which would be an unsound vacuous `PASS`.
+    lowering_failed: bool,
 }
 
 /// Lower one MIR body into an MSIR function plus its parameter contracts.
@@ -78,6 +86,7 @@ fn lower_function(
         panic_used: false,
         slice_len: HashMap::new(),
         func_ids: func_ids.clone(),
+        lowering_failed: false,
     };
 
     // Parameters and their contracts (by position). A reference parameter
@@ -131,6 +140,9 @@ fn lower_function(
     for b in &body.blocks {
         blocks.push(ctx.lower_block(b)?);
     }
+    if ctx.lowering_failed {
+        return Err(Error::unsupported("a memory access could not be lowered to a known pointer"));
+    }
     if ctx.panic_used {
         // A diverging panic landing pad: an aborting check never returns, so the
         // continuation is unreachable for the purpose of memory safety.
@@ -172,7 +184,14 @@ impl Ctx {
         };
         match place {
             // Register destination: `_d = rvalue`.
-            Place::Local(d) => self.lower_rvalue_into(RegId(*d), rv, out),
+            Place::Local(d) => {
+                self.lower_rvalue_into(RegId(*d), rv, out)?;
+                // A slice's length flows through pointer copies/borrows, so a
+                // later `PtrMetadata`/`Len` of the copy still resolves to it
+                // (rustc takes `_4 = &raw const (*_1); _5 = PtrMetadata(_4)`).
+                self.propagate_slice_len(*d, rv);
+                Ok(())
+            }
             // Memory destination: `(*_p)[..] = operand` / `*_p = operand`.
             Place::Deref(_) | Place::Index(_, _) => {
                 let Rvalue::Use(op) = rv else {
@@ -192,8 +211,15 @@ impl Ctx {
                 }
                 Ok(())
             }
-            // Field stores are not modelled (aggregates are opaque): skip.
-            Place::Field(_, _) => Ok(()),
+            // A field of a plain local is opaque (a tuple value) — skip; a field
+            // *through a pointer* (`(*_p).0 = …`) is a memory write we cannot
+            // place without struct layout, so reject the function.
+            Place::Field(_, _) => {
+                if is_memory_place(place) {
+                    self.lowering_failed = true;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -386,27 +412,65 @@ impl Ctx {
     /// Emit the pointer to a memory `place` and return `(pointer reg, elem type)`.
     fn place_access(&mut self, place: &Place, out: &mut Vec<Inst>) -> Option<(RegId, Type)> {
         match place {
-            // `(*_p)[i]`: base pointer `_p`, indexed by `i` with the array elem.
+            // `(*_p)[i]`: base pointer `_p`, indexed by `i`. An unknown element
+            // type falls back to one byte — the access is still emitted (and so
+            // checked) through the real pointer, never dropped.
             Place::Index(base, idx) => {
-                let Place::Deref(inner) = base.as_ref() else { return None };
-                let Place::Local(p) = inner.as_ref() else { return None };
-                let elem = self.index_elem(*p)?;
+                let p = match base.as_ref() {
+                    Place::Deref(inner) => match inner.as_ref() {
+                        Place::Local(p) => *p,
+                        _ => {
+                            self.lowering_failed = true;
+                            return None;
+                        }
+                    },
+                    _ => {
+                        self.lowering_failed = true;
+                        return None;
+                    }
+                };
+                let elem = self.index_elem(p).unwrap_or_else(|| Type::int(8));
                 let dst = self.fresh();
                 out.push(Inst::PtrOffset {
                     dst,
-                    base: IrOp::Reg(RegId(*p)),
+                    base: IrOp::Reg(RegId(p)),
                     index: IrOp::Reg(RegId(*idx)),
                     elem: elem.clone(),
                 });
                 Some((dst, elem))
             }
             // `*_p`: the pointer is `_p`; the access is at offset 0.
-            Place::Deref(inner) => {
-                let Place::Local(p) = inner.as_ref() else { return None };
-                let elem = self.deref_elem(*p)?;
-                Some((RegId(*p), elem))
+            Place::Deref(inner) => match inner.as_ref() {
+                Place::Local(p) => {
+                    let elem = self.deref_elem(*p).unwrap_or_else(|| Type::int(8));
+                    Some((RegId(*p), elem))
+                }
+                _ => {
+                    self.lowering_failed = true;
+                    None
+                }
+            },
+            _ => {
+                self.lowering_failed = true;
+                None
             }
+        }
+    }
+
+    /// Carry a slice's synthetic length to `dst` when the rvalue copies or
+    /// borrows a slice pointer (`dst = move _p`, `dst = &(*_p)`, a pointer cast).
+    fn propagate_slice_len(&mut self, dst: u32, rv: &Rvalue) {
+        let src = match rv {
+            Rvalue::Use(Operand::Copy(Place::Local(p)) | Operand::Move(Place::Local(p)))
+            | Rvalue::Cast(Operand::Copy(Place::Local(p)) | Operand::Move(Place::Local(p))) => Some(*p),
+            Rvalue::Ref(Place::Deref(inner)) => match inner.as_ref() {
+                Place::Local(p) => Some(*p),
+                _ => None,
+            },
             _ => None,
+        };
+        if let Some(len) = src.and_then(|p| self.slice_len.get(&p).copied()) {
+            self.slice_len.insert(dst, len);
         }
     }
 
@@ -477,10 +541,16 @@ fn bin_rvalue(kind: BinKind, lhs: IrOp, rhs: IrOp) -> Option<RValue> {
     }
 }
 
-/// Whether a place denotes a memory access (a deref/index projection) rather
-/// than a plain register.
+/// Whether a place denotes a memory access — its projection chain reaches a
+/// deref or index. A field of a plain local (`_11.0`, a tuple value) is *not*
+/// memory; a field reached through a pointer (`(*_1).0`) *is* (and, lacking
+/// struct layout, is rejected rather than silently dropped).
 fn is_memory_place(p: &Place) -> bool {
-    matches!(p, Place::Deref(_) | Place::Index(_, _))
+    match p {
+        Place::Local(_) => false,
+        Place::Deref(_) | Place::Index(_, _) => true,
+        Place::Field(inner, _) => is_memory_place(inner),
+    }
 }
 
 /// The local a place is rooted at, peeling every projection.
