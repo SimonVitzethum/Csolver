@@ -65,8 +65,26 @@ would step over it, never hit the `== bound` exit, and exceed `bound` — so the
 bound would be unsound. With these proved, the body (entered under `i != bound`)
 has `i ≤ bound ∧ i != bound`, i.e. the strict `i < bound` that proves `buf[i]` in
 bounds. If any side-condition is unproved, no fact is asserted (sound fallback),
-so an out-of-bounds exit bound never fakes safety. This is the integer stage of
-the pointer-walk (`iter != end`) loop.
+so an out-of-bounds exit bound never fakes safety.
+
+### Pointer-walk loops (`iter != end`)
+The same reasoning carries to a **pointer** induction. First, comparisons are
+**pointer-aware**: `iter == end` between two pointers into the *same* allocation
+is the offset relation `o == end_off` (differing/opaque provenance falls back to
+fresh — sound). Then for a recognized pointer walk (`PtrIndVar`), the generic
+havoc makes `iter` opaque; `assert_ptr_walk_bound` restores its region
+provenance with a fresh offset `o` and the facts `b0 ≤ o ≤ end_off ≤ size` and
+`o ≡ b0 (mod stride)` — but **only after proving** `0 ≤ b0 ≤ end_off ≤ size ≤
+isize::MAX` and `stride | (end_off − b0)` (with the region's no-wrap premise
+added for a symbolic slice length). The congruence is essential here in a way it
+was not for the integer index loop: a load reads `stride` bytes, so `o ≤ end_off
+− 1` does not suffice; `o ≡ b0 mod stride` together with `o < end_off` gives `o ≤
+end_off − stride`, hence `o + stride ≤ end_off ≤ size`. With the guard `iter !=
+end` (`o != end_off`) the moving load is in bounds. If a side-condition is
+unproved (e.g. the end pointer lies past the region), the offset is never
+installed and `iter` stays opaque — the access is not proved (no false PASS).
+This is the header-test `for x in s` walk; the rotated `-O` (bottom-test) form is
+the next step.
 
 ## Symbolic memory model
 A pointer is `provenance + symbolic offset + alignment` — **never a bare

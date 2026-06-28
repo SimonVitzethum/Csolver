@@ -720,6 +720,108 @@ fn eq_exit_loop_to(exit: u128) -> Function {
     }
 }
 
+/// `ptr_walk_loop()`: the fully-optimized iterator shape — walk a `[i32; 8]` by
+/// a moving pointer until it reaches the end pointer.
+///
+/// ```text
+///   bb0: buf = alloc i32 * 8 ; end = buf + 8 ; br bb1(buf)
+///   bb1(iter): c = (iter == end) ; condbr c -> bb3 / bb2
+///   bb2: x = load iter ; nx = iter + 1 ; br bb1(nx)
+///   bb3: return
+/// ```
+///
+/// The loop exits on the **pointer** equality `iter == end`; the equality-exit
+/// pointer-induction analysis keeps `iter`'s region provenance with a bounded,
+/// stride-aligned offset (`0 ≤ o ≤ end_off ≤ size`, `o ≡ 0 mod 4`), and the guard
+/// `iter != end` then proves the `load iter` in bounds → PASS.
+pub fn ptr_walk_loop() -> Function {
+    ptr_walk_to(8)
+}
+
+/// As [`ptr_walk_loop`] but the end pointer is past the buffer (`buf + 16` over a
+/// `[i32; 8]`): the walk would read out of bounds, so the load must NOT be
+/// proved PASS. The `end_off ≤ size` side-condition fails, so the pointer keeps
+/// opaque (the bounded offset is never installed) and the access stays UNKNOWN.
+pub fn ptr_walk_loop_oob() -> Function {
+    ptr_walk_to(16)
+}
+
+fn ptr_walk_to(end_elems: u128) -> Function {
+    let buf = RegId(0);
+    let end = RegId(1);
+    let iter = RegId(2);
+    let c = RegId(3);
+    let nx = RegId(4);
+    let x = RegId(5);
+
+    let mut bb0 = BasicBlock::new(
+        BlockId(0),
+        Terminator::Br { target: BlockId(1), args: vec![Operand::Reg(buf)] },
+    );
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(32),
+        count: Operand::int(64, 8),
+        align: 4,
+    });
+    bb0.insts.push(Inst::PtrOffset {
+        dst: end,
+        base: Operand::Reg(buf),
+        index: Operand::int(64, end_elems),
+        elem: Type::int(32),
+    });
+
+    let mut bb1 = BasicBlock::new(
+        BlockId(1),
+        Terminator::CondBr {
+            cond: Operand::Reg(c),
+            then_blk: BlockId(3),
+            then_args: vec![],
+            else_blk: BlockId(2),
+            else_args: vec![],
+        },
+    );
+    bb1.params = vec![(iter, Type::ptr(Type::int(32)))];
+    bb1.insts.push(Inst::Assign {
+        dst: c,
+        ty: Type::Bool,
+        value: csolver_ir::RValue::Cmp {
+            op: CmpOp::Eq,
+            lhs: Operand::Reg(iter),
+            rhs: Operand::Reg(end),
+        },
+    });
+
+    let mut bb2 = BasicBlock::new(
+        BlockId(2),
+        Terminator::Br { target: BlockId(1), args: vec![Operand::Reg(nx)] },
+    );
+    bb2.insts.push(Inst::Load {
+        dst: x,
+        ty: Type::int(32),
+        ptr: Operand::Reg(iter),
+        align: 4,
+    });
+    bb2.insts.push(Inst::PtrOffset {
+        dst: nx,
+        base: Operand::Reg(iter),
+        index: Operand::int(64, 1),
+        elem: Type::int(32),
+    });
+
+    let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+
+    Function {
+        id: FuncId(0),
+        name: "ptr_walk_loop".into(),
+        params: vec![],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0, bb1, bb2, bb3],
+        entry: BlockId(0),
+    }
+}
+
 /// `masked_index_store(x)`: write `buf[x & 7]` into a `[i8; 8]`. The masked
 /// index is provably in `[0, 7]`, so every access is in bounds — but *only*
 /// bit-precisely: the linear decision procedure abstracts the bitwise `&` as an

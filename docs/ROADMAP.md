@@ -111,11 +111,16 @@ whole tool, argued in each crate's `Verification/`.
   isize::MAX` and `stride | (bound − start)`, the divisibility that stops the
   counter overshooting a `!=` bound). With the loop guard `v != bound` this gives
   the strict `v < bound` the interval domain cannot derive from a `!=` exit, so an
-  **integer** `while i != n { buf[i] … }` loop now verifies (and an out-of-bounds
-  bound is still not proved). Remaining (stage 2): carry this to the **pointer**
-  offset itself (keep `iter`'s region provenance with a fresh bounded offset) and
-  add the **congruence** fact `offset ≡ 0 (mod stride)` so a load of `stride`
-  bytes at `offset < end` is in bounds — then the real `iter != end` walk verifies.
+  **integer** `while i != n { buf[i] … }` loop verifies. **Stage 2 is in:** the
+  same reasoning is carried to the **pointer** offset — a same-allocation pointer
+  comparison is evaluated as an offset relation, and a recognized `iter != end`
+  walk keeps `iter`'s region provenance with a fresh offset bounded by `0 ≤ o ≤
+  end_off ≤ size` plus the **congruence** `o ≡ 0 (mod stride)` (so a `stride`-byte
+  load at `o < end_off` is in bounds, which `o ≤ end_off − 1` alone is not). The
+  header-test `for x in s` walk now verifies (`ptr_walk_loop` → PASS; a walk past
+  the end → not PASS). Remaining (stage 3): the rotated `-O` (bottom-test) form,
+  where the exit compares the *stepped* pointer and the load precedes the check
+  (needs a preheader-guard analysis), and the LLVM front-end producing this shape.
 - **Relational loop invariants** — **in** (zone / difference-bound domain). A
   `Zone` DBM tracks `vⱼ − vᵢ ≤ c` between registers; the symbolic engine adds its
   header invariants as facts, so a loop whose safety is a *relation* (a second

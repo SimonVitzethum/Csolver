@@ -19,11 +19,11 @@
 
 use csolver_cfg::{Cfg, Dominators, Loops};
 use csolver_ir::{
-    BinOp, BlockId, CmpOp, Const, Function, Inst, Operand, RValue, RegId, Terminator,
+    BinOp, BlockId, CmpOp, Const, Function, Inst, Operand, RValue, RegId, Terminator, Type,
 };
 use std::collections::HashMap;
 
-/// A recognized equality-exit induction variable at a loop header.
+/// A recognized equality-exit **integer** induction variable at a loop header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EqExitIndVar {
     /// The induction register (a header block-parameter).
@@ -35,16 +35,38 @@ pub struct EqExitIndVar {
     pub stride: i128,
 }
 
-/// Per-loop-header equality-exit induction variables.
+/// A recognized equality-exit **pointer** induction variable (`iter != end`):
+/// a pointer header-parameter that advances by a constant element step on the
+/// back-edge and exits when it equals `end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtrIndVar {
+    /// The pointer induction register (a header block-parameter).
+    pub reg: RegId,
+    /// The end pointer the loop exits on (`iter == end`).
+    pub end: Operand,
+    /// The element type stepped over (its size is the per-iteration byte stride).
+    pub elem: Type,
+    /// The per-iteration element step (`> 0`).
+    pub stride_elems: i128,
+}
+
+/// Per-loop-header equality-exit induction variables (integer and pointer).
 #[derive(Debug, Clone, Default)]
 pub struct InductionAnalysis {
     by_header: HashMap<BlockId, Vec<EqExitIndVar>>,
+    ptr_by_header: HashMap<BlockId, Vec<PtrIndVar>>,
 }
 
 impl InductionAnalysis {
-    /// The equality-exit induction variables governing `header`'s loop.
+    /// The integer equality-exit induction variables governing `header`'s loop.
     pub fn eq_exit_indvars(&self, header: BlockId) -> &[EqExitIndVar] {
         self.by_header.get(&header).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The pointer equality-exit induction variables (`iter != end`) governing
+    /// `header`'s loop.
+    pub fn eq_exit_ptr_indvars(&self, header: BlockId) -> &[PtrIndVar] {
+        self.ptr_by_header.get(&header).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -54,16 +76,30 @@ pub fn analyze_induction(f: &Function) -> InductionAnalysis {
     let doms = Dominators::new(&cfg);
     let loops = Loops::detect(&cfg, &doms);
     let mut by_header = HashMap::new();
+    let mut ptr_by_header = HashMap::new();
     for l in loops.all() {
-        if let Some(var) = recognize(f, &cfg, l) {
-            by_header.entry(cfg.block_id(l.header)).or_insert_with(Vec::new).push(var);
+        let header = cfg.block_id(l.header);
+        if let Some(var) = recognize_int(f, &cfg, l) {
+            by_header.entry(header).or_insert_with(Vec::new).push(var);
+        } else if let Some(var) = recognize_ptr(f, &cfg, l) {
+            ptr_by_header.entry(header).or_insert_with(Vec::new).push(var);
         }
     }
-    InductionAnalysis { by_header }
+    InductionAnalysis { by_header, ptr_by_header }
 }
 
-/// Try to recognize the governing equality-exit induction variable of loop `l`.
-fn recognize(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<EqExitIndVar> {
+/// The governing equality-exit structure shared by the integer and pointer
+/// recognisers: the induction register, the value it exits on, the latch node,
+/// and the register's header-parameter position.
+struct ExitShape {
+    reg: RegId,
+    bound: Operand,
+    latch: usize,
+    pos: usize,
+}
+
+/// Recognize the loop's governing equality-exit branch (`v == bound`).
+fn exit_shape(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<ExitShape> {
     // A single back-edge keeps the induction unambiguous.
     let [latch] = l.latches[..] else { return None };
     let header_id = cfg.block_id(l.header);
@@ -90,8 +126,7 @@ fn recognize(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<EqExitInd
         CmpOp::Eq => false,
         _ => return None,
     };
-    let in_loop_is_then = then_in;
-    if in_loop_is_then != continue_is_true {
+    if then_in != continue_is_true {
         return None; // the loop continues on the `==` edge — not a count-up exit
     }
 
@@ -107,16 +142,39 @@ fn recognize(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<EqExitInd
         }
     }
 
-    // The back-edge must carry `reg := reg + stride` (a positive constant step).
     let pos = header.params.iter().position(|(p, _)| *p == reg)?;
-    let next = edge_arg(f.block(cfg.block_id(latch))?, header_id, pos)?;
-    let Operand::Reg(nv) = next else { return None };
-    let stride = self_increment(f, cfg, l, nv, reg)?;
+    Some(ExitShape { reg, bound, latch, pos })
+}
+
+/// The back-edge's argument for the induction register, as a register.
+fn back_edge_next(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop, s: &ExitShape) -> Option<RegId> {
+    let latch = f.block(cfg.block_id(s.latch))?;
+    match edge_arg(latch, cfg.block_id(l.header), s.pos)? {
+        Operand::Reg(nv) => Some(nv),
+        _ => None,
+    }
+}
+
+/// Try to recognize an integer equality-exit induction variable.
+fn recognize_int(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<EqExitIndVar> {
+    let s = exit_shape(f, cfg, l)?;
+    let nv = back_edge_next(f, cfg, l, &s)?;
+    let stride = self_increment(f, cfg, l, nv, s.reg)?;
     if stride <= 0 {
         return None;
     }
+    Some(EqExitIndVar { reg: s.reg, bound: s.bound, stride })
+}
 
-    Some(EqExitIndVar { reg, bound, stride })
+/// Try to recognize a pointer equality-exit induction variable (`iter != end`).
+fn recognize_ptr(f: &Function, cfg: &Cfg, l: &csolver_cfg::Loop) -> Option<PtrIndVar> {
+    let s = exit_shape(f, cfg, l)?;
+    let nv = back_edge_next(f, cfg, l, &s)?;
+    let (stride_elems, elem) = self_increment_ptr(f, cfg, l, nv, s.reg)?;
+    if stride_elems <= 0 {
+        return None;
+    }
+    Some(PtrIndVar { reg: s.reg, end: s.bound, elem, stride_elems })
 }
 
 /// Find the comparison a boolean register was assigned in `block` (SSA: one def).
@@ -181,6 +239,40 @@ fn self_increment(
                 return Some(if *op == BinOp::Sub { -c } else { c });
             }
             return None; // defined, but not as a constant step
+        }
+    }
+    None
+}
+
+/// If `nv` is defined within the loop as `PtrOffset(base, k, elem)` for the
+/// induction pointer `base` and a constant element step `k`, return `(k, elem)`;
+/// else `None`.
+fn self_increment_ptr(
+    f: &Function,
+    cfg: &Cfg,
+    l: &csolver_cfg::Loop,
+    nv: RegId,
+    base: RegId,
+) -> Option<(i128, Type)> {
+    for &node in &l.body {
+        let block = f.block(cfg.block_id(node))?;
+        for inst in &block.insts {
+            if inst.defined_reg() != Some(nv) {
+                continue;
+            }
+            if let Inst::PtrOffset {
+                base: Operand::Reg(b),
+                index: Operand::Const(Const::Int(k)),
+                elem,
+                ..
+            } = inst
+            {
+                if *b != base {
+                    return None;
+                }
+                return Some((k.signed(), elem.clone()));
+            }
+            return None; // defined, but not as a constant pointer step
         }
     }
     None
@@ -266,6 +358,75 @@ mod tests {
             vars,
             &[EqExitIndVar { reg: RegId(0), bound: Operand::int(64, 8), stride: 1 }]
         );
+    }
+
+    /// `while iter != end { …; iter = iter + 1 (elem i32) }`:
+    ///   bb0: br bb1(base)
+    ///   bb1(iter): c = (iter == end); condbr c -> bb3 / bb2
+    ///   bb2: nx = iter + 1 (i32); br bb1(nx)
+    ///   bb3: return
+    fn ptr_walk() -> Function {
+        let base = RegId(0);
+        let end = RegId(1);
+        let iter = RegId(2);
+        let c = RegId(3);
+        let nx = RegId(4);
+        let bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::Br { target: BlockId(1), args: vec![Operand::Reg(base)] },
+        );
+        let mut bb1 = BasicBlock::new(
+            BlockId(1),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(3),
+                then_args: vec![],
+                else_blk: BlockId(2),
+                else_args: vec![],
+            },
+        );
+        bb1.params = vec![(iter, Type::ptr(Type::int(32)))];
+        bb1.insts.push(Inst::Assign {
+            dst: c,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Eq, lhs: Operand::Reg(iter), rhs: Operand::Reg(end) },
+        });
+        let mut bb2 = BasicBlock::new(
+            BlockId(2),
+            Terminator::Br { target: BlockId(1), args: vec![Operand::Reg(nx)] },
+        );
+        bb2.insts.push(Inst::PtrOffset {
+            dst: nx,
+            base: Operand::Reg(iter),
+            index: Operand::int(64, 1),
+            elem: Type::int(32),
+        });
+        let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+        Function {
+            id: FuncId(0),
+            name: "ptr_walk".into(),
+            params: vec![(base, Type::ptr(Type::int(32))), (end, Type::ptr(Type::int(32)))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2, bb3],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn recognizes_pointer_equality_exit_induction() {
+        let a = analyze_induction(&ptr_walk());
+        let vars = a.eq_exit_ptr_indvars(BlockId(1));
+        assert_eq!(
+            vars,
+            &[PtrIndVar {
+                reg: RegId(2),
+                end: Operand::Reg(RegId(1)),
+                elem: Type::int(32),
+                stride_elems: 1,
+            }]
+        );
+        // It is a pointer induction, not an integer one.
+        assert!(a.eq_exit_indvars(BlockId(1)).is_empty());
     }
 
     #[test]

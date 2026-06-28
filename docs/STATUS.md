@@ -3,6 +3,29 @@
 Milestone **M1 — symbolic execution + SMT (increment 1 done)**, on top of the
 completed **M0 — architecture + foundations**.
 
+## Pointer-walk loops (`for x in s`): `iter != end`
+
+The fully-optimized iterator shape — a moving pointer walked until it reaches an
+end pointer — now verifies (header-test form). Two pieces make it sound: (1)
+**pointer-aware comparison** — `iter == end` between two pointers into the *same*
+allocation is evaluated as the offset relation `o == end_off` (differing/opaque
+provenance still falls back to fresh, sound); and (2) **pointer equality-exit
+induction** — `csolver-absint::induction` recognizes a pointer header-parameter
+that steps by a constant element stride (`iter := iter + 1`) and exits on `iter
+== end`, and the engine restores `iter`'s region provenance with a fresh offset
+`o` constrained by `0 ≤ o ≤ end_off ≤ size` and the **congruence** `o ≡ 0 (mod
+stride)` — but **only after proving** `0 ≤ b0 ≤ end_off ≤ size ≤ isize::MAX` and
+`stride | (end_off − b0)` (the region's no-wrap premise supplied for a symbolic
+slice length). The congruence is what the integer index loop did not need: a
+load reads `stride` bytes, so `o ≤ end_off − 1` is insufficient — `o ≡ 0 mod
+stride` with `o < end_off` gives `o ≤ end_off − stride`, hence `o + stride ≤
+end_off ≤ size`. With the guard `iter != end` (`o != end_off`) the moving load is
+proved in bounds (`ptr_walk_loop` → PASS); an end pointer past the buffer fails
+the `end_off ≤ size` check, so the offset is never installed and the load is not
+proved (`ptr_walk_loop_oob` → not PASS). The rotated `-O` (bottom-test) form,
+where the exit compares the *stepped* pointer and the load precedes the check
+(needing a preheader-guard analysis), is the next step.
+
 ## Equality-exit loops (`while i != n`): induction bounds
 
 The `!=`/`==`-exit loop — the integer precursor of the pointer-walk (`iter !=

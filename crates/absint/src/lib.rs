@@ -32,7 +32,7 @@ pub mod zone;
 
 pub use analysis::{analyze_intervals, IntervalAnalysis, Trivalent};
 pub use domain::AbstractDomain;
-pub use induction::{analyze_induction, EqExitIndVar, InductionAnalysis};
+pub use induction::{analyze_induction, EqExitIndVar, InductionAnalysis, PtrIndVar};
 pub use engine::{solve, Solution};
 pub use env::IntervalState;
 pub use interval::{Bound, Interval};

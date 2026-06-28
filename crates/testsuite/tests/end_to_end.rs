@@ -7,7 +7,7 @@ use csolver_testsuite::{
     dangling_store, eq_exit_loop, eq_exit_loop_oob, guarded_get, indirect_store, init_read,
     interproc_module, loop_array_store, masked_index_store, mixed_module, needs_solver,
     oob_dynamic_store, oob_index_store, oob_mask_check, provably_buggy, provably_safe,
-    relational_loop, safe_buffer_store, uninit_read,
+    ptr_walk_loop, ptr_walk_loop_oob, relational_loop, safe_buffer_store, uninit_read,
 };
 use csolver_verifier::{verify_function, verify_module, Config};
 
@@ -297,6 +297,30 @@ fn equality_exit_loop_out_of_bounds_is_not_pass() {
     m.functions.push(eq_exit_loop_oob());
     let report = verify_module(&m, &Config::default());
     assert_ne!(report.verdict, Verdict::Pass, "out-of-bounds equality-exit loop must not pass");
+}
+
+#[test]
+fn pointer_walk_loop_is_proven_via_induction_bounds() {
+    // The fully-optimized iterator shape: `iter` walks a `[i32; 8]` until
+    // `iter == end`. The pointer equality-exit induction keeps `iter`'s region
+    // provenance with a bounded, stride-aligned offset, and the guard `iter !=
+    // end` proves the moving load in bounds — the canonical `for x in s` loop.
+    let mut m = csolver_ir::Module::new("ptrwalk");
+    m.functions.push(ptr_walk_loop());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.functions[0].outcomes.iter().all(|o| o.verdict() == Verdict::Pass));
+}
+
+#[test]
+fn pointer_walk_past_the_end_is_not_pass() {
+    // Soundness: an end pointer past the buffer (`buf + 16` over `[i32; 8]`)
+    // would read out of bounds. The `end_off <= size` side-condition fails, so
+    // the bounded offset is never installed and the load is not proved.
+    let mut m = csolver_ir::Module::new("ptrwalkoob");
+    m.functions.push(ptr_walk_loop_oob());
+    let report = verify_module(&m, &Config::default());
+    assert_ne!(report.verdict, Verdict::Pass, "a pointer walk past the end must not pass");
 }
 
 #[test]

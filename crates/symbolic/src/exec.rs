@@ -13,7 +13,7 @@
 use crate::ExecLimits;
 use csolver_absint::{
     analyze_induction, analyze_intervals, analyze_zones, Bound, EqExitIndVar, InductionAnalysis,
-    IntervalAnalysis, ZoneAnalysis,
+    IntervalAnalysis, PtrIndVar, ZoneAnalysis,
 };
 use csolver_cfg::{Dominators, Loops};
 use csolver_core::{Model, RegionKind, SafetyProperty};
@@ -361,6 +361,25 @@ struct SymRegion {
 enum SymValue {
     Scalar(ExprId),
     Ptr(SymPointer),
+}
+
+/// Captured data for asserting a pointer equality-exit induction's offset bound
+/// (`iter != end`), taken before the loop header havoc clobbers `iter`.
+struct PtrIndCapture {
+    /// The induction pointer register (a header block-parameter).
+    reg: RegId,
+    /// The allocation `iter` walks within.
+    region: usize,
+    /// `iter`'s start offset (its preheader value's offset).
+    b0: ExprId,
+    /// `iter`'s start alignment.
+    align: u64,
+    /// The end pointer's offset within the same allocation.
+    end_off: ExprId,
+    /// The allocation's byte size.
+    size: ExprId,
+    /// The per-iteration byte stride (`elem size × element step`).
+    stride_bytes: u64,
 }
 
 /// Where a loaded value comes from, per the store log (most-recent-first scan).
@@ -840,6 +859,39 @@ impl Explorer<'_> {
             })
             .collect();
 
+        // Pointer equality-exit induction (`iter != end`): capture each one's
+        // base region/offset/alignment, the end pointer's offset in that same
+        // region, and the region byte size — all before the havoc clobbers
+        // `iter`. The bounded offset is installed after the havoc (see
+        // `assert_ptr_walk_bound`).
+        let ptr_inductions: Vec<PtrIndCapture> = self
+            .inductions
+            .eq_exit_ptr_indvars(header)
+            .to_vec()
+            .into_iter()
+            .filter_map(|iv: PtrIndVar| {
+                let SymValue::Ptr(base) = state.env.get(&iv.reg)?.clone() else { return None };
+                let Prov::Region(region) = base.prov else { return None };
+                let size = state.regions.get(region)?.size;
+                let SymValue::Ptr(end) = self.eval_value(&iv.end, state) else { return None };
+                let Prov::Region(end_region) = end.prov else { return None };
+                if end_region != region {
+                    return None; // end is in a different allocation: cannot relate
+                }
+                let elem_stride = iv.elem.stride_bytes(&LAYOUT).unwrap_or(1).max(1);
+                let stride_bytes = u64::try_from(iv.stride_elems).ok()?.checked_mul(elem_stride)?;
+                Some(PtrIndCapture {
+                    reg: iv.reg,
+                    region,
+                    b0: base.offset,
+                    align: base.align,
+                    end_off: end.offset,
+                    size,
+                    stride_bytes,
+                })
+            })
+            .collect();
+
         // If the loop body may free memory, then on any iteration after the
         // first a region could already be freed — so no region's liveness can
         // be proved inside (or after) the loop. Invalidate liveness
@@ -929,6 +981,83 @@ impl Explorer<'_> {
                 self.assert_eq_exit_bound(state, v, start_e, bound_e, iv.stride);
             }
         }
+
+        // Pointer-walk (`iter != end`) bounds: install the region-bounded offset
+        // for each recognized pointer induction, replacing the conservative
+        // opaque pointer the generic havoc produced.
+        for cap in ptr_inductions {
+            self.assert_ptr_walk_bound(state, cap);
+        }
+    }
+
+    /// Install the sound offset bound for a pointer equality-exit induction
+    /// (`iter != end`). The generic havoc made `iter` opaque; here — only after
+    /// **proving** the side-conditions — we restore its region provenance with a
+    /// fresh offset `o` constrained by `b0 ≤ o ≤ end_off ≤ size` and the
+    /// congruence `o ≡ b0 (mod stride)`. With those, the loop guard `iter != end`
+    /// (an offset `o != end_off` within the region) yields `o ≤ end_off − stride`,
+    /// so a `stride`-byte load at `o` is in bounds.
+    ///
+    /// The side-conditions: `0 ≤ b0 ≤ end_off ≤ size ≤ isize::MAX` and
+    /// `stride | (end_off − b0)` (so `end` lies on the walk's grid — otherwise
+    /// `iter` steps over `end`, never satisfies the `== end` exit, and the bound
+    /// would be unsound). Only power-of-two strides (the element sizes that
+    /// arise) get the exact bit-precise divisibility; others are skipped.
+    fn assert_ptr_walk_bound(&mut self, state: &mut PathState, cap: PtrIndCapture) {
+        let stride = cap.stride_bytes;
+        if stride == 0 || !(stride as u128).is_power_of_two() {
+            return;
+        }
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let isize_max = self.ctx.int(PTR_WIDTH, i64::MAX as u128);
+        let mask = self.ctx.int(PTR_WIDTH, (stride as u128) - 1);
+        // (end_off − b0) & mask == 0: end is on the walk's grid.
+        let ediff = self.ctx.bin(BvOp::Sub, cap.end_off, cap.b0);
+        let emask = self.ctx.bin(BvOp::And, ediff, mask);
+        let end_on_grid = self.ctx.cmp(SCmp::Eq, emask, zero);
+        let gate = [
+            self.ctx.cmp(SCmp::Sle, zero, cap.b0),          // 0 ≤ b0
+            self.ctx.cmp(SCmp::Sle, cap.b0, cap.end_off),   // b0 ≤ end_off
+            self.ctx.cmp(SCmp::Sle, cap.end_off, cap.size), // end_off ≤ size
+            self.ctx.cmp(SCmp::Sle, cap.size, isize_max),   // size ≤ isize::MAX
+            end_on_grid,
+        ];
+        // The region's no-wrap premise (`size = count·stride ≤ isize::MAX`) lets
+        // `size ≤ isize::MAX` be proved for a *symbolic* slice length. It is added
+        // only for the gate proof (kept off the permanent facts, which would slow
+        // every later proof) — exactly as the memory-OOB refutation does.
+        let nowrap = state.regions.get(cap.region).and_then(|r| r.size_nowrap);
+        let restore = state.facts.len();
+        if let Some(nw) = nowrap {
+            state.facts.push(nw);
+        }
+        let proved = gate.into_iter().all(|g| self.prove(g, state));
+        state.facts.truncate(restore);
+        if !proved {
+            return;
+        }
+        // Sound: a region pointer at a fresh, grid-aligned, in-range offset.
+        let o = self.fresh_scalar(PTR_WIDTH);
+        state.env.insert(
+            cap.reg,
+            SymValue::Ptr(SymPointer {
+                prov: Prov::Region(cap.region),
+                offset: o,
+                align: gcd(cap.align, stride),
+            }),
+        );
+        let odiff = self.ctx.bin(BvOp::Sub, o, cap.b0);
+        let omask = self.ctx.bin(BvOp::And, odiff, mask);
+        let ediff2 = self.ctx.bin(BvOp::Sub, cap.end_off, cap.b0);
+        let emask2 = self.ctx.bin(BvOp::And, ediff2, mask);
+        let facts = [
+            self.ctx.cmp(SCmp::Sle, cap.b0, o),             // b0 ≤ o
+            self.ctx.cmp(SCmp::Sle, o, cap.end_off),        // o ≤ end_off
+            self.ctx.cmp(SCmp::Sle, cap.end_off, cap.size), // end_off ≤ size
+            self.ctx.cmp(SCmp::Eq, omask, zero),            // o ≡ b0 (mod stride)
+            self.ctx.cmp(SCmp::Eq, emask2, zero),           // end_off ≡ b0 (mod stride)
+        ];
+        state.facts.extend(facts);
     }
 
     /// Assert the sound bound `start ≤ v ≤ bound` for an equality-exit induction
@@ -1720,13 +1849,46 @@ impl Explorer<'_> {
     }
 
     fn eval_scalar(&mut self, op: &Operand, state: &PathState) -> ExprId {
-        match self.eval_value(op, state) {
+        let v = self.eval_value(op, state);
+        self.scalarize(v)
+    }
+
+    /// A symbolic value as a scalar expression: a pointer of null provenance is
+    /// `0`, any other pointer a fresh unknown (its numeric address is unknown).
+    fn scalarize(&mut self, v: SymValue) -> ExprId {
+        match v {
             SymValue::Scalar(e) => e,
             SymValue::Ptr(p) => match p.prov {
                 Prov::Null => self.ctx.int(PTR_WIDTH, 0),
                 _ => self.fresh_scalar(PTR_WIDTH),
             },
         }
+    }
+
+    /// Evaluate a comparison, treating two **same-allocation** pointer operands
+    /// as a comparison of their offsets — so `iter != end` within one allocation
+    /// becomes the offset relation the pointer-walk bounds reasoning needs.
+    /// Pointers of differing or opaque provenance fall back to fresh scalars
+    /// (sound: the result is simply unconstrained).
+    fn eval_ptr_aware_cmp(
+        &mut self,
+        op: CmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        state: &PathState,
+    ) -> ExprId {
+        let lv = self.eval_value(lhs, state);
+        let rv = self.eval_value(rhs, state);
+        if let (SymValue::Ptr(pa), SymValue::Ptr(pb)) = (&lv, &rv) {
+            if let (Prov::Region(ra), Prov::Region(rb)) = (&pa.prov, &pb.prov) {
+                if ra == rb {
+                    return self.ctx.cmp(map_cmpop(op), pa.offset, pb.offset);
+                }
+            }
+        }
+        let a = self.scalarize(lv);
+        let b = self.scalarize(rv);
+        self.ctx.cmp(map_cmpop(op), a, b)
     }
 
     fn eval_pointer(&mut self, op: &Operand, state: &PathState) -> SymPointer {
@@ -1749,9 +1911,7 @@ impl Explorer<'_> {
                 SymValue::Scalar(self.ctx.bin(map_binop(*op), a, b))
             }
             RValue::Cmp { op, lhs, rhs } => {
-                let a = self.eval_scalar(lhs, state);
-                let b = self.eval_scalar(rhs, state);
-                SymValue::Scalar(self.ctx.cmp(map_cmpop(*op), a, b))
+                SymValue::Scalar(self.eval_ptr_aware_cmp(*op, lhs, rhs, state))
             }
             RValue::Cast { op, operand, .. } => match op {
                 CastOp::Bitcast => self.eval_value(operand, state),
@@ -1772,11 +1932,7 @@ impl Explorer<'_> {
     fn eval_condition(&mut self, cond: &Condition, state: &PathState) -> ExprId {
         match cond {
             Condition::True => self.ctx.boolean(true),
-            Condition::Cmp { op, lhs, rhs } => {
-                let a = self.eval_scalar(lhs, state);
-                let b = self.eval_scalar(rhs, state);
-                self.ctx.cmp(map_cmpop(*op), a, b)
-            }
+            Condition::Cmp { op, lhs, rhs } => self.eval_ptr_aware_cmp(*op, lhs, rhs, state),
             Condition::And(cs) => {
                 let parts = cs.iter().map(|c| self.eval_condition(c, state)).collect();
                 self.ctx.and(parts)

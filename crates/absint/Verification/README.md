@@ -46,6 +46,14 @@ the counter's grid and `v` cannot overshoot it). Anything unrecognised yields no
 induction variable. Tested by `recognizes_equality_exit_induction` /
 `ignores_a_less_than_exit`.
 
+The same recogniser handles a **pointer** equality-exit (`iter != end`): when the
+back-edge step is a `PtrOffset(iter, k, elem)` instead of an integer `Add` it
+reports a `PtrIndVar { reg, end, elem, stride_elems }`. The engine then restores
+`iter`'s region provenance with a bounded, stride-aligned offset — again only
+after proving the side-conditions (`0 ≤ b0 ≤ end_off ≤ size ≤ isize::MAX` and
+`stride | (end_off − b0)`). Tested by
+`recognizes_pointer_equality_exit_induction`.
+
 ## Specification
 - `Interval` is `⊥ ∪ [lo,hi]` over `ℤ ∪ {±∞}`; arithmetic saturates at ±∞.
 - `widen`: bounds that grew jump to ±∞ (finite ascending chains collapse in ≤2
