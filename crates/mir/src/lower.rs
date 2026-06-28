@@ -41,6 +41,9 @@ struct Ctx {
     next_temp: u32,
     panic_id: u32,
     panic_used: bool,
+    /// For a slice parameter `_k: &[T]`, the synthetic length parameter's
+    /// register (so `Len((*_k))` resolves to it).
+    slice_len: HashMap<u32, RegId>,
 }
 
 /// Lower one MIR body into an MSIR function plus its parameter contracts.
@@ -59,17 +62,54 @@ fn lower_function(body: &MirBody, id: FuncId) -> Result<(Function, Vec<(u32, Ptr
         .unwrap_or(0);
     let panic_id = body.blocks.iter().map(|b| b.id as u32).max().unwrap_or(0) + 1;
 
-    let mut ctx = Ctx { local_types, next_temp: max_local + 1, panic_id, panic_used: false };
+    let mut ctx =
+        Ctx { local_types, next_temp: max_local + 1, panic_id, panic_used: false, slice_len: HashMap::new() };
 
-    // Parameters and their contracts (by position).
+    // Parameters and their contracts (by position). A reference parameter
+    // becomes a pointer; a *sized* reference (`&[T; N]`, `&T`) gets a `Bytes`
+    // contract directly, while a *slice* `&[T]` (whose length lives in the fat
+    // pointer, not a separate MIR local) gets a synthetic `usize` length
+    // parameter appended at the end and a `ParamElements` contract referring to
+    // it — exactly the slice ABI the analysis already models.
     let mut params = Vec::new();
     let mut contracts = Vec::new();
+    let mut pending_slices: Vec<(u32, u32, u64, bool)> = Vec::new();
     for (idx, (local, mty)) in body.params.iter().enumerate() {
-        let (ir_ty, contract) = ctx.param_lowering(mty);
-        params.push((RegId(*local), ir_ty));
-        if let Some(c) = contract {
-            contracts.push((idx as u32, c));
+        match mty {
+            MType::Ref(inner, mutable) | MType::Ptr(inner, mutable) => {
+                params.push((RegId(*local), Type::ptr(mtype_to_ir(inner))));
+                if let MType::Slice(elem) = inner.as_ref() {
+                    let stride = mtype_to_ir(elem).stride_bytes(&LAYOUT).unwrap_or(1).max(1);
+                    pending_slices.push((idx as u32, *local, stride, *mutable));
+                } else if let Some(size) = pointee_size(inner) {
+                    contracts.push((
+                        idx as u32,
+                        PtrContract {
+                            size: SizeSpec::Bytes(size),
+                            align: pointee_align(inner),
+                            readable: true,
+                            writable: *mutable,
+                        },
+                    ));
+                }
+            }
+            other => params.push((RegId(*local), mtype_to_ir(other))),
         }
+    }
+    for (ptr_pos, local, stride, mutable) in pending_slices {
+        let len_pos = params.len() as u32;
+        let len_reg = ctx.fresh();
+        params.push((len_reg, Type::int(64)));
+        ctx.slice_len.insert(local, len_reg);
+        contracts.push((
+            ptr_pos,
+            PtrContract {
+                size: SizeSpec::ParamElements { len_param: len_pos, elem_size: stride },
+                align: stride as u32,
+                readable: true,
+                writable: mutable,
+            },
+        ));
     }
 
     let mut blocks = Vec::new();
@@ -98,24 +138,6 @@ impl Ctx {
         let r = RegId(self.next_temp);
         self.next_temp += 1;
         r
-    }
-
-    /// The MSIR parameter type and (for a sized reference) the region contract.
-    fn param_lowering(&self, mty: &MType) -> (Type, Option<PtrContract>) {
-        match mty {
-            MType::Ref(pointee, mutable) | MType::Ptr(pointee, mutable) => {
-                let ir_pointee = mtype_to_ir(pointee);
-                let ty = Type::ptr(ir_pointee.clone());
-                let contract = pointee_size(pointee).map(|size| PtrContract {
-                    size: SizeSpec::Bytes(size),
-                    align: pointee_align(pointee),
-                    readable: true,
-                    writable: *mutable,
-                });
-                (ty, contract)
-            }
-            other => (mtype_to_ir(other), None),
-        }
     }
 
     fn lower_block(&mut self, b: &MBlock) -> Result<BasicBlock> {
@@ -195,10 +217,15 @@ impl Ctx {
                 Ok(())
             }
             Rvalue::Len(place) => {
-                // The length of `&[T; N]` / `[T; N]` is the constant `N`.
-                let value = match self.array_len(place) {
-                    Some(n) => IrOp::int(64, n as u128),
-                    None => IrOp::Const(Const::Undef), // slice length not modelled
+                // `Len(&[T; N])` is the constant `N`; `Len(&[T])` is the slice's
+                // synthetic length parameter.
+                let value = if let Some(n) = self.array_len(place) {
+                    IrOp::int(64, n as u128)
+                } else if let Some(len) = place_base_local(place).and_then(|l| self.slice_len.get(&l))
+                {
+                    IrOp::Reg(*len)
+                } else {
+                    IrOp::Const(Const::Undef)
                 };
                 out.push(assign(dst, RValue::Use(value)));
                 Ok(())
@@ -410,6 +437,16 @@ fn bin_rvalue(kind: BinKind, lhs: IrOp, rhs: IrOp) -> Option<RValue> {
 /// than a plain register.
 fn is_memory_place(p: &Place) -> bool {
     matches!(p, Place::Deref(_) | Place::Index(_, _))
+}
+
+/// The local a place is rooted at, peeling every projection.
+fn place_base_local(p: &Place) -> Option<u32> {
+    match p {
+        Place::Local(n) => Some(*n),
+        Place::Deref(inner) | Place::Field(inner, _) | Place::Index(inner, _) => {
+            place_base_local(inner)
+        }
+    }
 }
 
 /// The locals a block mentions (params plus any `_N` in index/assign positions),

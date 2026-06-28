@@ -71,6 +71,78 @@ fn mir_unchecked_index_is_not_pass() {
     assert!(!in_bounds_proved, "an unchecked index must not prove in-bounds");
 }
 
+/// `fn get(s: &[i32], i: usize) -> i32 { s[i] }` over a **slice** (symbolic
+/// length): the length comes from `Len((*_1))`, which the frontend resolves to a
+/// synthetic length parameter, and the `assert(Lt(i, len))` proves the access in
+/// bounds. Verifies PASS under the `slice-abi` assumption.
+const SLICE: &str = r#"
+fn get(_1: &[i32], _2: usize) -> i32 {
+    debug s => _1;
+    debug i => _2;
+    let mut _0: i32;
+    let mut _3: usize;
+    let mut _4: bool;
+    bb0: {
+        _3 = Len((*_1));
+        _4 = Lt(_2, move _3);
+        assert(move _4, "index out of bounds: the length is {} but the index is {}", move _3, _2) -> [success: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = (*_1)[_2];
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_checked_slice_index_verifies_pass() {
+    let module = lower(SLICE, "slice");
+    assert!(module.unanalyzed.is_empty());
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.assumptions.iter().any(|a| a.id == "slice-abi"));
+}
+
+/// A real index-based slice loop `for i in 0..s.len() { … s[i] … }`: the loop
+/// invariant `i >= 0`, the guard `i < len` (from the `switchInt` edge), and the
+/// slice contract (region size `len * 4`) combine to prove every access. The
+/// length is read from `Len((*_1))` at the header.
+const SLICE_LOOP: &str = r#"
+fn sum(_1: &[i32]) -> () {
+    let mut _0: ();
+    let mut _2: usize;
+    let mut _3: usize;
+    let mut _4: bool;
+    let mut _5: i32;
+    let mut _6: usize;
+    bb0: {
+        _2 = const 0_usize;
+        goto -> bb1;
+    }
+    bb1: {
+        _3 = Len((*_1));
+        _4 = Lt(_2, move _3);
+        switchInt(move _4) -> [0: bb4, otherwise: bb2];
+    }
+    bb2: {
+        _5 = (*_1)[_2];
+        _2 = Add(_2, const 1_usize);
+        goto -> bb1;
+    }
+    bb4: {
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_slice_index_loop_verifies_pass() {
+    let module = lower(SLICE_LOOP, "sumloop");
+    assert!(module.unanalyzed.is_empty(), "report: {:?}", module.unanalyzed);
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
 /// A function using a construct outside the modelled subset (a `call`) is
 /// recorded as unanalyzed rather than mis-lowered — and a sound function in the
 /// same dump still verifies.

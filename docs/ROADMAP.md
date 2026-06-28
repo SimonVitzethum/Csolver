@@ -54,9 +54,13 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    (failure → an `unreachable` panic pad), so a checked `s[i]` over `&[i32; N]`
    verifies **PASS** precisely because the check is present, while the unchecked
    index is not proved. Sized references become region contracts; index/deref
-   places become `PtrOffset` + `Load`/`Store`; unmodelled constructs (`call`,
-   slice length) degrade per-function to `UNKNOWN`. Remaining: slice `&[T]`
-   length modelling, calls/drops, aggregates, and a real multi-block corpus.
+   places become `PtrOffset` + `Load`/`Store`. **Slices `&[T]`** are modelled too:
+   the fat-pointer length (exposed via `Len((*_1))`) becomes a synthetic `usize`
+   length parameter with a `ParamElements` contract (region size `len·elem`), so
+   a checked slice index *and* an index-based slice loop `for i in 0..s.len()`
+   verify **PASS** from MIR. Unmodelled constructs (`call`, aggregates) degrade
+   per-function to `UNKNOWN`. Remaining: calls/drops (interprocedural), aggregates,
+   and a real multi-block corpus.
 3. **Assembly** (`csolver-asm`) + **ELF/DWARF** (`csolver-elf`): **started.** A
    pure-Rust ELF64 reader (`csolver-elf`) parses sections/symbols and recovers a
    function's machine bytes; a minimal x86-64 decoder (`csolver-asm`

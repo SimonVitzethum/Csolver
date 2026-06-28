@@ -227,8 +227,12 @@ place becomes `PtrOffset` + `Load`/`Store`; `Len(&[T; N])` is the constant `N`.
 The canonical `fn get(s: &[i32; 8], i: usize) -> i32 { s[i] }` MIR verifies
 **PASS** (under `param-contracts`); the same index *without* the assert is
 correctly **not** proved; and a function using an unmodelled construct (a `call`)
-is recorded `UNKNOWN` per-function while a sound sibling still verifies. Remaining:
-slice `&[T]` length modelling (fixed arrays are done), calls/drops, aggregates.
+is recorded `UNKNOWN` per-function while a sound sibling still verifies.
+**Slices** `&[T]` are modelled too: the fat-pointer length (read via
+`Len((*_1))`) becomes a synthetic `usize` length parameter with a `ParamElements`
+contract (region size `len·elem`), so a checked slice index `get(s: &[i32], i)`
+*and* an index-based slice loop `for i in 0..s.len() { s[i] }` verify **PASS**
+from MIR (under `slice-abi`). Remaining: calls/drops, aggregates.
 
 ## First real front-end: LLVM-IR
 

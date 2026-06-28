@@ -23,7 +23,11 @@ index `s[i]` is preceded by `assert(Lt(i, len), "index out of bounds…") ->
   `&T`/`&mut T`, `*const T`/`*mut T`, `[T; N]`, `[T]` (element only).
 - **Parameters**: a sized reference (`&[T; N]`, `&T`, `&mut T`) becomes a region
   contract (`Bytes(size)`, alignment, `writable` only for `&mut`/`*mut` — so a
-  write through `&T` is soundly not provable); a scalar parameter is a register.
+  write through `&T` is soundly not provable); a **slice** `&[T]` becomes a
+  pointer plus a synthetic `usize` length parameter and a `ParamElements`
+  contract (region size `len · elem`), with `Len((*_1))` resolving to that length
+  — the same slice ABI the analysis already models; a scalar parameter is a
+  register.
 - **Places**: `_N`, `(*_N)`, `(*_N)[_M]` (→ `PtrOffset` + `Load`/`Store`); a
   `Field` projection is opaque.
 - **Rvalues**: `Use`/`copy`/`move`/`const`, the integer binops and comparisons
@@ -47,10 +51,6 @@ local and conservative; in particular:
 - a reference parameter is `writable` only when `&mut`/`*mut`.
 
 ## Limits (this increment)
-- **Slices `&[T]`** (symbolic length) are not yet given a region: `Len((*_1))`
-  on a slice is opaque, so slice-indexing functions stay `UNKNOWN`. Fixed arrays
-  `&[T; N]` (concrete length) are fully modelled. (A later increment threads the
-  slice length the way `Len` exposes it.)
 - **Calls/drops** reject the function (no interprocedural lowering yet).
 - **Aggregates/fields**, checked-arithmetic tuples, and constant-index
   projections are opaque.
@@ -59,7 +59,9 @@ local and conservative; in particular:
 ## Test strategy
 Unit test: the `get(&[i32; 8], usize)` body parses and lowers to a `PtrOffset` +
 `Load` under a contracted parameter. End-to-end (`csolver-testsuite/tests/
-mir_frontend.rs`): the checked index verifies **PASS** (with the `param-contracts`
-assumption), the unchecked index is **not** proved, and a call-using function is
-recovered as `UNKNOWN` while a sound sibling still verifies. Next: a real
-multi-block `rustc --emit=mir` corpus and slice-length modelling.
+mir_frontend.rs`): the checked array index verifies **PASS** (`param-contracts`);
+a checked **slice** index `get(&[i32], usize)` and an index-based slice **loop**
+`for i in 0..s.len() { s[i] }` verify **PASS** (`slice-abi`); the unchecked index
+is **not** proved; and a call-using function is recovered as `UNKNOWN` while a
+sound sibling still verifies. Next: a real multi-block `rustc --emit=mir` corpus,
+calls (interprocedural summaries), and aggregates.
