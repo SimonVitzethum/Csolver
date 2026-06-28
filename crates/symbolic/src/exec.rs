@@ -11,7 +11,7 @@
 //! reachable path, which the UNSAT-only solver cannot supply.
 
 use crate::ExecLimits;
-use csolver_absint::{analyze_intervals, Bound, IntervalAnalysis};
+use csolver_absint::{analyze_intervals, analyze_zones, Bound, IntervalAnalysis, ZoneAnalysis};
 use csolver_cfg::{Dominators, Loops};
 use csolver_core::{Model, RegionKind, SafetyProperty};
 use crate::summary::{Affine, RetSummary, Summary};
@@ -142,6 +142,7 @@ fn discharge_inner(
     contracts: &[Option<PtrContract>],
 ) -> SymbolicReport {
     let analysis = analyze_intervals(f);
+    let zones = analyze_zones(f);
     let dominators = Dominators::new(analysis.cfg());
     let loops = Loops::detect(analysis.cfg(), &dominators);
 
@@ -186,6 +187,7 @@ fn discharge_inner(
         mem: HashMap::new(),
         assumptions: HashSet::new(),
         analysis,
+        zones,
         dominators,
         headers,
         loop_modified,
@@ -443,6 +445,9 @@ struct Explorer<'f> {
     assumptions: HashSet<&'static str>,
     /// Sound interval invariants (the source of loop invariants).
     analysis: IntervalAnalysis,
+    /// Relational (zone) invariants — difference constraints between registers
+    /// that the per-register interval domain cannot express.
+    zones: ZoneAnalysis,
     dominators: Dominators,
     /// Block ids that are loop headers.
     headers: HashSet<BlockId>,
@@ -850,6 +855,30 @@ impl Explorer<'_> {
                 }
                 None => {} // not live at the header; defined fresh in the body
             }
+        }
+
+        // Relational (zone) invariants: difference constraints `a - b <= c`
+        // between the freshly-havoc'd register values that hold on every header
+        // visit (e.g. `j <= i`). These are exactly what the per-register interval
+        // bounds above cannot express, so they let a loop whose safety is a
+        // *relation* between variables (a second induction variable, `buf[j]`
+        // with `j <= i < n`) be proved. Sound under the same `linear-no-overflow`
+        // assumption as the interval facts.
+        let diffs: Vec<(ExprId, ExprId, i128)> = self
+            .zones
+            .entry_diffs(header)
+            .into_iter()
+            .filter_map(|(a, b, c)| match (state.env.get(&a), state.env.get(&b)) {
+                (Some(SymValue::Scalar(ea)), Some(SymValue::Scalar(eb))) => Some((*ea, *eb, c)),
+                _ => None,
+            })
+            .collect();
+        for (ea, eb, c) in diffs {
+            // a - b <= c   ⟺   a <= b + c.
+            let cexpr = self.const_expr(c);
+            let rhs = self.ctx.bin(BvOp::Add, eb, cexpr);
+            let fact = self.ctx.cmp(SCmp::Sle, ea, rhs);
+            state.facts.push(fact);
         }
     }
 

@@ -6,7 +6,7 @@ use csolver_report::{render_json, render_text};
 use csolver_testsuite::{
     dangling_store, guarded_get, indirect_store, interproc_module, loop_array_store,
     masked_index_store, mixed_module, needs_solver, oob_dynamic_store, oob_index_store,
-    oob_mask_check, provably_buggy, provably_safe, safe_buffer_store,
+    oob_mask_check, provably_buggy, provably_safe, relational_loop, safe_buffer_store,
 };
 use csolver_verifier::{verify_function, verify_module, Config};
 
@@ -234,6 +234,20 @@ fn dynamic_size_out_of_bounds_is_refuted_with_a_counterexample() {
     // Both the length and the index are witnessed.
     assert!(refuted.model.get("arg0").is_some(), "length witnessed: {:?}", refuted.model);
     assert!(refuted.model.get("arg1").is_some(), "index witnessed: {:?}", refuted.model);
+}
+
+#[test]
+fn relational_loop_is_proven_via_the_zone_domain() {
+    // `for (i,j)=(0,0); i<n; i++,j++ { buf[j] = 0 }` over `[i32; n]`. The access
+    // `buf[j]` is in bounds only because `j <= i < n` — a *relation* between
+    // variables that the interval domain and the loop guard (on `i`, not `j`)
+    // cannot express. The zone (relational) analysis supplies `j <= i`, so it
+    // verifies PASS.
+    let mut m = csolver_ir::Module::new("rel");
+    m.functions.push(relational_loop());
+    let report = verify_module(&m, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.functions[0].outcomes.iter().all(|o| o.verdict() == Verdict::Pass));
 }
 
 #[test]

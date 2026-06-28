@@ -104,6 +104,18 @@ a feasibility witness, while a *maybe*-freed region (after a freeing call or loo
 stays `UNKNOWN`. So the verifier now produces counterexamples for both spatial and
 temporal safety.
 
+## Relational loop invariants (zone domain)
+
+Beyond the per-variable interval domain, a **relational** `Zone` (difference-bound)
+domain (`csolver-absint`) tracks `vⱼ − vᵢ ≤ c` between registers — the invariants
+intervals cannot express. The symbolic engine adds a loop header's zone invariants
+as facts on the havoc'd variables, so a loop whose safety is a *relation* between
+variables verifies: `for (i,j)=(0,0); i<n; i++,j++ { buf[j] = 0 }` is **PASS**
+because the zone supplies `j ≤ i`, which with the guard `i < n` gives `j < n` —
+something neither intervals nor the loop guard (on `i`, not `j`) can prove alone.
+The zone's widening is a terminating *keep-if-equal* operator and its closure is
+sound (argued in the crate's `Verification/`).
+
 ## Scaling: path-feasibility pruning + state merging
 
 Two changes stop path explosion from forcing truncated, all-`UNKNOWN` runs.

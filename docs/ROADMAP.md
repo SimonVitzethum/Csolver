@@ -97,8 +97,12 @@ whole tool, argued in each crate's `Verification/`.
   Verifying it soundly needs a relational pointer-offset abstract domain *plus*
   congruence/modular reasoning (the `!=` end-pointer guard). Index-based slice
   loops already verify; this is the remaining (research-level) loop shape.
-- **Relational loop invariants** (octagon / polyhedra domains, invariant
-  inference) beyond `i ≥ 0`, for loops whose safety needs `a[i] == …` relations.
+- **Relational loop invariants** — **in** (zone / difference-bound domain). A
+  `Zone` DBM tracks `vⱼ − vᵢ ≤ c` between registers; the symbolic engine adds its
+  header invariants as facts, so a loop whose safety is a *relation* (a second
+  induction variable, `buf[j]` with `j ≤ i < n`) verifies — which the per-variable
+  interval domain and the loop guard alone cannot. Still ahead: full octagon
+  (`±x ± y`) / polyhedra and relations between more than two variables.
 - **Precondition propagation / context-sensitive interprocedural** proving, so a
   helper that accesses `buf[i]` is verified once-per-context. (A first form of
   this is already in: pointer-parameter `dereferenceable`/`align`/`readonly`

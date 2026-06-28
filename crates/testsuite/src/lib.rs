@@ -394,6 +394,91 @@ pub fn loop_array_store() -> Function {
     }
 }
 
+/// `relational_loop(n)`: `for (i, j) = (0, 0); i < n; i++, j++ { buf[j] = 0 }`
+/// over a `[i32; n]`. Proving `buf[j]` in bounds needs the **relation** `j <= i`
+/// (so `j <= i < n`), which the per-register interval domain and the loop guard
+/// (`i < n`, on `i` not `j`) cannot supply — only the relational *zone* domain
+/// can. So this verifies PASS solely because of the zone invariant.
+///
+/// ```text
+///   bb0: buf = alloc i32 * n ; br bb1(0, 0)
+///   bb1(i, j): c = i < n ; condbr c -> bb2 / bb3
+///   bb2: p = buf + j*4 ; store 0 -> p ; ni = i+1 ; nj = j+1 ; br bb1(ni, nj)
+///   bb3: return
+/// ```
+pub fn relational_loop() -> Function {
+    let n = RegId(0);
+    let buf = RegId(1);
+    let i = RegId(2);
+    let j = RegId(3);
+    let c = RegId(4);
+    let p = RegId(5);
+    let ni = RegId(6);
+    let nj = RegId(7);
+
+    let mut bb0 = BasicBlock::new(
+        BlockId(0),
+        Terminator::Br { target: BlockId(1), args: vec![Operand::int(64, 0), Operand::int(64, 0)] },
+    );
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(32),
+        count: Operand::Reg(n),
+        align: 4,
+    });
+
+    let mut bb1 = BasicBlock::new(
+        BlockId(1),
+        Terminator::CondBr {
+            cond: Operand::Reg(c),
+            then_blk: BlockId(2),
+            then_args: vec![],
+            else_blk: BlockId(3),
+            else_args: vec![],
+        },
+    );
+    bb1.params = vec![(i, Type::int(64)), (j, Type::int(64))];
+    bb1.insts.push(Inst::Assign {
+        dst: c,
+        ty: Type::Bool,
+        value: RValue::Cmp { op: CmpOp::Slt, lhs: Operand::Reg(i), rhs: Operand::Reg(n) },
+    });
+
+    // The body uses the header's i/j directly (it is dominated by bb1).
+    let mut bb2 = BasicBlock::new(
+        BlockId(2),
+        Terminator::Br { target: BlockId(1), args: vec![Operand::Reg(ni), Operand::Reg(nj)] },
+    );
+    bb2.insts.push(Inst::PtrOffset {
+        dst: p,
+        base: Operand::Reg(buf),
+        index: Operand::Reg(j),
+        elem: Type::int(32),
+    });
+    bb2.insts.push(Inst::Store { ty: Type::int(32), ptr: Operand::Reg(p), value: Operand::int(32, 0), align: 4 });
+    bb2.insts.push(Inst::Assign {
+        dst: ni,
+        ty: Type::int(64),
+        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) },
+    });
+    bb2.insts.push(Inst::Assign {
+        dst: nj,
+        ty: Type::int(64),
+        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) },
+    });
+
+    let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+    Function {
+        id: FuncId(0),
+        name: "relational_loop".into(),
+        params: vec![(n, Type::int(64))],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0, bb1, bb2, bb3],
+        entry: BlockId(0),
+    }
+}
+
 /// `indirect_store()`: store a pointer into a slot, load it back, and write
 /// through it — a raw-pointer round-trip through memory. The alias-aware
 /// symbolic heap preserves the pointer's provenance across the store/load, so
