@@ -81,6 +81,14 @@ pub trait SmtSolver {
 /// [`SatResult::Unknown`]. Used as the default backend when no external solver
 /// is configured, keeping the pipeline sound (every query degrades to
 /// `UNKNOWN`, never a false `PASS`).
+///
+/// This is the prepared opt-in extension point for an external backend (Bitwuzla
+/// → Z3 → CVC5). It is deliberately the *only* backend today: diagnosing the
+/// scaling corpus's one timeout (memchr's `packedpair`) showed it to be a liveness
+/// problem the wall-clock valve in `csolver-solver` fixes, not a precision gap — no
+/// function has yet needed bit-precise reasoning the internal pure-Rust solver
+/// cannot deliver. An external (C/C++) backend would add TCB surface against the
+/// pure-Rust principle for a need the data has not shown; see `docs/ROADMAP.md`.
 #[derive(Debug, Default)]
 pub struct NullSolver {
     next: u32,

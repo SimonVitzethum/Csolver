@@ -82,3 +82,15 @@ It was cut `40_000 → 3_000` to fix a 250× slowdown on unit-stride `&[u8]` loo
 the budget). This is recorded here so the constant is not "optimised" back up
 without re-measuring that case: it is a deliberate precision/performance choice at
 a soundness-*irrelevant* point, not a soundness parameter.
+
+A decision budget bounds *work*, not *time* — and a single query can grind for
+seconds before exhausting it. So the SAT solver also carries a **wall-clock valve**
+(`SOLVE_TIME_BUDGET` in `crates/solver/src/sat`, 250ms): a query that runs past it
+bails to `Unknown`, checked cheaply every few thousand decisions. This is the same
+soundness-irrelevant kind of dial — a bail only weakens a verdict (the goal falls
+to the linear path or to `UNKNOWN`), never fabricates a `PASS` — but on the *time*
+axis. It is what keeps a pathological function (memchr's `packedpair` SIMD search)
+from hanging the whole analysis; it is generous enough that ordinary sub-millisecond
+queries never reach it, so normal verdicts stay deterministic. The companion
+`docs/ROADMAP.md` records why this valve, not an external SMT backend, is the right
+answer to that timeout: it was a liveness problem, not a precision one.

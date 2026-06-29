@@ -114,10 +114,24 @@ whole tool, argued in each crate's `Verification/`.
   the `linear-no-overflow` assumption**) and a bit-precise *fallback* (proving
   wrap-sensitive / bitwise goals the linear fragment abstracts away — e.g.
   `buf[x & 7]` is now PASS). This is pure Rust by design (no C/C++), keeping with
-  the project's principle. Remaining here: bit-blast division/remainder and
-  symbolic shifts, array/heap theories, and — only if ever wanted — an *opt-in*
-  external backend (Bitwuzla → Z3 → CVC5) behind the `SmtSolver` trait for very
-  large queries.
+  the project's principle. A **wall-clock valve** (`SOLVE_TIME_BUDGET` in
+  `crates/solver/src/sat`) caps each SAT query on *time*, not just decision count,
+  so a single hard query cannot hang the whole analysis (it bails to `Unknown`,
+  which only weakens a verdict). Remaining here: bit-blast division/remainder and
+  symbolic shifts, array/heap theories.
+
+  **External SMT backend — deliberately deferred (data-driven).** The `SmtSolver`
+  trait + `NullSolver` are the prepared opt-in extension point (Bitwuzla → Z3 →
+  CVC5), but it is *not* built, on purpose. Scaling the corpus to memchr surfaced
+  the only timeout so far (its `packedpair` SIMD search), and diagnosis showed it
+  was a **liveness** problem — the bit-precise SAT grinding toward its budget — not
+  a **precision** one: the obligations prove fine on the linear path, so the
+  wall-clock valve turns the timeout into a fast PASS. No corpus function has yet
+  needed bit-precise reasoning the internal solver cannot deliver. Until the
+  per-obligation residual bucket shows a case that stays `UNKNOWN` where a generous
+  bit-precise proof would `PASS`, an external backend would add C/C++ TCB surface
+  (and break the offline pure-Rust build) for a need the data has not demonstrated.
+  That residual bucket is the precise trigger to revisit this.
 - **Counterexample model extraction** — **done** (for the current analysis). The
   internal SAT layer returns a satisfying model (`bitprecise::find_counterexample`),
   and the symbolic engine emits a `FAIL` with a concrete witness (named `arg{i}`)
