@@ -252,11 +252,19 @@ impl ExprCtx {
         // Algebraic identities that are always sound.
         let zero = self.as_const(a).map(|v| v.is_zero());
         let zero_b = self.as_const(b).map(|v| v.is_zero());
+        let one = self.as_const(a).map(|v| v.unsigned() == 1);
+        let one_b = self.as_const(b).map(|v| v.unsigned() == 1);
         match op {
             BvOp::Add | BvOp::Sub | BvOp::Or | BvOp::Xor if zero_b == Some(true) => return a,
             BvOp::Add | BvOp::Or if zero == Some(true) => return b,
             BvOp::Mul | BvOp::And if zero_b == Some(true) => return b, // x*0 = 0, x&0 = 0
             BvOp::Mul | BvOp::And if zero == Some(true) => return a,
+            // x*1 = x / 1*x = x: a unit stride (`&[u8]`, `&[T]` of a 1-byte
+            // element) must not leave an opaque `Mul` node — the linear procedure
+            // then fails to relate the offset to the length and falls back to the
+            // (slow) bit-precise path.
+            BvOp::Mul if one_b == Some(true) => return a,
+            BvOp::Mul if one == Some(true) => return b,
             BvOp::Sub if a == b => return self.int(width, 0),
             _ => {}
         }

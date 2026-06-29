@@ -33,9 +33,16 @@ pub enum ProofMethod {
 }
 
 /// SAT decision budget for the *refinement* attempt (after the linear procedure
-/// already succeeded, to see whether the assumption can be dropped). Tight,
-/// because it runs on every linear success.
-const REFINE_BUDGET: u64 = 40_000;
+/// already succeeded, to see whether the assumption can be dropped). Deliberately
+/// **small**, because it runs on every linear success: the refinement is only a
+/// nicety (it drops the already-recorded `linear-no-overflow` assumption when
+/// cheap), and a *successful* bit-precise proof of a 64-bit bound (e.g. the
+/// unit-stride `i + 1 ≤ len` of a `&[u8]` access, which is genuinely valid and so
+/// makes the SAT solver grind out an `Unsat`) can be expensive. A tight budget
+/// keeps such goals on the fast linear path (still sound, under the assumption)
+/// instead of spending seconds upgrading them; the *fallback* below stays
+/// generous for goals linear cannot prove at all.
+const REFINE_BUDGET: u64 = 3_000;
 
 /// SAT decision budget for the *fallback* attempt (when the linear procedure
 /// failed and bit-precise reasoning is the only hope). More generous, but still

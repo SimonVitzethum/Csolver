@@ -297,6 +297,76 @@ fn mir_real_slice_write_verifies_pass() {
     assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
 }
 
+/// **Real** `rustc --emit=mir` for `fn fill(s: &mut [u8], v: u8) { let mut i=0;
+/// while i < s.len() { s[i] = v; i += 1 } }` (frozen). A mutable-slice write loop
+/// over a **unit-stride** `&[u8]` — the access offset is the bare index, whose
+/// bit-precise refinement of `i + 1 ≤ len` once made it slow; with the tight
+/// refine budget it stays on the fast linear path and verifies PASS quickly.
+const REAL_FILL: &str = r#"
+fn fill(_1: &mut [u8], _2: u8) -> () {
+    debug s => _1;
+    debug v => _2;
+    let mut _0: ();
+    let mut _3: usize;
+    let mut _4: bool;
+    let mut _5: usize;
+    let mut _6: usize;
+    let mut _7: &[u8];
+    let _8: usize;
+    let mut _9: *const [u8];
+    let mut _10: usize;
+    let mut _11: bool;
+    let mut _12: (usize, bool);
+    scope 1 {
+        debug i => _3;
+    }
+
+    bb0: {
+        _3 = const 0_usize;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _5 = copy _3;
+        _7 = &(*_1);
+        _6 = PtrMetadata(move _7);
+        _4 = Lt(move _5, move _6);
+        switchInt(move _4) -> [0: bb5, otherwise: bb2];
+    }
+
+    bb2: {
+        _8 = copy _3;
+        _9 = &raw const (fake) (*_1);
+        _10 = PtrMetadata(move _9);
+        _11 = Lt(copy _8, copy _10);
+        assert(move _11, "index out of bounds: the length is {} but the index is {}", move _10, copy _8) -> [success: bb3, unwind continue];
+    }
+
+    bb3: {
+        (*_1)[_8] = copy _2;
+        _12 = AddWithOverflow(copy _3, const 1_usize);
+        assert(!move (_12.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _3, const 1_usize) -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _3 = move (_12.0: usize);
+        goto -> bb1;
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_mut_slice_fill_loop_verifies_pass() {
+    let module = lower(REAL_FILL, "real_fill");
+    assert!(module.unanalyzed.is_empty(), "lowers: {:?}", module.unanalyzed);
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
 /// **Soundness** against real output: `fn unchecked(s: &[i32], i) -> i32 {
 /// unsafe { *s.get_unchecked(i) } }` (frozen). There is **no** bounds check — the
 /// deref goes through the (opaque) result of a `get_unchecked` call. It must NOT

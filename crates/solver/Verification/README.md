@@ -63,10 +63,17 @@ for bit-precise proofs.
   condition. Any other outcome (model found, budget exhausted, unblastable
   construct, CNF over the size cap) yields `false` = "not proved".
 - **`prove_implies_method`** composes them soundly: linear first (fast), then a
-  tight-budget bit-precise *refinement* (so a goal decidable exactly is reported
-  `BitPrecise` and drops the overflow assumption), and a bit-precise *fallback*
-  when linear fails (catching wrap/bitwise goals linear abstracts away). Every
-  branch returns only a genuinely-proved verdict.
+  **tight-budget** bit-precise *refinement* (so a goal decidable exactly is
+  reported `BitPrecise` and drops the overflow assumption), and a bit-precise
+  *fallback* when linear fails (catching wrap/bitwise goals linear abstracts
+  away). Every branch returns only a genuinely-proved verdict. The refinement
+  budget is deliberately small because it runs on *every* linear success and is
+  only a nicety: a *successful* bit-precise proof of a valid 64-bit bound — e.g.
+  the unit-stride `i + 1 ≤ len` of a `&[u8]` access — makes the SAT solver grind
+  out an `Unsat`, which a small budget cuts short, keeping such goals on the fast
+  linear path (still sound, under the recorded assumption) rather than spending
+  seconds upgrading them. (This was a real ~10× slowdown on unit-stride slice
+  loops.)
 
 ## Limits
 - The linear procedure does not linearize `≠`/disjunctive goals (→ "not

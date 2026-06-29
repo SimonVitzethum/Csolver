@@ -88,8 +88,7 @@ local and conservative; in particular:
   bound is only a fact for `usize` *parameters*, not derived temporaries.
 - The aggregate field accessed must be `.0` of a checked-arithmetic tuple;
   general struct/tuple fields and constant-index projections are opaque.
-- Integer constants are lowered at 64-bit width; a real mutable-slice **fill**
-  loop verifies but is currently slow (an engine cost to revisit).
+- Integer constants are lowered at 64-bit width.
 
 ## Test strategy
 Unit tests: the `get(&[i32; 8], usize)` body parses and lowers to a `PtrOffset` +
