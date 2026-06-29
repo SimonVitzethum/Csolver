@@ -42,6 +42,15 @@ pub enum ProofMethod {
 /// keeps such goals on the fast linear path (still sound, under the assumption)
 /// instead of spending seconds upgrading them; the *fallback* below stays
 /// generous for goals linear cannot prove at all.
+///
+/// SOUNDNESS NOTE — this constant is a **precision/performance dial, never a
+/// correctness one**, so it may be tuned freely without re-auditing soundness.
+/// A smaller budget only makes the refinement give up sooner, leaving the goal on
+/// the linear path *with* its recorded `linear-no-overflow` assumption — a weaker,
+/// still-sound result (a more honest verdict, never a false `PASS`). A larger
+/// budget only drops that assumption on more goals (more precise, slower). It was
+/// cut 40_000 → 3_000 to fix a 250× slowdown on unit-stride `&[u8]` loops; do not
+/// raise it back without measuring that case (see `docs/PROVABILITY.md`).
 const REFINE_BUDGET: u64 = 3_000;
 
 /// SAT decision budget for the *fallback* attempt (when the linear procedure

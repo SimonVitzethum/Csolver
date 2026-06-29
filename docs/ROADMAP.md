@@ -81,6 +81,24 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    hold on ARM binaries. Remaining: the broad ISA (and ARM control flow), DWARF
    types, relocations/PLT, and PE/Mach-O.
 
+> **Scope decision — the binary/ASM track is FROZEN as a research demonstrator.**
+> The x86-64 and AArch64 decoders carry **hand-written, unvalidated instruction
+> semantics**, which is the single highest residual false-`PASS` risk in the whole
+> project. Graceful degradation (`unrecognised opcode → UNKNOWN`) only protects
+> against *missing* instructions; it does **not** catch a *handled* opcode whose
+> modelled semantics is subtly wrong — e.g. a 32-bit `mov eax, …` must zero the
+> upper 32 bits of `rax` (partial-register write), and flag / sign-extension /
+> one-past-the-end-pointer rules are easy to mis-encode. Such a bug yields a silent
+> false `PASS` on a real binary. Because the project's truth source for "proving
+> real Rust" is **MIR**, not the binary, engineering effort goes to the Rust
+> pipeline (Bucket A points 1–2) and the binary track is held at its current
+> demonstrator scope. **It must not be relied on for safety-critical claims until
+> its decoders are translation-validated** against a reference emulator (random
+> byte sequences → MSIR semantics vs. a real CPU/emulator), the same measured
+> discipline the bit-blaster now has (exhaustive oracle test) and the verdict
+> pipeline now has (Miri differential corpus). This is recorded so the freeze is a
+> conscious choice, not a silent gap.
+
 Each front-end owes a **refinement proof** (every concrete behaviour of the
 input is a concrete behaviour of the emitted MSIR) — the soundness hinge for the
 whole tool, argued in each crate's `Verification/`.

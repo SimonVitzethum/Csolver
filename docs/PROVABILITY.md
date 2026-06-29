@@ -61,3 +61,24 @@ open (unbounded loop, opaque FFI, solver `unknown`, lost provenance, …), and a
 **suggested minimal assumption** that would make it `PASS`. The goal is that a
 human (or a future annotation pass) can close the remaining gap with the least
 possible added trust.
+
+## Precision is budgeted; soundness is not
+
+Several knobs trade analysis time against precision but **cannot affect
+soundness** — they only move goals between `PASS` and `UNKNOWN`, never toward a
+false `PASS`. The most load-bearing is `REFINE_BUDGET` in `crates/solver/src/lib`:
+the SAT decision budget for the *refinement* step that retries a linear-proved
+goal bit-precisely to see whether the `linear-no-overflow` assumption can be
+dropped.
+
+- A **smaller** budget makes refinement give up sooner, so more goals stay on the
+  linear path *carrying* their recorded assumption — a weaker but still-sound (more
+  honest) verdict.
+- A **larger** budget discharges that assumption on more goals — more precise, but
+  slower.
+
+It was cut `40_000 → 3_000` to fix a 250× slowdown on unit-stride `&[u8]` loops
+(where `i + 1 ≤ len` is genuinely valid, so the solver grinds the `Unsat` out to
+the budget). This is recorded here so the constant is not "optimised" back up
+without re-measuring that case: it is a deliberate precision/performance choice at
+a soundness-*irrelevant* point, not a soundness parameter.

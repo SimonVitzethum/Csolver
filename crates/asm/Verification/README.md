@@ -80,6 +80,23 @@ incomplete, never unsound. End-to-end: a real ELF `xor eax,eax; ret` verifies
 `rdi`); a `syscall` is `UNKNOWN` (undecoded). See
 `csolver-testsuite/tests/binary.rs`.
 
+### The residual risk graceful degradation does *not* cover
+Degradation protects against a *missing* instruction, not a *mis-modelled* one.
+The semantics of every **handled** opcode is hand-written and **not yet validated**
+against the hardware, and a subtly wrong rule produces a silent false `PASS`:
+
+- partial-register writes — a 32-bit `mov eax, …` zeroes the upper 32 bits of
+  `rax`, an 8/16-bit write does not;
+- flag computation, sign- vs. zero-extension, one-past-the-end pointer rules.
+
+This makes the decoders the **highest residual false-`PASS` risk in the project**.
+Accordingly the binary/ASM track is **frozen as a research demonstrator** (see
+`docs/ROADMAP.md`): it must not be relied on for safety-critical claims until its
+per-instruction semantics are **translation-validated against a reference
+emulator** (the "Proofs" item below) — the same measured discipline the bit-blaster
+(exhaustive oracle test) and the verdict pipeline (Miri differential corpus)
+already have.
+
 ## Specification (target)
 - Refinement: every concrete machine execution is a concrete MSIR execution.
 - Memory operands lower to `PtrOffset` + `Load`/`Store` with the canonical
