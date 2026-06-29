@@ -251,10 +251,19 @@ impl Parser {
 
     /// Parse one function body (the cursor sits just past `fn`).
     fn body(&mut self) -> Result<MirBody> {
-        let name = self.word()?;
-        // Generic args / paths on the name are not expected in MIR fn headers,
-        // but tolerate a trailing `::<…>` defensively by ignoring to `(`.
+        // The header name may be a plain ident (`foo`), a qualified path
+        // (`Type::method`), or — most commonly for `impl` methods — a path that
+        // *starts* with `<`: `<impl at …>::method`, `<T as Trait>::method`.
+        // Consume a leading `<…>`, then take the last path segment before the
+        // argument `(` as the function's name.
+        if self.peek() == &Tok::Punct('<') {
+            self.skip_balanced_angle();
+        }
+        let mut name = String::new();
         while !matches!(self.peek(), Tok::Punct('(') | Tok::Eof) {
+            if let Tok::Word(w) = self.peek() {
+                name = w.clone();
+            }
             self.pos += 1;
         }
         self.expect_punct('(')?;
@@ -813,14 +822,24 @@ impl Parser {
             Tok::Punct('[') => {
                 self.pos += 1;
                 let elem = self.ty()?;
-                let t = if self.eat_punct(';') {
-                    let n = self.int_lit()? as u64;
-                    MType::Array(Box::new(elem), n)
+                if self.eat_punct(';') {
+                    // `[T; N]` with a literal length is an array; a const-generic
+                    // or expression length (`[T; CAP]`) is a sized array of unknown
+                    // size, so model it opaquely (consume up to the `]`).
+                    if let &Tok::Int(n) = self.peek() {
+                        self.pos += 1;
+                        self.expect_punct(']')?;
+                        Ok(MType::Array(Box::new(elem), n as u64))
+                    } else {
+                        while !self.eat_punct(']') && !matches!(self.peek(), Tok::Eof) {
+                            self.pos += 1;
+                        }
+                        Ok(MType::Other)
+                    }
                 } else {
-                    MType::Slice(Box::new(elem))
-                };
-                self.expect_punct(']')?;
-                Ok(t)
+                    self.expect_punct(']')?;
+                    Ok(MType::Slice(Box::new(elem)))
+                }
             }
             Tok::Punct('(') => {
                 // `()` unit, or a tuple (not modelled).
@@ -834,14 +853,21 @@ impl Parser {
             }
             Tok::Word(w) => {
                 self.pos += 1;
-                // A named type may carry generic arguments (`Option<i32>`,
-                // `Vec<T>`) or be a qualified path (`std::option::Option<i32>`);
-                // consume any `<…>` so the type lowers to `Other`, not a parse
-                // error. The element types inside are not needed (the aggregate is
-                // opaque-size; field accesses carry their own type ascription).
+                // A named type may be a qualified path with generic arguments
+                // (`core::option::Option<i32>`, `Vec<T>`); consume the whole path
+                // tail so the type lowers to `Other`, not a parse error. The inner
+                // element types are not needed (the aggregate is opaque-size; a
+                // field access carries its own type ascription).
                 let ty = int_type(&w).unwrap_or(MType::Other);
-                self.skip_balanced_angle();
+                self.skip_path_tail();
                 Ok(ty)
+            }
+            // A qualified type `<T as Trait>::Assoc` starts with `<`; consume the
+            // `<…>` and any `::Assoc` tail.
+            Tok::Punct('<') => {
+                self.skip_balanced_angle();
+                self.skip_path_tail();
+                Ok(MType::Other)
             }
             _ => Ok(MType::Other),
         }
@@ -871,6 +897,26 @@ impl Parser {
                 Tok::Punct('<') => depth += 1,
                 Tok::Punct('>') => depth -= 1,
                 _ => {}
+            }
+        }
+    }
+
+    /// Consume a type's path/generic tail: `::segment` steps, generic `<…>` lists,
+    /// and turbofish `::<…>`, in any order — so `core::result::Result<…>` and
+    /// `Foo<T>::Bar` are fully consumed (the type itself stays `Other`).
+    fn skip_path_tail(&mut self) {
+        loop {
+            match self.peek() {
+                Tok::Punct('<') => self.skip_balanced_angle(),
+                Tok::Punct(':') if self.peek2() == &Tok::Punct(':') => {
+                    self.pos += 2; // `::`
+                    match self.peek() {
+                        Tok::Punct('<') => self.skip_balanced_angle(), // turbofish
+                        Tok::Word(_) => self.pos += 1,                 // a path segment
+                        _ => {}
+                    }
+                }
+                _ => break,
             }
         }
     }
