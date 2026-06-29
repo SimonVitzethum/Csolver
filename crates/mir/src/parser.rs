@@ -81,6 +81,9 @@ pub(crate) enum BinKind {
 pub(crate) enum Rvalue {
     Use(Operand),
     Bin(BinKind, Operand, Operand),
+    /// Checked arithmetic (`AddWithOverflow`/…): a `(result, overflow)` tuple.
+    /// Field `.0` is the arithmetic result, `.1` the overflow flag.
+    CheckedBin(BinKind, Operand, Operand),
     Len(Place),
     Ref(Place),
     Cast(Operand),
@@ -675,6 +678,16 @@ impl Parser {
                     self.expect_punct(')')?;
                     return Ok(Rvalue::Bin(kind, a, b));
                 }
+                // Checked arithmetic (`AddWithOverflow`/…): a `(result, overflow)`.
+                if let Some(kind) = checked_bin_kind(&w) {
+                    self.pos += 1;
+                    self.expect_punct('(')?;
+                    let a = self.operand()?;
+                    let _ = self.eat_punct(',');
+                    let b = self.operand()?;
+                    self.expect_punct(')')?;
+                    return Ok(Rvalue::CheckedBin(kind, a, b));
+                }
                 // A different `Word(...)` rvalue (Aggregate, discriminant, a
                 // checked op, …) is not modelled.
                 self.skip_statement_inline();
@@ -842,6 +855,17 @@ fn bin_kind(w: &str) -> Option<BinKind> {
         "BitXor" => BinKind::BitXor,
         // A modelled-as-opaque arithmetic op (Div/Rem/Shl/Shr/Offset/checked …).
         "Div" | "Rem" | "Shl" | "Shr" | "Offset" => BinKind::Other,
+        _ => return None,
+    })
+}
+
+/// The base operator of a checked-arithmetic rvalue (`AddWithOverflow`,
+/// `CheckedAdd`, …) — these produce a `(result, overflow)` tuple.
+fn checked_bin_kind(w: &str) -> Option<BinKind> {
+    Some(match w {
+        "AddWithOverflow" | "CheckedAdd" => BinKind::Add,
+        "SubWithOverflow" | "CheckedSub" => BinKind::Sub,
+        "MulWithOverflow" | "CheckedMul" => BinKind::Mul,
         _ => return None,
     })
 }

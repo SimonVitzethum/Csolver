@@ -57,6 +57,9 @@ struct Ctx {
     /// function is then rejected (reported `UNKNOWN`) rather than silently
     /// dropping the access — which would be an unsound vacuous `PASS`.
     lowering_failed: bool,
+    /// For a checked-arithmetic tuple local `_k = AddWithOverflow(a, b)`, the
+    /// arithmetic result `a + b` (its field `.0`), so `move (_k.0)` recovers it.
+    checked_arith: HashMap<u32, IrOp>,
 }
 
 /// Lower one MIR body into an MSIR function plus its parameter contracts.
@@ -87,6 +90,7 @@ fn lower_function(
         slice_len: HashMap::new(),
         func_ids: func_ids.clone(),
         lowering_failed: false,
+        checked_arith: HashMap::new(),
     };
 
     // Parameters and their contracts (by position). A reference parameter
@@ -257,6 +261,21 @@ impl Ctx {
                 out.push(assign(dst, value));
                 Ok(())
             }
+            // Checked arithmetic produces a `(result, overflow)` tuple. Compute
+            // the result into a fresh register and remember it as the tuple's
+            // `.0`, so a later `move (_k.0)` recovers the actual value (e.g. the
+            // `n - 1` of a checked subtraction) — the `.1` overflow flag stays
+            // opaque (it only feeds the overflow `assert`).
+            Rvalue::CheckedBin(kind, a, b) => {
+                let av = self.operand_value(a, out);
+                let bv = self.operand_value(b, out);
+                if let Some(rv) = bin_rvalue(*kind, av, bv) {
+                    let tmp = self.fresh();
+                    out.push(assign(tmp, rv));
+                    self.checked_arith.insert(dst.0, IrOp::Reg(tmp));
+                }
+                Ok(())
+            }
             Rvalue::Len(place) => {
                 // `Len(&[T; N])` is the constant `N`; `Len(&[T])` is the slice's
                 // synthetic length parameter.
@@ -390,6 +409,13 @@ impl Ctx {
             Operand::Const(MConst::Bool(b)) => IrOp::int(1, *b as u128),
             Operand::Copy(p) | Operand::Move(p) => match p {
                 Place::Local(n) => IrOp::Reg(RegId(*n)),
+                // Field `.0` of a checked-arithmetic tuple is its result value.
+                Place::Field(inner, 0) => match inner.as_ref() {
+                    Place::Local(k) => {
+                        self.checked_arith.get(k).cloned().unwrap_or(IrOp::Const(Const::Undef))
+                    }
+                    _ => IrOp::Const(Const::Undef),
+                },
                 _ if is_memory_place(p) => {
                     if let Some((ptr, elem)) = self.place_access(p, out) {
                         let dst = self.fresh();

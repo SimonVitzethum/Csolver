@@ -89,4 +89,44 @@ fn get(_1: &[i32; 8], _2: usize) -> i32 {
         assert!(bb1.insts.iter().any(|i| matches!(i, csolver_ir::Inst::PtrOffset { .. })));
         assert!(bb1.insts.iter().any(|i| matches!(i, csolver_ir::Inst::Load { .. })));
     }
+
+    /// Checked arithmetic is modelled by its result: `_3 = AddWithOverflow(_1,
+    /// _2); _4 = move (_3.0)` makes `_4` the actual sum `_1 + _2` (an `Add`
+    /// instruction), not an opaque unknown — so a checked value used downstream
+    /// keeps its meaning. The overflow flag `_3.1` stays opaque.
+    const CHECKED: &str = r#"
+fn add(_1: u32, _2: u32) -> u32 {
+    let mut _0: u32;
+    let mut _3: (u32, bool);
+    bb0: {
+        _3 = AddWithOverflow(copy _1, copy _2);
+        assert(!move (_3.1: bool), "overflow", copy _1, copy _2) -> [success: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = move (_3.0: u32);
+        return;
+    }
+}
+"#;
+
+    #[test]
+    fn models_checked_arithmetic_result() {
+        let module = MirFrontend
+            .lower(MirInput { source: CHECKED.into(), name: "add".into() })
+            .expect("lower");
+        let f = &module.functions[0];
+        // The result of the checked add became a real `Add` instruction…
+        let has_add = f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(i, csolver_ir::Inst::Assign { value: csolver_ir::RValue::Bin { op: csolver_ir::BinOp::Add, .. }, .. })
+        });
+        assert!(has_add, "the checked add's result is a real Add, not opaque");
+        // …and `_0 = move (_3.0)` forwards that result (no `Undef`).
+        let bb1 = f.block(csolver_ir::BlockId(1)).expect("bb1");
+        let forwards = bb1.insts.iter().any(|i| matches!(
+            i,
+            csolver_ir::Inst::Assign { dst, value: csolver_ir::RValue::Use(csolver_ir::Operand::Reg(_)), .. }
+                if *dst == csolver_ir::RegId(0)
+        ));
+        assert!(forwards, "_0 forwards the checked result register, not Undef");
+    }
 }

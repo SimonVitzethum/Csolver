@@ -36,7 +36,13 @@ index `s[i]` is preceded by `assert(Lt(i, len), "index out of bounds…") ->
   length (modern rustc emits `PtrMetadata`, not `Len`), `&place` (element
   address / inner pointer), `as` casts (value-preserving); checked-arithmetic
   (`AddWithOverflow`, …) and other aggregate rvalues are opaque.
-- **Places** also tolerate a type ascription (`(_11.1: bool)`, `(*_1: &[i32])`).
+- **Checked arithmetic** (`AddWithOverflow`/`SubWithOverflow`/…) is modelled by
+  its result: field `.0` of the `(result, overflow)` tuple becomes the actual
+  `a ± b`, so a checked value used downstream keeps its meaning; the `.1`
+  overflow flag stays opaque (it only feeds the overflow `assert`).
+- **Places** also tolerate a variant downcast (`(_5 as Some)`), a type ascription
+  (`(_11.1: bool)`, `(*_1: &[i32])`), and a borrow-kind annotation (`&raw const
+  (fake) (*_1)`).
 - **Terminators**: `goto`, `return`, `switchInt` (→ `CondBr`/`Switch`),
   `assert` (→ guarded `CondBr` + panic pad), the assignment-form **call**
   `_d = f(args) -> [return: bb, …]` (→ an MSIR `Call` + a `Br` to the return
@@ -73,13 +79,23 @@ local and conservative; in particular:
 - **Drops** reject the function; a call's **unwind/cleanup** path is not analysed
   (the return path is); call **return types** default to a 64-bit scalar (local
   decls are not yet parsed for the dst type).
-- **Aggregates/fields**, checked-arithmetic tuples, and constant-index
-  projections are opaque.
-- Integer constants are lowered at 64-bit width.
+- **Struct field accesses through a pointer** (`(*_1).f`) and the
+  **iterator/enum-downcast** shape (`for x in s`) are `UNKNOWN` (the former needs
+  struct layout, absent from the MIR text; the latter needs enum-variant
+  modelling).
+- An index *derived by arithmetic* (`s[len - 1]`) can stay `UNKNOWN`: the
+  bounds-check `assert` gives the upper bound, but the implicit `0 ≤ idx` lower
+  bound is only a fact for `usize` *parameters*, not derived temporaries.
+- The aggregate field accessed must be `.0` of a checked-arithmetic tuple;
+  general struct/tuple fields and constant-index projections are opaque.
+- Integer constants are lowered at 64-bit width; a real mutable-slice **fill**
+  loop verifies but is currently slow (an engine cost to revisit).
 
 ## Test strategy
-Unit test: the `get(&[i32; 8], usize)` body parses and lowers to a `PtrOffset` +
-`Load` under a contracted parameter. End-to-end (`csolver-testsuite/tests/
+Unit tests: the `get(&[i32; 8], usize)` body parses and lowers to a `PtrOffset` +
+`Load` under a contracted parameter; a checked `AddWithOverflow` result is
+modelled as a real `Add` and forwarded by `move (_3.0)`. End-to-end
+(`csolver-testsuite/tests/
 mir_frontend.rs`): the checked array index verifies **PASS** (`param-contracts`);
 a checked **slice** index `get(&[i32], usize)` and an index-based slice **loop**
 `for i in 0..s.len() { s[i] }` verify **PASS** (`slice-abi`); the unchecked index
