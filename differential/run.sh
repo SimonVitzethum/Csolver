@@ -11,10 +11,16 @@
 # (e.g. a bounds-check abort) is *safe* behaviour — CSolver proves memory safety,
 # not panic-freedom — so a panic counts as "no UB".
 #
+# Each driver FUZZES its input (a tiny deterministic PRNG, see tests/drive.rs), so
+# Miri reaches UB paths a hand-picked input would miss. FUZZ_CASES bounds how many
+# inputs each driver draws under Miri (Miri is slow); raise it for a deeper sweep.
+#
 # Exits non-zero iff any soundness violation is found.
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
+: "${FUZZ_CASES:=32}"
+export FUZZ_CASES
 
 echo "== building the solver CLI =="
 (cd "$ROOT" && cargo build -q -p csolver-cli) || { echo "build failed"; exit 2; }
@@ -37,7 +43,7 @@ violations=0
 precise=0
 miss=0
 sound_caught=0
-printf "%-18s %-9s %-7s  %s\n" "function" "CSolver" "Miri" "result"
+printf "%-22s %-9s %-7s  %s\n" "function" "CSolver" "Miri" "result"
 printf -- "------------------------------------------------------------\n"
 for fn in $FNS; do
     cs="$(verdict "$fn")"
@@ -60,7 +66,7 @@ for fn in $FNS; do
     else
         res="~ precision miss (unknown on safe)"; miss=$((miss+1))
     fi
-    printf "%-18s %-9s %-7s  %s\n" "$fn" "$cs" "$miri" "$res"
+    printf "%-22s %-9s %-7s  %s\n" "$fn" "$cs" "$miri" "$res"
 done
 
 echo
