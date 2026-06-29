@@ -117,7 +117,7 @@ With the grep fixed (`grep -E "residual:"`, bucketing by the parenthetical
 | residual root cause | POs | what it is |
 |---|---:|---|
 | `pointer provenance is not tracked` | 1822 | raw-pointer obligations (UAF / in-bounds / align / valid-read) on pointers with no tracked provenance |
-| `memory operation not analyzed (loops, symbolic disabled, or truncated)` | 1437 | a memory op the engine did not symbolically evaluate — inside a loop, with symbolic off, or in a truncated body |
+| `memory operation not analyzed` (loop/unsupported op) | 1437 | a memory op the symbolic model reached but could not decide |
 | `pointer may be null or have opaque provenance` | 429 | nullness unprovable |
 | `could not prove the access stays in bounds` | 48 | a genuine in-bounds residual the solver could not close |
 
@@ -127,11 +127,42 @@ landings). The old top bucket — `could not be lowered to a known pointer` (the
 "unlowerable mem access (42)", field-of-field + double-deref) — is now **0**: the
 field-of-field lowering closed it entirely, double-deref included.
 
+### Splitting the second bucket honestly (the same discipline, one level down)
+
+That 1437 row used to read `memory operation not analyzed (loops, symbolic disabled,
+or truncated)` — three very different causes lumped into one string, one of which
+("truncated") could have been a *hidden front-end body cut-off* masquerading as an
+engine limit. That is the soundness-critical case the Miri oracle cannot catch (an
+*incompletely* analysed function is not *wrongly* modelled), so it could not be left
+ambiguous. The emission site now distinguishes them — `symbolic analysis disabled`
+(config) / `symbolic exploration truncated at the visit budget` (coverage cap) /
+`reached but not decided by the symbolic memory model` (the genuine per-op limit) —
+and the re-measured split is unambiguous:
+
+```
+   1437  reached but not decided (loop body or unsupported op)
+      0  symbolic exploration truncated at the visit budget
+      0  symbolic analysis disabled
+```
+
+**All 1437 are the genuine engine limit; zero are truncation, let alone a hidden
+front-end cut-off.** The explorer *reached* every one of these ops (exploration ran
+to completion) and simply could not discharge it — a loop body it does not summarise
+or an unsupported construct — leaving it soundly `Open`. And the truncation rule it
+rests on is now pinned by a positive control (`truncated_exploration_reports_no_
+memory_decision` in `csolver-symbolic`): under a forced 1-visit budget the report is
+`{ truncated: true, ..default }` with *every* decision map empty, so a truncated
+function can never report a memory op safe — it always falls to non-`PASS`.
+
 So the corrected finding is the **opposite** of the parked claim: the front end is
 now nearly complete, and the dominant driver of `UNKNOWN` at scale is **engine
-analysis depth** — pointer provenance tracking (1822) and loop/symbolic memory
-evaluation (1437). These are real, prioritisable engine capabilities, not parser
-chores. The lesson is the project's own methodology turned on itself: *the
-aggregation is part of the measurement; an unverified bucket count is not evidence
-of an empty bucket.* The four "empty" readings were the metric lying, not the engine
-being idle.
+analysis depth** — pointer provenance tracking (1822, ~189 functions) and loop /
+unsupported-op memory evaluation (1437, ~63 functions). Both are real, prioritisable
+engine capabilities, not parser chores; the parse tail (~32 functions, 9%) is rightly
+the *least* of them. The lesson is the project's own methodology turned on itself, in
+two layers: *the aggregation is part of the measurement, and so is the residual
+string it aggregates.* An unverified bucket count is not evidence of an empty bucket
+(the `grep -A1` phantom), and an unsplit residual is not evidence of a single cause
+(the "truncated" that turned out to be zero). The fix for both is the same — a
+positive control that feeds a known input and checks the bucket — which is why the
+sweep now gates on `selftest.sh` before printing a single number.

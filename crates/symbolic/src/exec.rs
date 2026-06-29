@@ -2460,6 +2460,33 @@ mod tests {
         assert!(arith.proven, "pointer arithmetic: {}", arith.residual);
     }
 
+    #[test]
+    fn truncated_exploration_reports_no_memory_decision() {
+        // Soundness positive control for the truncation rule. When exploration
+        // hits its visit budget, the report is `{ truncated: true, ..default }` —
+        // every decision map empty — so each memory op falls back to `Open` and the
+        // function can never PASS on an unanalysed access. (This is the property the
+        // scaling sweep's "truncated" residual bucket rests on; the sweep happens to
+        // show 0 truncations today, but the guarantee must hold for the ones it will
+        // eventually hit, so it is pinned here rather than assumed.) A 1-visit budget
+        // truncates this 4-block function before it reaches the store at bb2.
+        let f = store_buf();
+        let r = discharge_with(&f, crate::ExecLimits { max_visits: 1 });
+        assert!(r.truncated, "a 1-visit budget must truncate a 4-block function");
+        for prop in [
+            SafetyProperty::NoNullDeref,
+            SafetyProperty::NoUseAfterFree,
+            SafetyProperty::InBounds,
+            SafetyProperty::Alignment,
+            SafetyProperty::ValidWrite,
+        ] {
+            assert!(
+                r.mem_decision(BlockId(2), 1, prop).is_none(),
+                "{prop} must be undecided (Open) under truncation, never reported safe"
+            );
+        }
+    }
+
     /// A use-after-free: alloc, free, then store through the freed pointer.
     fn use_after_free() -> Function {
         let buf = RegId(0);

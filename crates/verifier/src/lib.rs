@@ -34,7 +34,7 @@ use csolver_core::{
 };
 use csolver_ir::{Condition, Const, FuncId, Function, Inst, Module, Operand, PtrContract};
 use csolver_symbolic::{
-    discharge_full, discharge_function, summarize_module, Summary, SymOutcome,
+    discharge_full, discharge_function, summarize_module, Summary, SymOutcome, SymbolicReport,
 };
 use std::collections::HashMap;
 
@@ -266,11 +266,7 @@ fn verify_function_with(
                         Some(model) => refuted_by_symbolic(property, &predicate, model.clone()),
                         None => open_memory(property, &predicate, &d.residual),
                     },
-                    None => open_memory(
-                        property,
-                        &predicate,
-                        "memory operation not analyzed (loops, symbolic disabled, or truncated)",
-                    ),
+                    None => open_memory(property, &predicate, not_analyzed_reason(&symbolic)),
                 };
                 outcomes.push(ObligationOutcome { obligation, result });
             }
@@ -338,6 +334,34 @@ fn proven_by_symbolic_memory(predicate: &str, assumptions: &[String]) -> Obligat
     ))
     .with_assumptions(assumptions.to_vec());
     ObligationResult::Proven(tree)
+}
+
+/// Why a memory op produced no symbolic decision, kept distinct so the scaling
+/// sweep can separate three very different situations that all read as `Open`:
+///
+/// - **disabled** — symbolic analysis was switched off (a config, not a limit);
+/// - **truncated** — exploration hit its visit budget, after which *no* decisions
+///   are reported for the whole function (a deliberate soundness rule: truncation
+///   must never hide a violating path, so every op falls back to `Open`);
+/// - **undecided** — exploration ran to completion and *reached* this op but the
+///   symbolic memory model could not decide it (a loop body it does not summarise,
+///   or an unsupported construct) — the genuine per-op engine limit.
+///
+/// All three are sound: the op is still enumerated as an obligation and stays
+/// `Open`, so the function can never `PASS` on an unanalysed access. The split only
+/// makes the *reason* honest, so a coverage cap is not mistaken for an engine gap
+/// (nor either for a hidden front-end truncation, which cannot reach here — a
+/// dropped body yields fewer obligations or a whole-function parse error, not an
+/// `Open` memory op). See `Verification/`.
+fn not_analyzed_reason(symbolic: &Option<SymbolicReport>) -> &'static str {
+    match symbolic {
+        None => "memory operation not analyzed (symbolic analysis disabled)",
+        Some(r) if r.truncated => {
+            "memory operation not analyzed (symbolic exploration truncated at the visit budget)"
+        }
+        Some(_) => "memory operation not analyzed (reached but not decided by the \
+                    symbolic memory model: loop body or unsupported op)",
+    }
 }
 
 fn open_memory(property: SafetyProperty, predicate: &str, reason: &str) -> ObligationResult {
