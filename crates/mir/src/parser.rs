@@ -245,7 +245,14 @@ impl Parser {
     /// Advance to the next top-level `fn`, returning whether one was found.
     fn skip_to_fn(&mut self) -> bool {
         while !matches!(self.peek(), Tok::Eof) {
-            if matches!(self.peek(), Tok::Word(w) if w == "fn") {
+            // A real function header is `fn name(…)` / `fn <impl …>::m(…)` — the
+            // token after `fn` names it. A `fn` immediately followed by `(` is a
+            // function-*pointer type* (`unsafe fn(&T) -> R`, e.g. inside a const's
+            // vtable, which rustc dumps with a MIR body), not an item: skip it so
+            // we never land mid-type and try to parse a bogus function body.
+            if matches!(self.peek(), Tok::Word(w) if w == "fn")
+                && !matches!(self.peek2(), Tok::Punct('('))
+            {
                 self.pos += 1;
                 return true;
             }
