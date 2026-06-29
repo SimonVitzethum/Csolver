@@ -264,6 +264,25 @@ pub enum Inst {
         /// Element type (the scale).
         elem: Type,
     },
+    /// A pointer to field `field` (of `size` bytes, `align`-aligned) within the
+    /// struct/aggregate that `base` points to. Unlike [`Inst::PtrOffset`] the byte
+    /// offset is *not* computed: a typed field access through a valid reference is
+    /// in bounds and aligned by construction (the field lies within the
+    /// aggregate). The engine models this with a fresh symbolic offset constrained
+    /// to fit, which avoids reconstructing a struct layout — that layout is absent
+    /// from MIR and unspecified for `repr(Rust)`.
+    FieldPtr {
+        /// Destination register (the field pointer).
+        dst: RegId,
+        /// Base pointer to the aggregate.
+        base: Operand,
+        /// Field index.
+        field: u32,
+        /// Field size in bytes.
+        size: u64,
+        /// Field alignment in bytes.
+        align: u64,
+    },
     /// A call. The callee's summary supplies the effect; opaque callees emit an
     /// explicit assumption.
     Call {
@@ -345,7 +364,8 @@ impl Inst {
             Inst::Assign { dst, .. }
             | Inst::Load { dst, .. }
             | Inst::Alloc { dst, .. }
-            | Inst::PtrOffset { dst, .. } => Some(*dst),
+            | Inst::PtrOffset { dst, .. }
+            | Inst::FieldPtr { dst, .. } => Some(*dst),
             Inst::Call { dst, .. } | Inst::Intrinsic { dst, .. } => *dst,
             Inst::Store { .. }
             | Inst::Dealloc { .. }

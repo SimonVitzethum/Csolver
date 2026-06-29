@@ -47,7 +47,10 @@ pub(crate) enum Place {
     Local(Local),
     Deref(Box<Place>),
     Index(Box<Place>, Local),
-    Field(Box<Place>, u32),
+    /// A field projection `.N`, carrying the field's type from the place's type
+    /// ascription (`((*_1).0: i32)`) when present — the field type gives its size
+    /// and alignment, which is all the layout a field access needs.
+    Field(Box<Place>, u32, Option<MType>),
 }
 
 /// A MIR operand.
@@ -589,8 +592,14 @@ impl Parser {
             if self.eat_word("as") {
                 let _ = self.word(); // the variant name (downcast is opaque here)
             }
+            let mut inner = inner;
             if self.eat_punct(':') {
-                let _ = self.ty()?;
+                let ty = self.ty()?;
+                // For `((*_1).0: i32)` the ascription is the field's type — attach
+                // it so the lowerer knows the field's size/alignment.
+                if let Place::Field(_, _, fty @ None) = &mut inner {
+                    *fty = Some(ty);
+                }
             }
             self.expect_punct(')')?;
             inner
@@ -607,7 +616,7 @@ impl Parser {
                 base = Place::Index(Box::new(base), idx);
             } else if self.eat_punct('.') {
                 let field = self.field_index()?;
-                base = Place::Field(Box::new(base), field);
+                base = Place::Field(Box::new(base), field, None);
             } else {
                 break;
             }

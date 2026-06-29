@@ -131,6 +131,25 @@ pub fn window_sum(s: &[i32]) -> i64 {
     s.windows(2).map(|w| w[0] as i64 + w[1] as i64).sum()
 }
 
+// ---- struct field access through a reference: always in bounds by typing ------
+
+/// A small struct, to exercise field access through a reference.
+pub struct Pair {
+    pub a: i32,
+    pub b: i32,
+}
+
+/// A field read through `&Pair` — a typed field of a valid reference is always in
+/// bounds.
+pub fn read_field(p: &Pair) -> i32 {
+    p.a
+}
+
+/// A field write through `&mut Pair` — always in bounds and permitted (mutable).
+pub fn write_field(p: &mut Pair, v: i32) {
+    p.a = v;
+}
+
 // ---- helper chains: the safety precondition flows across a call boundary ------
 
 /// First element via a helper that returns `Option<&_>` — safe for every slice.

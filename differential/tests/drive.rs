@@ -195,6 +195,25 @@ fn drive_window_sum() {
 }
 
 #[test]
+fn drive_read_field() {
+    let mut f = Fuzz::new(0x5afe_000f);
+    for _ in 0..cases() {
+        let p = Pair { a: f.int(), b: f.int() };
+        black_box(read_field(black_box(&p)));
+    }
+}
+
+#[test]
+fn drive_write_field() {
+    let mut f = Fuzz::new(0x5afe_0010);
+    for _ in 0..cases() {
+        let mut p = Pair { a: f.int(), b: f.int() };
+        write_field(black_box(&mut p), black_box(f.int()));
+        black_box(&p);
+    }
+}
+
+#[test]
 fn drive_head_via_helper() {
     let mut f = Fuzz::new(0x5afe_000d);
     for _ in 0..cases() {

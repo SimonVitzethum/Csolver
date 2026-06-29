@@ -335,7 +335,10 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         }
         // These define values the interval domain does not model precisely
         // (pointers, opaque results): conservatively top.
-        Inst::Load { dst, .. } | Inst::Alloc { dst, .. } | Inst::PtrOffset { dst, .. } => {
+        Inst::Load { dst, .. }
+        | Inst::Alloc { dst, .. }
+        | Inst::PtrOffset { dst, .. }
+        | Inst::FieldPtr { dst, .. } => {
             state.set(*dst, Interval::top());
         }
         Inst::Call { dst: Some(d), .. } | Inst::Intrinsic { dst: Some(d), .. } => {

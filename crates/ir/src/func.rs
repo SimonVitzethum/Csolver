@@ -137,6 +137,11 @@ pub enum SizeSpec {
         /// Size in bytes of one element.
         elem_size: u64,
     },
+    /// A statically-unknown size — an aggregate (`&Struct`/`&mut Struct`) whose
+    /// layout is absent from the source IR. Modelled as a fresh symbolic size; a
+    /// field access through it is proved in bounds by construction (the field lies
+    /// within the aggregate), never by a reconstructed byte offset.
+    Opaque,
 }
 
 /// A caller-guaranteed contract on a pointer parameter (from a frontend, e.g.

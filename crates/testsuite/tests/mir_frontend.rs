@@ -689,3 +689,65 @@ fn mir_nested_index_inner_unchecked_is_not_pass() {
     });
     assert!(!in_bounds_proved, "an unbounded inner index must not prove in-bounds");
 }
+
+/// Real `rustc --emit=mir` for struct field access through a reference:
+/// `fn get_x(p: &Point) -> i32 { p.x }` reads field 0 (`((*_1).0: i32)`) and
+/// `fn set_x(p: &mut Point, v: i32) { p.x = v; }` writes it. A struct's layout is
+/// absent from MIR (and unspecified for `repr(Rust)`), so the field is *not*
+/// placed at a byte offset; instead the `&Point` parameter is an opaque-size
+/// region and the field access is proved in bounds and aligned by construction
+/// (a typed field of a valid reference lies within it), under `struct-abi`.
+const REAL_STRUCT_FIELDS: &str = r#"
+fn get_x(_1: &Point) -> i32 {
+    debug p => _1;
+    let mut _0: i32;
+    bb0: {
+        _0 = copy ((*_1).0: i32);
+        return;
+    }
+}
+
+fn set_x(_1: &mut Point, _2: i32) -> () {
+    debug p => _1;
+    debug v => _2;
+    let mut _0: ();
+    bb0: {
+        ((*_1).0: i32) = copy _2;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_struct_field_access_verifies_pass() {
+    let module = lower(REAL_STRUCT_FIELDS, "real_fields");
+    assert!(module.unanalyzed.is_empty(), "field-through-pointer lowers, not dropped");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.assumptions.iter().any(|a| a.id == "struct-abi"));
+}
+
+/// Soundness of the write permission: the *same* field store through a shared
+/// `&Point` (not `&mut`) must not prove `valid_write` — a readonly reference may
+/// be read but not written. (rustc would never emit this, but the verifier's
+/// permission gate must hold regardless.)
+const FIELD_WRITE_READONLY: &str = r#"
+fn ro_write(_1: &Point, _2: i32) -> () {
+    let mut _0: ();
+    bb0: {
+        ((*_1).0: i32) = copy _2;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_readonly_field_write_is_not_pass() {
+    let module = lower(FIELD_WRITE_READONLY, "ro_write");
+    let report = verify_module(&module, &Config::default());
+    let write_proved = report.functions[0].outcomes.iter().any(|o| {
+        o.obligation.property == SafetyProperty::ValidWrite
+            && matches!(o.result, csolver_core::ObligationResult::Proven(_))
+    });
+    assert!(!write_proved, "a field write through a shared reference must not prove valid_write");
+}

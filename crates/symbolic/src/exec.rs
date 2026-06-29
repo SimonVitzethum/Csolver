@@ -43,6 +43,7 @@ const ALLOC_SUCCEEDS: &str = "alloc-succeeds";
 const LINEAR_NO_OVERFLOW: &str = "linear-no-overflow";
 const PARAM_CONTRACTS: &str = "param-contracts";
 const SLICE_ABI: &str = "slice-abi";
+const STRUCT_ABI: &str = "struct-abi";
 
 /// Whether a scalar `SafetyCheck` was discharged symbolically.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,7 +228,7 @@ fn discharge_inner(
             // A concrete byte size cannot wrap; nothing extra is needed (`true`).
             SizeSpec::Bytes(n) => {
                 let truth = ex.ctx.boolean(true);
-                (ex.ctx.int(PTR_WIDTH, n as u128), PARAM_CONTRACTS, truth)
+                (ex.ctx.int(PTR_WIDTH, n as u128), PARAM_CONTRACTS, Some(truth))
             }
             SizeSpec::ParamElements { len_param, elem_size } => {
                 let len_reg = f.params[len_param as usize].0;
@@ -240,8 +241,12 @@ fn discharge_inner(
                 // A valid slice has `len * size_of::<T>() <= isize::MAX`, so the
                 // length times the element size does not wrap (`slice-abi`).
                 let nowrap = ex.size_no_wrap_fact(len_e, elem_size);
-                (size, SLICE_ABI, nowrap)
+                (size, SLICE_ABI, Some(nowrap))
             }
+            // An aggregate of unknown layout: a fresh symbolic size. Field accesses
+            // are proved in bounds by construction (`struct-abi`), so the region is
+            // prove-only (no refutation — `size_nowrap = None`).
+            SizeSpec::Opaque => (ex.fresh_scalar(PTR_WIDTH), STRUCT_ABI, None),
         };
         let zero = ex.ctx.int(PTR_WIDTH, 0);
         let nonneg = ex.ctx.cmp(SCmp::Sle, zero, size);
@@ -257,7 +262,7 @@ fn discharge_inner(
                 exec: false,
             },
             contract: Some(assumption),
-            size_nowrap: Some(nowrap),
+            size_nowrap: nowrap,
         });
         env.insert(
             *reg,
@@ -1201,6 +1206,38 @@ impl Explorer<'_> {
                     align: new_align,
                 };
                 self.check_ptr_arith(block, idx, &result, state);
+                state.env.insert(*dst, SymValue::Ptr(result));
+            }
+            Inst::FieldPtr { dst, base, field: _, size, align } => {
+                let base_ptr = self.eval_pointer(base, state);
+                let result = match &base_ptr.prov {
+                    Prov::Region(r) => {
+                        // A typed field of a valid aggregate lies within it. Model
+                        // it at a fresh offset constrained `0 <= off` and
+                        // `off + size <= region size`, and inherit the field's
+                        // alignment (a field is aligned within its struct). The
+                        // following Load/Store is then in bounds and aligned by
+                        // construction — no struct byte-layout is reconstructed.
+                        let rid = *r;
+                        let region_size = state.regions[rid].size;
+                        let off = self.fresh_scalar(PTR_WIDTH);
+                        let zero = self.ctx.int(PTR_WIDTH, 0);
+                        let lo = self.ctx.cmp(SCmp::Sle, zero, off);
+                        let sz = self.ctx.int(PTR_WIDTH, *size as u128);
+                        let end = self.ctx.bin(BvOp::Add, off, sz);
+                        let hi = self.ctx.cmp(SCmp::Sle, end, region_size);
+                        state.facts.push(lo);
+                        state.facts.push(hi);
+                        SymPointer { prov: Prov::Region(rid), offset: off, align: (*align).max(1) }
+                    }
+                    // Not a known region (null/unknown provenance): the field
+                    // pointer inherits it, so a later access is soundly unproven.
+                    _ => SymPointer {
+                        prov: base_ptr.prov.clone(),
+                        offset: base_ptr.offset,
+                        align: (*align).max(1),
+                    },
+                };
                 state.env.insert(*dst, SymValue::Ptr(result));
             }
             Inst::Load { dst, ty, ptr, align } => {

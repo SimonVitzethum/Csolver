@@ -119,6 +119,19 @@ fn lower_function(
                             writable: *mutable,
                         },
                     ));
+                } else if matches!(inner.as_ref(), MType::Other) {
+                    // An aggregate of statically-unknown layout (`&Struct`): an
+                    // opaque-size region, so a field access through it is modelled
+                    // (proved in bounds by construction, not by a byte offset).
+                    contracts.push((
+                        idx as u32,
+                        PtrContract {
+                            size: SizeSpec::Opaque,
+                            align: 1,
+                            readable: true,
+                            writable: *mutable,
+                        },
+                    ));
                 }
             }
             other => params.push((RegId(*local), mtype_to_ir(other))),
@@ -196,8 +209,13 @@ impl Ctx {
                 self.propagate_slice_len(*d, rv);
                 Ok(())
             }
-            // Memory destination: `(*_p)[..] = operand` / `*_p = operand`.
-            Place::Deref(_) | Place::Index(_, _) => {
+            // Memory destination: `(*_p)[..] = …` / `*_p = …` / `(*_p).f = …`.
+            // A *by-value* field write (`_3.0 = …`) is an opaque aggregate update
+            // with no memory effect, so it is skipped soundly.
+            Place::Deref(_) | Place::Index(_, _) | Place::Field(_, _, _) => {
+                if !is_memory_place(place) {
+                    return Ok(());
+                }
                 let Rvalue::Use(op) = rv else {
                     // A non-`Use` store (e.g. a binop result written straight to
                     // memory) is rare in MIR; not modelled — skip soundly (the
@@ -212,15 +230,6 @@ impl Ctx {
                         value,
                         align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32,
                     });
-                }
-                Ok(())
-            }
-            // A field of a plain local is opaque (a tuple value) — skip; a field
-            // *through a pointer* (`(*_p).0 = …`) is a memory write we cannot
-            // place without struct layout, so reject the function.
-            Place::Field(_, _) => {
-                if is_memory_place(place) {
-                    self.lowering_failed = true;
                 }
                 Ok(())
             }
@@ -409,13 +418,17 @@ impl Ctx {
             Operand::Const(MConst::Bool(b)) => IrOp::int(1, *b as u128),
             Operand::Copy(p) | Operand::Move(p) => match p {
                 Place::Local(n) => IrOp::Reg(RegId(*n)),
-                // Field `.0` of a checked-arithmetic tuple is its result value.
-                Place::Field(inner, 0) => match inner.as_ref() {
-                    Place::Local(k) => {
-                        self.checked_arith.get(k).cloned().unwrap_or(IrOp::Const(Const::Undef))
+                // Field `.0` of a checked-arithmetic tuple (a by-value local) is
+                // its result value. A field *through a pointer* (`(*_1).0`) is a
+                // memory place and is loaded by the arm below instead.
+                Place::Field(inner, 0, _) if matches!(inner.as_ref(), Place::Local(_)) => {
+                    match inner.as_ref() {
+                        Place::Local(k) => {
+                            self.checked_arith.get(k).cloned().unwrap_or(IrOp::Const(Const::Undef))
+                        }
+                        _ => IrOp::Const(Const::Undef),
                     }
-                    _ => IrOp::Const(Const::Undef),
-                },
+                }
                 _ if is_memory_place(p) => {
                     if let Some((ptr, elem)) = self.place_access(p, out) {
                         let dst = self.fresh();
@@ -493,6 +506,36 @@ impl Ctx {
                     let elem = self.deref_elem(*p).unwrap_or_else(|| Type::int(8));
                     Some((RegId(*p), elem))
                 }
+                _ => {
+                    self.lowering_failed = true;
+                    None
+                }
+            },
+            // `(*_p).f`: a field of the struct behind pointer `_p`. The field's
+            // type (from the MIR ascription) gives its size and alignment; the
+            // engine proves the access in bounds by construction, so no struct
+            // byte-layout is needed (it is absent from MIR anyway).
+            Place::Field(base, field, fty) => match base.as_ref() {
+                Place::Deref(inner) => match inner.as_ref() {
+                    Place::Local(p) => {
+                        let elem = fty.as_ref().map(mtype_to_ir).unwrap_or_else(|| Type::int(8));
+                        let size = elem.size_bytes(&LAYOUT).unwrap_or(1).max(1);
+                        let align = elem.align_bytes(&LAYOUT).unwrap_or(1).max(1);
+                        let dst = self.fresh();
+                        out.push(Inst::FieldPtr {
+                            dst,
+                            base: IrOp::Reg(RegId(*p)),
+                            field: *field,
+                            size,
+                            align,
+                        });
+                        Some((dst, elem))
+                    }
+                    _ => {
+                        self.lowering_failed = true;
+                        None
+                    }
+                },
                 _ => {
                     self.lowering_failed = true;
                     None
@@ -597,7 +640,7 @@ fn is_memory_place(p: &Place) -> bool {
     match p {
         Place::Local(_) => false,
         Place::Deref(_) | Place::Index(_, _) => true,
-        Place::Field(inner, _) => is_memory_place(inner),
+        Place::Field(inner, _, _) => is_memory_place(inner),
     }
 }
 
@@ -605,7 +648,7 @@ fn is_memory_place(p: &Place) -> bool {
 fn place_base_local(p: &Place) -> Option<u32> {
     match p {
         Place::Local(n) => Some(*n),
-        Place::Deref(inner) | Place::Field(inner, _) | Place::Index(inner, _) => {
+        Place::Deref(inner) | Place::Field(inner, _, _) | Place::Index(inner, _) => {
             place_base_local(inner)
         }
     }
@@ -623,7 +666,7 @@ fn block_locals(b: &MBlock) -> Vec<u32> {
                     out.push(*n);
                     break;
                 }
-                Place::Deref(inner) | Place::Field(inner, _) => cur = inner,
+                Place::Deref(inner) | Place::Field(inner, _, _) => cur = inner,
                 Place::Index(inner, idx) => {
                     out.push(*idx);
                     cur = inner;
