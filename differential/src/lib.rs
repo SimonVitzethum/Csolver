@@ -150,6 +150,46 @@ pub fn write_field(p: &mut Pair, v: i32) {
     p.a = v;
 }
 
+// ---- field-of-field: a nested field lies within the struct, by construction ----
+
+/// A two-level struct, so `o.inner.f` lowers to a nested field path `((*_1).0).f`.
+pub struct Inner {
+    pub idx: usize,
+    pub val: i32,
+}
+pub struct Outer {
+    pub inner: Inner,
+    pub tag: i32,
+}
+
+/// Read a nested field — memory-safe for any valid `&Outer`.
+pub fn ff_read(o: &Outer) -> i32 {
+    o.inner.val
+}
+
+/// Write a nested field, then read it back and a sibling — exercises that distinct
+/// field paths do not alias (the write must not corrupt `o.tag`).
+pub fn ff_write(o: &mut Outer, v: i32) -> i32 {
+    o.inner.val = v;
+    o.inner.val + o.tag
+}
+
+/// A guarded nested-field index — safe for every `o.inner.idx`.
+pub fn ff_guarded_index(o: &Outer, s: &[i32]) -> i32 {
+    if o.inner.idx < s.len() {
+        s[o.inner.idx]
+    } else {
+        -1
+    }
+}
+
+/// An *unchecked* access indexed by a nested field — out of bounds when
+/// `o.inner.idx >= len`. CSolver must not PASS it (the loaded field value is
+/// opaque), and Miri finds the UB when driven there.
+pub fn ff_unchecked(o: &Outer, s: &[i32]) -> i32 {
+    unsafe { *s.get_unchecked(o.inner.idx) }
+}
+
 // ---- enum / match: a variant payload lies within the enum, by construction ----
 
 /// A `match` on an `Option` reference — both arms are memory-safe.

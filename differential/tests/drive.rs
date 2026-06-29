@@ -236,6 +236,44 @@ fn drive_write_field() {
 }
 
 #[test]
+fn drive_ff_read() {
+    let mut f = Fuzz::new(0x5afe_0013);
+    for _ in 0..cases() {
+        let o = Outer {
+            inner: Inner { idx: f.below(1000), val: f.int() },
+            tag: f.int(),
+        };
+        black_box(ff_read(black_box(&o)));
+    }
+}
+
+#[test]
+fn drive_ff_write() {
+    let mut f = Fuzz::new(0x5afe_0014);
+    for _ in 0..cases() {
+        let mut o = Outer {
+            inner: Inner { idx: f.below(1000), val: f.int() },
+            tag: f.int(),
+        };
+        black_box(ff_write(black_box(&mut o), black_box(f.int())));
+        black_box(&o);
+    }
+}
+
+#[test]
+fn drive_ff_guarded_index() {
+    let mut f = Fuzz::new(0x5afe_0015);
+    for _ in 0..cases() {
+        let v = f.vec(12);
+        let o = Outer {
+            inner: Inner { idx: f.below(2 * v.len() + 8), val: f.int() },
+            tag: f.int(),
+        };
+        black_box(ff_guarded_index(black_box(&o), black_box(&v)));
+    }
+}
+
+#[test]
 fn drive_head_via_helper() {
     let mut f = Fuzz::new(0x5afe_000d);
     for _ in 0..cases() {
@@ -345,6 +383,20 @@ fn drive_slice_oob_from_raw() {
     for _ in 0..cases() {
         let v = f.vec(12);
         black_box(slice_oob_from_raw(black_box(&v))); // reads past the alloc — UB
+    }
+}
+
+#[test]
+fn drive_ff_unchecked() {
+    let mut f = Fuzz::new(0x0bad_000c);
+    for _ in 0..cases() {
+        let v = f.vec(12);
+        let o = Outer {
+            inner: Inner { idx: f.below(2 * v.len() + 8), val: f.int() },
+            tag: f.int(),
+        };
+        // o.inner.idx reliably samples >= len — the unchecked access is then UB.
+        black_box(ff_unchecked(black_box(&o), black_box(&v)));
     }
 }
 

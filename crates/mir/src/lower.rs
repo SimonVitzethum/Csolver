@@ -60,7 +60,16 @@ struct Ctx {
     /// For a checked-arithmetic tuple local `_k = AddWithOverflow(a, b)`, the
     /// arithmetic result `a + b` (its field `.0`), so `move (_k.0)` recovers it.
     checked_arith: HashMap<u32, IrOp>,
+    /// Distinct field *paths* (`[0, 1]` for `((*p).0).1`) → a stable unique id, so
+    /// a nested field gets its own FieldPtr `field` key (and thus its own disjoint
+    /// synthetic offset) that never collides with a sibling or a top-level field.
+    field_path_ids: HashMap<Vec<u32>, u32>,
 }
+
+/// FieldPtr `field` ids at or above this are *nested* field paths; below are plain
+/// (single-level) field indices. The gap keeps the two namespaces disjoint so no
+/// nested field can alias a top-level one.
+const NESTED_FIELD_BASE: u32 = 1_000_000;
 
 /// Lower one MIR body into an MSIR function plus its parameter contracts.
 fn lower_function(
@@ -91,6 +100,7 @@ fn lower_function(
         func_ids: func_ids.clone(),
         lowering_failed: false,
         checked_arith: HashMap::new(),
+        field_path_ids: HashMap::new(),
     };
 
     // Parameters and their contracts (by position). A reference parameter
@@ -182,6 +192,22 @@ impl Ctx {
         let r = RegId(self.next_temp);
         self.next_temp += 1;
         r
+    }
+
+    /// A stable FieldPtr `field` id for a field path. A single-level path keeps its
+    /// plain field index (so top-level field handling and round-trips are
+    /// unchanged); a nested path gets a fresh id in the reserved high namespace, so
+    /// each distinct path has its own disjoint synthetic offset.
+    fn field_path_id(&mut self, path: &[u32]) -> u32 {
+        if let [f] = path {
+            return *f;
+        }
+        if let Some(&id) = self.field_path_ids.get(path) {
+            return id;
+        }
+        let id = NESTED_FIELD_BASE + self.field_path_ids.len() as u32;
+        self.field_path_ids.insert(path.to_vec(), id);
+        id
     }
 
     fn lower_block(&mut self, b: &MBlock) -> Result<BasicBlock> {
@@ -575,32 +601,33 @@ impl Ctx {
             // type (from the MIR ascription) gives its size and alignment; the
             // engine proves the access in bounds by construction, so no struct
             // byte-layout is needed (it is absent from MIR anyway).
-            Place::Field(base, field, fty) => match base.as_ref() {
-                Place::Deref(inner) => match inner.as_ref() {
-                    Place::Local(p) => {
-                        let elem = fty.as_ref().map(mtype_to_ir).unwrap_or_else(|| Type::int(8));
-                        let size = elem.size_bytes(&LAYOUT).unwrap_or(1).max(1);
-                        let align = elem.align_bytes(&LAYOUT).unwrap_or(1).max(1);
-                        let dst = self.fresh();
-                        out.push(Inst::FieldPtr {
-                            dst,
-                            base: IrOp::Reg(RegId(*p)),
-                            field: *field,
-                            size,
-                            align,
-                        });
-                        Some((dst, elem))
-                    }
-                    _ => {
-                        self.lowering_failed = true;
-                        None
-                    }
-                },
-                _ => {
+            // `(*p).f` and nested `((*p).f0).f1` both denote a field that lies
+            // within the referent of `p` by construction. Walk the whole field
+            // path down to a `Deref(Local p)` base and emit one FieldPtr keyed on a
+            // unique id for that path, so a nested field gets its own disjoint
+            // synthetic offset — in bounds and aligned by construction, and never
+            // aliasing a sibling or top-level field. The innermost field's type
+            // ascription gives its size and alignment.
+            Place::Field(_, _, fty) => {
+                if let Some((p, path)) = deref_field_path(place) {
+                    let elem = fty.as_ref().map(mtype_to_ir).unwrap_or_else(|| Type::int(8));
+                    let size = elem.size_bytes(&LAYOUT).unwrap_or(1).max(1);
+                    let align = elem.align_bytes(&LAYOUT).unwrap_or(1).max(1);
+                    let id = self.field_path_id(&path);
+                    let dst = self.fresh();
+                    out.push(Inst::FieldPtr {
+                        dst,
+                        base: IrOp::Reg(RegId(p)),
+                        field: id,
+                        size,
+                        align,
+                    });
+                    Some((dst, elem))
+                } else {
                     self.lowering_failed = true;
                     None
                 }
-            },
+            }
             _ => {
                 self.lowering_failed = true;
                 None
@@ -747,6 +774,33 @@ fn block_locals(b: &MBlock) -> Vec<u32> {
 }
 
 /// Convert a MIR type to an MSIR type.
+/// Walk a (possibly nested) field place down to a `(*_p)` base, returning the
+/// pointer local and the field path, outer-to-inner (`[0, 1]` for `((*p).0).1`).
+/// `None` if the base is not a deref of a local — a field of a by-value local, or
+/// through an index, has no single pointer to offset from.
+fn deref_field_path(place: &Place) -> Option<(u32, Vec<u32>)> {
+    let mut fields = Vec::new();
+    let mut cur = place;
+    loop {
+        match cur {
+            Place::Field(base, f, _) => {
+                fields.push(*f);
+                cur = base;
+            }
+            Place::Deref(inner) => {
+                return match inner.as_ref() {
+                    Place::Local(p) => {
+                        fields.reverse();
+                        Some((*p, fields))
+                    }
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// The element type of an array `Type`, for chaining a nested index.
 fn array_elem(ty: &Type) -> Option<Type> {
     match ty {
