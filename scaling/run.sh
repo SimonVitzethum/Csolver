@@ -19,6 +19,15 @@ ROOT="$(cd "$DIR/.." && pwd)"
 OUT="$DIR/out"
 mkdir -p "$OUT"
 
+# The aggregation is part of the measurement — gate on its positive control before
+# trusting a single bucket count. A broken filter and a real zero look identical;
+# this catches the former (it once hid a populated bucket for four sweeps).
+. "$DIR/aggregate.sh"
+if ! "$DIR/selftest.sh" >/dev/null 2>&1; then
+    echo "ABORT: aggregation self-test failed — the bucket counts cannot be trusted."
+    echo "Run scaling/selftest.sh to see which bucket the metric miscounts."; exit 3
+fi
+
 # Dep-free utility crates — emitted directly with `rustc --emit=mir`. Span the
 # code that matters for memory safety: arithmetic (PRNG/checksum), buffer
 # formatting, and data structures full of slices, indexing and `unsafe`.
@@ -97,26 +106,11 @@ printf "%-12s %5d %5d %5d %6d\n" "TOTAL" "$tP" "$tF" "$tU" "$((tP+tF+tU))"
 
 echo
 echo "== why UNKNOWN: frontend gaps (a parse/lowering error loses the whole fn) =="
-# Normalise reasons: drop concrete identifiers/integers so they bucket.
-grep -oE "not analyzed by the frontend: [^)]*" "$ALL" \
-    | sed -E "s/found Punct\('(.)'\)/found '\1'/; s/found \`[^\`]*\`/found <ident>/; \
-              s/found Word\(\"[^\"]*\"\)/found <word>/; s/[0-9]+/N/g" \
-    | sort | uniq -c | sort -rn | head -15
+agg_frontend "$ALL" | head -15
 
 echo
 echo "== why UNKNOWN: per-obligation residuals (fn analyzed, a check unproven) =="
-# Bucket by each residual's ROOT CAUSE — the parenthetical, which names the
-# *missing capability* (provenance, loop/symbolic depth, nullness), not the
-# obligation kind, which only says which check tripped. NOTE: match the
-# `residual:` line directly. An earlier version anchored on `UNKNOWN PO` with
-# `grep -A1`, which lands on the `predicate:` line — the residual is one line
-# further down — so it counted zero and made this whole bucket look empty. It
-# was never empty; it is in fact the dominant driver of UNKNOWN at scale.
-grep -E "residual:" "$ALL" \
-    | grep -v "not analyzed by the frontend" \
-    | sed -E "s/.*residual: [^(]*\((.*)\)$/\1/" \
-    | sed -E "s/_[0-9]+/_N/g; s/[0-9]+/N/g" \
-    | sort | uniq -c | sort -rn | head -12
+agg_residual "$ALL" | head -12
 
 echo
 echo "(full output: $ALL)"
