@@ -1,0 +1,25 @@
+# Soundness at scale: drive the real scaling-corpus crates under Miri.
+#
+# The scaling sweep measures *coverage* (what fraction of real functions CSolver
+# can analyse). This crate measures *soundness* on the same real code: it fuzzes
+# each crate's public API and runs it under Miri, the independent dynamic oracle.
+# Any Miri "Undefined Behavior" in a function CSolver verified `PASS` is a false
+# PASS — the cardinal sin. A standalone crate (own `[workspace]`), built offline
+# from the cargo cache, like `../../differential`.
+[package]
+name = "scaling-miri"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+adler2 = "2"
+oorandom = "11"
+arrayvec = "0.7"
+tinyvec = { version = "1", features = ["alloc"] }
+itoa = "1"
+
+[workspace]
