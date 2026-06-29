@@ -303,7 +303,17 @@ impl Ctx {
                 // `&(*_p)[i]` is the element address; `&(*_p)` is the pointer
                 // itself; other refs (a stack local's address) are opaque.
                 match place {
+                    // `&(*_p)[i]` is the element address; `&((*_p).f)` /
+                    // `&(((*_p) as V).f)` is a struct/enum-variant field address —
+                    // both lower to the access pointer.
                     Place::Index(_, _) => {
+                        if let Some((ptr, _)) = self.place_access(place, out) {
+                            out.push(assign(dst, RValue::Use(IrOp::Reg(ptr))));
+                        } else {
+                            out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
+                        }
+                    }
+                    Place::Field(_, _, _) if is_memory_place(place) => {
                         if let Some((ptr, _)) = self.place_access(place, out) {
                             out.push(assign(dst, RValue::Use(IrOp::Reg(ptr))));
                         } else {
@@ -326,6 +336,34 @@ impl Ctx {
             Rvalue::Cast(op) => {
                 let v = self.operand_value(op, out);
                 out.push(assign(dst, RValue::Use(v)));
+                Ok(())
+            }
+            Rvalue::Discriminant(place) => {
+                // The discriminant value is opaque (so a following `switchInt`
+                // soundly explores every arm), but reading it through a pointer is
+                // a real memory access: emit a one-byte read at the base of the
+                // enum so an invalid enum reference is caught (in bounds by
+                // construction, like a field). A by-value enum needs no access.
+                if is_memory_place(place) {
+                    if let Some(p) = place_base_local(place) {
+                        let ptr = self.fresh();
+                        out.push(Inst::FieldPtr {
+                            dst: ptr,
+                            base: IrOp::Reg(RegId(p)),
+                            field: 0,
+                            size: 1,
+                            align: 1,
+                        });
+                        let val = self.fresh();
+                        out.push(Inst::Load {
+                            dst: val,
+                            ty: Type::int(8),
+                            ptr: IrOp::Reg(ptr),
+                            align: 1,
+                        });
+                    }
+                }
+                out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
                 Ok(())
             }
             Rvalue::Other => {

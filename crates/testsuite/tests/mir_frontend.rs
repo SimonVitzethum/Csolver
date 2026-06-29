@@ -751,3 +751,50 @@ fn mir_readonly_field_write_is_not_pass() {
     });
     assert!(!write_proved, "a field write through a shared reference must not prove valid_write");
 }
+
+/// Real `rustc --emit=mir` for a `match` on an enum reference:
+/// `fn opt_or(o: &Option<i32>) -> i32 { match o { Some(v) => *v, None => -1 } }`.
+/// Exercises three new constructs together — `discriminant((*_1))` (a tag read,
+/// checked as a memory access but opaque in value, so the `switchInt` explores
+/// both arms), `&(((*_1) as Some).0: i32)` (a *variant field* address — the same
+/// field-sensitive model as a struct field, since the payload lies within the
+/// enum), and the generic type `Option<i32>` in the signature. Verifies PASS.
+const REAL_ENUM_MATCH: &str = r#"
+fn opt_or(_1: &Option<i32>) -> i32 {
+    debug o => _1;
+    let mut _0: i32;
+    let mut _2: isize;
+    let _3: &i32;
+    scope 1 {
+        debug v => _3;
+    }
+    bb0: {
+        _2 = discriminant((*_1));
+        switchInt(move _2) -> [0: bb2, 1: bb3, otherwise: bb1];
+    }
+    bb1: {
+        unreachable;
+    }
+    bb2: {
+        _0 = const -1_i32;
+        goto -> bb4;
+    }
+    bb3: {
+        _3 = &(((*_1) as Some).0: i32);
+        _0 = copy (*_3);
+        goto -> bb4;
+    }
+    bb4: {
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_enum_match_verifies_pass() {
+    let module = lower(REAL_ENUM_MATCH, "real_enum");
+    assert!(module.unanalyzed.is_empty(), "the enum match lowers (generics + discriminant)");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+    assert!(report.assumptions.iter().any(|a| a.id == "struct-abi"));
+}

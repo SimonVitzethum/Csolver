@@ -195,6 +195,28 @@ fn drive_window_sum() {
 }
 
 #[test]
+fn drive_match_opt() {
+    let mut f = Fuzz::new(0x5afe_0011);
+    for _ in 0..cases() {
+        let o = if f.boolean() { Some(f.int()) } else { None };
+        black_box(match_opt(black_box(&o)));
+    }
+}
+
+#[test]
+fn drive_tagged_first() {
+    let mut f = Fuzz::new(0x5afe_0012);
+    for _ in 0..cases() {
+        let t = if f.boolean() {
+            Tagged::One(f.int())
+        } else {
+            Tagged::Two(f.int(), f.int())
+        };
+        black_box(tagged_first(black_box(&t)));
+    }
+}
+
+#[test]
 fn drive_read_field() {
     let mut f = Fuzz::new(0x5afe_000f);
     for _ in 0..cases() {

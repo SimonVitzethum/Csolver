@@ -90,6 +90,10 @@ pub(crate) enum Rvalue {
     Len(Place),
     Ref(Place),
     Cast(Operand),
+    /// `discriminant(PLACE)` — reads an enum's tag. The value is opaque (so a
+    /// `switchInt` on it soundly explores every arm); lowering still checks the
+    /// enum reference is valid.
+    Discriminant(Place),
     /// An rvalue outside the modelled subset.
     Other,
 }
@@ -697,8 +701,16 @@ impl Parser {
                     self.expect_punct(')')?;
                     return Ok(Rvalue::CheckedBin(kind, a, b));
                 }
-                // A different `Word(...)` rvalue (Aggregate, discriminant, a
-                // checked op, …) is not modelled.
+                // `discriminant(PLACE)` — an enum tag read.
+                if w == "discriminant" {
+                    self.pos += 1;
+                    self.expect_punct('(')?;
+                    let place = self.place()?;
+                    self.expect_punct(')')?;
+                    return Ok(Rvalue::Discriminant(place));
+                }
+                // A different `Word(...)` rvalue (Aggregate, a checked op, …) is
+                // not modelled.
                 self.skip_statement_inline();
                 return Ok(Rvalue::Other);
             }
@@ -822,7 +834,14 @@ impl Parser {
             }
             Tok::Word(w) => {
                 self.pos += 1;
-                Ok(int_type(&w).unwrap_or(MType::Other))
+                // A named type may carry generic arguments (`Option<i32>`,
+                // `Vec<T>`) or be a qualified path (`std::option::Option<i32>`);
+                // consume any `<…>` so the type lowers to `Other`, not a parse
+                // error. The element types inside are not needed (the aggregate is
+                // opaque-size; field accesses carry their own type ascription).
+                let ty = int_type(&w).unwrap_or(MType::Other);
+                self.skip_balanced_angle();
+                Ok(ty)
             }
             _ => Ok(MType::Other),
         }
@@ -834,6 +853,23 @@ impl Parser {
             match self.bump() {
                 Tok::Punct('(') => depth += 1,
                 Tok::Punct(')') => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// Skip a balanced `<…>` generic-argument list (`Option<i32>`,
+    /// `Vec<Vec<i32>>`), if one follows. Each `>` is a separate token, so nested
+    /// closers balance by depth.
+    fn skip_balanced_angle(&mut self) {
+        if !self.eat_punct('<') {
+            return;
+        }
+        let mut depth = 1;
+        while depth > 0 && !matches!(self.peek(), Tok::Eof) {
+            match self.bump() {
+                Tok::Punct('<') => depth += 1,
+                Tok::Punct('>') => depth -= 1,
                 _ => {}
             }
         }

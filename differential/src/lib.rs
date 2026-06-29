@@ -150,6 +150,30 @@ pub fn write_field(p: &mut Pair, v: i32) {
     p.a = v;
 }
 
+// ---- enum / match: a variant payload lies within the enum, by construction ----
+
+/// A `match` on an `Option` reference — both arms are memory-safe.
+pub fn match_opt(o: &Option<i32>) -> i32 {
+    match o {
+        Some(v) => *v,
+        None => -1,
+    }
+}
+
+/// A small tagged union, to exercise variant-field access through a reference.
+pub enum Tagged {
+    One(i32),
+    Two(i32, i32),
+}
+
+/// A `match` reading a variant's payload — in bounds for every variant.
+pub fn tagged_first(t: &Tagged) -> i32 {
+    match t {
+        Tagged::One(x) => *x,
+        Tagged::Two(x, _) => *x,
+    }
+}
+
 // ---- helper chains: the safety precondition flows across a call boundary ------
 
 /// First element via a helper that returns `Option<&_>` — safe for every slice.
