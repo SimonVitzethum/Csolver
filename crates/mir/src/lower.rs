@@ -530,9 +530,11 @@ impl Ctx {
                             return None;
                         }
                     },
-                    // `…[i][j]`: lower the inner index to a pointer-to-inner-array
-                    // and its array type, then index that array's element.
-                    Place::Index(_, _) => {
+                    // `…[i][j]` or a field of array type `(*_p).f[i]`: lower the
+                    // inner place to a pointer-to-array and its array type, then
+                    // index that array's element. (The field's `[u32; 4]`-typed
+                    // pointer comes from the FieldPtr the `Field` arm emits.)
+                    Place::Index(_, _) | Place::Field(_, _, _) => {
                         let (inner_ptr, inner_ty) = self.place_access(base, out)?;
                         match array_elem(&inner_ty) {
                             Some(elem) => (IrOp::Reg(inner_ptr), elem),
@@ -697,8 +699,12 @@ fn bin_rvalue(kind: BinKind, lhs: IrOp, rhs: IrOp) -> Option<RValue> {
 fn is_memory_place(p: &Place) -> bool {
     match p {
         Place::Local(_) => false,
-        Place::Deref(_) | Place::Index(_, _) => true,
-        Place::Field(inner, _, _) => is_memory_place(inner),
+        Place::Deref(_) => true,
+        // An index/field is a memory access only if its base ultimately derefs a
+        // pointer: `(*_p)[i]` and `(*_p).f[i]` are memory, but indexing a by-value
+        // local array (`_l[i]`, `_l.0[i]`) is a bounds-checked stack value, not a
+        // heap access — modelled opaquely, with no memory obligation.
+        Place::Index(base, _) | Place::Field(base, _, _) => is_memory_place(base),
     }
 }
 
