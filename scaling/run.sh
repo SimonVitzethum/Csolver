@@ -105,8 +105,16 @@ grep -oE "not analyzed by the frontend: [^)]*" "$ALL" \
 
 echo
 echo "== why UNKNOWN: per-obligation residuals (fn analyzed, a check unproven) =="
-grep -A1 -E "^    UNKNOWN PO" "$ALL" | grep -E "residual:" \
+# Bucket by each residual's ROOT CAUSE — the parenthetical, which names the
+# *missing capability* (provenance, loop/symbolic depth, nullness), not the
+# obligation kind, which only says which check tripped. NOTE: match the
+# `residual:` line directly. An earlier version anchored on `UNKNOWN PO` with
+# `grep -A1`, which lands on the `predicate:` line — the residual is one line
+# further down — so it counted zero and made this whole bucket look empty. It
+# was never empty; it is in fact the dominant driver of UNKNOWN at scale.
+grep -E "residual:" "$ALL" \
     | grep -v "not analyzed by the frontend" \
+    | sed -E "s/.*residual: [^(]*\((.*)\)$/\1/" \
     | sed -E "s/_[0-9]+/_N/g; s/[0-9]+/N/g" \
     | sort | uniq -c | sort -rn | head -12
 

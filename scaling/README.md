@@ -83,10 +83,10 @@ soundness violations**.
 
 This is the whole methodology in one episode: measuring at scale surfaced the gap,
 acting on it exposed a latent unsoundness, and the differential guard caught it
-before it shipped. The analysis core is *still* not the bottleneck — the
-per-obligation residual bucket remains empty; the remaining `UNKNOWN`s are
-unmodelled `drop`/`resume` terminators (a deliberate, sound coverage limit) and a
-few residual operand-path parse cases.
+before it shipped. At this stage the parser was genuinely the bottleneck — but the
+claim that the per-obligation bucket was *empty* turned out to be a measurement
+artifact, corrected below once the parser gaps had been closed enough for the real
+distribution to show through.
 
 ## Caveats
 
@@ -98,3 +98,40 @@ few residual operand-path parse cases.
   not a 0% result.
 - The crate set and versions depend on what the cargo cache happens to hold; the
   numbers are indicative, not a fixed benchmark.
+
+## Correction (12-crate sweep): the per-obligation bucket was never empty
+
+Four successive sweeps reported the per-obligation residual bucket as *empty*, and
+that reading hardened into a tempting architectural claim — "the engine is
+overdimensioned relative to the front end; all marginal value is in parser
+completeness." **A 12-crate re-measurement (after the parser tail and field-of-field
+lowering landed) refuted it.** The "empty" was a bug in this script's own
+aggregation: it anchored on the `UNKNOWN PO …` line with `grep -A1`, which lands on
+the `predicate:` line — the `residual:` is one line *further* down — so it matched
+zero residuals every time. The bucket was never empty; it was never being read.
+
+With the grep fixed (`grep -E "residual:"`, bucketing by the parenthetical
+*root cause*), the honest distribution over **3874 PASS / 0 FAIL / 342 UNKNOWN**
+(4216 functions, ~92%) is:
+
+| residual root cause | POs | what it is |
+|---|---:|---|
+| `pointer provenance is not tracked` | 1822 | raw-pointer obligations (UAF / in-bounds / align / valid-read) on pointers with no tracked provenance |
+| `memory operation not analyzed (loops, symbolic disabled, or truncated)` | 1437 | a memory op the engine did not symbolically evaluate — inside a loop, with symbolic off, or in a truncated body |
+| `pointer may be null or have opaque provenance` | 429 | nullness unprovable |
+| `could not prove the access stays in bounds` | 48 | a genuine in-bounds residual the solver could not close |
+
+Whole-function front-end losses are now **down to ~32** (operand-path parse tail:
+25× `expected a local, found <ident>`, plus a handful of `fn`/`Fn`/`static`/`core`
+landings). The old top bucket — `could not be lowered to a known pointer` (the
+"unlowerable mem access (42)", field-of-field + double-deref) — is now **0**: the
+field-of-field lowering closed it entirely, double-deref included.
+
+So the corrected finding is the **opposite** of the parked claim: the front end is
+now nearly complete, and the dominant driver of `UNKNOWN` at scale is **engine
+analysis depth** — pointer provenance tracking (1822) and loop/symbolic memory
+evaluation (1437). These are real, prioritisable engine capabilities, not parser
+chores. The lesson is the project's own methodology turned on itself: *the
+aggregation is part of the measurement; an unverified bucket count is not evidence
+of an empty bucket.* The four "empty" readings were the metric lying, not the engine
+being idle.
