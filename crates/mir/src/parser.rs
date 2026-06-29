@@ -306,8 +306,12 @@ impl Parser {
     }
 
     fn at_block_header(&self) -> bool {
+        // `bbN:` or an annotated header `bbN (cleanup):` — the latter must still be
+        // recognised, or the block loop would stop early and silently DROP every
+        // following block (which may contain a memory access → an unsound vacuous
+        // PASS). So a `bbN` followed by `:` or `(` starts a block.
         matches!(self.peek(), Tok::Word(w) if is_bb(w))
-            && self.peek2() == &Tok::Punct(':')
+            && matches!(self.peek2(), Tok::Punct(':') | Tok::Punct('('))
     }
 
     fn skip_to_first_block(&mut self) {
@@ -319,6 +323,10 @@ impl Parser {
     fn block(&mut self) -> Result<MBlock> {
         let w = self.word()?;
         let id = bb_index(&w).ok_or_else(|| Error::parse(format!("bad block label `{w}`")))?;
+        // An optional block annotation, e.g. `bbN (cleanup):`.
+        if self.eat_punct('(') {
+            self.skip_balanced_paren();
+        }
         self.expect_punct(':')?;
         self.expect_punct('{')?;
         let mut stmts = Vec::new();
@@ -469,6 +477,17 @@ impl Parser {
                 let _ = self.eat_punct(',');
             }
             Ok(target)
+        } else if self.eat_word("unwind") {
+            // A diverging call `-> unwind continue` / `unwind unreachable` /
+            // `unwind terminate(…)` (e.g. `_ = panic(…) -> unwind continue`): no
+            // return target. Consume the action word and any payload.
+            if matches!(self.peek(), Tok::Word(_)) {
+                self.pos += 1;
+                if self.eat_punct('(') {
+                    self.skip_balanced_paren();
+                }
+            }
+            Ok(None)
         } else {
             let w = self.word()?;
             Ok(bb_index(&w))
@@ -758,9 +777,80 @@ impl Parser {
             Ok(Operand::Copy(self.place()?))
         } else if self.eat_word("const") {
             Ok(Operand::Const(self.constant()?))
-        } else {
-            // A bare place operand.
+        } else if self.starts_place() {
+            // A bare place operand (`_N`, `(*_p)…`).
             Ok(Operand::Copy(self.place()?))
+        } else {
+            // A path / aggregate / unevaluated constant in operand position
+            // (`RangeTo::<usize> { … }`, `Foo::Bar(…)`, `core::X`): not a memory
+            // operation, so model it as an opaque value and consume it whole.
+            self.skip_opaque_value();
+            Ok(Operand::Const(MConst::Int(0)))
+        }
+    }
+
+    /// Whether the cursor is at the start of a *bare* place operand: a local `_N`,
+    /// a deref `*_p`, or a parenthesised place `(*_p)…`. A bare `(` that is a tuple
+    /// aggregate `(a, b)` / `()` is *not* a place, and a bare identifier is a path
+    /// — both are consumed opaquely instead.
+    fn starts_place(&self) -> bool {
+        match self.peek() {
+            Tok::Punct('*') => true,
+            Tok::Word(w) => w.starts_with('_'),
+            Tok::Punct('(') => !self.paren_is_tuple(),
+            _ => false,
+        }
+    }
+
+    /// Look ahead at a `( … )` to tell a tuple aggregate (a top-level comma, or
+    /// `()`) from a parenthesised place (`(*_p)`, `((*_p).0: T)` — no top-level
+    /// comma). Brackets balance by depth; only `()[]{}` are tracked.
+    fn paren_is_tuple(&self) -> bool {
+        let mut i = self.pos + 1;
+        let mut depth = 1i32;
+        let mut saw_content = false;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::Punct('(') | Tok::Punct('[') | Tok::Punct('{') => depth += 1,
+                Tok::Punct(')') | Tok::Punct(']') | Tok::Punct('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return !saw_content; // `()` is the unit tuple
+                    }
+                }
+                Tok::Punct(',') if depth == 1 => return true,
+                Tok::Eof => break,
+                _ => saw_content = true,
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Consume a path/aggregate/const expression opaquely: a path with generics
+    /// (`core::ops::RangeTo::<usize>`), then any struct-literal `{ … }`, call/tuple
+    /// `( … )` or array `[ … ]` body, balancing all brackets, up to the enclosing
+    /// statement/argument delimiter. Used where the value is not a memory operation
+    /// and only its presence (not its contents) matters.
+    fn skip_opaque_value(&mut self) {
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                Tok::Eof => break,
+                Tok::Punct('(') | Tok::Punct('[') | Tok::Punct('{') | Tok::Punct('<') => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                Tok::Punct(')') | Tok::Punct(']') | Tok::Punct('}') | Tok::Punct('>')
+                    if depth > 0 =>
+                {
+                    depth -= 1;
+                    self.pos += 1;
+                }
+                Tok::Punct(',') | Tok::Punct(';') if depth == 0 => break,
+                Tok::Punct(')') | Tok::Punct(']') | Tok::Punct('}') if depth == 0 => break,
+                _ => self.pos += 1,
+            }
         }
     }
 
@@ -788,10 +878,11 @@ impl Parser {
                 }
             }
             // A symbolic / unevaluated constant (a function item, a promoted
-            // value, …): consume a token so progress is made; model as 0 (its
-            // value is never relied on for a sound PASS).
+            // value, an associated const `<A as Array>::CAPACITY`, …): consume the
+            // whole path/expression; model as 0 (its value is never relied on for a
+            // sound PASS).
             _ => {
-                self.pos += 1;
+                self.skip_opaque_value();
                 Ok(MConst::Int(0))
             }
         }
@@ -869,6 +960,14 @@ impl Parser {
                 self.skip_path_tail();
                 Ok(MType::Other)
             }
+            // An anonymous type printed with braces: `{closure@…}`,
+            // `{async block@…}`. Consume exactly the balanced `{…}` (not a function
+            // body that may follow, e.g. a closure return type), then any tail.
+            Tok::Punct('{') => {
+                self.skip_balanced_braces();
+                self.skip_path_tail();
+                Ok(MType::Other)
+            }
             _ => Ok(MType::Other),
         }
     }
@@ -879,6 +978,22 @@ impl Parser {
             match self.bump() {
                 Tok::Punct('(') => depth += 1,
                 Tok::Punct(')') => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// Consume exactly one balanced `{ … }` group (an anonymous closure/async
+    /// type), if one is next.
+    fn skip_balanced_braces(&mut self) {
+        if !self.eat_punct('{') {
+            return;
+        }
+        let mut depth = 1;
+        while depth > 0 && !matches!(self.peek(), Tok::Eof) {
+            match self.bump() {
+                Tok::Punct('{') => depth += 1,
+                Tok::Punct('}') => depth -= 1,
                 _ => {}
             }
         }

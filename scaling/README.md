@@ -49,28 +49,44 @@ that parses by construction. The dominant gaps were all **boring parser robustne
 | ~6 | `expected an integer, found "CAP"` | const-generic array length `[T; CAP]` |
 | ~10 | unsupported construct | genuine lowering gaps (small!) |
 
-## Acting on it: two parser fixes, 2.5× the PASS rate
+## Acting on it: iterative parser fixes, ~4× the PASS rate
 
-The measurement paid for itself immediately. Two small, *low-TCB-risk* front-end
-fixes — robust type parsing (qualified paths, generics, `<T as Trait>::Assoc`,
-const-generic array lengths → opaque) and impl-method headers (`fn <impl at …>::m`)
-— lifted the whole sweep:
+The measurement paid for itself immediately. A sequence of small, *low-TCB-risk*
+front-end fixes — robust type parsing (qualified paths, generics,
+`<T as Trait>::Assoc`, const-generic array lengths, `{closure@…}` types →
+opaque), impl-method headers (`fn <impl at …>::m`), path/aggregate operands
+(`RangeTo::<usize> { … }`, tuple aggregates, associated-const paths), and
+diverging calls (`… -> unwind continue`) — lifted the whole sweep:
 
 ```
-before:  126 PASS    0 FAIL    513 UNKNOWN   (20%)
-after:   321 PASS    0 FAIL    305 UNKNOWN   (51%)
+first run:  126 PASS    0 FAIL    513 UNKNOWN   (20%)
+after:      486 PASS    0 FAIL    129 UNKNOWN   (79%)
 ```
 
-`smallvec` alone went 1 → 108 PASS. Parsing more real MIR cannot, by itself, turn a
-bug into a PASS — it only feeds more obligations to the same trusted core, as long
-as each fix *consumes* its construct rather than silently dropping a memory
-operation. The differential corpus stayed at **0 soundness violations** throughout,
-which is what proves that.
+`smallvec` alone went 1 → 151 PASS, `arrayvec` 95 → 170.
 
-The next gap is now precisely characterised (and still pure parser robustness, not
-the engine): **~173 `expected a local, found <ident>`** — paths in operand/place
-position (path constants, enum-variant construction). The analysis core is still
-not the bottleneck — the per-obligation residual bucket remains empty.
+### The differential corpus earned its keep mid-iteration
+
+One of the parser fixes made a pathological debug-MIR function
+(`cond_use_after_free`, a conditional free + dangling read) *parse* for the first
+time — and it came back a **vacuous PASS** (zero obligations), a false PASS the
+differential corpus caught immediately (Miri UB + CSolver PASS). The root cause was
+a pre-existing parser bug the new coverage exposed: a `bbN (cleanup):` block header
+was not recognised, so the block loop stopped at the first cleanup block and
+**silently dropped every following block** — including, here, the block holding the
+dangling read. A dropped block with a memory access is exactly an unsound vacuous
+PASS. Recognising the annotation fixed it (the function is now `UNKNOWN`, since its
+`drop` terminators are unmodelled), and it retroactively corrected ~35 other
+functions across the sweep that had been silently vacuous-PASSing — which is why the
+PASS count is an honest 486, not a flattering 521. The corpus is back to **0
+soundness violations**.
+
+This is the whole methodology in one episode: measuring at scale surfaced the gap,
+acting on it exposed a latent unsoundness, and the differential guard caught it
+before it shipped. The analysis core is *still* not the bottleneck — the
+per-obligation residual bucket remains empty; the remaining `UNKNOWN`s are
+unmodelled `drop`/`resume` terminators (a deliberate, sound coverage limit) and a
+few residual operand-path parse cases.
 
 ## Caveats
 
