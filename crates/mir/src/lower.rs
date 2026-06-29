@@ -438,28 +438,50 @@ impl Ctx {
     /// Emit the pointer to a memory `place` and return `(pointer reg, elem type)`.
     fn place_access(&mut self, place: &Place, out: &mut Vec<Inst>) -> Option<(RegId, Type)> {
         match place {
-            // `(*_p)[i]`: base pointer `_p`, indexed by `i`. An unknown element
-            // type falls back to one byte — the access is still emitted (and so
-            // checked) through the real pointer, never dropped.
+            // `base[i]`: a pointer to element 0 of the array/slice `base` denotes,
+            // offset by `i` (stride = element size). `base` is either `*_p` (the
+            // slice/array behind a pointer) or an *outer* index, so nested indices
+            // `(*_p)[i][j]` chain — the inner index yields a pointer to an inner
+            // array, which this level indexes again. The strides come from the
+            // array element types, which are unambiguous (no struct-layout needed).
             Place::Index(base, idx) => {
-                let p = match base.as_ref() {
+                let (base_ptr, elem) = match base.as_ref() {
+                    // `(*_p)[i]`: an unknown element type falls back to one byte —
+                    // the access is still emitted (and so checked) through the real
+                    // pointer, never dropped.
                     Place::Deref(inner) => match inner.as_ref() {
-                        Place::Local(p) => *p,
+                        Place::Local(p) => (
+                            IrOp::Reg(RegId(*p)),
+                            self.index_elem(*p).unwrap_or_else(|| Type::int(8)),
+                        ),
                         _ => {
                             self.lowering_failed = true;
                             return None;
                         }
                     },
+                    // `…[i][j]`: lower the inner index to a pointer-to-inner-array
+                    // and its array type, then index that array's element.
+                    Place::Index(_, _) => {
+                        let (inner_ptr, inner_ty) = self.place_access(base, out)?;
+                        match array_elem(&inner_ty) {
+                            Some(elem) => (IrOp::Reg(inner_ptr), elem),
+                            // A non-array inner type (or a 1-byte fallback) has no
+                            // sound stride here, so reject rather than guess.
+                            None => {
+                                self.lowering_failed = true;
+                                return None;
+                            }
+                        }
+                    }
                     _ => {
                         self.lowering_failed = true;
                         return None;
                     }
                 };
-                let elem = self.index_elem(p).unwrap_or_else(|| Type::int(8));
                 let dst = self.fresh();
                 out.push(Inst::PtrOffset {
                     dst,
-                    base: IrOp::Reg(RegId(p)),
+                    base: base_ptr,
                     index: IrOp::Reg(RegId(*idx)),
                     elem: elem.clone(),
                 });
@@ -618,6 +640,14 @@ fn block_locals(b: &MBlock) -> Vec<u32> {
 }
 
 /// Convert a MIR type to an MSIR type.
+/// The element type of an array `Type`, for chaining a nested index.
+fn array_elem(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Array { elem, .. } => Some((**elem).clone()),
+        _ => None,
+    }
+}
+
 fn mtype_to_ir(mty: &MType) -> Type {
     match mty {
         MType::Int { width, .. } => Type::int(*width),

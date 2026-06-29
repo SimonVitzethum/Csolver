@@ -230,3 +230,8 @@ pub fn slice_oob_from_raw(s: &[i32]) -> i32 {
     let longer = unsafe { std::slice::from_raw_parts(s.as_ptr(), s.len() + 4) };
     longer[s.len() + 2]
 }
+
+/// An unchecked nested index — out of bounds for `i >= rows` or `j >= 4`.
+pub fn nested_oob(m: &[[i32; 4]], i: usize, j: usize) -> i32 {
+    unsafe { *m.get_unchecked(i).as_ptr().add(j) }
+}

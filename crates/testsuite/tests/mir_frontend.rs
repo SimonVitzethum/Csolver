@@ -588,3 +588,104 @@ fn mir_external_call_result_is_unknown() {
     });
     assert!(!deref_proved, "deref of an external call's result must not be proved");
 }
+
+/// Real `rustc --emit=mir` for
+/// `fn nested(m: &[[i32; 4]], i: usize, j: usize) -> i32 {
+///      if i < m.len() && j < 4 { m[i][j] } else { 0 } }`.
+/// The nested index `(*_1)[_2][_3]` lowers to a *chain* of `PtrOffset`s (outer
+/// stride 16 = `size_of::<[i32;4]>()`, inner stride 4 = `size_of::<i32>()`); the
+/// two asserts give `i < len` and `j < 4`, which together prove
+/// `i*16 + j*4 + 4 <= len*16`. Array strides are unambiguous, so no struct
+/// layout is needed. Frozen text, captured from rustc.
+const REAL_NESTED: &str = r#"
+fn nested(_1: &[[i32; 4]], _2: usize, _3: usize) -> i32 {
+    debug m => _1;
+    debug i => _2;
+    debug j => _3;
+    let mut _0: i32;
+    let mut _4: bool;
+    let mut _5: usize;
+    let mut _6: bool;
+    let mut _7: usize;
+    let mut _8: bool;
+    let mut _9: bool;
+
+    bb0: {
+        _5 = PtrMetadata(copy _1);
+        _4 = Lt(copy _2, move _5);
+        switchInt(move _4) -> [0: bb5, otherwise: bb1];
+    }
+
+    bb1: {
+        _6 = Lt(copy _3, const 4_usize);
+        switchInt(move _6) -> [0: bb5, otherwise: bb2];
+    }
+
+    bb2: {
+        _7 = PtrMetadata(copy _1);
+        _8 = Lt(copy _2, copy _7);
+        assert(move _8, "index out of bounds: the length is {} but the index is {}", move _7, copy _2) -> [success: bb3, unwind continue];
+    }
+
+    bb3: {
+        _9 = Lt(copy _3, const 4_usize);
+        assert(move _9, "index out of bounds: the length is {} but the index is {}", const 4_usize, copy _3) -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _0 = copy (*_1)[_2][_3];
+        goto -> bb6;
+    }
+
+    bb5: {
+        _0 = const 0_i32;
+        goto -> bb6;
+    }
+
+    bb6: {
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_nested_index_verifies_pass() {
+    let module = lower(REAL_NESTED, "real_nested");
+    assert!(module.unanalyzed.is_empty(), "the nested-index body lowers, not dropped");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
+/// Soundness for the inner stride: a nested index where only the **outer** index
+/// is bounded (`i < len`) and the inner `j` is unconstrained. The offset
+/// `i*16 + j*4` can exceed `len*16` for a large `j`, so the access must not be
+/// proved in bounds — which it can only be if the inner index is actually
+/// modelled (dropping it would fabricate a false PASS).
+const NESTED_INNER_UNCHECKED: &str = r#"
+fn nested_inner(_1: &[[i32; 4]], _2: usize, _3: usize) -> i32 {
+    let mut _0: i32;
+    let mut _7: usize;
+    let mut _8: bool;
+    bb0: {
+        _7 = PtrMetadata(copy _1);
+        _8 = Lt(_2, move _7);
+        assert(move _8, "oob", move _7, _2) -> [success: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = (*_1)[_2][_3];
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_nested_index_inner_unchecked_is_not_pass() {
+    let module = lower(NESTED_INNER_UNCHECKED, "nested_inner");
+    assert!(module.unanalyzed.is_empty(), "it lowers (the access is emitted, not dropped)");
+    let report = verify_module(&module, &Config::default());
+    let in_bounds_proved = report.functions[0].outcomes.iter().any(|o| {
+        o.obligation.property == SafetyProperty::InBounds
+            && matches!(o.result, csolver_core::ObligationResult::Proven(_))
+    });
+    assert!(!in_bounds_proved, "an unbounded inner index must not prove in-bounds");
+}

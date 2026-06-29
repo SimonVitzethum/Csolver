@@ -306,3 +306,17 @@ fn drive_slice_oob_from_raw() {
         black_box(slice_oob_from_raw(black_box(&v))); // reads past the alloc — UB
     }
 }
+
+#[test]
+fn drive_nested_oob() {
+    let mut f = Fuzz::new(0x0bad_000b);
+    for _ in 0..cases() {
+        let rows = f.below(6);
+        let m: Vec<[i32; 4]> = (0..rows)
+            .map(|_| [f.int(), f.int(), f.int(), f.int()])
+            .collect();
+        let i = f.below(rows + 4);
+        let j = f.below(8); // reliably samples i >= rows or j >= 4
+        black_box(nested_oob(black_box(&m), black_box(i), black_box(j)));
+    }
+}
