@@ -208,6 +208,102 @@ fn fuzz_bytes() {
     }
 }
 
+/// A tiny dependency-free hasher (FNV-style) so `hashbrown::HashMap::with_hasher`
+/// works without a default-hasher feature, and runs reproduce.
+#[derive(Clone, Default)]
+struct FxBuild;
+impl std::hash::BuildHasher for FxBuild {
+    type Hasher = Fx;
+    fn build_hasher(&self) -> Fx {
+        Fx(0xcbf2_9ce4_8422_2325)
+    }
+}
+struct Fx(u64);
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+/// `hashbrown::HashMap` — complex unsafe generics over raw allocation, the densest
+/// UB target. The driver fuzzes long **operation sequences**, not single calls: a
+/// single insert on a fresh map never resizes, so the interesting paths (grow +
+/// rehash, tombstones from removes, probe sequences, `entry`, `retain`, the table
+/// scan) are only reached by driving a map through ~120 mixed ops until it resizes
+/// several times.
+#[test]
+fn fuzz_hashbrown() {
+    let mut f = Fuzz::new(0xba50_4111);
+    for _ in 0..cases() {
+        let mut m: hashbrown::HashMap<u16, u32, FxBuild> = hashbrown::HashMap::with_hasher(FxBuild);
+        for _ in 0..120 {
+            match f.below(8) {
+                // Insert-heavy so the table grows and rehashes repeatedly.
+                0 | 1 => {
+                    m.insert(f.u16(), f.u32());
+                }
+                // Removes leave tombstones the probe sequence must skip.
+                2 => {
+                    let k = f.u16();
+                    m.remove(&k);
+                }
+                3 => {
+                    let k = f.u16();
+                    black_box(m.get(&k));
+                }
+                4 => {
+                    *m.entry(f.u16()).or_insert(0) += 1;
+                }
+                5 => m.retain(|k, _| (k & 3) != 0),
+                6 => {
+                    black_box(m.contains_key(&f.u16()));
+                }
+                _ => {
+                    if f.below(30) == 0 {
+                        m.clear();
+                    }
+                }
+            }
+        }
+        // A full table scan over whatever survived (live slots + skipped tombstones).
+        let mut s = 0u64;
+        for (k, v) in &m {
+            s = s.wrapping_add(*k as u64 ^ *v as u64);
+        }
+        black_box((m.len(), s));
+    }
+}
+
+/// `nom` — parser combinators (the called-closure lowering this round enabled). Run
+/// a small combinator chain over fuzzed bytes; nom slices with bounds checks, so a
+/// clean run validates the new closure/generic lowering paths stay memory-safe.
+#[test]
+fn fuzz_nom() {
+    use nom::branch::alt;
+    use nom::bytes::complete::{tag, take_while};
+    use nom::character::complete::{char, digit1};
+    use nom::multi::separated_list0;
+    use nom::sequence::separated_pair;
+    use nom::IResult;
+    type E<'a> = nom::error::Error<&'a [u8]>;
+    let mut f = Fuzz::new(0x0_0e3c_acec);
+    for _ in 0..cases() {
+        let len = f.below(80);
+        let data: Vec<u8> = (0..len).map(|_| f.byte()).collect();
+        let _: IResult<&[u8], _, E> = separated_list0(char(','), digit1)(&data);
+        let _: IResult<&[u8], _, E> = take_while(|c: u8| c.is_ascii_alphanumeric())(&data);
+        let _: IResult<&[u8], _, E> = nom::number::complete::be_u32(&data);
+        let _: IResult<&[u8], _, E> =
+            alt((tag(b"GET".as_slice()), tag(b"PUT".as_slice())))(&data);
+        let _: IResult<&[u8], _, E> = separated_pair(digit1, char(':'), digit1)(&data);
+    }
+}
+
 /// `itoa`: integer-to-string into a fixed buffer (raw byte writes internally).
 /// A fresh buffer per call (`format` borrows the buffer for the returned `&str`).
 #[test]

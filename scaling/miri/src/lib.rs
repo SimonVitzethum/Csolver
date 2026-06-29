@@ -53,6 +53,10 @@ impl Fuzz {
         self.bits() as u8
     }
 
+    pub fn u16(&mut self) -> u16 {
+        self.bits() as u16
+    }
+
     pub fn u32(&mut self) -> u32 {
         self.bits() as u32
     }

@@ -22,8 +22,12 @@ arrayvec = "0.7"
 tinyvec = { version = "1", features = ["alloc"] }
 itoa = "1"
 # Complex-tier crates (added with the corpus growth): bytes exercises the fn-pointer
-# Vtable the latest parse fix enabled; memchr the SIMD search paths.
+# Vtable the latest parse fix enabled; memchr the SIMD search paths; hashbrown is the
+# dense UB target (unsafe generics over raw allocation — its resize/probe/tombstone
+# paths); nom forced the called-closure lowering.
 bytes = "1"
 memchr = "2"
+hashbrown = "0.16"
+nom = "7"
 
 [workspace]

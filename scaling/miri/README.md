@@ -33,8 +33,18 @@ The unsafe-heavy data structures are the most valuable targets — their interna
 `unsafe` (raw writes, element shifting) is what a lowering bug would mis-model and
 what a latent crate bug would trip:
 
+- **`hashbrown`** — the densest UB target: complex unsafe generics over raw
+  allocation. The driver fuzzes long **operation sequences** (insert / remove /
+  `entry` / `retain` / `clear` / scan), not single calls — empirically ~5 table
+  resizes per 120-op run — so it reaches the grow + rehash, tombstone and probe
+  paths a single insert on a fresh map never touches. A clean run here is the most
+  meaningful soundness signal in the harness.
 - **`arrayvec`**, **`tinyvec`** — fixed-capacity vectors; fuzzed with random
   sequences of push/pop/insert/remove/swap_remove/truncate/index.
+- **`bytes`** — ref-counted byte buffers; exercises the fn-pointer `Vtable` the
+  fn-pointer-type parse fix enabled.
+- **`nom`** — parser combinators; validates the called-closure lowering paths.
+- **`memchr`** — SIMD byte search.
 - **`adler2`** — Adler-32 checksum; exercises the index-into-struct-field lowering
   (its state is a `[u32; 4]` field updated as `((*_1).0)[i]`).
 - **`oorandom`** — the PRNGs (arithmetic baseline).
@@ -52,6 +62,9 @@ verdict for that function.
 
 ## Latest run
 
-5 crates, `FUZZ_CASES=40`: **0 Miri UB** — every fuzzed real-crate API is clean, so
-the executed PASS functions (adler2, oorandom, arrayvec, tinyvec, itoa) are validated
-against the independent oracle.
+9 crates, `FUZZ_CASES=40`: **0 Miri UB**. Every fuzzed real-crate API is clean,
+including the sequence-fuzzed `hashbrown` (663 PASS functions, resizing ~5× per run)
+and the complex-tier `nom`/`bytes`/`memchr` — closing the soundness gap on exactly
+the lowering paths the latest corpus growth forced (called closures, unsafe generics
+over raw allocation, the fn-pointer Vtable). The executed PASS functions are
+validated against the independent oracle.
