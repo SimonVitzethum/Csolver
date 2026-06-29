@@ -1,0 +1,13 @@
+# A standalone crate (its own `[workspace]`, so the parent CSolver workspace
+# ignores it): the differential-validation corpus checked statically by CSolver
+# and dynamically by Miri. Not built by the normal `cargo test`.
+[package]
+name = "differential"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

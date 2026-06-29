@@ -1353,14 +1353,19 @@ impl Explorer<'_> {
         // a *freeing* callee additionally invalidates region liveness (we do
         // not know which region it freed, so no region's liveness can be proved
         // afterwards). Without this, a use after a freeing call would be a false
-        // PASS.
+        // PASS. A **contracted reference region** (`&[T]`/`&T`/`&mut T`) is
+        // *borrowed*, though: the caller holds the borrow for the call's whole
+        // duration, so the callee cannot deallocate it — its liveness survives
+        // the call. Only *owned* regions (a local `alloc`, `contract == None`)
+        // can be moved into and freed by a callee. (Without this a `&[T]` passed
+        // to any helper — e.g. `s.is_empty()` — would defeat every later access.)
         let (writes, frees) = summary.as_ref().map_or((true, true), |s| (s.writes, s.frees));
         if writes || frees {
             state.heap.clear();
         }
         if frees {
             for r in &mut state.regions {
-                if r.state == LifetimeState::Live {
+                if r.state == LifetimeState::Live && r.contract.is_none() {
                     r.state = LifetimeState::Freed;
                 }
             }

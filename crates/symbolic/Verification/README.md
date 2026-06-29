@@ -116,6 +116,15 @@ fall back to havoc + heap clear (sound). This makes pointer-returning helpers
 transparent — `caller` proving its dereference of `first(buf)` even though
 `first` alone cannot (its parameter pointer has no provenance in isolation).
 
+A freeing (or unsummarized) call invalidates region **liveness** so a later use
+of freed memory is never a false `PASS` — but only for **owned** regions (a local
+`alloc`, no contract). A **contracted reference region** (`&[T]`/`&T`/`&mut T`) is
+*borrowed*: the caller holds the borrow for the whole call, so the callee cannot
+deallocate it (a borrow confers no ownership), and its liveness **survives the
+call**. Without this, any method call (`s.is_empty()`, `s.len()`, a helper) would
+mark every borrowed region freed and defeat every subsequent access — fatal for
+real, call-heavy code (caught by the Miri differential harness).
+
 ## Symbolic heap + alias analysis (increment 4)
 Each path carries a list of store records. A `Load` resolves by scanning them
 most-recent-first via [`csolver_memory::AliasResult`]: a **must-aliasing** store
