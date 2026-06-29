@@ -798,3 +798,60 @@ fn mir_real_enum_match_verifies_pass() {
     assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
     assert!(report.assumptions.iter().any(|a| a.id == "struct-abi"));
 }
+
+/// Field-precise heap: storing `3` to field 0 and loading it back must round-trip
+/// the value, so the (otherwise unguarded) index `(*_2)[_4]` with `_4 = 3` is
+/// proved in bounds of `[i32; 8]`. Without the store→load round-trip the loaded
+/// value would be unknown and the index unprovable. (This only propagates a value
+/// the program actually stored, so it can never turn a real bug into a PASS.)
+const FIELD_ROUNDTRIP: &str = r#"
+fn roundtrip(_1: &mut Pair, _2: &[i32; 8]) -> i32 {
+    let mut _0: i32;
+    let mut _3: i32;
+    let mut _4: usize;
+    bb0: {
+        ((*_1).0: i32) = const 3_i32;
+        _3 = copy ((*_1).0: i32);
+        _4 = move _3 as usize (IntToInt);
+        _0 = (*_2)[_4];
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_field_store_load_roundtrips() {
+    let module = lower(FIELD_ROUNDTRIP, "roundtrip");
+    assert!(module.unanalyzed.is_empty());
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
+/// Soundness of the field layout's disjointness: storing to field 0 then loading
+/// field **1** must *not* recover the stored value (distinct fields do not alias),
+/// so the index built from field 1 stays unknown — the store to field 0 may never
+/// pollute a different field, which would be a false PASS.
+const FIELD_CROSS: &str = r#"
+fn cross_field(_1: &mut Pair, _2: &[i32; 8]) -> i32 {
+    let mut _0: i32;
+    let mut _3: i32;
+    let mut _4: usize;
+    bb0: {
+        ((*_1).0: i32) = const 3_i32;
+        _3 = copy ((*_1).1: i32);
+        _4 = move _3 as usize (IntToInt);
+        _0 = (*_2)[_4];
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_field_distinct_fields_do_not_alias() {
+    let module = lower(FIELD_CROSS, "cross_field");
+    let report = verify_module(&module, &Config::default());
+    // The field accesses are in bounds by construction; the only open obligation
+    // is the array index built from field 1 — which must stay unproven, since
+    // field 1 never received field 0's stored value.
+    assert_ne!(report.verdict, Verdict::Pass, "distinct fields must not alias: {report:?}");
+}

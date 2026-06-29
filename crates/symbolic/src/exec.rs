@@ -199,6 +199,8 @@ fn discharge_inner(
         loop_modified,
         loop_frees,
         summaries: summaries.clone(),
+        field_offsets: HashMap::new(),
+        field_frontier: HashMap::new(),
         f,
     };
 
@@ -506,6 +508,14 @@ struct Explorer<'f> {
     loop_frees: HashMap<BlockId, bool>,
     /// Interprocedural summaries, by callee id (empty = havoc all calls).
     summaries: HashMap<FuncId, Summary>,
+    /// A deterministic synthetic field layout per region: the byte offset assigned
+    /// to each `(region, field index)` the first time it is accessed, and the
+    /// running frontier per region. Fields are packed sequentially so distinct
+    /// fields occupy disjoint ranges (an exact field-sensitive heap), while the
+    /// same field always reuses its offset (so a store then load round-trips). The
+    /// real layout is irrelevant — only `offset + size <= region size` is asserted.
+    field_offsets: HashMap<(usize, u32), u64>,
+    field_frontier: HashMap<usize, u64>,
     f: &'f Function,
 }
 
@@ -514,6 +524,21 @@ impl Explorer<'_> {
         let name = format!("?{}", self.fresh);
         self.fresh += 1;
         self.ctx.symbol(name, width)
+    }
+
+    /// The synthetic byte offset of `(region, field)`: cached on first access, else
+    /// the region's current frontier, which is then advanced by the field size so
+    /// the next new field lands in a disjoint range. Deterministic across paths
+    /// (the executor processes each block once), so merges stay consistent.
+    fn field_offset(&mut self, rid: usize, field: u32, size: u64) -> u64 {
+        if let Some(&o) = self.field_offsets.get(&(rid, field)) {
+            return o;
+        }
+        let frontier = self.field_frontier.entry(rid).or_insert(0);
+        let off = *frontier;
+        *frontier += size.max(1);
+        self.field_offsets.insert((rid, field), off);
+        off
     }
 
     fn fresh_value(&mut self, ty: &Type) -> SymValue {
@@ -1208,27 +1233,25 @@ impl Explorer<'_> {
                 self.check_ptr_arith(block, idx, &result, state);
                 state.env.insert(*dst, SymValue::Ptr(result));
             }
-            Inst::FieldPtr { dst, base, field: _, size, align } => {
+            Inst::FieldPtr { dst, base, field, size, align } => {
                 let base_ptr = self.eval_pointer(base, state);
                 let result = match &base_ptr.prov {
                     Prov::Region(r) => {
-                        // A typed field of a valid aggregate lies within it. Model
-                        // it at a fresh offset constrained `0 <= off` and
-                        // `off + size <= region size`, and inherit the field's
-                        // alignment (a field is aligned within its struct). The
-                        // following Load/Store is then in bounds and aligned by
-                        // construction — no struct byte-layout is reconstructed.
+                        // A typed field of a valid aggregate lies within it. Place
+                        // it at its synthetic offset (concrete, so distinct fields
+                        // are disjoint and the same field round-trips), assert
+                        // `offset + size <= region size` (the field fits), and
+                        // inherit the field's alignment (a field is aligned within
+                        // its struct). The following Load/Store is then in bounds
+                        // and aligned by construction — no real layout is needed.
                         let rid = *r;
                         let region_size = state.regions[rid].size;
-                        let off = self.fresh_scalar(PTR_WIDTH);
-                        let zero = self.ctx.int(PTR_WIDTH, 0);
-                        let lo = self.ctx.cmp(SCmp::Sle, zero, off);
-                        let sz = self.ctx.int(PTR_WIDTH, *size as u128);
-                        let end = self.ctx.bin(BvOp::Add, off, sz);
+                        let off = self.field_offset(rid, *field, *size);
+                        let off_e = self.ctx.int(PTR_WIDTH, off as u128);
+                        let end = self.ctx.int(PTR_WIDTH, (off + *size) as u128);
                         let hi = self.ctx.cmp(SCmp::Sle, end, region_size);
-                        state.facts.push(lo);
                         state.facts.push(hi);
-                        SymPointer { prov: Prov::Region(rid), offset: off, align: (*align).max(1) }
+                        SymPointer { prov: Prov::Region(rid), offset: off_e, align: (*align).max(1) }
                     }
                     // Not a known region (null/unknown provenance): the field
                     // pointer inherits it, so a later access is soundly unproven.
