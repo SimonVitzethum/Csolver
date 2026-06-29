@@ -368,7 +368,15 @@ impl Parser {
             match t {
                 Tok::Punct('(') | Tok::Punct('[') => depth += 1,
                 Tok::Punct(')') | Tok::Punct(']') => depth -= 1,
-                Tok::Arrow if depth == 0 => return true,
+                // A terminator edge is `-> [return: bb, …]` or `-> bbN`. A `->`
+                // followed by anything else is a function-pointer type's return
+                // arrow inside the rvalue (`_0 = f as fn(T) -> R`), *not* an edge —
+                // keep scanning so the statement is not mis-read as a call.
+                Tok::Arrow if depth == 0 => match self.toks.get(i + 1) {
+                    Some(Tok::Punct('[')) => return true,
+                    Some(Tok::Word(w)) if is_bb(w) => return true,
+                    _ => {}
+                },
                 Tok::Punct(';') if depth == 0 => return false,
                 Tok::Punct('}') if depth <= 0 => return false,
                 Tok::Eof => return false,
