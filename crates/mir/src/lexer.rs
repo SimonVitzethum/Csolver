@@ -7,7 +7,7 @@
 //! literals (assert messages), the `->` and `=>` arrows, and single-character
 //! punctuation. Line (`//`) comments and whitespace are skipped.
 
-use csolver_core::{Error, Result};
+use csolver_core::Result;
 
 /// A single MIR token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +113,13 @@ fn lex_string(b: &[u8], mut i: usize) -> Result<(String, usize)> {
     while i < b.len() {
         match b[i] {
             b'"' => return Ok((s, i + 1)),
+            // A real MIR string literal never spans a line (newlines are emitted as
+            // `\n`). So a `"` with no close on its line is *not* a string opener —
+            // it is a stray quote, e.g. in an `alloc … { 0x00 │ … │ !"#$… }` data
+            // dump's ASCII column. End the token at the newline instead of eating
+            // the rest of the file, so one such quote cannot vanish the whole crate
+            // (lexing runs before per-function recovery).
+            b'\n' => return Ok((s, i)),
             b'\\' if i + 1 < b.len() => {
                 s.push(b[i + 1] as char);
                 i += 2;
@@ -123,7 +130,7 @@ fn lex_string(b: &[u8], mut i: usize) -> Result<(String, usize)> {
             }
         }
     }
-    Err(Error::parse("unterminated string literal"))
+    Ok((s, i)) // EOF: recover rather than fail the module
 }
 
 fn is_ident_start(c: u8) -> bool {
