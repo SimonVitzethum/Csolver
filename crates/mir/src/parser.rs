@@ -944,6 +944,13 @@ impl Parser {
             }
             Tok::Word(w) => {
                 self.pos += 1;
+                // A trait object / impl-trait type (`dyn core::fmt::Debug`,
+                // `impl Iterator + 'a`): consume the `+`-separated trait-path
+                // bounds (a lifetime such as `'a` lexes to a bare word). Opaque.
+                if w == "dyn" || w == "impl" {
+                    self.skip_trait_bounds();
+                    return Ok(MType::Other);
+                }
                 // A named type may be a qualified path with generic arguments
                 // (`core::option::Option<i32>`, `Vec<T>`); consume the whole path
                 // tail so the type lowers to `Other`, not a parse error. The inner
@@ -1012,6 +1019,23 @@ impl Parser {
                 Tok::Punct('<') => depth += 1,
                 Tok::Punct('>') => depth -= 1,
                 _ => {}
+            }
+        }
+    }
+
+    /// Consume the `+`-separated trait-path bounds of a `dyn`/`impl` type
+    /// (`dyn core::fmt::Debug + Send + 'a`). Each bound is a path (lifetimes lex
+    /// to bare words, the `'` being dropped by the lexer).
+    fn skip_trait_bounds(&mut self) {
+        loop {
+            if matches!(self.peek(), Tok::Word(_)) {
+                self.pos += 1;
+                self.skip_path_tail();
+            } else {
+                break;
+            }
+            if !self.eat_punct('+') {
+                break;
             }
         }
     }
