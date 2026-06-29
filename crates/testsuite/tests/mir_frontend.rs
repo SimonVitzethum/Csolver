@@ -482,12 +482,10 @@ fn good(_1: &[i32; 8], _2: usize) -> i32 {
     }
 }
 
-fn uses_drop(_1: i32) -> () {
-    let mut _0: ();
+fn double_deref(_1: &mut &mut i32) -> i32 {
+    let mut _0: i32;
     bb0: {
-        drop(_1) -> [return: bb1, unwind continue];
-    }
-    bb1: {
+        _0 = copy (*(*_1));
         return;
     }
 }
@@ -496,15 +494,47 @@ fn uses_drop(_1: i32) -> () {
 #[test]
 fn mir_per_function_recovery() {
     let module = lower(MIXED, "mixed");
-    // The good function lowered; the drop-using one is recorded unanalyzed.
+    // The good function lowered; the one with an access that cannot be lowered to
+    // a known pointer (a double deref) is recorded unanalyzed.
     assert_eq!(module.functions.len(), 1);
     assert_eq!(module.functions[0].name, "good");
-    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_drop"));
+    assert!(module.unanalyzed.iter().any(|(n, _)| n == "double_deref"));
 
     let report = verify_module(&module, &Config::default());
     assert_eq!(report.verdict, Verdict::Unknown);
     let good = report.functions.iter().find(|f| f.function == "good").unwrap();
     assert_eq!(good.verdict, Verdict::Pass);
+}
+
+/// A `drop` terminator no longer rejects the function: its destructor is modelled
+/// as a freeing call, so a guarded access *before* the drop still verifies PASS.
+/// (The free's soundness — a use of a *dropped* owned region is not a PASS — is
+/// covered by the differential corpus's `cond_use_after_free`.)
+const DROP_OK: &str = r#"
+fn drop_then_get(_1: &[i32; 8], _2: usize) -> i32 {
+    let mut _0: i32;
+    let mut _3: bool;
+    let _4: i32;
+    bb0: {
+        _3 = Lt(_2, const 8_usize);
+        assert(move _3, "oob", const 8_usize, _2) -> [success: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = (*_1)[_2];
+        drop(_4) -> [return: bb2, unwind continue];
+    }
+    bb2: {
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_drop_terminator_is_modelled_and_analyses() {
+    let module = lower(DROP_OK, "drop_ok");
+    assert!(module.unanalyzed.is_empty(), "a drop terminator no longer rejects the function");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
 }
 
 /// An interprocedural module: `caller` calls a verified `helper` (a checked

@@ -442,6 +442,26 @@ impl Ctx {
                     Terminator::Switch { value, cases, default: BlockId(*otherwise as u32) }
                 }
             }
+            MTerm::Drop { target } => {
+                // A drop runs the value's destructor, which may free what the value
+                // owns (a `Vec`/`Box` buffer, or a raw pointer a custom `Drop`
+                // frees). Model it as a freeing call: an unknown `Symbol` callee,
+                // which the verifier treats as possibly-freeing — it invalidates
+                // every owned region's liveness and the heap, so a later use of a
+                // freed owned region is not a false PASS. Borrowed (contracted)
+                // regions survive, since a destructor cannot free a borrow. Then
+                // branch to the return block.
+                out.push(Inst::Call {
+                    dst: None,
+                    callee: Callee::Symbol("drop".into()),
+                    args: vec![],
+                    ret_ty: Type::Unit,
+                });
+                match target {
+                    Some(t) => Terminator::Br { target: BlockId(*t as u32), args: vec![] },
+                    None => Terminator::Unreachable,
+                }
+            }
             MTerm::Unsupported => {
                 return Err(Error::unsupported("MIR terminator outside the modelled subset"))
             }

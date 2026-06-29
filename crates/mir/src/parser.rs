@@ -128,6 +128,11 @@ pub(crate) enum MTerm {
     /// `_d = callee(args) -> [return: bb, …]`: a function call (`target` is
     /// `None` for a diverging call with no return edge).
     Call { dst: Place, callee: CalleeSpec, args: Vec<Operand>, target: Option<usize> },
+    /// `drop(place) -> [return: bb, …]`: runs the value's destructor, which may
+    /// free what it owns. Modelled as a freeing call (`target` is `None` for a
+    /// diverging drop). The dropped place itself is not needed — the conservative
+    /// free invalidates every owned region's liveness regardless.
+    Drop { target: Option<usize> },
     Unreachable,
     /// A terminator outside the modelled subset (`call`, `drop`, …): the whole
     /// function is rejected (recorded unanalyzed) rather than mis-modelled.
@@ -390,8 +395,20 @@ impl Parser {
             }
             "switchInt" => self.switch_int()?,
             "assert" => self.assert_term()?,
-            // `call`, `drop`, `yield`, … are not modelled: reject the function.
-            "call" | "drop" | "yield" | "resume" | "abort" => {
+            "drop" => self.drop_term()?,
+            // Abnormal terminators with no normal continuation: `resume` re-raises
+            // a panic, `abort`/`terminate` end the process. They only sit in
+            // cleanup blocks reached via `unwind:` edges, which the analysis does
+            // not follow — so the block is unreachable in our CFG. Lowering them to
+            // `Unreachable` lets the *rest* of the function analyse (instead of
+            // being rejected for an unmodelled terminator), soundly.
+            "resume" | "abort" | "terminate" => {
+                self.skip_statement();
+                MTerm::Unreachable
+            }
+            // `call` (a bare call terminator) and `yield` (a coroutine resume point,
+            // which *does* have a normal continuation) are not modelled: reject.
+            "call" | "yield" => {
                 self.skip_statement();
                 MTerm::Unsupported
             }
@@ -518,6 +535,18 @@ impl Parser {
         }
         let otherwise = otherwise.ok_or_else(|| Error::parse("switchInt without an `otherwise`"))?;
         Ok(MTerm::SwitchInt(scrutinee, cases, otherwise))
+    }
+
+    /// `drop(place) -> [return: bb, unwind …]` — a destructor run. The dropped
+    /// place is parsed (so it is consumed) but discarded: the conservative free
+    /// model does not need to know which value is dropped.
+    fn drop_term(&mut self) -> Result<MTerm> {
+        self.pos += 1; // drop
+        self.expect_punct('(')?;
+        let _ = self.place()?;
+        self.expect_punct(')')?;
+        let target = self.return_edge()?;
+        Ok(MTerm::Drop { target })
     }
 
     fn assert_term(&mut self) -> Result<MTerm> {
