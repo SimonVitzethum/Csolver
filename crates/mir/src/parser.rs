@@ -1045,6 +1045,11 @@ impl Parser {
                 self.skip_path_tail();
                 Ok(MType::Other)
             }
+            // The never type `!` (e.g. a `-> !` diverging return).
+            Tok::Punct('!') => {
+                self.pos += 1;
+                Ok(MType::Unit)
+            }
             _ => Ok(MType::Other),
         }
     }
@@ -1101,6 +1106,15 @@ impl Parser {
             if matches!(self.peek(), Tok::Word(_)) {
                 self.pos += 1;
                 self.skip_path_tail();
+                // `Fn`/`FnMut`/`FnOnce` sugar — `Fn(Args) -> R` — has a
+                // parenthesised argument list and an optional return type.
+                if self.eat_punct('(') {
+                    self.skip_balanced_paren();
+                    if self.peek() == &Tok::Arrow {
+                        self.pos += 1;
+                        let _ = self.ty();
+                    }
+                }
             } else {
                 break;
             }
