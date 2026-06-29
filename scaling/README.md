@@ -206,8 +206,43 @@ unsplit residual is not evidence of a single cause (the "truncated" that was zer
 and a coarse origin is not evidence of a single origin (the `Merge` that was really
 `scalar-as-pointer`). Each was caught the same way — feed a known input, check the
 bucket, refuse to trust a "0", an "empty", or a dominant catch-all without it — which
-is why the sweep gates on `selftest.sh` before printing a single number. The M3 entry
-point is now a measured question, not an assumed one: characterise `scalar-as-pointer`
-(a representation/lowering gap that may be sound-extensible, vs. genuine pointer-as-
-integer arithmetic that should stay `UNKNOWN`) before building — the next diagnostic,
-explicitly not guessed here.
+is why the sweep gates on `selftest.sh` before printing a single number.
+
+### Drilling `scalar-as-pointer` to its mechanism (the M3-defining number)
+
+The question that decides M3's *nature* (a low-risk representation fix vs. a
+capability needing assumption discipline) is: of the 1550 scalar-as-pointer, how much
+is "provenance exists in the source, the IR lost the pointer *type*" (recoverable, no
+new assumption) vs. "genuinely integer-derived" (bit-masking, pointer arithmetic over
+raw integers — stays `UNKNOWN`)? Each `ScalarPtrCause` now records the proximate
+defining instruction of the scalar (with `Use`-copy chains resolved to their source).
+The split:
+
+```
+  1011  unresolved scalar copy / param / const   (Use-copies; representation)
+   529  call/index result typed non-pointer       (Index::index → &T; recoverable)
+    10  loaded scalar (store-load dependent)
+     0  bit-mask of an address (alignment)        ← the ambiguous category
+     0  integer arithmetic                        ← the ambiguous category
+     0  ptr-to-int cast / pointer arithmetic
+```
+
+**The genuinely-ambiguous arithmetic categories are empty.** Not one of the 1550 is
+a bit-masked or integer-arithmetic address; the entire bucket is *type-fidelity loss*
+— references and pointers the IR carries as non-pointer-typed values. The 529 are
+`Index::index`/`index_mut` returning `&T`/`&mut T` and internal direct calls (drilled
+to the callee to confirm: **none** are `from_raw_parts`/`as_ptr` — the raw-pointer
+hazard stays absent even one level into the calls), and the 1011 are `Use`-copies of
+such values whose chain roots at a parameter/const. So M3's largest lever is a
+**lowering/representation fix** — preserve pointer typing through `index`/`index_mut`,
+`Use`-copies, and pointer-returning calls — not an engine capability that *assumes*
+anything: it restores type information already present in the source, so it adds no
+TCB and cannot flip the raw-pointer hazard. The guardian for that last claim is in the
+corpus and stays green: `slice_oob_from_raw`/`raw_add`/`raw_sub` remain `UNKNOWN`
+(Miri-UB), not `PASS`.
+
+Three reframes in one investigation, each from refusing to trust a number until it was
+split one level finer: the bucket was not empty (grep), the residual was not one cause
+(truncated=0), the origin was not one origin (`Merge`→scalar-as-pointer), and the
+scalar-as-pointer is not provenance-tracking work but lowering type-fidelity. The M3
+entry point is now a *measured* question.

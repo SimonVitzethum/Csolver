@@ -201,6 +201,7 @@ fn discharge_inner(
         summaries: summaries.clone(),
         field_offsets: HashMap::new(),
         field_frontier: HashMap::new(),
+        scalar_ptr_cause: classify_scalar_ptr_defs(f),
         f,
     };
 
@@ -372,8 +373,189 @@ enum POrigin {
     /// A block parameter / merged value with no incoming argument to evaluate.
     PhiFallback,
     /// A scalar value used where a pointer was expected (a pointer that was
-    /// scalarised earlier and read back as an address).
-    ScalarAsPtr,
+    /// scalarised earlier and read back as an address). Carries *how* the scalar
+    /// arose — the split that decides whether M3 can recover provenance soundly
+    /// (the source had a pointer) or must leave it `UNKNOWN` (genuinely
+    /// integer-derived).
+    ScalarAsPtr(ScalarPtrCause),
+}
+
+/// How the integer value used as a pointer was computed — the proximate defining
+/// instruction of the pointer operand. Diagnostic only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarPtrCause {
+    /// `ptr as usize` (`PtrToInt`) — the value *was* a pointer; provenance existed
+    /// in the source and was cast away. Recoverable.
+    PtrToInt,
+    /// `Add`/`Sub`/… with a pointer-typed operand — offset arithmetic done as a
+    /// scalar `Bin` instead of `PtrOffset`. The base carries provenance.
+    /// Recoverable.
+    PtrArith,
+    /// A copy/reinterpret (`Use`/`Bitcast`) of a pointer-typed value. Recoverable.
+    PtrCopy,
+    /// `And`/`Or`/`Xor`/shift — bit manipulation of an address (alignment masking
+    /// `ptr & !7`, tag bits). Provenance is genuinely ambiguous → stays `UNKNOWN`.
+    BitMask,
+    /// `Add`/`Sub`/… over operands with no pointer among them — pure integer
+    /// arithmetic. Ambiguous → stays `UNKNOWN`.
+    IntArith,
+    /// A non-pointer value loaded from memory and used as an address (its
+    /// provenance, if any, depends on store→load tracking).
+    LoadedScalar,
+    /// A call/index result the IR typed as non-pointer — e.g. `Index::index`
+    /// returning `&T`, or an internal direct call returning a reference. The
+    /// reference carries provenance in the source; the IR lost the pointer *type*.
+    /// Recoverable via lowering type-fidelity / a pointer-return summary.
+    CallResult,
+    /// A block parameter (a PHI / loop-carried value): the pointer is threaded
+    /// through a CFG join, where a scalarised incoming edge value loses the
+    /// pointer representation. The store→load and merge machinery, not arithmetic.
+    BlockParam,
+    /// The result of a `PtrOffset`/`FieldPtr`/`Alloc` that nonetheless reached
+    /// `eval_pointer` as a scalar — would indicate a representation leak in those
+    /// (expected near-zero).
+    PtrResult,
+    /// An opaque call result, a constant address, a parameter, or otherwise
+    /// unclassified.
+    Other,
+}
+
+impl ScalarPtrCause {
+    fn residual(self) -> &'static str {
+        match self {
+            ScalarPtrCause::PtrToInt => {
+                "pointer provenance is not tracked: scalar-as-pointer (ptr-to-int cast; recoverable)"
+            }
+            ScalarPtrCause::PtrArith => {
+                "pointer provenance is not tracked: scalar-as-pointer (pointer arithmetic; recoverable)"
+            }
+            ScalarPtrCause::PtrCopy => {
+                "pointer provenance is not tracked: scalar-as-pointer (pointer copy/reinterpret; recoverable)"
+            }
+            ScalarPtrCause::BitMask => {
+                "pointer provenance is not tracked: scalar-as-pointer (bit-mask of an address; ambiguous)"
+            }
+            ScalarPtrCause::IntArith => {
+                "pointer provenance is not tracked: scalar-as-pointer (integer arithmetic; ambiguous)"
+            }
+            ScalarPtrCause::LoadedScalar => {
+                "pointer provenance is not tracked: scalar-as-pointer (loaded scalar; store-load dependent)"
+            }
+            ScalarPtrCause::CallResult => {
+                "pointer provenance is not tracked: scalar-as-pointer (call/index result typed non-pointer; recoverable)"
+            }
+            ScalarPtrCause::BlockParam => {
+                "pointer provenance is not tracked: scalar-as-pointer (block param / PHI; loop-carried)"
+            }
+            ScalarPtrCause::PtrResult => {
+                "pointer provenance is not tracked: scalar-as-pointer (ptroffset/field/alloc leak)"
+            }
+            ScalarPtrCause::Other => {
+                "pointer provenance is not tracked: scalar-as-pointer (unresolved scalar copy / param / const)"
+            }
+        }
+    }
+}
+
+/// Classify, per register, how a scalar value later used as a pointer was computed
+/// — the proximate defining instruction. Built once per function and read at the
+/// `eval_pointer` scalar fallback. Two passes: first an `is_ptr` map over every
+/// defined register, then the cause, using it to tell offset-on-a-pointer
+/// (`PtrArith`, recoverable) from pure integer arithmetic (`IntArith`, ambiguous).
+fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
+    let mut is_ptr: HashMap<RegId, bool> = HashMap::new();
+    let mut note = |r: &RegId, p: bool| {
+        is_ptr.insert(*r, p);
+    };
+    for (r, ty) in &f.params {
+        note(r, ty.is_ptr());
+    }
+    for b in &f.blocks {
+        for (r, ty) in &b.params {
+            note(r, ty.is_ptr());
+        }
+        for inst in &b.insts {
+            match inst {
+                Inst::Assign { dst, ty, .. } | Inst::Load { dst, ty, .. } => note(dst, ty.is_ptr()),
+                Inst::PtrOffset { dst, .. }
+                | Inst::FieldPtr { dst, .. }
+                | Inst::Alloc { dst, .. } => note(dst, true),
+                Inst::Call { dst: Some(dst), ret_ty, .. } => note(dst, ret_ty.is_ptr()),
+                _ => {}
+            }
+        }
+    }
+    let op_is_ptr = |op: &Operand| matches!(op, Operand::Reg(r) if is_ptr.get(r) == Some(&true));
+
+    // First pass: a concrete cause for each defining instruction, plus a `copy_of`
+    // edge for scalar `Use` copies so a chain like `p = use q; q = index(...)` is
+    // attributed to its source (`index`), not to a vague "copy".
+    let mut cause: HashMap<RegId, ScalarPtrCause> = HashMap::new();
+    let mut copy_of: HashMap<RegId, RegId> = HashMap::new();
+    for b in &f.blocks {
+        for (r, _) in &b.params {
+            cause.insert(*r, ScalarPtrCause::BlockParam);
+        }
+        for inst in &b.insts {
+            let (dst, c) = match inst {
+                Inst::Load { dst, .. } => (*dst, ScalarPtrCause::LoadedScalar),
+                Inst::Call { dst: Some(dst), .. } => (*dst, ScalarPtrCause::CallResult),
+                Inst::PtrOffset { dst, .. }
+                | Inst::FieldPtr { dst, .. }
+                | Inst::Alloc { dst, .. } => (*dst, ScalarPtrCause::PtrResult),
+                Inst::Assign { dst, value, .. } => {
+                    let c = match value {
+                        RValue::Cast { op: CastOp::PtrToInt, .. } => ScalarPtrCause::PtrToInt,
+                        RValue::Cast { operand, .. } => {
+                            if op_is_ptr(operand) {
+                                ScalarPtrCause::PtrCopy
+                            } else {
+                                ScalarPtrCause::IntArith
+                            }
+                        }
+                        RValue::Use(operand) => {
+                            if op_is_ptr(operand) {
+                                ScalarPtrCause::PtrCopy
+                            } else {
+                                if let Operand::Reg(src) = operand {
+                                    copy_of.insert(*dst, *src);
+                                }
+                                ScalarPtrCause::Other
+                            }
+                        }
+                        RValue::Bin { op, lhs, rhs } => match op {
+                            BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::LShr
+                            | BinOp::AShr => ScalarPtrCause::BitMask,
+                            _ if op_is_ptr(lhs) || op_is_ptr(rhs) => ScalarPtrCause::PtrArith,
+                            _ => ScalarPtrCause::IntArith,
+                        },
+                        RValue::Cmp { .. } => ScalarPtrCause::IntArith,
+                    };
+                    (*dst, c)
+                }
+                _ => continue,
+            };
+            cause.insert(dst, c);
+        }
+    }
+
+    // Resolve `Use` copy chains to their source's concrete cause (bounded, with a
+    // cycle guard) so the dominant `assign-use` copies are attributed correctly.
+    let copiers: Vec<RegId> = copy_of.keys().copied().collect();
+    for start in copiers {
+        let mut cur = start;
+        for _ in 0..64 {
+            let Some(&src) = copy_of.get(&cur) else { break };
+            match cause.get(&src) {
+                Some(&ScalarPtrCause::Other) | None => cur = src, // keep following the chain
+                Some(&c) => {
+                    cause.insert(start, c);
+                    break;
+                }
+            }
+        }
+    }
+    cause
 }
 
 impl POrigin {
@@ -388,7 +570,7 @@ impl POrigin {
             POrigin::SelectJoin => "pointer provenance is not tracked: select/PHI join of differing provenance",
             POrigin::RegionDrop => "pointer provenance is not tracked: region dropped at path merge",
             POrigin::PhiFallback => "pointer provenance is not tracked: PHI fallback (no incoming arg)",
-            POrigin::ScalarAsPtr => "pointer provenance is not tracked: scalar used as pointer",
+            POrigin::ScalarAsPtr(cause) => cause.residual(),
         }
     }
 }
@@ -602,6 +784,9 @@ struct Explorer<'f> {
     /// real layout is irrelevant — only `offset + size <= region size` is asserted.
     field_offsets: HashMap<(usize, u32), u64>,
     field_frontier: HashMap<usize, u64>,
+    /// Per-register classification of how a scalar-used-as-pointer was computed
+    /// (diagnostic; tags the `ScalarAsPtr` provenance residual at scale).
+    scalar_ptr_cause: HashMap<RegId, ScalarPtrCause>,
     f: &'f Function,
 }
 
@@ -2078,11 +2263,19 @@ impl Explorer<'_> {
     fn eval_pointer(&mut self, op: &Operand, state: &PathState) -> SymPointer {
         match self.eval_value(op, state) {
             SymValue::Ptr(p) => p,
-            SymValue::Scalar(_) => SymPointer {
-                prov: Prov::Unknown(POrigin::ScalarAsPtr),
-                offset: self.ctx.int(PTR_WIDTH, 0),
-                align: 1,
-            },
+            SymValue::Scalar(_) => {
+                let cause = match op {
+                    Operand::Reg(r) => {
+                        self.scalar_ptr_cause.get(r).copied().unwrap_or(ScalarPtrCause::Other)
+                    }
+                    _ => ScalarPtrCause::Other,
+                };
+                SymPointer {
+                    prov: Prov::Unknown(POrigin::ScalarAsPtr(cause)),
+                    offset: self.ctx.int(PTR_WIDTH, 0),
+                    align: 1,
+                }
+            }
         }
     }
 
