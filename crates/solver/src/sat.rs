@@ -66,6 +66,16 @@ pub enum SatResult {
 /// but a hard backstop against pathological blow-up.
 pub const DEFAULT_BUDGET: u64 = 2_000_000;
 
+/// Wall-clock backstop per `solve`. The decision budget bounds *work* but not
+/// *time* — a single hard query (e.g. wide byte-pointer arithmetic in a SIMD
+/// search) can grind for many seconds before exhausting 2M decisions and hang the
+/// whole analysis. This caps the time instead: a query that runs past the budget
+/// bails to `Unknown` (sound — only `Unsat` is ever trusted, so a bail can only
+/// weaken a verdict to UNKNOWN or leave it on the linear path, never fabricate a
+/// PASS). It is generous enough that ordinary sub-millisecond queries never reach
+/// it (so they stay deterministic); it fires only on a pathological grind.
+const SOLVE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A DPLL solver over a fixed set of variables and clauses.
 pub struct Solver {
     num_vars: usize,
@@ -216,6 +226,8 @@ impl Solver {
 
         let mut decisions: Vec<Decision> = Vec::new();
         let mut budget_left = budget;
+        let start = std::time::Instant::now();
+        let mut ticks: u32 = 0;
         loop {
             let Some(v) = self.pick_branch() else {
                 return SatResult::Sat(self.model());
@@ -224,6 +236,15 @@ impl Solver {
                 return SatResult::Unknown;
             }
             budget_left -= 1;
+            // Wall-clock backstop (see `SOLVE_TIME_BUDGET`): checked every 8192
+            // decisions so the clock read is negligible.
+            ticks += 1;
+            if ticks >= 8192 {
+                ticks = 0;
+                if start.elapsed() > SOLVE_TIME_BUDGET {
+                    return SatResult::Unknown;
+                }
+            }
 
             // Decide v = true first.
             decisions.push(Decision {
