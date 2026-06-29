@@ -403,6 +403,68 @@ fn mir_real_unchecked_deref_is_not_pass() {
     );
 }
 
+/// **Real** `rustc --emit=mir` for `fn last(s: &[i32]) -> i32 { let n = s.len();
+/// if n == 0 { 0 } else { s[n - 1] } }` (frozen). The index `n - 1` is *derived*
+/// (a checked subtraction), and the guarding `if n == 0` lowers to a `≠`
+/// disequality the linear fragment cannot read. It verifies PASS only because the
+/// prover **skips** the unusable `≠` assumption and proves the access from its
+/// own `n-1 <u len` bounds guard.
+const REAL_LAST: &str = r#"
+fn last(_1: &[i32]) -> i32 {
+    debug s => _1;
+    let mut _0: i32;
+    let _2: usize;
+    let mut _3: bool;
+    let _4: usize;
+    let mut _5: (usize, bool);
+    let mut _6: usize;
+    let mut _7: bool;
+    scope 1 {
+        debug n => _2;
+    }
+
+    bb0: {
+        _2 = PtrMetadata(copy _1);
+        _3 = Eq(copy _2, const 0_usize);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = const 0_i32;
+        goto -> bb5;
+    }
+
+    bb2: {
+        _5 = SubWithOverflow(copy _2, const 1_usize);
+        assert(!move (_5.1: bool), "attempt to compute `{} - {}`, which would overflow", copy _2, const 1_usize) -> [success: bb3, unwind continue];
+    }
+
+    bb3: {
+        _4 = move (_5.0: usize);
+        _6 = PtrMetadata(copy _1);
+        _7 = Lt(copy _4, copy _6);
+        assert(move _7, "index out of bounds: the length is {} but the index is {}", move _6, copy _4) -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _0 = copy (*_1)[_4];
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mir_real_last_element_verifies_pass() {
+    let module = lower(REAL_LAST, "real_last");
+    assert!(module.unanalyzed.is_empty());
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "report: {report:?}");
+}
+
 /// A function using a construct outside the modelled subset (a `drop`
 /// terminator) is recorded as unanalyzed rather than mis-lowered — and a sound
 /// function in the same dump still verifies.

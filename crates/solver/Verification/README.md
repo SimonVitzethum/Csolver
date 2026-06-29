@@ -76,8 +76,12 @@ for bit-precise proofs.
   loops.)
 
 ## Limits
-- The linear procedure does not linearize `≠`/disjunctive goals (→ "not
-  proved").
+- The linear procedure does not linearize a `≠`/disjunctive *goal* (→ "not
+  proved"). An *assumption* it cannot read (a `≠` guard, an opaque boolean) is
+  **skipped**, not fatal: a smaller premise set only weakens the prover (it
+  proves strictly fewer goals — never a false one), whereas bailing would defeat
+  every later goal that depends on the *readable* premises (e.g. an `s[len - 1]`
+  access proving from its `i <u len` bounds guard despite a sibling `len != 0`).
 - Bit-blasting declines division/remainder, *symbolic* shift amounts, and widths
   above 64; the CNF size cap and SAT decision budget bound cost, so large or
   hard goals (e.g. two symbolic multiplicands) fall back to the linear method

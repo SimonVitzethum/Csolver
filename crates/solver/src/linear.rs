@@ -286,9 +286,15 @@ fn feasible(mut constraints: Vec<Linear>) -> bool {
 pub fn prove_implies(ctx: &ExprCtx, assumptions: &[ExprId], goal: ExprId) -> bool {
     let mut constraints = Vec::new();
     for &a in assumptions {
-        match constraints_of(ctx, a, true) {
-            Some(cs) => constraints.extend(cs),
-            None => return false,
+        // An assumption the linear fragment cannot read (a `≠` guard, an opaque
+        // boolean from an unmodelled check, …) is **skipped**, not fatal: dropping
+        // a premise only weakens the prover (a smaller constraint set is *more*
+        // feasible, so it proves *fewer* goals — never a false proof), while
+        // bailing entirely would defeat every later goal. This lets, e.g., a
+        // `s[len - 1]` access prove from its `i <u len` bounds guard even though
+        // the sibling `len != 0` guard is a disequality the fragment cannot use.
+        if let Some(cs) = constraints_of(ctx, a, true) {
+            constraints.extend(cs);
         }
     }
     match constraints_of(ctx, goal, false) {
@@ -368,5 +374,27 @@ mod tests {
         let goal = c.cmp(CmpOp::Ult, i, eight);
         // Nothing constrains i, so i < 8 cannot be proved.
         assert!(!prove_implies(&c, &[], goal));
+    }
+
+    #[test]
+    fn skips_unparseable_assumption_instead_of_bailing() {
+        let mut c = ExprCtx::new();
+        let i = c.symbol("i", 64);
+        let len = c.symbol("len", 64);
+        let zero = c.int(64, 0);
+        // A `≠` guard the fragment cannot read, alongside a usable `<` guard.
+        let ne = c.cmp(CmpOp::Ne, len, zero);
+        let guard = c.cmp(CmpOp::Ult, i, len);
+        let goal = c.cmp(CmpOp::Ult, i, len);
+        // The `≠` assumption is skipped, not fatal: the goal still proves from
+        // the usable guard (exactly what an `s[len - 1]` access needs, whose
+        // sibling `len != 0` guard the fragment cannot use).
+        assert!(prove_implies(&c, &[ne, guard], goal));
+        // The skip stays sound — an unsupported assumption cannot make an unsound
+        // goal provable.
+        let one = c.int(64, 1);
+        let lenm1 = c.bin(BvOp::Sub, len, one);
+        let unsound = c.cmp(CmpOp::Ult, i, lenm1); // i < len-1 (not implied)
+        assert!(!prove_implies(&c, &[ne, guard], unsound));
     }
 }

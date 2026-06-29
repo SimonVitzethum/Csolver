@@ -83,9 +83,8 @@ local and conservative; in particular:
   **iterator/enum-downcast** shape (`for x in s`) are `UNKNOWN` (the former needs
   struct layout, absent from the MIR text; the latter needs enum-variant
   modelling).
-- An index *derived by arithmetic* (`s[len - 1]`) can stay `UNKNOWN`: the
-  bounds-check `assert` gives the upper bound, but the implicit `0 ≤ idx` lower
-  bound is only a fact for `usize` *parameters*, not derived temporaries.
+- A **nested** index (`m[i][j]`) is `UNKNOWN` (the inner index needs the
+  element-stride relation the model does not yet carry).
 - The aggregate field accessed must be `.0` of a checked-arithmetic tuple;
   general struct/tuple fields and constant-index projections are opaque.
 - Integer constants are lowered at 64-bit width.
@@ -96,8 +95,9 @@ Unit tests: the `get(&[i32; 8], usize)` body parses and lowers to a `PtrOffset` 
 modelled as a real `Add` and forwarded by `move (_3.0)`. End-to-end
 (`csolver-testsuite/tests/
 mir_frontend.rs`): the checked array index verifies **PASS** (`param-contracts`);
-a checked **slice** index `get(&[i32], usize)` and an index-based slice **loop**
-`for i in 0..s.len() { s[i] }` verify **PASS** (`slice-abi`); the unchecked index
+a checked **slice** index `get(&[i32], usize)`, an index-based slice **loop**
+`for i in 0..s.len() { s[i] }`, a mutable-slice **fill** loop, and the last-element
+idiom `s[len - 1]` all verify **PASS** (`slice-abi`); the unchecked index
 is **not** proved; an **interprocedural** module (`caller` calling a checked
 `helper`) lowers the call to a `Direct` MSIR `Call` and verifies **PASS** via the
 helper's summary, while a dereference of an **external** call's unknown result is
