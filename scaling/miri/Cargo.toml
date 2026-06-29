@@ -21,5 +21,9 @@ oorandom = "11"
 arrayvec = "0.7"
 tinyvec = { version = "1", features = ["alloc"] }
 itoa = "1"
+# Complex-tier crates (added with the corpus growth): bytes exercises the fn-pointer
+# Vtable the latest parse fix enabled; memchr the SIMD search paths.
+bytes = "1"
+memchr = "2"
 
 [workspace]

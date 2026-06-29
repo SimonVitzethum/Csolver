@@ -980,6 +980,32 @@ impl Parser {
                     self.skip_trait_bounds();
                     return Ok(MType::Other);
                 }
+                // A function-pointer type, possibly higher-ranked / qualified:
+                // `for<'a> unsafe extern "C" fn(&'a T, U) -> R` (e.g. a vtable
+                // entry). Consume the binder/qualifiers, the `fn(args)`, and any
+                // `-> ret`, opaquely.
+                if w == "for" {
+                    self.skip_balanced_angle(); // the `for<'a>` binder
+                    return self.ty();
+                }
+                if w == "unsafe" || w == "extern" {
+                    if w == "extern" {
+                        if let Tok::Str(_) = self.peek() {
+                            self.pos += 1; // the ABI string, e.g. `"C"`
+                        }
+                    }
+                    return self.ty();
+                }
+                if w == "fn" {
+                    if self.eat_punct('(') {
+                        self.skip_balanced_paren();
+                    }
+                    if self.peek() == &Tok::Arrow {
+                        self.pos += 1;
+                        let _ = self.ty()?;
+                    }
+                    return Ok(MType::Other);
+                }
                 // A named type may be a qualified path with generic arguments
                 // (`core::option::Option<i32>`, `Vec<T>`); consume the whole path
                 // tail so the type lowers to `Other`, not a parse error. The inner

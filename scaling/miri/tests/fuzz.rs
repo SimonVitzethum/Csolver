@@ -148,6 +148,66 @@ fn fuzz_tinyvec() {
     }
 }
 
+/// `memchr`: SIMD byte search — fuzz needle(s) + haystack over its unsafe paths.
+#[test]
+fn fuzz_memchr() {
+    let mut f = Fuzz::new(0x0e3c_4111);
+    for _ in 0..cases() {
+        let len = f.below(200);
+        let hay: Vec<u8> = (0..len).map(|_| f.byte()).collect();
+        let (a, b, c) = (f.byte(), f.byte(), f.byte());
+        black_box(memchr::memchr(a, &hay));
+        black_box(memchr::memrchr(a, &hay));
+        black_box(memchr::memchr2(a, b, &hay));
+        black_box(memchr::memchr3(a, b, c, &hay));
+        let nlen = f.below(5);
+        let needle: Vec<u8> = (0..nlen).map(|_| f.byte()).collect();
+        black_box(memchr::memmem::find(&hay, &needle));
+    }
+}
+
+/// `bytes`: ref-counted byte buffers — the `Vtable` of fn pointers the fn-pointer
+/// type parse fix just enabled. Fuzz BytesMut/Bytes ops over its internal unsafe.
+#[test]
+fn fuzz_bytes() {
+    use bytes::{Buf, BufMut, Bytes, BytesMut};
+    let mut f = Fuzz::new(0xb17e_5111);
+    for _ in 0..cases() {
+        let mut b = BytesMut::new();
+        for _ in 0..40 {
+            match f.below(6) {
+                0 => b.put_u8(f.byte()),
+                1 => {
+                    let n = f.below(8);
+                    let s: Vec<u8> = (0..n).map(|_| f.byte()).collect();
+                    b.put_slice(&s);
+                }
+                2 => {
+                    let n = f.below(b.remaining() + 1);
+                    b.advance(n);
+                }
+                3 => {
+                    let n = f.below(b.len() + 1);
+                    let _ = b.split_to(n);
+                }
+                4 => {
+                    let n = f.below(b.len() + 1);
+                    let _ = b.split_off(n);
+                }
+                _ => {
+                    black_box(b.len());
+                }
+            }
+        }
+        let frozen: Bytes = b.freeze();
+        if !frozen.is_empty() {
+            let i = f.below(frozen.len());
+            black_box(frozen.slice(i..));
+        }
+        black_box(Bytes::copy_from_slice(&[f.byte(), f.byte(), f.byte()]));
+    }
+}
+
 /// `itoa`: integer-to-string into a fixed buffer (raw byte writes internally).
 /// A fresh buffer per call (`format` borrows the buffer for the returned `&str`).
 #[test]

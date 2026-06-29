@@ -18,7 +18,7 @@ ROOT="$(cd "$DIR/../.." && pwd)"
 export FUZZ_CASES
 
 # crate  ->  fuzz test name (1:1).
-CRATES=(adler2 oorandom arrayvec tinyvec itoa)
+CRATES=(adler2 oorandom arrayvec tinyvec itoa memchr bytes)
 
 echo "== building the solver CLI =="
 (cd "$ROOT" && cargo build -q -p csolver-cli) || { echo "build failed"; exit 2; }
