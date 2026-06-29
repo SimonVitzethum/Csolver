@@ -62,9 +62,10 @@ pub enum SatResult {
     Unknown,
 }
 
-/// Default decision budget — generous for the small bit-blasted queries here,
-/// but a hard backstop against pathological blow-up.
-pub const DEFAULT_BUDGET: u64 = 2_000_000;
+/// Default decision budget. With the wall-clock valve (`SOLVE_TIME_BUDGET`) as the
+/// real liveness backstop, this no longer needs to be huge — a query that would do
+/// more work than this is a pathological grind the wall-clock already caps on time.
+pub const DEFAULT_BUDGET: u64 = 200_000;
 
 /// Wall-clock backstop per `solve`. The decision budget bounds *work* but not
 /// *time* — a single hard query (e.g. wide byte-pointer arithmetic in a SIMD
