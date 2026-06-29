@@ -159,10 +159,55 @@ now nearly complete, and the dominant driver of `UNKNOWN` at scale is **engine
 analysis depth** — pointer provenance tracking (1822, ~189 functions) and loop /
 unsupported-op memory evaluation (1437, ~63 functions). Both are real, prioritisable
 engine capabilities, not parser chores; the parse tail (~32 functions, 9%) is rightly
-the *least* of them. The lesson is the project's own methodology turned on itself, in
-two layers: *the aggregation is part of the measurement, and so is the residual
-string it aggregates.* An unverified bucket count is not evidence of an empty bucket
-(the `grep -A1` phantom), and an unsplit residual is not evidence of a single cause
-(the "truncated" that turned out to be zero). The fix for both is the same — a
-positive control that feeds a known input and checks the bucket — which is why the
-sweep now gates on `selftest.sh` before printing a single number.
+the *least* of them.
+
+### Splitting the largest bucket honestly (and catching a mislabel doing it)
+
+Before committing M3 ("track provenance") to a direction, the 1822 provenance bucket
+was split by *origin* — each `Prov::Unknown` now carries a diagnostic tag of why
+provenance is absent (`POrigin` in `csolver-symbolic`, excluded from equality so it
+changes no verdict). The motivating worry was the dangerous category: a raw pointer
+from `slice::from_raw_parts`/`as_ptr`, where validity rests on the caller's `unsafe`
+contract, not the language — flipping those to `PASS` by "tracking provenance" would
+be the worst regression possible (the corpus's `slice_oob_from_raw` is the live proof
+that category is real UB). The split:
+
+```
+   1550  scalar used as pointer        (a pointer operand that evaluated to a scalar)
+    223  loaded value                  (no store→load provenance — the M3 core)
+     41  uncontracted pointer param
+      8  loop-havocked pointer
+      0  opaque call result (raw ptr)  ← the feared from_raw_parts/as_ptr category
+      0  int→ptr cast
+```
+
+Two findings, one of them only because the first label was wrong. The raw-pointer
+and int→ptr categories — the ones that need careful assumption discipline — are
+**empty in these twelve crates**: the `slice_oob_from_raw` hazard does not arise
+here, so an M3 that recovers reference/load provenance cannot accidentally flip it.
+And the dominant cause is **none of the three** anticipated sub-cases: it is "a
+pointer operand that evaluated to a scalar" (a pointer carried as an integer address
+the engine no longer sees as a pointer), spread across *every* crate including the
+non-pointer-arithmetic ones (`itoa`, `hexf-parse`) — byte iteration is universal, and
+its iterator/offset pointers are where this happens.
+
+That number was almost reported as "path-merge over-approximation": the first cut
+lumped six distinct opaque-pointer sites under one `Merge` origin, and `Merge` came
+out dominant. Believing it would have pointed M3 at control-flow joins — the wrong
+target. Splitting `Merge` into its six sites moved all 1550 to `scalar-used-as-
+pointer`; the merge/join sites were near-zero. Same mistake as the `grep -A1`
+phantom, one level deeper: *a coarse bucket is a hypothesis, not a measurement.*
+
+The lesson is the project's own methodology turned on itself, now in three layers:
+*the aggregation is part of the measurement, the residual string it aggregates is
+part of the measurement, and so is the granularity at which that string is bucketed.*
+An unverified count is not evidence of an empty bucket (the `grep -A1` phantom), an
+unsplit residual is not evidence of a single cause (the "truncated" that was zero),
+and a coarse origin is not evidence of a single origin (the `Merge` that was really
+`scalar-as-pointer`). Each was caught the same way — feed a known input, check the
+bucket, refuse to trust a "0", an "empty", or a dominant catch-all without it — which
+is why the sweep gates on `selftest.sh` before printing a single number. The M3 entry
+point is now a measured question, not an assumed one: characterise `scalar-as-pointer`
+(a representation/lowering gap that may be sound-extensible, vs. genuine pointer-as-
+integer arithmetic that should stay `UNKNOWN`) before building — the next diagnostic,
+explicitly not guessed here.

@@ -214,7 +214,7 @@ fn discharge_inner(
             // Name scalar parameters `arg{i}` so a counterexample model is
             // readable; pointer parameters get the usual opaque placeholder.
             let v = if ty.is_ptr() {
-                ex.fresh_value(ty)
+                ex.fresh_value(ty, POrigin::Param)
             } else {
                 SymValue::Scalar(ex.ctx.symbol(format!("arg{i}"), type_width(ty)))
             };
@@ -331,12 +331,98 @@ fn discharge_inner(
 }
 
 /// Provenance of a symbolic pointer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum Prov {
     Null,
     Region(usize),
-    Unknown,
+    /// No tracked provenance, tagged with *why* — purely diagnostic (it does not
+    /// affect equality or any verdict; see the manual `PartialEq`), so the scaling
+    /// sweep can split the "requires known provenance" residual by origin and
+    /// separate the sound-extensible cases (provenance through memory) from the
+    /// assumption-needed ones (raw-pointer call results, int→ptr).
+    Unknown(POrigin),
 }
+
+/// Why a pointer has no tracked provenance. Diagnostic only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum POrigin {
+    /// A pointer parameter with no derivable contract (a raw-pointer param, or an
+    /// opaque-generic reference the front end could not contract).
+    Param,
+    /// An opaque call result — `slice::from_raw_parts`, `<*T>::as_ptr`, an
+    /// un-summarised callee. The assumption-needed category: the caller's `unsafe`
+    /// guarantee, not the language, backs validity.
+    Call,
+    /// Loaded from memory with no provenance carried through the store. The
+    /// sound-extensible case: store→load provenance (M3) would recover it.
+    Load,
+    /// An `int → ptr` cast. Provenance is fundamentally destroyed (strict
+    /// provenance); stays `UNKNOWN` by design.
+    IntToPtr,
+    /// Havocked across a loop back-edge (a loop-modified pointer, conservatively
+    /// opaque).
+    Loop,
+    // The merge/join family — kept as distinct origins rather than one "Merge"
+    // catch-all, so a dominant join-loss is not mistaken for path merges in
+    // general (the same don't-trust-a-coarse-bucket discipline, one level down).
+    /// Joining two pointers of differing provenance at a `select`/PHI.
+    SelectJoin,
+    /// A region index that fell out of range when path-states were merged.
+    RegionDrop,
+    /// A block parameter / merged value with no incoming argument to evaluate.
+    PhiFallback,
+    /// A scalar value used where a pointer was expected (a pointer that was
+    /// scalarised earlier and read back as an address).
+    ScalarAsPtr,
+}
+
+impl POrigin {
+    /// The residual reason string (the bucket key the sweep aggregates on).
+    fn residual(self) -> &'static str {
+        match self {
+            POrigin::Param => "pointer provenance is not tracked: uncontracted pointer parameter",
+            POrigin::Call => "pointer provenance is not tracked: opaque call result (raw pointer)",
+            POrigin::Load => "pointer provenance is not tracked: loaded value (no store-load provenance)",
+            POrigin::IntToPtr => "pointer provenance is not tracked: int-to-pointer cast",
+            POrigin::Loop => "pointer provenance is not tracked: loop-havocked pointer",
+            POrigin::SelectJoin => "pointer provenance is not tracked: select/PHI join of differing provenance",
+            POrigin::RegionDrop => "pointer provenance is not tracked: region dropped at path merge",
+            POrigin::PhiFallback => "pointer provenance is not tracked: PHI fallback (no incoming arg)",
+            POrigin::ScalarAsPtr => "pointer provenance is not tracked: scalar used as pointer",
+        }
+    }
+}
+
+impl Prov {
+    /// Residual reason for a `requires known provenance` obligation, naming the
+    /// origin when known so the bucket splits by sub-case.
+    fn provenance_residual(&self) -> &'static str {
+        match self {
+            // A null (or integer-derived) pointer reaching a provenance check.
+            Prov::Null => "pointer provenance is not tracked: null or integer-derived pointer",
+            Prov::Unknown(o) => o.residual(),
+            // Unreachable at the emission sites (they fire on the non-Region else),
+            // but a total function is cheaper to keep correct than a panic.
+            Prov::Region(_) => "pointer provenance is not tracked",
+        }
+    }
+}
+
+// Provenance equality is purely structural over the *kind*: two opaque pointers
+// are interchangeable regardless of *why* they are opaque, so the diagnostic
+// `POrigin` is deliberately excluded. This keeps `select`/merge behaviour (and
+// every verdict) byte-identical to before the origin tag was added.
+impl PartialEq for Prov {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Prov::Null, Prov::Null) => true,
+            (Prov::Region(a), Prov::Region(b)) => a == b,
+            (Prov::Unknown(_), Prov::Unknown(_)) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for Prov {}
 
 #[derive(Debug, Clone)]
 struct SymPointer {
@@ -541,10 +627,10 @@ impl Explorer<'_> {
         off
     }
 
-    fn fresh_value(&mut self, ty: &Type) -> SymValue {
+    fn fresh_value(&mut self, ty: &Type, origin: POrigin) -> SymValue {
         if ty.is_ptr() {
             SymValue::Ptr(SymPointer {
-                prov: Prov::Unknown,
+                prov: Prov::Unknown(origin),
                 offset: self.ctx.int(PTR_WIDTH, 0),
                 align: 1,
             })
@@ -693,7 +779,7 @@ impl Explorer<'_> {
         let vals: Vec<SymValue> = (0..params.len())
             .map(|j| match args.get(j) {
                 Some(a) => self.eval_value(a, s),
-                None => self.fresh_value(&params[j].1),
+                None => self.fresh_value(&params[j].1, POrigin::PhiFallback),
             })
             .collect();
         for ((preg, _), v) in params.iter().zip(vals) {
@@ -728,7 +814,7 @@ impl Explorer<'_> {
                 .map(|(e, &d)| {
                     let v = match e.args.get(j) {
                         Some(a) => self.eval_value(a, &e.pred_state),
-                        None => self.fresh_value(pty),
+                        None => self.fresh_value(pty, POrigin::PhiFallback),
                     };
                     (d, v)
                 })
@@ -773,7 +859,7 @@ impl Explorer<'_> {
             if let SymValue::Ptr(p) = v {
                 if let Prov::Region(rid) = p.prov {
                     if rid >= rcount {
-                        p.prov = Prov::Unknown;
+                        p.prov = Prov::Unknown(POrigin::RegionDrop);
                     }
                 }
             }
@@ -803,7 +889,7 @@ impl Explorer<'_> {
     /// discriminators (the last edge is the final `else`).
     fn merge_values(&mut self, vals: &[(ExprId, SymValue)], ty: &Type) -> SymValue {
         let Some((_, last)) = vals.last().cloned() else {
-            return self.fresh_value(ty);
+            return self.fresh_value(ty, POrigin::PhiFallback);
         };
         let mut acc = last;
         for (d, v) in vals[..vals.len() - 1].iter().rev() {
@@ -824,11 +910,11 @@ impl Explorer<'_> {
                 align: gcd(pa.align, pb.align),
             }),
             (SymValue::Ptr(_), SymValue::Ptr(_)) => SymValue::Ptr(SymPointer {
-                prov: Prov::Unknown,
+                prov: Prov::Unknown(POrigin::SelectJoin),
                 offset: self.ctx.int(PTR_WIDTH, 0),
                 align: 1,
             }),
-            _ => self.fresh_value(ty),
+            _ => self.fresh_value(ty, POrigin::SelectJoin),
         }
     }
 
@@ -956,7 +1042,11 @@ impl Explorer<'_> {
                     let offset = self.ctx.int(PTR_WIDTH, 0);
                     state.env.insert(
                         reg,
-                        SymValue::Ptr(SymPointer { prov: Prov::Unknown, offset, align: 1 }),
+                        SymValue::Ptr(SymPointer {
+                            prov: Prov::Unknown(POrigin::Loop),
+                            offset,
+                            align: 1,
+                        }),
                     );
                 }
                 Some(SymValue::Scalar(_)) => {
@@ -1439,7 +1529,7 @@ impl Explorer<'_> {
                 Some(RetSummary::Scalar(aff)) => {
                     SymValue::Scalar(self.instantiate_affine(aff, &argvals))
                 }
-                _ => self.fresh_value(ret_ty),
+                _ => self.fresh_value(ret_ty, POrigin::Call),
             };
             state.env.insert(*d, value);
         }
@@ -1464,7 +1554,7 @@ impl Explorer<'_> {
                     align: base.align,
                 })
             }
-            _ => self.fresh_value(ret_ty),
+            _ => self.fresh_value(ret_ty, POrigin::Call),
         }
     }
 
@@ -1513,8 +1603,9 @@ impl Explorer<'_> {
         self.record(block, idx, NoNullDeref, non_null, "pointer is non-null", "pointer may be null or have opaque provenance");
 
         let Prov::Region(rid) = p.prov else {
+            let residual = p.prov.provenance_residual();
             for prop in [NoUseAfterFree, InBounds, Alignment, perm_prop] {
-                self.record(block, idx, prop, false, "requires known provenance", "pointer provenance is not tracked");
+                self.record(block, idx, prop, false, "requires known provenance", residual);
             }
             return;
         };
@@ -1564,7 +1655,7 @@ impl Explorer<'_> {
     fn check_ptr_arith(&mut self, block: BlockId, idx: usize, p: &SymPointer, state: &PathState) {
         use SafetyProperty::ValidPointerArith;
         let Prov::Region(rid) = p.prov else {
-            self.record(block, idx, ValidPointerArith, false, "requires known provenance", "pointer provenance is not tracked");
+            self.record(block, idx, ValidPointerArith, false, "requires known provenance", p.prov.provenance_residual());
             return;
         };
         let rsize = state.regions[rid].size;
@@ -1789,10 +1880,10 @@ impl Explorer<'_> {
             match self.alias_check(&target, p, rec_size, asize, state) {
                 AliasResult::No => continue,
                 AliasResult::Must => return (state.heap[k].value.clone(), LoadOrigin::Stored),
-                AliasResult::May => return (self.fresh_value(ty), LoadOrigin::Uncertain),
+                AliasResult::May => return (self.fresh_value(ty, POrigin::Load), LoadOrigin::Uncertain),
             }
         }
-        (self.fresh_value(ty), LoadOrigin::Unwritten)
+        (self.fresh_value(ty, POrigin::Load), LoadOrigin::Unwritten)
     }
 
     /// Does `p` point into a freshly-allocated region (one with no caller
@@ -1988,7 +2079,7 @@ impl Explorer<'_> {
         match self.eval_value(op, state) {
             SymValue::Ptr(p) => p,
             SymValue::Scalar(_) => SymPointer {
-                prov: Prov::Unknown,
+                prov: Prov::Unknown(POrigin::ScalarAsPtr),
                 offset: self.ctx.int(PTR_WIDTH, 0),
                 align: 1,
             },
@@ -2009,7 +2100,7 @@ impl Explorer<'_> {
             RValue::Cast { op, operand, .. } => match op {
                 CastOp::Bitcast => self.eval_value(operand, state),
                 CastOp::IntToPtr => SymValue::Ptr(SymPointer {
-                    prov: Prov::Unknown,
+                    prov: Prov::Unknown(POrigin::IntToPtr),
                     offset: self.ctx.int(PTR_WIDTH, 0),
                     align: 1,
                 }),
