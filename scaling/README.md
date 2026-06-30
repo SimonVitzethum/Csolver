@@ -287,3 +287,40 @@ wrong target — the last one off by a factor of 80×. Each was caught the same 
 feed a known input, split one level finer, refuse to trust a "0"/"empty"/dominant
 bucket — *especially* one whose units you have not checked against the thing you are
 about to dimension a fix on. *A coarse bucket is a hypothesis, not a measurement.*
+
+### Probing the four M3 levers before building — none is a free representation fix
+
+With the provenance bucket split to the root, the four candidate M3 levers were each
+*probed* (wired experimentally and measured, or instrumented) before committing a
+build, on the axis that matters: *additive* (recover provenance the IR already holds)
+vs. *assumption-laden / reconstruction* (new trust surface). Every one turned out to
+need real work:
+
+- **call/index results (529).** Typing the call result correctly (its destination
+  local's declared type, now that the parser captures `let _N: T;`) is sound and
+  committed — but **precision-neutral**: it moves the 529 from "scalar-as-pointer" to
+  "opaque call result", still `UNKNOWN`. Flipping them to `PASS` needs a *return
+  summary* (`Index::index` returns an in-bounds pointer into arg 0, via its
+  panic-on-OOB), a surfaced assumption of the `slice-abi` class — not free.
+- **by-value aggregate `.0` (983).** Hypothesised as the additive lever (read back a
+  fat pointer's data half from a contracted region). Wired experimentally: **0
+  flipped.** Instrumented: all 2320 such locals are `MType::Other` — the parser
+  collapses their aggregate types to opaque, so the provenance is *not in the IR* to
+  read back; it must be reconstructed (aggregate-type modelling). Reverted.
+- **store→load (223).** Recommended as the one genuinely-additive lever (a stored
+  pointer's provenance is a *fact*). Instrumented: **806 of the pointer-typed
+  fresh loads are `Unwritten`** (the location was never written in the analysed
+  function), and **0** are the refinable `May`→`Must` case. The pointers come from
+  *outside* — caller memory, fields initialised elsewhere — so this is an
+  interprocedural / initial-heap gap, not a local alias refinement. The `Must` case
+  already carries provenance; there is nothing local to sharpen.
+- **`&stack_local` (12).** Tiny, and the only lever that introduces a new region with
+  a scope-bound lifetime (a dangling-stack-reference false-`PASS` risk). Deferrable.
+
+The measured conclusion is the opposite of the hope that opened this section: **there
+is no free, TCB-neutral, additive *big* lever.** Every M3 entry point costs real
+design — a surfaced summary assumption (call/index), front-end aggregate-type
+modelling (by-value), or interprocedural memory provenance (store→load). That is a
+*good* result to enter M3 with: the optimistic "provenance is already there, just
+recover it" assumption was measured and buried before it became code, so M3 starts
+with the correct expectation rather than one that shatters mid-build.
