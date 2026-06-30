@@ -234,7 +234,7 @@ returning `&T`/`&mut T` and internal direct calls (drilled to the callee: **none
 calls). But the 1011 `Use`-copies were still a dominant catch-all "rooted at a
 param/const", so — once more — they were resolved one level finer.
 
-### Resolving the 1011 copy-roots exhaustively (the third reframe, fully measured)
+### Resolving the 1011 copy-roots — and cross-checking the root against its source
 
 Following each `Use`-copy chain to its root and classifying the root:
 
@@ -244,31 +244,46 @@ Following each `Use`-copy chain to its root and classifying the root:
      0  rooted in a symbol / pointer / scalar param / null
 ```
 
-The dominant root is **`Const::Undef`** — and `undef` is what the MIR lowering emits
-when it cannot lower a pointer's computation. Drilling the emission site (gated count
-over the crates): **3124 of them are `&stack_local`** — taking the address of a stack
-variable, which the front end models as `undef` instead of a pointer into a stack
-region. So the largest single driver of the whole provenance bucket is **not engine
-provenance tracking at all** — it is a front-end fidelity gap: `&local` has no
-modelled provenance, so every access through it is `UNKNOWN`.
+The dominant root is **`Const::Undef`** — what the MIR lowering emits when it cannot
+lower a pointer's computation. The *first* attempt to attribute it counted `undef`
+emissions at the source and found `&stack_local` dominant (3124), and it was tempting
+to conclude "model `&local` as a stack region — 995 of the bucket, ~55%." **A
+cross-check refuted that**, and it is the cleanest example in this whole document of
+why a coarse number must be split before it is trusted: emission counts and
+obligation counts are *different units*. Re-emitting each candidate `undef` site as a
+uniquely-named marker symbol and re-aggregating shows where the `undef` that actually
+reaches a *dereferenced pointer obligation* comes from:
 
-That overturns the previous paragraph's own conclusion ("M3's largest lever is a
-representation fix in the engine"): measured to the root, the largest lever is in the
-**front end** — model `&stack_local` as a stack region (995, ~55% of the bucket) and
-preserve pointer typing through `index`/call results (529, ~29%). Both are
-sound-extensible (a stack local is a valid sized allocation; an index returns a live
-reference — provenance exists in the source), low-TCB, and restore information the
-source already carries. The genuine engine lever (store→load provenance) is only 223
-(~12%); the genuinely-ambiguous `int→ptr`/`Const::Int` remainder is 16, and it must
-stay `UNKNOWN`. The raw-pointer hazard is 0 throughout; `slice_oob_from_raw`/`raw_add`
-/`raw_sub` stay `UNKNOWN` (Miri-UB), not `PASS`.
+```
+   506  operand_value: `(_local).0` of a by-value aggregate not in the checked-arith map
+   477  operand_value: other by-value Copy/Move projection (the `_ =>` fallback)
+    12  &stack_local   ← the entire stack-local contribution to the 995
+```
 
-Four reframes in one investigation, each from refusing to trust a number until it was
+So `&stack_local` accounts for **12 of the 995**, not 995. Its 3124 emissions flow
+almost entirely into values that are never dereferenced. The real driver is
+[`operand_value`](../crates/mir/src/lower.rs)'s by-value-aggregate fallbacks: a
+by-value tuple/struct/fat-pointer field used as an address — e.g. the `ptr` half of a
+by-value `&[T]` read as `(_slice).0` — falls through to `undef`. A `&stack_local →
+stack region` fix (the natural read of the first number) would have addressed **12 of
+995** and missed the lever almost entirely — the exact "build on the unmeasured
+internal distribution of a dominant bucket" failure, avoided only by the cross-check.
+
+Measured to the verified root, the priority order is: model by-value aggregate
+pointer fields in `operand_value` (≈983, the 506 + 477) and preserve pointer typing
+through `index`/call results (529) — both front-end fidelity, both sound-extensible
+(the provenance exists in the source; the lowering discards it). The genuine engine
+lever (store→load provenance) is 223; the ambiguous `Const::Int` remainder is 16 and
+stays `UNKNOWN`; the raw-pointer hazard is 0 throughout (`slice_oob_from_raw`/`raw_add`
+/`raw_sub` stay `UNKNOWN`, Miri-UB).
+
+Five reframes in one investigation, each from refusing to trust a number until it was
 split one level finer: the bucket was not empty (the `grep -A1` phantom), the residual
 was not one cause (the "truncated" that was 0), the origin was not one origin
-(`Merge`→scalar-as-pointer), and the dominant scalar-as-pointer root was not
-representation work in the engine but a front-end `&local` lowering gap. Each catch-all
-that was *believed* would have aimed the next build at the wrong target; each was
-caught the same way — feed a known input, split one level finer, refuse to trust a
-"0"/"empty"/dominant bucket without it. *A coarse bucket is a hypothesis, not a
-measurement* — and the priority order is now measured to the root, not assumed.
+(`Merge`→scalar-as-pointer), the copy-root was not representation work but a front-end
+`undef`, and the `undef` was not `&stack_local` (12) but by-value aggregate
+projections (983). Each *believed* catch-all would have aimed the next build at the
+wrong target — the last one off by a factor of 80×. Each was caught the same way:
+feed a known input, split one level finer, refuse to trust a "0"/"empty"/dominant
+bucket — *especially* one whose units you have not checked against the thing you are
+about to dimension a fix on. *A coarse bucket is a hypothesis, not a measurement.*
