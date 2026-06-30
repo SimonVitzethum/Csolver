@@ -522,9 +522,18 @@ impl Ctx {
                 // memory place and is loaded by the arm below instead.
                 Place::Field(inner, 0, _) if matches!(inner.as_ref(), Place::Local(_)) => {
                     match inner.as_ref() {
-                        Place::Local(k) => {
-                            self.checked_arith.get(k).cloned().unwrap_or(IrOp::Const(Const::Undef))
-                        }
+                        Place::Local(k) => self.checked_arith.get(k).cloned().unwrap_or_else(|| {
+                            // `.0` of a by-value fat pointer (`&[T]`) is its data
+                            // pointer — which CSolver already models as the region
+                            // pointer held in `_k`. Read it back (keeping the
+                            // contracted region's provenance) instead of dropping it
+                            // to undef.
+                            if self.is_fat_ref(*k) {
+                                IrOp::Reg(RegId(*k))
+                            } else {
+                                IrOp::Const(Const::Undef)
+                            }
+                        }),
                         _ => IrOp::Const(Const::Undef),
                     }
                 }
@@ -676,6 +685,15 @@ impl Ctx {
             },
             _ => None,
         }
+    }
+
+    /// Whether local `p` is a fat-pointer reference (`&[T]`/`&mut [T]`) — so its
+    /// `.0` projection is a data pointer into a contracted region, not opaque.
+    fn is_fat_ref(&self, p: u32) -> bool {
+        matches!(
+            self.local_types.get(&p),
+            Some(MType::Ref(inner, _) | MType::Ptr(inner, _)) if matches!(inner.as_ref(), MType::Slice(_))
+        )
     }
 
     /// The pointee type for dereferencing local `p` (an `&T`/`*T`).
