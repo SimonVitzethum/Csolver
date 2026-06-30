@@ -153,6 +153,11 @@ pub(crate) struct MirBody {
     pub(crate) name: String,
     pub(crate) params: Vec<(Local, MType)>,
     pub(crate) ret: MType,
+    /// The `let _N: T;` declarations from the body preamble (including those nested
+    /// in `scope { … }`). Carries the type of every non-parameter local — notably a
+    /// call result `let _x: &T;`, so its `Inst::Call` gets a pointer `ret_ty`
+    /// instead of an opaque scalar.
+    pub(crate) locals: Vec<(Local, MType)>,
     pub(crate) blocks: Vec<MBlock>,
 }
 
@@ -295,8 +300,10 @@ impl Parser {
         };
         self.expect_punct('{')?;
 
-        // Skip the scope/debug/`let` preamble: advance to the first `bbN:`.
-        self.skip_to_first_block();
+        // Parse the scope/debug/`let` preamble for its local declarations, then
+        // stop at the first `bbN:`. (Previously skipped wholesale — the local types
+        // are needed to type call results and dereferences.)
+        let locals = self.parse_locals();
 
         let mut blocks = Vec::new();
         while self.at_block_header() {
@@ -306,7 +313,7 @@ impl Parser {
         while !matches!(self.peek(), Tok::Eof) && !self.eat_punct('}') {
             self.pos += 1;
         }
-        Ok(MirBody { name, params, ret, blocks })
+        Ok(MirBody { name, params, ret, locals, blocks })
     }
 
     /// `_N` → `N`.
@@ -326,10 +333,37 @@ impl Parser {
             && matches!(self.peek2(), Tok::Punct(':') | Tok::Punct('('))
     }
 
-    fn skip_to_first_block(&mut self) {
+    /// Collect every `let [mut] _N: T;` in the preamble (descending through
+    /// `scope { … }` is automatic — we only act on `let` and skip everything else),
+    /// stopping at the first block header. Fully tolerant: a declaration whose type
+    /// will not parse is skipped, never aborting the body — preserving the old
+    /// skip-the-whole-preamble robustness while capturing the types that do parse.
+    fn parse_locals(&mut self) -> Vec<(Local, MType)> {
+        let mut locals = Vec::new();
         while !matches!(self.peek(), Tok::Eof) && !self.at_block_header() {
-            self.pos += 1;
+            if matches!(self.peek(), Tok::Word(w) if w == "let") {
+                self.pos += 1; // `let`
+                if matches!(self.peek(), Tok::Word(w) if w == "mut") {
+                    self.pos += 1;
+                }
+                let decl = self.local().ok().filter(|_| self.eat_punct(':')).and_then(|l| {
+                    let ty = self.ty().ok()?;
+                    Some((l, ty))
+                });
+                if let Some(d) = decl {
+                    locals.push(d);
+                }
+                // Recover to the terminating `;` (an array type's inner `;` was
+                // consumed by `ty()`), tolerant of a partially-parsed declaration.
+                while !matches!(self.peek(), Tok::Eof | Tok::Punct(';')) && !self.at_block_header() {
+                    self.pos += 1;
+                }
+                self.eat_punct(';');
+            } else {
+                self.pos += 1;
+            }
         }
+        locals
     }
 
     fn block(&mut self) -> Result<MBlock> {

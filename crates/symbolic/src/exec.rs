@@ -350,9 +350,11 @@ enum POrigin {
     /// A pointer parameter with no derivable contract (a raw-pointer param, or an
     /// opaque-generic reference the front end could not contract).
     Param,
-    /// An opaque call result — `slice::from_raw_parts`, `<*T>::as_ptr`, an
-    /// un-summarised callee. The assumption-needed category: the caller's `unsafe`
-    /// guarantee, not the language, backs validity.
+    /// An opaque pointer returned by a call with no return summary — a reference
+    /// returned by `Index::index`/an internal fn (provenance exists in the source,
+    /// recoverable by a `PtrFromArg` summary), or a raw pointer from
+    /// `slice::from_raw_parts`/`<*T>::as_ptr` (assumption-needed). The two are not
+    /// distinguished here without inspecting the callee; both stay `UNKNOWN`.
     Call,
     /// Loaded from memory with no provenance carried through the store. The
     /// sound-extensible case: store→load provenance (M3) would recover it.
@@ -637,7 +639,7 @@ impl POrigin {
     fn residual(self) -> &'static str {
         match self {
             POrigin::Param => "pointer provenance is not tracked: uncontracted pointer parameter",
-            POrigin::Call => "pointer provenance is not tracked: opaque call result (raw pointer)",
+            POrigin::Call => "pointer provenance is not tracked: opaque call result (no return summary)",
             POrigin::Load => "pointer provenance is not tracked: loaded value (no store-load provenance)",
             POrigin::IntToPtr => "pointer provenance is not tracked: int-to-pointer cast",
             POrigin::Loop => "pointer provenance is not tracked: loop-havocked pointer",

@@ -77,8 +77,12 @@ fn lower_function(
     id: FuncId,
     func_ids: &HashMap<String, FuncId>,
 ) -> Result<(Function, Vec<(u32, PtrContract)>)> {
-    let local_types: HashMap<u32, MType> =
-        body.params.iter().map(|(l, t)| (*l, t.clone())).collect();
+    let local_types: HashMap<u32, MType> = body
+        .params
+        .iter()
+        .chain(body.locals.iter())
+        .map(|(l, t)| (*l, t.clone()))
+        .collect();
 
     // Temporaries (for `PtrOffset` results, loaded operands) get registers above
     // every MIR local so they never collide.
@@ -436,11 +440,22 @@ impl Ctx {
                     CalleeSpec::Indirect(local) => Callee::Indirect(IrOp::Reg(RegId(*local))),
                 };
                 let ir_args = args.iter().map(|a| self.operand_value(a, out)).collect();
+                // The result type is the destination local's declared type — so a
+                // call returning a reference (`Index::index` → `&T`, an internal fn
+                // returning `&_`) yields a *pointer*, not a scalar the engine would
+                // have to treat as an opaque address. A non-`Local` dst keeps the
+                // scalar default (its value is unused for memory reasoning).
+                let ret_ty = match dst {
+                    Place::Local(d) => {
+                        self.local_types.get(d).map(mtype_to_ir).unwrap_or_else(|| Type::int(64))
+                    }
+                    _ => Type::int(64),
+                };
                 out.push(Inst::Call {
                     dst: ir_dst,
                     callee: ir_callee,
                     args: ir_args,
-                    ret_ty: Type::int(64),
+                    ret_ty,
                 });
                 match target {
                     Some(t) => Terminator::Br { target: BlockId(*t as u32), args: vec![] },
