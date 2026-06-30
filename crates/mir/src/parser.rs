@@ -144,7 +144,12 @@ pub(crate) enum MTerm {
 pub(crate) struct MBlock {
     pub(crate) id: usize,
     pub(crate) stmts: Vec<MStmt>,
+    /// Source location of each statement (`FILE:LINE:COL`), parallel to `stmts`;
+    /// `None` where unknown. Threaded into the lowered instructions' obligations.
+    pub(crate) stmt_spans: Vec<Option<String>>,
     pub(crate) term: MTerm,
+    /// Source location of the terminator.
+    pub(crate) term_span: Option<String>,
 }
 
 /// A parsed MIR function body.
@@ -169,8 +174,8 @@ pub(crate) type ParsedModule = (Vec<MirBody>, Vec<(String, String)>);
 /// `UNKNOWN`) and parsing resumes at the next `fn` — per-function recovery, like
 /// the lowerer's.
 pub(crate) fn parse_module(src: &str) -> Result<ParsedModule> {
-    let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let (toks, locs) = lex(src)?;
+    let mut p = Parser { toks, pos: 0, locs };
     let mut bodies = Vec::new();
     let mut failed = Vec::new();
     while p.skip_to_fn() {
@@ -195,9 +200,19 @@ pub(crate) fn parse_module(src: &str) -> Result<ParsedModule> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Per-token source location (`FILE:LINE:COL`), parallel to `toks`; `None`
+    /// where the MIR carries no span. Read at a statement's first token to give
+    /// each lowered obligation a source pointer.
+    locs: Vec<Option<String>>,
 }
 
 impl Parser {
+    /// The source location recorded for the token at index `at` (a statement's
+    /// first token), if the MIR carried a span there.
+    fn loc_at(&self, at: usize) -> Option<String> {
+        self.locs.get(at).cloned().flatten()
+    }
+
     fn peek(&self) -> &Tok {
         self.toks.get(self.pos).unwrap_or(&Tok::Eof)
     }
@@ -376,21 +391,24 @@ impl Parser {
         self.expect_punct(':')?;
         self.expect_punct('{')?;
         let mut stmts = Vec::new();
-        let term = loop {
+        let mut stmt_spans = Vec::new();
+        let (term, term_span) = loop {
+            let at = self.pos;
             if let Some(t) = self.try_terminator()? {
-                break t;
+                break (t, self.loc_at(at));
             }
             // An assignment-form terminator (`_0 = f(args) -> [return: bb, …]`)
             // reads like a statement but ends in `->` rather than `;`: a call.
             if self.stmt_is_terminator() {
                 let t = self.call_terminator()?;
                 let _ = self.eat_punct(';');
-                break t;
+                break (t, self.loc_at(at));
             }
             stmts.push(self.statement()?);
+            stmt_spans.push(self.loc_at(at));
         };
         self.expect_punct('}')?;
-        Ok(MBlock { id, stmts, term })
+        Ok(MBlock { id, stmts, stmt_spans, term, term_span })
     }
 
     /// Whether the upcoming statement is actually an assignment-form terminator:

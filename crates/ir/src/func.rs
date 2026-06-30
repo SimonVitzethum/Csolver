@@ -74,6 +74,12 @@ pub struct BasicBlock {
     pub params: Vec<(RegId, Type)>,
     /// The body.
     pub insts: Vec<Inst>,
+    /// Optional source location (`FILE:LINE:COL`) per instruction, parallel to
+    /// `insts` when populated (the MIR frontend with span info); empty otherwise.
+    /// A frontend-agnostic carrier: the verifier renders it on each obligation, so
+    /// a later DWARF populator (for ELF) feeds the same field. Empty ⇒ no source
+    /// pointer, the sound default.
+    pub inst_spans: Vec<Option<String>>,
     /// The control-flow exit.
     pub term: Terminator,
 }
@@ -85,6 +91,7 @@ impl BasicBlock {
             id,
             params: Vec::new(),
             insts: Vec::new(),
+            inst_spans: Vec::new(),
             term,
         }
     }

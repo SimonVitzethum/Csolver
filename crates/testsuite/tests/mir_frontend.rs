@@ -885,3 +885,79 @@ fn mir_field_distinct_fields_do_not_alias() {
     // field 1 never received field 0's stored value.
     assert_ne!(report.verdict, Verdict::Pass, "distinct fields must not alias: {report:?}");
 }
+
+/// `pick` with nightly span comments (`-Z mir-include-spans`): two indexed
+/// accesses on *different* source lines — `a[1]` at line 3 (bb2), `a[2]` at line 5
+/// (bb4). The frontend captures each statement's `// … at FILE:L:C` span and
+/// threads it onto the lowered instructions, so each obligation points back at the
+/// access that produced it.
+const PICK_SPANS: &str = r#"
+fn pick(_1: &[i32; 4], _2: bool) -> i32 {
+    debug a => _1;                       // in scope 0 at src/lib.rs:1:13: 1:14
+    let _3: usize;                       // in scope 0 at src/lib.rs:3:11: 3:12
+    let mut _4: bool;                    // in scope 0 at src/lib.rs:3:9: 3:13
+    let _5: usize;                       // in scope 0 at src/lib.rs:5:11: 5:12
+    let mut _6: bool;                    // in scope 0 at src/lib.rs:5:9: 5:13
+
+    bb0: {
+        switchInt(copy _2) -> [0: bb3, otherwise: bb1]; // scope 0 at src/lib.rs:2:8: 2:12
+    }
+    bb1: {
+        _3 = const 1_usize;              // scope 0 at src/lib.rs:3:11: 3:12
+        _4 = Lt(copy _3, const 4_usize); // scope 0 at src/lib.rs:3:9: 3:13
+        assert(move _4, "index out of bounds: the length is {} but the index is {}", const 4_usize, copy _3) -> [success: bb2, unwind continue]; // scope 0 at src/lib.rs:3:9: 3:13
+    }
+    bb2: {
+        _0 = copy (*_1)[_3];             // scope 0 at src/lib.rs:3:9: 3:13
+        goto -> bb5;                     // scope 0 at src/lib.rs:2:5: 6:6
+    }
+    bb3: {
+        _5 = const 2_usize;              // scope 0 at src/lib.rs:5:11: 5:12
+        _6 = Lt(copy _5, const 4_usize); // scope 0 at src/lib.rs:5:9: 5:13
+        assert(move _6, "index out of bounds: the length is {} but the index is {}", const 4_usize, copy _5) -> [success: bb4, unwind continue]; // scope 0 at src/lib.rs:5:9: 5:13
+    }
+    bb4: {
+        _0 = copy (*_1)[_5];             // scope 0 at src/lib.rs:5:9: 5:13
+        goto -> bb5;                     // scope 0 at src/lib.rs:2:5: 6:6
+    }
+    bb5: {
+        return;                          // scope 0 at src/lib.rs:7:2: 7:2
+    }
+}
+"#;
+
+#[test]
+fn mir_obligations_carry_their_own_source_line() {
+    let module = lower(PICK_SPANS, "pick");
+    assert!(module.unanalyzed.is_empty(), "the body lowers, not dropped");
+    let report = verify_module(&module, &Config::default());
+
+    // The in-bounds obligations of the two accesses, with their rendered source
+    // locations. (Both PASS — rustc guards them — but the *location* is per
+    // obligation regardless of verdict, which is exactly what a FAIL would use.)
+    let in_bounds_locs: Vec<String> = report.functions[0]
+        .outcomes
+        .iter()
+        .filter(|o| o.obligation.property == SafetyProperty::InBounds)
+        .filter_map(|o| o.obligation.location.raw.clone())
+        .collect();
+
+    assert!(!in_bounds_locs.is_empty(), "in-bounds obligations exist with a source location");
+    // `a[1]` is on line 3, `a[2]` on line 5 — each access's obligation must point
+    // at its *own* line.
+    assert!(
+        in_bounds_locs.iter().any(|l| l.contains(":3:")),
+        "the a[1] access → line 3, got {in_bounds_locs:?}"
+    );
+    assert!(
+        in_bounds_locs.iter().any(|l| l.contains(":5:")),
+        "the a[2] access → line 5, got {in_bounds_locs:?}"
+    );
+    // The span-phantom guard: not merely that *some* line renders, but that no
+    // obligation claims a line its access is not on (e.g. line 1, the signature,
+    // or line 4). Every in-bounds location is line 3 or line 5, never a stray one.
+    assert!(
+        in_bounds_locs.iter().all(|l| l.contains(":3:") || l.contains(":5:")),
+        "an in-bounds obligation rendered a wrong line: {in_bounds_locs:?}"
+    );
+}

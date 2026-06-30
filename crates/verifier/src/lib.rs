@@ -227,7 +227,8 @@ fn verify_function_with(
                 *next_id += 1;
                 let location = Location::level_only(config.level)
                     .in_function(f.name.as_str())
-                    .at_instruction(index as u32);
+                    .at_instruction(index as u32)
+                    .with_raw(block.inst_spans.get(index).cloned().flatten());
                 let predicate = render_condition(condition);
                 let obligation = ProofObligation::new(id, *property, location, predicate.clone());
 
@@ -250,7 +251,8 @@ fn verify_function_with(
                 *next_id += 1;
                 let location = Location::level_only(config.level)
                     .in_function(f.name.as_str())
-                    .at_instruction(index as u32);
+                    .at_instruction(index as u32)
+                    .with_raw(block.inst_spans.get(index).cloned().flatten());
                 let decision = symbolic
                     .as_ref()
                     .and_then(|r| r.mem_decision(block.id, index, property));

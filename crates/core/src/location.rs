@@ -102,6 +102,16 @@ impl Location {
         self.instruction = Some(index);
         self
     }
+
+    /// Builder: attach the free-form source pointer (`raw`), e.g. a
+    /// `FILE:LINE:COL` from MIR spans or a DWARF line for a binary. A no-op for
+    /// `None`, so callers thread it unconditionally.
+    pub fn with_raw(mut self, raw: Option<String>) -> Self {
+        if raw.is_some() {
+            self.raw = raw;
+        }
+        self
+    }
 }
 
 impl fmt::Display for Location {

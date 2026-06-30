@@ -226,6 +226,7 @@ fn lower_block(ctx: &Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         id,
         params: block_params,
         insts,
+        inst_spans: Vec::new(),
         term,
     })
 }

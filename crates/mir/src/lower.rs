@@ -216,12 +216,19 @@ impl Ctx {
 
     fn lower_block(&mut self, b: &MBlock) -> Result<BasicBlock> {
         let mut insts = Vec::new();
-        for s in &b.stmts {
+        // Every instruction a statement emits inherits that statement's source
+        // location (one MIR statement → possibly several MSIR insts, e.g. a
+        // PtrOffset + a Load), so an obligation points back at the right line.
+        let mut inst_spans: Vec<Option<String>> = Vec::new();
+        for (s, span) in b.stmts.iter().zip(b.stmt_spans.iter()) {
             self.lower_stmt(s, &mut insts)?;
+            inst_spans.resize(insts.len(), span.clone());
         }
         let term = self.lower_term(&b.term, &mut insts)?;
+        inst_spans.resize(insts.len(), b.term_span.clone());
         let mut block = BasicBlock::new(BlockId(b.id as u32), term);
         block.insts = insts;
+        block.inst_spans = inst_spans;
         Ok(block)
     }
 
