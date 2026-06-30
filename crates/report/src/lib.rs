@@ -59,6 +59,11 @@ fn render_outcome_text(s: &mut String, o: &ObligationOutcome) {
         }
         ObligationResult::Refuted(cx) => {
             let _ = writeln!(s, "        counterexample: {}", cx.summary);
+            // The witnessing inputs — the concrete values that drive the violation,
+            // so a FAIL is reproducible, not just asserted.
+            for a in &cx.model.assignments {
+                let _ = writeln!(s, "          input {} = {}", a.name, a.value);
+            }
         }
         ObligationResult::Open { residual, suggested } => {
             for r in residual {
@@ -193,6 +198,43 @@ mod tests {
         let t = render_text(&sample_report());
         assert!(t.contains("module m: PASS"));
         assert!(t.contains("interval abstract interpretation"));
+    }
+
+    #[test]
+    fn text_renders_the_counterexample_witness() {
+        use csolver_core::proof::{Assignment, CounterExample, Model};
+        use csolver_core::BitVector;
+        let ob = ProofObligation::new(
+            ObligationId(1),
+            SafetyProperty::InBounds,
+            Location::level_only(SourceLevel::Mir).in_function("f"),
+            "index < len",
+        );
+        let cx = CounterExample {
+            summary: "access is within allocation bounds: violated".into(),
+            model: Model {
+                assignments: vec![Assignment { name: "arg0".into(), value: BitVector::new(64, 10) }],
+            },
+            trace: vec![],
+        };
+        let func = FunctionReport {
+            function: "f".into(),
+            verdict: Verdict::Fail,
+            outcomes: vec![ObligationOutcome {
+                obligation: ob,
+                result: csolver_core::ObligationResult::Refuted(cx),
+            }],
+        };
+        let report = ModuleReport {
+            module: "m".into(),
+            verdict: Verdict::Fail,
+            functions: vec![func],
+            assumptions: vec![],
+        };
+        let t = render_text(&report);
+        assert!(t.contains("counterexample:"), "{t}");
+        // The witnessing input value is rendered, so the FAIL is reproducible.
+        assert!(t.contains("input arg0 = 10"), "witness value renders: {t}");
     }
 
     #[test]
