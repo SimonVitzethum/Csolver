@@ -228,21 +228,47 @@ The split:
 ```
 
 **The genuinely-ambiguous arithmetic categories are empty.** Not one of the 1550 is
-a bit-masked or integer-arithmetic address; the entire bucket is *type-fidelity loss*
-— references and pointers the IR carries as non-pointer-typed values. The 529 are
-`Index::index`/`index_mut` returning `&T`/`&mut T` and internal direct calls (drilled
-to the callee to confirm: **none** are `from_raw_parts`/`as_ptr` — the raw-pointer
-hazard stays absent even one level into the calls), and the 1011 are `Use`-copies of
-such values whose chain roots at a parameter/const. So M3's largest lever is a
-**lowering/representation fix** — preserve pointer typing through `index`/`index_mut`,
-`Use`-copies, and pointer-returning calls — not an engine capability that *assumes*
-anything: it restores type information already present in the source, so it adds no
-TCB and cannot flip the raw-pointer hazard. The guardian for that last claim is in the
-corpus and stays green: `slice_oob_from_raw`/`raw_add`/`raw_sub` remain `UNKNOWN`
-(Miri-UB), not `PASS`.
+a bit-masked or integer-arithmetic address; the 529 are `Index::index`/`index_mut`
+returning `&T`/`&mut T` and internal direct calls (drilled to the callee: **none** are
+`from_raw_parts`/`as_ptr` — the raw-pointer hazard stays absent one level into the
+calls). But the 1011 `Use`-copies were still a dominant catch-all "rooted at a
+param/const", so — once more — they were resolved one level finer.
 
-Three reframes in one investigation, each from refusing to trust a number until it was
-split one level finer: the bucket was not empty (grep), the residual was not one cause
-(truncated=0), the origin was not one origin (`Merge`→scalar-as-pointer), and the
-scalar-as-pointer is not provenance-tracking work but lowering type-fidelity. The M3
-entry point is now a *measured* question.
+### Resolving the 1011 copy-roots exhaustively (the third reframe, fully measured)
+
+Following each `Use`-copy chain to its root and classifying the root:
+
+```
+   995  rooted in `undef`               ← FRONT-END lowering gap, not engine
+    16  rooted in an integer constant   ← genuinely ambiguous (stays UNKNOWN)
+     0  rooted in a symbol / pointer / scalar param / null
+```
+
+The dominant root is **`Const::Undef`** — and `undef` is what the MIR lowering emits
+when it cannot lower a pointer's computation. Drilling the emission site (gated count
+over the crates): **3124 of them are `&stack_local`** — taking the address of a stack
+variable, which the front end models as `undef` instead of a pointer into a stack
+region. So the largest single driver of the whole provenance bucket is **not engine
+provenance tracking at all** — it is a front-end fidelity gap: `&local` has no
+modelled provenance, so every access through it is `UNKNOWN`.
+
+That overturns the previous paragraph's own conclusion ("M3's largest lever is a
+representation fix in the engine"): measured to the root, the largest lever is in the
+**front end** — model `&stack_local` as a stack region (995, ~55% of the bucket) and
+preserve pointer typing through `index`/call results (529, ~29%). Both are
+sound-extensible (a stack local is a valid sized allocation; an index returns a live
+reference — provenance exists in the source), low-TCB, and restore information the
+source already carries. The genuine engine lever (store→load provenance) is only 223
+(~12%); the genuinely-ambiguous `int→ptr`/`Const::Int` remainder is 16, and it must
+stay `UNKNOWN`. The raw-pointer hazard is 0 throughout; `slice_oob_from_raw`/`raw_add`
+/`raw_sub` stay `UNKNOWN` (Miri-UB), not `PASS`.
+
+Four reframes in one investigation, each from refusing to trust a number until it was
+split one level finer: the bucket was not empty (the `grep -A1` phantom), the residual
+was not one cause (the "truncated" that was 0), the origin was not one origin
+(`Merge`→scalar-as-pointer), and the dominant scalar-as-pointer root was not
+representation work in the engine but a front-end `&local` lowering gap. Each catch-all
+that was *believed* would have aimed the next build at the wrong target; each was
+caught the same way — feed a known input, split one level finer, refuse to trust a
+"0"/"empty"/dominant bucket without it. *A coarse bucket is a hypothesis, not a
+measurement* — and the priority order is now measured to the root, not assumed.

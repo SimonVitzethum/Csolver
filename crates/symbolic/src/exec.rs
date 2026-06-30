@@ -415,8 +415,30 @@ enum ScalarPtrCause {
     /// `eval_pointer` as a scalar — would indicate a representation leak in those
     /// (expected near-zero).
     PtrResult,
-    /// An opaque call result, a constant address, a parameter, or otherwise
-    /// unclassified.
+    /// A `Use`-copy chain that roots in a pointer-typed value — the type was erased
+    /// by a copy into a non-pointer register. Provenance existed. Recoverable.
+    PtrRoot,
+    /// A `Use`-copy chain that roots in a scalar function parameter used as an
+    /// address (an integer/`usize` parameter — provenance is the caller's, opaque).
+    ScalarParam,
+    /// A `Use`-copy chain that roots in `Const::Undef` — the MIR front end could
+    /// not lower the pointer's computation and emitted `undef`. A *front-end*
+    /// lowering gap, not an engine provenance gap.
+    ConstUndef,
+    /// Roots in `Const::Symbol` — the address of a named global/function. Has
+    /// static provenance; recoverable by modelling it as a region.
+    ConstSymbol,
+    /// Roots in `Const::Int` — a literal integer used as an address. Genuinely
+    /// ambiguous (strict-provenance int→ptr); stays `UNKNOWN`.
+    ConstInt,
+    /// Roots in `Const::Null`.
+    ConstNull,
+    /// Internal placeholder for an as-yet-unresolved `Use`-copy (never emitted: the
+    /// resolution pass rewrites every `Copy` to its chain root).
+    Copy,
+    /// A chain root the resolver could not classify (an intrinsic/asm def, or a
+    /// chain longer than the bound). Kept distinct so it is not silently folded
+    /// into a recoverable category.
     Other,
 }
 
@@ -450,8 +472,29 @@ impl ScalarPtrCause {
             ScalarPtrCause::PtrResult => {
                 "pointer provenance is not tracked: scalar-as-pointer (ptroffset/field/alloc leak)"
             }
+            ScalarPtrCause::PtrRoot => {
+                "pointer provenance is not tracked: scalar-as-pointer (copy rooted in a pointer value; recoverable)"
+            }
+            ScalarPtrCause::ScalarParam => {
+                "pointer provenance is not tracked: scalar-as-pointer (copy rooted in a scalar parameter; opaque)"
+            }
+            ScalarPtrCause::ConstUndef => {
+                "pointer provenance is not tracked: scalar-as-pointer (rooted in undef; FRONTEND lowering gap)"
+            }
+            ScalarPtrCause::ConstSymbol => {
+                "pointer provenance is not tracked: scalar-as-pointer (rooted in a symbol address; recoverable)"
+            }
+            ScalarPtrCause::ConstInt => {
+                "pointer provenance is not tracked: scalar-as-pointer (rooted in an integer constant; ambiguous)"
+            }
+            ScalarPtrCause::ConstNull => {
+                "pointer provenance is not tracked: scalar-as-pointer (rooted in null)"
+            }
+            ScalarPtrCause::Copy => {
+                "pointer provenance is not tracked: scalar-as-pointer (unresolved copy)"
+            }
             ScalarPtrCause::Other => {
-                "pointer provenance is not tracked: scalar-as-pointer (unresolved scalar copy / param / const)"
+                "pointer provenance is not tracked: scalar-as-pointer (copy root unclassified: intrinsic/asm/deep)"
             }
         }
     }
@@ -487,11 +530,17 @@ fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
     }
     let op_is_ptr = |op: &Operand| matches!(op, Operand::Reg(r) if is_ptr.get(r) == Some(&true));
 
-    // First pass: a concrete cause for each defining instruction, plus a `copy_of`
-    // edge for scalar `Use` copies so a chain like `p = use q; q = index(...)` is
-    // attributed to its source (`index`), not to a vague "copy".
+    // First pass: a concrete root cause for each defining instruction. A scalar
+    // `Use(reg)` copy gets a `Copy` placeholder + a `copy_of` edge, resolved to its
+    // chain root in the second pass; `Use(const)` roots immediately. Scalar params
+    // are seeded so a copy chain that bottoms out at one is attributed, not lost.
     let mut cause: HashMap<RegId, ScalarPtrCause> = HashMap::new();
     let mut copy_of: HashMap<RegId, RegId> = HashMap::new();
+    for (r, ty) in &f.params {
+        if !ty.is_ptr() {
+            cause.insert(*r, ScalarPtrCause::ScalarParam);
+        }
+    }
     for b in &f.blocks {
         for (r, _) in &b.params {
             cause.insert(*r, ScalarPtrCause::BlockParam);
@@ -513,16 +562,20 @@ fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
                                 ScalarPtrCause::IntArith
                             }
                         }
-                        RValue::Use(operand) => {
-                            if op_is_ptr(operand) {
+                        RValue::Use(Operand::Reg(src)) => {
+                            if is_ptr.get(src) == Some(&true) {
                                 ScalarPtrCause::PtrCopy
                             } else {
-                                if let Operand::Reg(src) = operand {
-                                    copy_of.insert(*dst, *src);
-                                }
-                                ScalarPtrCause::Other
+                                copy_of.insert(*dst, *src);
+                                ScalarPtrCause::Copy
                             }
                         }
+                        RValue::Use(Operand::Const(c)) => match c {
+                            Const::Undef => ScalarPtrCause::ConstUndef,
+                            Const::Symbol(_) => ScalarPtrCause::ConstSymbol,
+                            Const::Int(_) => ScalarPtrCause::ConstInt,
+                            Const::Null => ScalarPtrCause::ConstNull,
+                        },
                         RValue::Bin { op, lhs, rhs } => match op {
                             BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::LShr
                             | BinOp::AShr => ScalarPtrCause::BitMask,
@@ -539,21 +592,42 @@ fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
         }
     }
 
-    // Resolve `Use` copy chains to their source's concrete cause (bounded, with a
-    // cycle guard) so the dominant `assign-use` copies are attributed correctly.
+    // Second pass: rewrite every `Copy` to the cause at its chain root, following
+    // `copy_of` exhaustively (depth-guarded). A chain rooting in a pointer-typed
+    // register is `PtrRoot` (the copy erased the pointer type — provenance existed);
+    // one rooting in an unclassifiable def (intrinsic/asm) or past the bound is
+    // `Other`. No `Copy` survives into the result, so nothing is left at a
+    // not-resolved-to-root catch-all.
     let copiers: Vec<RegId> = copy_of.keys().copied().collect();
     for start in copiers {
         let mut cur = start;
-        for _ in 0..64 {
-            let Some(&src) = copy_of.get(&cur) else { break };
+        let mut resolved = ScalarPtrCause::Other;
+        for _ in 0..1024 {
+            let Some(&src) = copy_of.get(&cur) else {
+                // `cur` is the root (not a tracked copy): its own cause, or PtrRoot
+                // if it is a pointer-typed value whose type the copy erased.
+                resolved = match cause.get(&cur) {
+                    Some(&ScalarPtrCause::Copy) | None if is_ptr.get(&cur) == Some(&true) => {
+                        ScalarPtrCause::PtrRoot
+                    }
+                    Some(&ScalarPtrCause::Copy) | None => ScalarPtrCause::Other,
+                    Some(&c) => c,
+                };
+                break;
+            };
+            if is_ptr.get(&src) == Some(&true) {
+                resolved = ScalarPtrCause::PtrRoot; // provenance existed at the root
+                break;
+            }
             match cause.get(&src) {
-                Some(&ScalarPtrCause::Other) | None => cur = src, // keep following the chain
+                Some(&ScalarPtrCause::Copy) | None => cur = src, // keep following
                 Some(&c) => {
-                    cause.insert(start, c);
+                    resolved = c;
                     break;
                 }
             }
         }
+        cause.insert(start, resolved);
     }
     cause
 }
