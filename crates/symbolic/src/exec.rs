@@ -188,6 +188,7 @@ fn discharge_inner(
         visits: 0,
         truncated: false,
         limits,
+        deadline: limits.time_budget.map(|b| std::time::Instant::now() + b),
         scalar: HashMap::new(),
         mem: HashMap::new(),
         assumptions: HashSet::new(),
@@ -831,6 +832,8 @@ struct Explorer<'f> {
     visits: usize,
     truncated: bool,
     limits: ExecLimits,
+    /// When exploration must stop (from `limits.time_budget`); `None` ⇒ no clock.
+    deadline: Option<std::time::Instant>,
     /// Scalar `SafetyCheck` aggregation, keyed by (block, idx).
     scalar: HashMap<(BlockId, usize), ScalarAgg>,
     mem: HashMap<(BlockId, usize, SafetyProperty), MemAgg>,
@@ -929,7 +932,13 @@ impl Explorer<'_> {
                 continue;
             }
             self.visits += 1;
-            if self.visits > self.limits.max_visits {
+            // Truncate on the visit budget, or on the wall-clock budget (checked
+            // here, between block visits, so the overrun is bounded by one block's
+            // work plus the 250 ms per-solve valve). Both set `truncated`, which
+            // discards every decision → non-`PASS`. See `ExecLimits::time_budget`.
+            if self.visits > self.limits.max_visits
+                || self.deadline.is_some_and(|dl| std::time::Instant::now() >= dl)
+            {
                 self.truncated = true;
                 return;
             }
@@ -2831,7 +2840,7 @@ mod tests {
         // eventually hit, so it is pinned here rather than assumed.) A 1-visit budget
         // truncates this 4-block function before it reaches the store at bb2.
         let f = store_buf();
-        let r = discharge_with(&f, crate::ExecLimits { max_visits: 1 });
+        let r = discharge_with(&f, crate::ExecLimits { max_visits: 1, ..Default::default() });
         assert!(r.truncated, "a 1-visit budget must truncate a 4-block function");
         for prop in [
             SafetyProperty::NoNullDeref,
@@ -2843,6 +2852,35 @@ mod tests {
             assert!(
                 r.mem_decision(BlockId(2), 1, prop).is_none(),
                 "{prop} must be undecided (Open) under truncation, never reported safe"
+            );
+        }
+    }
+
+    #[test]
+    fn time_budget_bail_reports_no_memory_decision() {
+        // The per-function wall-clock bail (the turnkey-path termination guarantee)
+        // must fall to non-PASS exactly like the visit budget: a zero time budget
+        // truncates before any memory op is decided, so every obligation is `Open`,
+        // never a half-analysed `PASS`. (Soundness pin for the bail path, the same
+        // discipline as the wall-clock solve valve.)
+        let f = store_buf();
+        let r = discharge_with(
+            &f,
+            crate::ExecLimits {
+                max_visits: usize::MAX,
+                time_budget: Some(std::time::Duration::ZERO),
+            },
+        );
+        assert!(r.truncated, "a zero time budget must truncate");
+        for prop in [
+            SafetyProperty::NoNullDeref,
+            SafetyProperty::InBounds,
+            SafetyProperty::Alignment,
+            SafetyProperty::ValidWrite,
+        ] {
+            assert!(
+                r.mem_decision(BlockId(2), 1, prop).is_none(),
+                "{prop} must be undecided (Open) under the time bail, never reported safe"
             );
         }
     }
@@ -3093,7 +3131,7 @@ mod tests {
         // budget far below the path count, merging still verifies — each block is
         // processed once (the old per-path walk would truncate).
         let f = wide_diamonds(8);
-        let r = discharge_with(&f, crate::ExecLimits { max_visits: 40 });
+        let r = discharge_with(&f, crate::ExecLimits { max_visits: 40, ..Default::default() });
         assert!(!r.truncated, "merging keeps visits linear in blocks, not exponential in paths");
         assert_eq!(r.outcome(BlockId(32), 0), Some(SymOutcome::Proven), "final check verified");
     }

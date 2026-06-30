@@ -35,12 +35,25 @@ pub use summary::{summarize_module, Affine, RetSummary, Summary};
 pub struct ExecLimits {
     /// Maximum number of block visits before exploration is truncated.
     pub max_visits: usize,
+    /// Wall-clock budget for exploring one function. On expiry, exploration
+    /// truncates exactly as the visit budget does — no decisions are reported, so
+    /// every memory obligation falls to `Open` and the function to non-`PASS`
+    /// (sound; the same rule the visit-truncation pin rests on). `None` disables
+    /// the clock.
+    ///
+    /// The default is generous on purpose: it is a *termination guarantee* for the
+    /// turnkey path (an arbitrary/adversarial crate must not make one function run
+    /// unbounded), not a speed knob. Current code never reaches it, so it changes
+    /// no verdict. Tightening it trades the `PASS` of a slow-but-provable function
+    /// for a snappier `UNKNOWN` — a precision-for-latency choice, left to the caller.
+    pub time_budget: Option<std::time::Duration>,
 }
 
 impl Default for ExecLimits {
     fn default() -> Self {
         ExecLimits {
             max_visits: 200_000,
+            time_budget: Some(std::time::Duration::from_secs(30)),
         }
     }
 }
