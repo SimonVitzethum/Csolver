@@ -16,7 +16,10 @@
 //! Everything here is parameter-relative data (no expressions / no solver); the
 //! caller instantiates a summary against its actual arguments.
 
-use csolver_ir::{BinOp, Callee, Const, DataLayout, FuncId, Function, Inst, Module, Operand, RValue, RegId};
+use csolver_ir::{
+    BinOp, BlockId, Callee, Const, DataLayout, FuncId, Function, Inst, Module, Operand, RValue,
+    RegId,
+};
 use std::collections::{BTreeMap, HashMap};
 
 const LAYOUT: DataLayout = DataLayout::LP64;
@@ -118,11 +121,26 @@ impl Summary {
 }
 
 /// Abstract value tracked while summarizing a function body.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum AbsVal {
     PtrArg { arg: usize, off: Affine },
     Scalar(Affine),
     Opaque,
+}
+
+impl AbsVal {
+    /// The join of two abstract values: equal values pass through, any
+    /// disagreement is `Opaque`. This is what makes the return summary a *must*
+    /// analysis — a summary is only produced when every path computes the same
+    /// parameter-relative value, since a caller will trust it to rebuild the
+    /// result exactly (a mere "may" summary would be unsound there).
+    fn join(&self, other: &AbsVal) -> AbsVal {
+        if self == other {
+            self.clone()
+        } else {
+            AbsVal::Opaque
+        }
+    }
 }
 
 /// Summarize every function in a module (with the call-graph effect fixpoint).
@@ -212,15 +230,7 @@ fn summarize_fn(f: &Function) -> Summary {
         }
     }
 
-    // Return characterization only for single-block functions (the common
-    // wrapper/accessor shape); anything more is conservatively Unknown.
-    let ret = if f.blocks.len() == 1 {
-        ret_of_block(f)
-    } else {
-        RetSummary::Unknown
-    };
-
-    Summary { ret, writes, frees }
+    Summary { ret: ret_of_fn(f), writes, frees }
 }
 
 /// The registers that provably hold pointers into the function's *own*
@@ -258,8 +268,20 @@ fn local_alloc_regs(f: &Function) -> std::collections::HashSet<RegId> {
     }
 }
 
-fn ret_of_block(f: &Function) -> RetSummary {
-    let block = &f.blocks[0];
+/// Characterize the return value across the whole CFG. Instruction results are
+/// pure functions of their inputs and are recomputed each pass; the only join
+/// points are **block parameters**, whose value is the [`AbsVal::join`] over
+/// every incoming branch argument seen so far. Joins are monotone toward
+/// `Opaque` (lattice height 2), so the iteration terminates; a defensive pass
+/// cap degrades to `Unknown` rather than looping.
+///
+/// This subsumes the previous single-block analysis and, crucially, covers
+/// rustc's guard shape — `entry: cond ? panic-block : ok-block; ok: ret p+off` —
+/// where the panic block never returns and thus never joins: the summary comes
+/// from the agreeing return sites alone.
+fn ret_of_fn(f: &Function) -> RetSummary {
+    use csolver_ir::Terminator;
+
     let mut env: HashMap<RegId, AbsVal> = HashMap::new();
     for (k, (reg, ty)) in f.params.iter().enumerate() {
         let v = if ty.is_ptr() {
@@ -270,41 +292,99 @@ fn ret_of_block(f: &Function) -> RetSummary {
         env.insert(*reg, v);
     }
 
-    for inst in &block.insts {
-        match inst {
-            Inst::Assign { dst, value, .. } => {
-                let v = eval_rvalue(value, &env);
-                env.insert(*dst, v);
-            }
-            Inst::PtrOffset { dst, base, index, elem } => {
-                let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1) as i128;
-                let v = match (eval_operand(base, &env), eval_operand(index, &env)) {
-                    (AbsVal::PtrArg { arg, off }, AbsVal::Scalar(ix)) => {
-                        match ix.scale(stride).and_then(|t| off.add(&t)) {
-                            Some(o) => AbsVal::PtrArg { arg, off: o },
-                            None => AbsVal::Opaque,
-                        }
+    // `param_join[reg]`: the running join of every branch argument bound to the
+    // block parameter `reg`. Function parameters are pre-seeded with their call
+    // value so that an edge that rebinds one (a back-edge into the entry block)
+    // joins *against the seed* rather than replacing it — replacing would claim
+    // the loop value holds on the first entry too.
+    let mut param_join: HashMap<RegId, AbsVal> = env.clone();
+    let by_id: HashMap<_, _> = f.blocks.iter().map(|b| (b.id, b)).collect();
+
+    for _pass in 0..64 {
+        let mut changed = false;
+        for b in &f.blocks {
+            // Bind this block's parameters from the joined incoming values.
+            for (reg, _) in &b.params {
+                if let Some(v) = param_join.get(reg) {
+                    if env.get(reg) != Some(v) {
+                        env.insert(*reg, v.clone());
+                        changed = true;
                     }
-                    _ => AbsVal::Opaque,
-                };
-                env.insert(*dst, v);
-            }
-            other => {
-                if let Some(dst) = other.defined_reg() {
-                    env.insert(dst, AbsVal::Opaque);
                 }
             }
+            for inst in &b.insts {
+                let (dst, v) = match inst {
+                    Inst::Assign { dst, value, .. } => (*dst, eval_rvalue(value, &env)),
+                    Inst::PtrOffset { dst, base, index, elem } => {
+                        let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1) as i128;
+                        let v = match (eval_operand(base, &env), eval_operand(index, &env)) {
+                            (AbsVal::PtrArg { arg, off }, AbsVal::Scalar(ix)) => {
+                                match ix.scale(stride).and_then(|t| off.add(&t)) {
+                                    Some(o) => AbsVal::PtrArg { arg, off: o },
+                                    None => AbsVal::Opaque,
+                                }
+                            }
+                            _ => AbsVal::Opaque,
+                        };
+                        (*dst, v)
+                    }
+                    other => match other.defined_reg() {
+                        Some(dst) => (dst, AbsVal::Opaque),
+                        None => continue,
+                    },
+                };
+                if env.get(&dst) != Some(&v) {
+                    env.insert(dst, v);
+                    changed = true;
+                }
+            }
+            // Propagate branch arguments into the successors' parameter joins.
+            let mut feed = |target: BlockId, args: &[Operand]| {
+                let Some(tb) = by_id.get(&target) else { return };
+                for ((reg, _), arg) in tb.params.iter().zip(args) {
+                    let v = eval_operand(arg, &env);
+                    let joined = match param_join.get(reg) {
+                        Some(prev) => prev.join(&v),
+                        None => v,
+                    };
+                    if param_join.get(reg) != Some(&joined) {
+                        param_join.insert(*reg, joined);
+                        changed = true;
+                    }
+                }
+            };
+            match &b.term {
+                Terminator::Br { target, args } => feed(*target, args),
+                Terminator::CondBr { then_blk, then_args, else_blk, else_args, .. } => {
+                    feed(*then_blk, then_args);
+                    feed(*else_blk, else_args);
+                }
+                // Switch targets carry no arguments; Return/Unreachable have no
+                // successors.
+                Terminator::Switch { .. } | Terminator::Return(_) | Terminator::Unreachable => {}
+            }
+        }
+        if !changed {
+            // Fixpoint reached: join the value of every returning site.
+            let mut ret: Option<AbsVal> = None;
+            for b in &f.blocks {
+                if let Terminator::Return(Some(op)) = &b.term {
+                    let v = eval_operand(op, &env);
+                    ret = Some(match ret {
+                        Some(prev) => prev.join(&v),
+                        None => v,
+                    });
+                }
+            }
+            return match ret {
+                Some(AbsVal::PtrArg { arg, off }) => RetSummary::PtrFromArg { arg, offset: off },
+                Some(AbsVal::Scalar(a)) => RetSummary::Scalar(a),
+                _ => RetSummary::Unknown,
+            };
         }
     }
-
-    match &block.term {
-        csolver_ir::Terminator::Return(Some(op)) => match eval_operand(op, &env) {
-            AbsVal::PtrArg { arg, off } => RetSummary::PtrFromArg { arg, offset: off },
-            AbsVal::Scalar(a) => RetSummary::Scalar(a),
-            AbsVal::Opaque => RetSummary::Unknown,
-        },
-        _ => RetSummary::Unknown,
-    }
+    // Pass cap hit (pathological CFG): degrade, never loop or guess.
+    RetSummary::Unknown
 }
 
 fn eval_rvalue(rv: &RValue, env: &HashMap<RegId, AbsVal>) -> AbsVal {
@@ -444,6 +524,135 @@ mod tests {
             s.ret,
             RetSummary::PtrFromArg { arg: 0, offset: Affine::constant(0) }
         );
+    }
+
+    /// rustc's guard shape: `entry: cond ? panic : ok; ok: ret p+4`. The panic
+    /// block never returns, so the summary must come from the agreeing return
+    /// site — multi-block functions were previously always `Unknown`.
+    #[test]
+    fn guarded_pointer_wrapper_summary() {
+        let p = RegId(0);
+        let c = RegId(1);
+        let q = RegId(2);
+        let mut entry = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(1),
+                then_args: vec![],
+                else_blk: BlockId(2),
+                else_args: vec![],
+            },
+        );
+        entry.insts.push(Inst::Call {
+            dst: Some(c),
+            callee: Callee::Symbol("check".into()),
+            args: vec![],
+            ret_ty: Type::Bool,
+        });
+        let panic_blk = BasicBlock::new(BlockId(1), Terminator::Unreachable);
+        let mut ok = BasicBlock::new(BlockId(2), Terminator::Return(Some(Operand::Reg(q))));
+        ok.insts.push(Inst::PtrOffset {
+            dst: q,
+            base: Operand::Reg(p),
+            index: Operand::int(64, 1),
+            elem: Type::int(32),
+        });
+        let f = Function {
+            id: FuncId(0),
+            name: "guarded".into(),
+            params: vec![(p, Type::ptr(Type::int(32)))],
+            ret_ty: Type::ptr(Type::int(32)),
+            blocks: vec![entry, panic_blk, ok],
+            entry: BlockId(0),
+        };
+        assert_eq!(
+            summarize_fn(&f).ret,
+            RetSummary::PtrFromArg { arg: 0, offset: Affine::constant(4) },
+            "the non-returning panic block must not defeat the summary"
+        );
+    }
+
+    /// Disagreeing return sites (`ret p` vs `ret p+4`) must yield `Unknown` —
+    /// the caller trusts a summary to rebuild the result *exactly*, so a "may"
+    /// summary would be unsound. Likewise a loop-varying pointer: the back-edge
+    /// join makes the block parameter `Opaque`.
+    #[test]
+    fn disagreeing_and_loop_varying_returns_are_unknown() {
+        let p = RegId(0);
+        let c = RegId(1);
+        let q = RegId(2);
+        // fn f(p, c) { if c { return p } else { return p+4 } }
+        let mut entry = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(1),
+                then_args: vec![],
+                else_blk: BlockId(2),
+                else_args: vec![],
+            },
+        );
+        entry.insts.push(Inst::PtrOffset {
+            dst: q,
+            base: Operand::Reg(p),
+            index: Operand::int(64, 1),
+            elem: Type::int(32),
+        });
+        let a = BasicBlock::new(BlockId(1), Terminator::Return(Some(Operand::Reg(p))));
+        let b = BasicBlock::new(BlockId(2), Terminator::Return(Some(Operand::Reg(q))));
+        let f = Function {
+            id: FuncId(0),
+            name: "diverging_returns".into(),
+            params: vec![(p, Type::ptr(Type::int(32))), (c, Type::Bool)],
+            ret_ty: Type::ptr(Type::int(32)),
+            blocks: vec![entry, a, b],
+            entry: BlockId(0),
+        };
+        assert_eq!(summarize_fn(&f).ret, RetSummary::Unknown);
+
+        // fn g(p) { loop { p = p+4; if done { return p } } } — the block param
+        // joins p (entry) with p+4k (back-edge) → Opaque → Unknown.
+        let cur = RegId(3);
+        let next = RegId(4);
+        let done = RegId(5);
+        let entry = BasicBlock::new(
+            BlockId(0),
+            Terminator::Br { target: BlockId(1), args: vec![Operand::Reg(p)] },
+        );
+        let mut head = BasicBlock::new(
+            BlockId(1),
+            Terminator::CondBr {
+                cond: Operand::Reg(done),
+                then_blk: BlockId(2),
+                then_args: vec![],
+                else_blk: BlockId(1),
+                else_args: vec![Operand::Reg(next)],
+            },
+        );
+        head.params.push((cur, Type::ptr(Type::int(32))));
+        head.insts.push(Inst::PtrOffset {
+            dst: next,
+            base: Operand::Reg(cur),
+            index: Operand::int(64, 1),
+            elem: Type::int(32),
+        });
+        head.insts.push(Inst::Call {
+            dst: Some(done),
+            callee: Callee::Symbol("check".into()),
+            args: vec![],
+            ret_ty: Type::Bool,
+        });
+        let exit = BasicBlock::new(BlockId(2), Terminator::Return(Some(Operand::Reg(next))));
+        let g = Function {
+            id: FuncId(1),
+            name: "loop_advance".into(),
+            params: vec![(p, Type::ptr(Type::int(32)))],
+            ret_ty: Type::ptr(Type::int(32)),
+            blocks: vec![entry, head, exit],
+            entry: BlockId(0),
+        };
+        assert_eq!(summarize_fn(&g).ret, RetSummary::Unknown);
     }
 
     #[test]

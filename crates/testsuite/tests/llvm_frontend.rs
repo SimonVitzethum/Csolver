@@ -631,3 +631,48 @@ start:
     let report = verify_module(&module, &Config::default());
     assert_eq!(report.verdict, Verdict::Fail, "a definite OOB store must FAIL");
 }
+
+/// End-to-end proof that *multi-block* return summaries reach verdicts: `@at`
+/// has rustc's guard shape (a checking call, a diverging panic block, then
+/// `ret gep(p, i)`), and `@caller` stores through its result. Only if the
+/// summary rebuilds the returned pointer with the alloca's provenance can the
+/// store's bounds be proven — before, any multi-block callee returned an opaque
+/// pointer and this was UNKNOWN.
+#[test]
+fn llvm_multi_block_pointer_helper_is_transparent() {
+    let src = r#"
+define internal ptr @at(ptr %p, i64 %i) {
+start:
+  %c = call i1 @check(i64 %i)
+  br i1 %c, label %ok, label %bad
+bad:
+  call void @panic()
+  unreachable
+ok:
+  %q = getelementptr inbounds i32, ptr %p, i64 %i
+  ret ptr %q
+}
+
+define void @caller() {
+start:
+  %buf = alloca [8 x i32], align 4
+  %q = call ptr @at(ptr %buf, i64 2)
+  store i32 7, ptr %q, align 4
+  ret void
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("frontend lowers the .ll");
+    let report = verify_module(&module, &Config::default());
+    let caller = report
+        .functions
+        .iter()
+        .find(|f| f.function == "caller")
+        .expect("caller verified");
+    assert_eq!(
+        caller.verdict,
+        Verdict::Pass,
+        "the store through the helper's return must prove via the summary: {caller:?}"
+    );
+}
