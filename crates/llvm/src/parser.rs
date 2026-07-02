@@ -150,6 +150,11 @@ pub enum LInst {
     /// first index only; nested indices are skipped). Used to recover a
     /// checked-arithmetic tuple's sum (index 0) and overflow flag (index 1).
     ExtractValue { dst: String, agg: LValue, index: u32 },
+    /// A value the frontend models opaquely — e.g. `landingpad`'s exception
+    /// object, which carries no memory-safety content. Lowered to `undef` (sound;
+    /// unconstrained), so a function that merely has an unwind-cleanup path is
+    /// analysed rather than dropped whole.
+    Opaque { dst: String },
 }
 
 /// A parsed terminator.
@@ -645,7 +650,36 @@ impl Parser {
                 self.pos += 1;
                 Ok(Some(LTerm::Unreachable))
             }
+            "resume" => {
+                // Re-raise an in-flight unwind — control leaves the function without
+                // returning normally, so there is no successor.
+                self.pos += 1;
+                let _ty = self.ltype()?;
+                let _ = self.value();
+                Ok(Some(LTerm::Unreachable))
+            }
             _ => Ok(None),
+        }
+    }
+
+    /// Consume a `landingpad`'s clauses (`cleanup` / `catch T v` / `filter T v`),
+    /// which may continue onto following lines. Only advances `pos` over an actual
+    /// clause, so a following instruction is left intact for the block loop.
+    fn skip_landingpad_clauses(&mut self) {
+        loop {
+            let mut j = self.pos;
+            while matches!(self.toks.get(j), Some(Tok::Newline)) {
+                j += 1;
+            }
+            match self.toks.get(j) {
+                Some(Tok::Word(w)) if w == "cleanup" => self.pos = j + 1,
+                Some(Tok::Word(w)) if w == "catch" || w == "filter" => {
+                    self.pos = j + 1;
+                    let _ = self.ltype();
+                    let _ = self.value();
+                }
+                _ => break,
+            }
         }
     }
 
@@ -714,6 +748,28 @@ impl Parser {
                 }
                 LInst::ExtractValue { dst: need_dst()?, agg, index }
             }
+            "landingpad" => {
+                let _ty = self.ltype()?;
+                self.skip_landingpad_clauses();
+                LInst::Opaque { dst: need_dst()? }
+            }
+            "insertvalue" => {
+                // `insertvalue AGG %agg, T %val, idx…` — the resulting aggregate is
+                // modelled opaquely (its fields are recovered by `extractvalue` when
+                // it matters, e.g. checked arithmetic; here it is an exception tuple).
+                let _agg_ty = self.ltype()?;
+                let _agg = self.value()?;
+                self.expect_punct(',')?;
+                let _val_ty = self.ltype()?;
+                let _val = self.value()?;
+                self.expect_punct(',')?;
+                let _index = self.int()?;
+                while matches!(self.peek(), Tok::Punct(',')) {
+                    self.pos += 1;
+                    let _ = self.int();
+                }
+                LInst::Opaque { dst: need_dst()? }
+            }
             "call" => self.call(dst)?,
             "phi" => {
                 let phi = self.phi(need_dst()?)?;
@@ -731,6 +787,10 @@ impl Parser {
                     let b = self.value()?;
                     LInst::Bin { dst: need_dst()?, op: bop, ty, a, b }
                 } else if let Some(cop) = cast_op(other) {
+                    // Skip cast flags (`trunc nuw`, `trunc nsw`, `zext nneg`).
+                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "nneg")) {
+                        self.pos += 1;
+                    }
                     let _from = self.ltype()?;
                     let val = self.value()?;
                     self.expect_word("to")?;

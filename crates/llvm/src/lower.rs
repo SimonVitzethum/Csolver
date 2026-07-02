@@ -325,6 +325,11 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                 to: lower_type(to),
             },
         },
+        LInst::Opaque { dst } => Inst::Assign {
+            dst: ctx.reg(dst)?,
+            ty: Type::int(64),
+            value: RValue::Use(Operand::Const(Const::Undef)),
+        },
         LInst::ExtractValue { dst, agg, index } => {
             let dst_reg = ctx.reg(dst)?;
             // Field 0 of a checked-arith tuple is the arithmetic result; anything
@@ -471,6 +476,7 @@ fn inst_dst(inst: &LInst) -> Option<&str> {
         | LInst::Bin { dst, .. }
         | LInst::Icmp { dst, .. }
         | LInst::ExtractValue { dst, .. }
+        | LInst::Opaque { dst, .. }
         | LInst::Cast { dst, .. } => Some(dst),
         LInst::Call { dst, .. } => dst.as_deref(),
         LInst::Store { .. } => None,

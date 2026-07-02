@@ -166,4 +166,33 @@ panic:
             });
         assert!(has_add, "checked-add field 0 must recover the addition");
     }
+
+    /// A panic-unwind cleanup path (`landingpad` + `insertvalue` + `resume`, with a
+    /// `personality`) carries no memory-safety content and must not drop the whole
+    /// function — before, every real obligation was dropped with it. rustc emits
+    /// this in every monomorphised library function that can unwind.
+    #[test]
+    fn unwind_cleanup_does_not_drop_the_function() {
+        let src = r#"
+define i32 @f(i32 %x) personality ptr @rust_eh_personality {
+start:
+  %s = add i32 %x, 1
+  ret i32 %s
+cleanup:
+  %e = landingpad { ptr, i32 }
+          cleanup
+  %a = insertvalue { ptr, i32 } %e, i32 0, 1
+  resume { ptr, i32 } %a
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        assert!(
+            module.unanalyzed.is_empty(),
+            "an unwind-cleanup path must not drop the function: {:?}",
+            module.unanalyzed
+        );
+        assert_eq!(module.functions.len(), 1);
+    }
 }
