@@ -82,14 +82,22 @@ the inner layers build. **~150–250 LOC** + the coverage report.
 
 ## Decided order (documented, not to be re-litigated)
 
-1. **Axis 2 — source spans** (additive, soundness-neutral) — with the right-line test.
-2. **Per-function time-budget bail** (~50 LOC) — pulled ahead of turnkey: once
-   `solver verify ./crate` is turnkey, users point it at *any* crate, and the nom
-   class (37 s) *feels* like a hang. Ship the bail first so the first experience is
-   "runs through, some functions `UNKNOWN` by budget" not "stares 40 s at a cursor".
-   With the non-`PASS`-on-bail check.
-3. **Axis 3 — turnkey, *with* crate-level coverage reporting** (found / verified /
-   not-emitted). The convenience layer must be as loud about gaps as the proof layer.
+1. **✓ Axis 2 — source spans** (additive, soundness-neutral) — done, with the
+   right-line test; witness values rendered; `arg{i}`→name renaming deferred (low ROI).
+2. **✓ Per-function time-budget bail** — done, but *measurement redirected it*: the
+   nom outliers (`permutation`, up to 5.8 s debug / ~2 s release) that "feel like a
+   hang" are not hangs — they verify to `PASS`. A tight budget would convert real
+   `PASS`es to `UNKNOWN` (precision loss), so the default is generous (30 s): a pure
+   *termination guarantee* for the turnkey path, not a speed knob. The perceived-speed
+   lever is the release build (nom 37.5 s → 12.9 s). Soundness pinned
+   (`time_budget_bail_reports_no_memory_decision`).
+3. **✓ Axis 3 — turnkey (`.rs` file), with a coverage report** — done. `solver verify
+   foo.rs` compiles to MIR itself (`+nightly -Z mir-include-spans`, stable fallback)
+   and reports *found / analyzed (PASS/FAIL/UNKNOWN) / not-analyzed (named)*, warns on
+   0 functions, and surfaces a compile error rather than a verdict. The
+   coverage-completeness trap is guarded: a not-lowered function is named, never
+   folded into a flattering count. **Follow-up:** a whole crate *directory* (cargo
+   orchestration over dependencies/workspace, picking the crate's own MIR).
 4. **Parallelism** — with the serial-vs-parallel determinism test.
 5. **Verdict cache** — last, with the changed-function positive control.
 

@@ -1,11 +1,15 @@
 //! The `solver` command-line interface.
 //!
 //! ```text
-//! solver verify <file.ll | file.s | binary | crate-dir>   [--json]
-//! solver demo                                             [--json]
+//! solver verify <file.rs | file.mir | file.ll | file.s | binary>   [--json]
+//! solver demo                                                      [--json]
 //! solver report <result.json>
 //! solver --help | --version
 //! ```
+//!
+//! A `.rs` file is turnkey: the tool compiles it to MIR itself (`+nightly -Z
+//! mir-include-spans` for source locations, stable fallback) and prints a coverage
+//! report — how many functions were found, verified, and *not analyzed*.
 //!
 //! Exit codes: `0` = PASS, `1` = FAIL, `2` = UNKNOWN, `3` = tool error.
 
@@ -22,7 +26,7 @@ const HELP: &str = "\
 solver — CSolver memory-safety verifier
 
 USAGE:
-    solver verify <path> [--json]   verify an .ll / .s / ELF binary / crate
+    solver verify <path> [--json]   verify a .rs (turnkey), .mir, .ll, .s, or ELF
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
     solver report <result.json>     re-render a saved JSON report
     solver --help                   show this help
@@ -79,6 +83,11 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
 /// Dispatch a path to the appropriate frontend, then verify.
 fn verify_path(path: &Path, json: bool) -> Result<ExitCode, String> {
+    // Turnkey: a `.rs` file is compiled to MIR by us, then verified with a
+    // coverage report — the user does not hand-run rustc.
+    if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+        return verify_rust_source(path, json);
+    }
     let level = detect_level(path)?;
     // The frontends are M0 stubs; report their honest status rather than
     // pretending to have analyzed the input.
@@ -135,6 +144,100 @@ fn verify_path(path: &Path, json: bool) -> Result<ExitCode, String> {
     }
 }
 
+/// Turnkey: compile a `.rs` file to MIR ourselves, verify it, and print a
+/// coverage report. The coverage report lifts the never-silently-skip discipline
+/// of the inner layers to the whole file: a function that failed to emit or lower
+/// is reported, not folded into a flattering "everything checked". A turnkey user
+/// looks less, so the tool must say what it did *not* verify — loudly.
+fn verify_rust_source(path: &Path, json: bool) -> Result<ExitCode, String> {
+    use csolver_ir::Frontend;
+    let mir = emit_mir(path)?;
+    let module = csolver_mir::MirFrontend
+        .lower(csolver_mir::MirInput { source: mir, name: path.display().to_string() })
+        .map_err(|e| format!("could not lower the emitted MIR of {}: {e}", path.display()))?;
+    let config = Config { level: SourceLevel::Mir, ..Config::default() };
+    let report = verify_module(&module, &config);
+    if !json {
+        eprint!("{}", render_coverage(path, &module, &report));
+    }
+    emit(&report, json);
+    Ok(verdict_code(report.verdict))
+}
+
+/// Emit a `.rs` file's MIR text. Prefers `+nightly -Z mir-include-spans` so
+/// obligations carry a source `FILE:LINE:COL`; falls back to stable (no spans)
+/// when nightly is unavailable — the same graceful degradation the span parser
+/// uses. A genuine compile error (stable also fails) is surfaced, never swallowed.
+fn emit_mir(path: &Path) -> Result<String, String> {
+    let base = ["--edition", "2021", "--crate-type=lib", "--emit=mir", "-o", "-"];
+    let mut last_err = String::new();
+    // Nightly first (with source spans), then stable.
+    for nightly in [true, false] {
+        let mut cmd = std::process::Command::new("rustc");
+        if nightly {
+            cmd.arg("+nightly");
+        }
+        cmd.args(base);
+        if nightly {
+            cmd.arg("-Zmir-include-spans");
+        }
+        match cmd.arg(path).output() {
+            Ok(o) if o.status.success() => {
+                return String::from_utf8(o.stdout)
+                    .map_err(|_| "rustc emitted non-UTF-8 MIR".to_string());
+            }
+            Ok(o) => last_err = String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            Err(e) => last_err = format!("could not run rustc: {e}"),
+        }
+    }
+    Err(format!("could not compile {} to MIR:\n{last_err}", path.display()))
+}
+
+/// A crate-/file-level coverage report: how many functions were found, how many
+/// verified (and to what), and — the point — how many were **not analyzed**, named
+/// individually. A `PASS` verdict on the analyzed set means nothing if a fifth of
+/// the functions silently never reached the analyzer.
+fn render_coverage(
+    path: &Path,
+    module: &csolver_ir::Module,
+    report: &csolver_verifier::ModuleReport,
+) -> String {
+    use std::fmt::Write as _;
+    let not_analyzed = &module.unanalyzed;
+    let analyzed = module.functions.len();
+    let found = analyzed + not_analyzed.len();
+    let pass = report.count(Verdict::Pass);
+    let fail = report.count(Verdict::Fail);
+    // Total UNKNOWN includes the not-analyzed (they verify as UNKNOWN); split them
+    // so "unknown but analyzed" is not confused with "never analyzed".
+    let unknown_analyzed = report.count(Verdict::Unknown).saturating_sub(not_analyzed.len());
+
+    let mut s = String::new();
+    let _ = writeln!(s, "coverage {}: {found} function(s) found", path.display());
+    if found == 0 {
+        let _ = writeln!(
+            s,
+            "  WARNING: MIR emitted but 0 functions found — an emission or parse gap; \
+             nothing was verified, so a PASS here would be meaningless."
+        );
+        return s;
+    }
+    let _ = writeln!(s, "  analyzed {analyzed}: {pass} PASS, {fail} FAIL, {unknown_analyzed} UNKNOWN");
+    if not_analyzed.is_empty() {
+        let _ = writeln!(s, "  not analyzed: 0 — every function found was analyzed");
+    } else {
+        let _ = writeln!(
+            s,
+            "  NOT ANALYZED {} (could not lower/parse — NOT covered by the verdict):",
+            not_analyzed.len()
+        );
+        for (name, reason) in not_analyzed {
+            let _ = writeln!(s, "    - {name}: {reason}");
+        }
+    }
+    s
+}
+
 /// Decide which level an input is, by extension / magic bytes.
 fn detect_level(path: &Path) -> Result<SourceLevel, String> {
     if path.is_dir() || path.join("Cargo.toml").is_file() {
@@ -182,5 +285,37 @@ fn verdict_code(verdict: Verdict) -> ExitCode {
         Verdict::Pass => ExitCode::from(0),
         Verdict::Fail => ExitCode::from(1),
         Verdict::Unknown => ExitCode::from(2),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The coverage report must *name* functions that were not analyzed rather than
+    /// fold them into a flattering count — the crate-level never-silently-skip
+    /// guard. A `PASS` set means nothing if a function silently never reached the
+    /// analyzer.
+    #[test]
+    fn coverage_names_not_analyzed_functions() {
+        let mut module = csolver_ir::Module::new("m");
+        module.unanalyzed.push(("uses_asm".into(), "inline asm unsupported".into()));
+        let config = Config { level: SourceLevel::Mir, ..Config::default() };
+        let report = verify_module(&module, &config);
+        let cov = render_coverage(Path::new("x.rs"), &module, &report);
+        assert!(cov.contains("NOT ANALYZED 1"), "reports the uncovered count: {cov}");
+        assert!(cov.contains("uses_asm"), "names the uncovered function: {cov}");
+    }
+
+    /// A file whose MIR yields no functions must warn loudly, not report a vacuous
+    /// clean bill of health.
+    #[test]
+    fn coverage_warns_on_zero_functions() {
+        let module = csolver_ir::Module::new("m");
+        let config = Config { level: SourceLevel::Mir, ..Config::default() };
+        let report = verify_module(&module, &config);
+        let cov = render_coverage(Path::new("empty.rs"), &module, &report);
+        assert!(cov.contains("0 function(s) found"), "{cov}");
+        assert!(cov.contains("WARNING"), "warns rather than implying coverage: {cov}");
     }
 }
