@@ -190,8 +190,42 @@ fn detect_slice(f: &LFunc, idx: usize) -> Option<(u32, u64)> {
     if !matches!(len.ty, LType::Int(_)) {
         return None;
     }
+    // The candidate must not be a *dereferenced* index of the pointer. If some
+    // `gep ptr, cand` result is loaded/stored, `cand` is an index argument
+    // (`fn(&[T; N], i)`) mistaken for a slice length — pairing it would size the
+    // region by the access index and refute *every* access (a false FAIL; the MIR
+    // frontend, having the array type, proves these PASS). A real slice's length
+    // *bounds* the index: it may form the one-past-end pointer (`gep ptr, len`),
+    // but that pointer is only *compared* (`icmp %next, %end`), never dereferenced.
+    if pointer_indexed_and_dereferenced_by(f, &p.name, &len.name) {
+        return None;
+    }
     let elem_size = slice_elem_size(f, &p.name)?;
     Some(((idx + 1) as u32, elem_size))
+}
+
+/// Whether some `getelementptr ptr_name, cand` has its result loaded or stored —
+/// the signature of a dereferenced index argument, distinct from a slice length
+/// (which may index the pointer to form a one-past-end bound but is only compared).
+fn pointer_indexed_and_dereferenced_by(f: &LFunc, ptr_name: &str, cand: &str) -> bool {
+    if cand.is_empty() {
+        return false;
+    }
+    f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+        matches!(inst,
+            LInst::Gep { dst, base: LValue::Local(base), index: LValue::Local(ix), .. }
+            if base == ptr_name && ix == cand && is_dereferenced(f, dst))
+    })
+}
+
+/// Whether local `name` is used as the address of any `load`/`store`.
+fn is_dereferenced(f: &LFunc, name: &str) -> bool {
+    f.blocks.iter().flat_map(|b| &b.insts).any(|inst| match inst {
+        LInst::Load { ptr: LValue::Local(p), .. } | LInst::Store { ptr: LValue::Local(p), .. } => {
+            p == name
+        }
+        _ => false,
+    })
 }
 
 /// The byte size of the element type of the first `getelementptr` on `ptr_name`.
