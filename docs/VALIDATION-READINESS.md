@@ -98,6 +98,20 @@ the inner layers build. **~150–250 LOC** + the coverage report.
    coverage-completeness trap is guarded: a not-lowered function is named, never
    folded into a flattering count. **Follow-up:** a whole crate *directory* (cargo
    orchestration over dependencies/workspace, picking the crate's own MIR).
+
+   **`.ll` input quality (measured 2026-07):** the verdicts on LLVM input depend
+   heavily on *how* the IR was emitted. rustc's debug emission (`-C opt-level=0`)
+   omits the `dereferenceable(N)`/`nonnull` parameter attributes the provenance
+   analysis feeds on — pointer-heavy functions then verify UNKNOWN (soundly, but
+   conservatively: the dominant residual bucket, ~4100 obligations on the 11-crate
+   sweep, is "uncontracted pointer parameter"). Emitting with
+   `rustc --emit=llvm-ir -O -C no-prepopulate-passes` keeps the attributes without
+   running LLVM's optimization passes: oorandom verifies **14/14 PASS (100 %)** vs
+   25/29 on debug IR; adler2 61 % → 78 %. The CLI prints an advisory note
+   (`llvm_attribute_hint`) when a `.ll` shows the debug-emission signature
+   (pointer params, no `dereferenceable`) — it never changes a verdict, only
+   explains the UNKNOWNs and how to emit richer input. For `.rs` input this is
+   moot: the turnkey path uses the MIR frontend, which has the types themselves.
 4. **✓ Parallelism** — done. Functions are verified over a work-stealing thread
    pool (`std::thread::scope` + an atomic index, scaling to the machine's cores,
    dependency-free); obligation ids are assigned by a serial renumbering pass in
