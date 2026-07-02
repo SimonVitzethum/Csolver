@@ -812,3 +812,38 @@ start:
 "#;
     assert_ne!(verdict_of(min_fold, "init"), Verdict::Pass, "access beyond the minimum site size");
 }
+
+/// Fixpoint grounding: `@outer`'s contract is synthesized from `@main`'s alloca
+/// (round 1); `@inner`'s only site forwards `@outer`'s parameter, so it needs
+/// round 2 — derivable only through the *earlier-round* contract. The chain is
+/// inductively grounded in a real allocation; no contract justifies itself.
+#[test]
+fn llvm_contract_synthesis_reaches_a_fixpoint_through_chains() {
+    let src = r#"
+define internal void @inner(ptr %p) {
+start:
+  %q = getelementptr inbounds i8, ptr %p, i64 8
+  store i32 7, ptr %q, align 4
+  ret void
+}
+
+define internal void @outer(ptr %p) {
+start:
+  call void @inner(ptr %p)
+  ret void
+}
+
+define void @main() {
+start:
+  %buf = alloca [16 x i8], align 8
+  call void @outer(ptr %buf)
+  ret void
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    let inner = report.functions.iter().find(|f| f.function == "inner").expect("inner");
+    assert_eq!(inner.verdict, Verdict::Pass, "round-2 chain must ground: {inner:?}");
+}

@@ -64,8 +64,35 @@ struct SiteGuarantee {
 }
 
 /// Synthesize contracts for internal functions' uncontracted pointer
-/// parameters. Returns an overlay map; declared contracts always win.
+/// parameters, to a fixpoint. Returns an overlay map; declared contracts win.
+///
+/// The iteration is grounded *from below*: a parameter is contracted only in
+/// the round where **all** its sites become derivable, and a site is derivable
+/// only through declared contracts, constant allocas, or contracts created in
+/// strictly earlier rounds — which are final by induction (their own inputs
+/// were final when they were computed). So no contract ever justifies itself
+/// through a cycle, values never change after creation, and the loop adds at
+/// least one parameter per round or stops.
 pub(crate) fn synthesize(module: &Module) -> HashMap<(FuncId, u32), PtrContract> {
+    let mut acc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
+    loop {
+        let round = synthesize_round(module, &acc);
+        let mut grew = false;
+        for (k, v) in round {
+            grew |= acc.insert(k, v).is_none();
+        }
+        if !grew {
+            return acc;
+        }
+    }
+}
+
+/// One synthesis round: derive using declared contracts plus the contracts
+/// accumulated in earlier rounds (`prior`).
+fn synthesize_round(
+    module: &Module,
+    prior: &HashMap<(FuncId, u32), PtrContract>,
+) -> HashMap<(FuncId, u32), PtrContract> {
     let escaped = address_taken_names(module);
 
     // Eligible (callee, param-index) pairs: internal, address never taken,
@@ -77,7 +104,10 @@ pub(crate) fn synthesize(module: &Module) -> HashMap<(FuncId, u32), PtrContract>
         }
         for (i, (_, ty)) in f.params.iter().enumerate() {
             let key = (f.id, i as u32);
-            if ty.is_ptr() && !module.param_contracts.contains_key(&key) {
+            if ty.is_ptr()
+                && !module.param_contracts.contains_key(&key)
+                && !prior.contains_key(&key)
+            {
                 candidates.insert(key);
             }
         }
@@ -90,7 +120,7 @@ pub(crate) fn synthesize(module: &Module) -> HashMap<(FuncId, u32), PtrContract>
     // site it could not derive — permanently ineligible.
     let mut folded: HashMap<(FuncId, u32), Option<SiteGuarantee>> = HashMap::new();
     for caller in &module.functions {
-        let defs = local_defs(caller, module);
+        let defs = local_defs(caller, module, prior);
         for inst in caller.blocks.iter().flat_map(|b| &b.insts) {
             let Inst::Call { callee: Callee::Direct(g), args, .. } = inst else {
                 continue;
@@ -156,12 +186,19 @@ fn derive_site(
 
 /// Per-function map from a register to the static guarantee it carries:
 /// `Alloc` results (constant size, full access, live for the frame) and the
-/// function's own parameters with a **declared** `Bytes` contract. Synthesized
-/// contracts are deliberately not consulted — that would be circular.
-fn local_defs(f: &csolver_ir::Function, module: &Module) -> HashMap<RegId, SiteGuarantee> {
+/// function's own parameters with a `Bytes` contract — declared, or synthesized
+/// in a strictly earlier round (final by the induction in [`synthesize`]).
+/// Same-round synthesized contracts are never consulted — that would be
+/// circular.
+fn local_defs(
+    f: &csolver_ir::Function,
+    module: &Module,
+    prior: &HashMap<(FuncId, u32), PtrContract>,
+) -> HashMap<RegId, SiteGuarantee> {
     let mut defs = HashMap::new();
     for (i, (reg, _)) in f.params.iter().enumerate() {
-        if let Some(c) = module.param_contracts.get(&(f.id, i as u32)) {
+        let key = (f.id, i as u32);
+        if let Some(c) = module.param_contracts.get(&key).or_else(|| prior.get(&key)) {
             if let SizeSpec::Bytes(n) = c.size {
                 defs.insert(
                     *reg,
