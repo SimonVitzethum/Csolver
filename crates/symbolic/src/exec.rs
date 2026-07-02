@@ -692,7 +692,6 @@ struct SymPointer {
 
 #[derive(Debug, Clone)]
 struct SymRegion {
-    #[allow(dead_code)]
     kind: RegionKind,
     size: ExprId,
     state: LifetimeState,
@@ -1286,10 +1285,16 @@ impl Explorer<'_> {
         // If the loop body may free memory, then on any iteration after the
         // first a region could already be freed — so no region's liveness can
         // be proved inside (or after) the loop. Invalidate liveness
-        // conservatively. (Loops that never free are unaffected.)
+        // conservatively. (Loops that never free are unaffected.) Only *owned
+        // heap* regions can be legitimately freed: a free of a borrowed or
+        // stack/global region is flagged by `check_dealloc` (or the callee's own
+        // verification), leaving the function non-PASS on that path anyway.
         if self.loop_frees.get(&header).copied().unwrap_or(false) {
             for r in &mut state.regions {
-                if r.state == LifetimeState::Live {
+                if r.state == LifetimeState::Live
+                    && r.contract.is_none()
+                    && matches!(r.kind, RegionKind::Heap)
+                {
                     r.state = LifetimeState::Freed;
                 }
             }
@@ -1824,7 +1829,16 @@ impl Explorer<'_> {
         }
         if frees {
             for r in &mut state.regions {
-                if r.state == LifetimeState::Live && r.contract.is_none() {
+                // A callee can only free *heap* memory it was handed ownership
+                // of. Contracted regions are borrowed for the call's duration,
+                // and freeing a stack region is UB in the callee — refuted there
+                // by `check_dealloc`'s non-heap check (the guarantee this
+                // assumption composes with). So a local alloca's liveness
+                // survives every call.
+                if r.state == LifetimeState::Live
+                    && r.contract.is_none()
+                    && matches!(r.kind, RegionKind::Heap)
+                {
                     r.state = LifetimeState::Freed;
                 }
             }
@@ -1991,6 +2005,15 @@ impl Explorer<'_> {
         if state.regions[rid].contract.is_some() {
             // Freeing caller-owned (borrowed) memory is not ours to prove safe.
             self.record(block, idx, NoDoubleFree, false, "caller-owned region", "freeing a borrowed (caller-owned) region is not provably valid");
+            return;
+        }
+        if !matches!(state.regions[rid].kind, RegionKind::Heap) {
+            // Only allocator memory can be deallocated: freeing a stack slot /
+            // global / TLS region is UB regardless of its state. This is also
+            // the callee-side guarantee behind the caller-side assumption that
+            // a call never frees a stack region (see `step_call`) — the pair
+            // must stay in sync or the composition is unsound.
+            self.record_temporal((block, idx), NoDoubleFree, true, state, "frees allocator memory", "freeing non-heap (stack/global) memory is undefined behaviour");
             return;
         }
         let rstate = state.regions[rid].state;
@@ -3236,6 +3259,98 @@ mod tests {
         let second = r.mem_decision(BlockId(0), 2, SafetyProperty::NoDoubleFree).expect("second free");
         assert!(!second.proven);
         assert!(second.refutation.is_some(), "double free is refuted with a witness");
+    }
+
+    /// `alloca; store; call @unknown(); load` — with `kind` distinguishing the
+    /// region. A callee cannot legitimately free a caller's *stack* slot (that
+    /// free is UB, refuted in the callee by `check_dealloc`'s non-heap check),
+    /// so the alloca's liveness survives the opaque call and the load's
+    /// use-after-free obligation is provable. This assume/guarantee pair is what
+    /// keeps rustc's ubiquitous alloca-heavy debug IR provable across helper
+    /// calls.
+    fn call_then_load(kind: RegionKind) -> Function {
+        let buf = RegId(0);
+        let v = RegId(1);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: kind,
+            elem: Type::int(32),
+            count: Operand::int(64, 1),
+            align: 4,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(buf),
+            value: Operand::int(32, 7),
+            align: 4,
+        });
+        bb0.insts.push(Inst::Call {
+            dst: None,
+            callee: Callee::Symbol("unknown".into()),
+            args: vec![],
+            ret_ty: Type::Unit,
+        });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 });
+        Function {
+            id: FuncId(0),
+            name: "call_then_load".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn stack_liveness_survives_an_opaque_call() {
+        let r = discharge_function(&call_then_load(RegionKind::Stack));
+        let d = r
+            .mem_decision(BlockId(0), 3, SafetyProperty::NoUseAfterFree)
+            .expect("UAF obligation for the load");
+        assert!(d.proven, "a stack slot cannot be freed by a callee: {d:?}");
+    }
+
+    /// Positive control for the stack-liveness rule: an *owned heap* region can
+    /// genuinely be handed off and freed by an opaque callee, so its liveness
+    /// must NOT be provable after the call. If this starts passing, the havoc is
+    /// muted and the rule above proves too much.
+    #[test]
+    fn heap_liveness_is_still_havocked_by_an_opaque_call() {
+        let r = discharge_function(&call_then_load(RegionKind::Heap));
+        let d = r
+            .mem_decision(BlockId(0), 3, SafetyProperty::NoUseAfterFree)
+            .expect("UAF obligation for the load");
+        assert!(!d.proven, "owned heap liveness must not survive an opaque call: {d:?}");
+    }
+
+    /// Freeing a stack region is UB no matter its state — and it is the
+    /// callee-side guarantee the stack-liveness rule composes with, so it must
+    /// be *refuted*, not merely unproven.
+    #[test]
+    fn freeing_a_stack_region_is_refuted() {
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Stack,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        bb0.insts.push(Inst::Dealloc { region: RegionKind::Heap, ptr: Operand::Reg(buf) });
+        let f = Function {
+            id: FuncId(0),
+            name: "free_stack".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let r = discharge_function(&f);
+        let d = r.mem_decision(BlockId(0), 1, SafetyProperty::NoDoubleFree).expect("free");
+        assert!(!d.proven, "freeing a stack region must never be proven");
+        assert!(d.refutation.is_some(), "freeing a stack region is definite UB: {d:?}");
     }
 
     /// A counting loop writing across an allocation:
