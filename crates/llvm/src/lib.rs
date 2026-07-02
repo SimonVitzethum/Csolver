@@ -328,4 +328,114 @@ start:
         );
     }
 
+    /// Named struct types (`%"core::fmt::rt::Argument<'_>" = type { … }`) must
+    /// resolve — including a definition that lexically *follows* its use — and a
+    /// `gep %"T", ptr, i64 N` must stride by the struct's *padded* size, not a
+    /// placeholder (a wrong stride misplaces every subsequent access: verdicts,
+    /// not cosmetics). `%"Outer"` = `{ ptr, %"Inner" }` with `%"Inner"` =
+    /// `{ i32, i64 }` (16 B padded) → 24 bytes.
+    #[test]
+    fn named_struct_types_resolve_with_correct_stride() {
+        let src = r#"
+%"Outer" = type { ptr, %"Inner" }
+
+define ptr @nth(ptr %base, i64 %i) {
+start:
+  %p = getelementptr inbounds %"Outer", ptr %base, i64 %i
+  ret ptr %p
+}
+
+%"Inner" = type { i32, i64 }
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        assert!(module.unanalyzed.is_empty(), "named types must resolve: {:?}", module.unanalyzed);
+        let elem = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                csolver_ir::Inst::PtrOffset { elem, .. } => Some(elem.clone()),
+                _ => None,
+            })
+            .expect("the gep lowers to a PtrOffset");
+        assert_eq!(
+            elem.size_bytes(&csolver_ir::DataLayout::LP64),
+            Some(24),
+            "gep stride must be the padded struct size"
+        );
+    }
+
+    /// A multi-line `switch` case table, a float literal as a call argument, and
+    /// an *indirect* call through a function pointer — each dropped whole
+    /// functions before. The indirect callee must stay unresolved (a symbol no
+    /// global can shadow), so the engine applies unknown-callee havoc semantics.
+    #[test]
+    fn switch_table_float_args_and_indirect_calls_parse() {
+        let src = r#"
+define i32 @f(i64 %x, ptr %fp) {
+start:
+  switch i64 %x, label %d [
+    i64 0, label %a
+    i64 1, label %b
+  ]
+a:
+  %r = call float @g(float 2.000000e+00, float 0x3E70000000000000)
+  br label %d
+b:
+  %s = call i32 %fp(i64 %x)
+  ret i32 %s
+d:
+  ret i32 0
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        assert!(module.unanalyzed.is_empty(), "must all parse: {:?}", module.unanalyzed);
+        let has_indirect = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, csolver_ir::Inst::Call { callee: csolver_ir::Callee::Symbol(s), .. }
+                if s.contains("indirect")));
+        assert!(has_indirect, "the indirect call lowers to an unresolved symbol callee");
+    }
+
+    /// `load atomic` / `store volatile` must lower as *real* accesses — an opaque
+    /// placeholder would silently drop their memory obligations (an unchecked
+    /// OOB store would then be a false PASS one level up). Packed structs are
+    /// rejected (padded layout would oversize them — phantom in-bounds bytes).
+    #[test]
+    fn atomic_volatile_accesses_keep_their_obligations() {
+        let src = r#"
+define i32 @f(ptr %p, i32 %v) {
+start:
+  store atomic i32 %v, ptr %p seq_cst, align 4
+  %a = load atomic i32, ptr %p acquire, align 4
+  %b = load volatile i32, ptr %p, align 4
+  ret i32 %b
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        assert!(module.unanalyzed.is_empty(), "{:?}", module.unanalyzed);
+        let f = &module.functions[0];
+        let loads = f.blocks.iter().flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, csolver_ir::Inst::Load { .. })).count();
+        let stores = f.blocks.iter().flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, csolver_ir::Inst::Store { .. })).count();
+        assert_eq!((loads, stores), (2, 1), "every qualified access stays a checked access");
+
+        let packed = LlvmFrontend.lower(LlvmInput {
+            source: "define void @g(ptr %p) {\nstart:\n  %v = load <{ i8, i32 }>, ptr %p\n  ret void\n}\n".into(),
+            name: "m".into(),
+        });
+        let dropped = packed.map(|m| !m.unanalyzed.is_empty()).unwrap_or(true);
+        assert!(dropped, "a packed struct must be rejected, not padded");
+    }
 }

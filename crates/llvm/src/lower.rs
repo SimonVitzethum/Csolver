@@ -579,10 +579,15 @@ fn lower_type(ty: &LType) -> Type {
             elem: Box::new(lower_type(elem)),
             len: *n,
         },
-        // An aggregate value (e.g. a checked-arith `{iN, i1}`) is never used
-        // directly — only destructured by `extractvalue` — so a scalar placeholder
-        // suffices for the intermediate register's type.
-        LType::Struct(_) => Type::int(64),
+        // A struct lowers structurally, so the IR layout machinery computes the
+        // exact padded size/alignment — a `gep %"T", ptr, i64 N` strides by
+        // `sizeof(T)`, and an under-sized placeholder would misplace every
+        // subsequent access.
+        LType::Struct(fields) => Type::Struct { fields: fields.iter().map(lower_type).collect() },
+        // Unreachable: the parser resolves every named reference or fails the
+        // function. A total function is cheaper to keep correct than a panic; a
+        // zero-size type can never *prove* an access in-bounds.
+        LType::Named(_) => Type::Opaque { bytes: 0, align: 1 },
     }
 }
 

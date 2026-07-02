@@ -10,6 +10,7 @@
 
 use crate::lexer::{lex, Tok};
 use csolver_core::{Error, Result};
+use std::collections::HashMap;
 
 /// A parsed module.
 #[derive(Debug, Clone)]
@@ -97,6 +98,10 @@ pub enum LType {
     /// `{ T, T, … }` (an aggregate — e.g. the `{iN, i1}` of a checked-arithmetic
     /// intrinsic; destructured by `extractvalue`, not used directly).
     Struct(Vec<LType>),
+    /// `%"name"` — a reference to a top-level `%"name" = type { … }` definition.
+    /// Resolved by [`Parser::ltype`] against the collected definitions before it
+    /// leaves the parser; reaching the lowering unresolved is a parser bug.
+    Named(String),
 }
 
 /// A parsed operand value.
@@ -201,7 +206,13 @@ pub enum LTerm {
 /// Parse a `.ll` source into an [`LModule`].
 pub fn parse_module(src: &str) -> Result<LModule> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser { toks, pos: 0, types: HashMap::new() };
+    // Pre-scan for `%"name" = type <T>` definitions: a definition may lexically
+    // follow its first use, so the table must be complete before any function
+    // parses. An unparseable definition is skipped — a function using it then
+    // fails per-function recovery (UNKNOWN), never a silent guess.
+    p.collect_type_defs();
+    p.pos = 0;
     let mut funcs = Vec::new();
     let mut unanalyzed = Vec::new();
     loop {
@@ -233,6 +244,11 @@ pub fn parse_module(src: &str) -> Result<LModule> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Top-level `%"name" = type <T>` definitions, collected in a pre-scan (a
+    /// definition may lexically follow its first use). Values may themselves
+    /// contain [`LType::Named`] references; [`Parser::resolve_named`] substitutes
+    /// them at use time.
+    types: HashMap<String, LType>,
 }
 
 impl Parser {
@@ -282,7 +298,58 @@ impl Parser {
         }
     }
 
+    /// Pre-scan the token stream for top-level `%"name" = type <T>` definitions.
+    /// Runs before function parsing; leaves `self.pos` at the end of input.
+    fn collect_type_defs(&mut self) {
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Tok::Eof) {
+                break;
+            }
+            if let (Tok::Local(name), Tok::Punct('=')) = (self.peek(), self.peek2()) {
+                if matches!(self.toks.get(self.pos + 2), Some(Tok::Word(w)) if w == "type") {
+                    let name = name.clone();
+                    self.pos += 3;
+                    if let Ok(ty) = self.ltype_raw() {
+                        self.types.insert(name, ty);
+                    }
+                }
+            }
+            self.skip_to_eol();
+        }
+    }
+
+    /// Substitute [`LType::Named`] references using the collected definitions.
+    /// The depth cap breaks pathological reference cycles (a *valid* IR struct
+    /// cannot contain itself by value, only behind `ptr`, which does not recurse).
+    fn resolve_named(&self, ty: &LType, depth: u32) -> Result<LType> {
+        if depth > 32 {
+            return Err(Error::unsupported("named-type reference cycle"));
+        }
+        Ok(match ty {
+            LType::Named(n) => match self.types.get(n) {
+                Some(def) => self.resolve_named(&def.clone(), depth + 1)?,
+                None => {
+                    return Err(Error::unsupported(format!("unknown named type %\"{n}\"")))
+                }
+            },
+            LType::Array(e, n) => LType::Array(Box::new(self.resolve_named(e, depth + 1)?), *n),
+            LType::Vector(e, n) => LType::Vector(Box::new(self.resolve_named(e, depth + 1)?), *n),
+            LType::Struct(fs) => LType::Struct(
+                fs.iter().map(|f| self.resolve_named(f, depth + 1)).collect::<Result<_>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+
+    /// Parse a type and resolve any named references — nothing downstream of the
+    /// parser ever sees [`LType::Named`].
     fn ltype(&mut self) -> Result<LType> {
+        let raw = self.ltype_raw()?;
+        self.resolve_named(&raw, 0)
+    }
+
+    fn ltype_raw(&mut self) -> Result<LType> {
         let mut ty = match self.bump() {
             Tok::Word(w) if w == "void" => LType::Void,
             Tok::Word(w) if w == "ptr" => LType::Ptr,
@@ -294,34 +361,31 @@ impl Parser {
                 Some(bits) => LType::Int(bits),
                 None => return Err(Error::unsupported(format!("type name `{w}`"))),
             },
+            // `%"core::…"` — a reference to a top-level type definition.
+            Tok::Local(n) => LType::Named(n),
             Tok::Punct('[') => {
                 let n = self.int()?;
                 self.expect_word("x")?;
-                let elem = self.ltype()?;
+                let elem = self.ltype_raw()?;
                 self.expect_punct(']')?;
                 LType::Array(Box::new(elem), n as u64)
             }
             Tok::Punct('<') => {
+                // `<{ … }>` is a *packed* struct (no padding). Modelling it with
+                // the ordinary (padded) layout could only *enlarge* the size —
+                // an in-bounds proof against phantom padding bytes would be a
+                // false PASS — so it is rejected. (rustc uses packed structs only
+                // in global constant initializers, which are skipped anyway.)
+                if matches!(self.peek(), Tok::Punct('{')) {
+                    return Err(Error::unsupported("packed struct type"));
+                }
                 let n = self.int()?;
                 self.expect_word("x")?;
-                let elem = self.ltype()?;
+                let elem = self.ltype_raw()?;
                 self.expect_punct('>')?;
                 LType::Vector(Box::new(elem), n as u64)
             }
-            Tok::Punct('{') => {
-                let mut fields = Vec::new();
-                if !matches!(self.peek(), Tok::Punct('}')) {
-                    loop {
-                        fields.push(self.ltype()?);
-                        if !matches!(self.peek(), Tok::Punct(',')) {
-                            break;
-                        }
-                        self.pos += 1;
-                    }
-                }
-                self.expect_punct('}')?;
-                LType::Struct(fields)
-            }
+            Tok::Punct('{') => LType::Struct(self.struct_fields()?),
             other => return Err(Error::unsupported(format!("type starting with {other:?}"))),
         };
         // Legacy pointer suffixes: `i32*`, `[..]**`, etc. all collapse to `ptr`.
@@ -330,6 +394,23 @@ impl Parser {
             ty = LType::Ptr;
         }
         Ok(ty)
+    }
+
+    /// The comma-separated field types of a struct body, ending at (and
+    /// consuming) the closing `}`. The opening `{` is already consumed.
+    fn struct_fields(&mut self) -> Result<Vec<LType>> {
+        let mut fields = Vec::new();
+        if !matches!(self.peek(), Tok::Punct('}')) {
+            loop {
+                fields.push(self.ltype_raw()?);
+                if !matches!(self.peek(), Tok::Punct(',')) {
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
+        self.expect_punct('}')?;
+        Ok(fields)
     }
 
     fn int(&mut self) -> Result<i128> {
@@ -385,6 +466,24 @@ impl Parser {
             Tok::Word(w) if w == "true" => Ok(LValue::Int(1)),
             Tok::Word(w) if w == "false" => Ok(LValue::Int(0)),
             other => Err(Error::unsupported(format!("operand value {other:?}"))),
+        }
+    }
+
+    /// Skip the `atomic` / `volatile` qualifiers of a `load`/`store`.
+    fn skip_memory_qualifiers(&mut self) {
+        while self.eat_word("atomic") || self.eat_word("volatile") {}
+    }
+
+    /// Skip an atomic access's trailing `syncscope("…")` and ordering keyword
+    /// (`load atomic i32, ptr %p seq_cst, align 4`).
+    fn skip_atomic_ordering(&mut self) {
+        if self.eat_word("syncscope") && matches!(self.peek(), Tok::Punct('(')) {
+            let _ = self.skip_balanced('(', ')');
+        }
+        while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(),
+            "unordered" | "monotonic" | "acquire" | "release" | "acq_rel" | "seq_cst"))
+        {
+            self.pos += 1;
         }
     }
 
@@ -472,10 +571,11 @@ impl Parser {
     fn skip_arg_attrs(&mut self) -> Result<()> {
         loop {
             match self.peek() {
-                // The operand: a register, global, integer, or aggregate const.
+                // The operand: a register, global, integer/float, or aggregate const.
                 Tok::Local(_)
                 | Tok::Global(_)
                 | Tok::Int(_)
+                | Tok::Float(_)
                 | Tok::Punct(',')
                 | Tok::Punct(')')
                 | Tok::Punct('<')
@@ -678,7 +778,7 @@ impl Parser {
                 self.pos += 1;
                 self.skip_to_type()?;
                 let ret = self.ltype()?;
-                let callee = self.global()?;
+                let callee = self.callee_name()?;
                 self.expect_punct('(')?;
                 let mut args = Vec::new();
                 if !matches!(self.peek(), Tok::Punct(')')) {
@@ -747,7 +847,12 @@ impl Parser {
                 let default = self.local()?;
                 self.expect_punct('[')?;
                 let mut cases = Vec::new();
-                while !matches!(self.peek(), Tok::Punct(']')) {
+                loop {
+                    // The case table spans lines (`[` newline `i64 0, label %bb` …).
+                    self.skip_newlines();
+                    if matches!(self.peek(), Tok::Punct(']')) {
+                        break;
+                    }
                     let _cty = self.ltype()?; // each case repeats the scrutinee's int type
                     let cv = match self.value()? {
                         LValue::Int(n) => n,
@@ -829,19 +934,26 @@ impl Parser {
                 LInst::Alloca { dst: need_dst()?, ty, align }
             }
             "load" => {
+                // `atomic`/`volatile` qualifiers don't change the memory-safety
+                // obligations (the analysis models sequential memory, as does the
+                // Miri oracle); the access itself must still be checked.
+                self.skip_memory_qualifiers();
                 let ty = self.ltype()?;
                 self.expect_punct(',')?;
                 let _pty = self.ltype()?;
                 let ptr = self.value()?;
+                self.skip_atomic_ordering();
                 let align = self.maybe_align().unwrap_or(0);
                 LInst::Load { dst: need_dst()?, ty, ptr, align }
             }
             "store" => {
+                self.skip_memory_qualifiers();
                 let ty = self.ltype()?;
                 let val = self.value()?;
                 self.expect_punct(',')?;
                 let _pty = self.ltype()?;
                 let ptr = self.value()?;
+                self.skip_atomic_ordering();
                 let align = self.maybe_align().unwrap_or(0);
                 LInst::Store { ty, val, ptr, align }
             }
@@ -971,12 +1083,28 @@ impl Parser {
         Ok(LInst::Gep { dst, elem, base, index })
     }
 
+    /// The callee of a `call`/`invoke`: a direct `@name`, or — for an *indirect*
+    /// call through a function pointer — a `%local`. The indirect case maps to a
+    /// name no real global can have; it never resolves to a known function, so
+    /// the lowering emits `Callee::Symbol` and the engine applies the sound
+    /// unknown-callee semantics (heap/liveness havoc, no refutation through it).
+    fn callee_name(&mut self) -> Result<String> {
+        match self.peek() {
+            Tok::Local(n) => {
+                let name = format!("<indirect via %{n}>");
+                self.pos += 1;
+                Ok(name)
+            }
+            _ => self.global(),
+        }
+    }
+
     fn call(&mut self, dst: Option<String>) -> Result<LInst> {
         // Skip calling-convention / tail / return-attribute words.
         while self.eat_word("tail") || self.eat_word("notail") || self.eat_word("musttail") {}
         self.skip_to_type()?;
         let ret = self.ltype()?;
-        let callee = self.global()?;
+        let callee = self.callee_name()?;
         self.expect_punct('(')?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Tok::Punct(')')) {
@@ -1052,7 +1180,9 @@ fn is_type_start(t: &Tok) -> bool {
         Tok::Word(w) => {
             is_int_type(w) || float_bits(w).is_some() || w == "ptr" || w == "void"
         }
-        Tok::Punct('[') | Tok::Punct('<') => true,
+        // `%"name"` — a named-type reference.
+        Tok::Local(_) => true,
+        Tok::Punct('[') | Tok::Punct('<') | Tok::Punct('{') => true,
         _ => false,
     }
 }
