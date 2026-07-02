@@ -282,6 +282,13 @@ impl Parser {
             Tok::Word(w) if w == "void" => LType::Void,
             Tok::Word(w) if w == "ptr" => LType::Ptr,
             Tok::Word(w) if is_int_type(&w) => LType::Int(int_bits(&w)?),
+            // Floating-point types carry no memory-safety content; model them as
+            // opaque scalars of the right byte width (so a `load`/`store float`
+            // gets the correct 4-byte access size). Float arithmetic never runs.
+            Tok::Word(w) => match float_bits(&w) {
+                Some(bits) => LType::Int(bits),
+                None => return Err(Error::unsupported(format!("type name `{w}`"))),
+            },
             Tok::Punct('[') => {
                 let n = self.int()?;
                 self.expect_word("x")?;
@@ -363,6 +370,8 @@ impl Parser {
         match self.bump() {
             Tok::Local(s) => Ok(LValue::Local(s)),
             Tok::Int(n) => Ok(LValue::Int(n)),
+            // A float constant carries no memory-safety content — opaque.
+            Tok::Float(_) => Ok(LValue::Undef),
             Tok::Global(s) => Ok(LValue::Global(s)),
             Tok::Word(w) if w == "null" => Ok(LValue::Null),
             Tok::Word(w) if w == "undef" || w == "poison" || w == "zeroinitializer" => {
@@ -874,6 +883,12 @@ impl Parser {
                 let phi = self.phi(need_dst()?)?;
                 return Ok(InstOrPhi::Phi(phi));
             }
+            other if is_float_op(other) => {
+                // Float arithmetic/casts/compares produce an opaque scalar. The
+                // operands are left for `skip_to_eol` (run after every
+                // instruction) to consume — no float value is ever modelled.
+                LInst::Opaque { dst: need_dst()? }
+            }
             other => {
                 if let Some(bop) = bin_op(other) {
                     // Skip flags like `nuw`, `nsw`, `exact`, `disjoint`.
@@ -1010,7 +1025,9 @@ fn is_int_type(w: &str) -> bool {
 /// `, !dbg …` metadata in comma-separated operand lists).
 fn is_type_start(t: &Tok) -> bool {
     match t {
-        Tok::Word(w) => is_int_type(w) || w == "ptr" || w == "void",
+        Tok::Word(w) => {
+            is_int_type(w) || float_bits(w).is_some() || w == "ptr" || w == "void"
+        }
         Tok::Punct('[') | Tok::Punct('<') => true,
         _ => false,
     }
@@ -1018,6 +1035,29 @@ fn is_type_start(t: &Tok) -> bool {
 
 fn int_bits(w: &str) -> Result<u32> {
     w[1..].parse().map_err(|_| Error::parse(format!("bad integer type `{w}`")))
+}
+
+/// The byte-accurate bit width of an LLVM floating-point type, or `None` if `w`
+/// is not one. Modelled as an opaque integer scalar of this width.
+fn float_bits(w: &str) -> Option<u32> {
+    Some(match w {
+        "half" | "bfloat" => 16,
+        "float" => 32,
+        "double" => 64,
+        "x86_fp80" => 80,
+        "fp128" | "ppc_fp128" => 128,
+        _ => return None,
+    })
+}
+
+/// Whether an opcode is a floating-point arithmetic/cast/compare op. These carry
+/// no memory-safety content, so they are lowered opaquely (`Undef`).
+fn is_float_op(op: &str) -> bool {
+    matches!(
+        op,
+        "fadd" | "fsub" | "fmul" | "fdiv" | "frem" | "fneg" | "fcmp"
+            | "fptrunc" | "fpext" | "fptoui" | "fptosi" | "uitofp" | "sitofp"
+    )
 }
 
 fn bin_op(op: &str) -> Option<LBin> {

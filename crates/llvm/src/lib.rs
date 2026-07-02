@@ -230,4 +230,43 @@ cleanup:
             "invoke must branch to both its normal and unwind successors"
         );
     }
+
+    /// Floating-point types and ops (`float`/`double`, `uitofp`, `fmul`, hex float
+    /// constants) carry no memory-safety content — before, an `float` return type
+    /// alone dropped the whole function (rustc emits this in every `f32`/`f64`
+    /// routine). The function must analyse; its *memory* operation (the safe
+    /// `alloca [4 x i8]` + store) must still be checked, and the float value stays
+    /// opaque (so nothing about it can be mis-proven).
+    #[test]
+    fn float_types_and_ops_do_not_drop_the_function() {
+        let src = r#"
+define float @scale(i32 %x) {
+start:
+  %u = alloca [4 x i8], align 4
+  store i32 %x, ptr %u, align 4
+  %v = load i32, ptr %u, align 4
+  %f = uitofp i32 %v to float
+  %r = fmul float %f, 0x3E70000000000000
+  ret float %r
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        assert!(
+            module.unanalyzed.is_empty(),
+            "a float-using function must not be dropped: {:?}",
+            module.unanalyzed
+        );
+        // The store/load into the local `[4 x i8]` alloca are real memory ops that
+        // must survive lowering (proving the float ops did not eat them).
+        let f = &module.functions[0];
+        let stores = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, csolver_ir::Inst::Store { .. }))
+            .count();
+        assert_eq!(stores, 1, "the store into the alloca must be preserved");
+    }
 }

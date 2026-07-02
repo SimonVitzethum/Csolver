@@ -18,6 +18,11 @@ pub(crate) enum Tok {
     Word(String),
     /// An integer literal.
     Int(i128),
+    /// A floating-point literal — decimal (`1.5`, `1.0e10`) or LLVM hex
+    /// (`0x3E70000000000000`, `0xK…`). The text is kept verbatim; the value is
+    /// never modelled (floats carry no memory-safety content), so the parser maps
+    /// it to an opaque operand.
+    Float(String),
     /// A single punctuation character: one of `(){}[],=:*<>#!`.
     Punct(char),
     /// A line break (statement separator; lets the parser drop trailing
@@ -85,14 +90,42 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Tok>> {
                 if b == b'-' {
                     i += 1;
                 }
+                let digits_start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let text = str_of(&bytes[start..i]);
-                let n: i128 = text
-                    .parse()
-                    .map_err(|_| Error::parse(format!("bad integer literal `{text}`")))?;
-                out.push(Tok::Int(n));
+                // Distinguish a float literal from an integer. LLVM hex float
+                // constants are `0x` (optionally `0xK`/`0xH`/… ) + hex digits;
+                // decimal floats carry a `.` and/or an `[eE]` exponent. Integers
+                // in textual IR are plain decimal.
+                let is_hex_float = i == digits_start + 1
+                    && bytes[digits_start] == b'0'
+                    && matches!(bytes.get(i), Some(b'x' | b'X'));
+                let is_dec_float = matches!(bytes.get(i), Some(b'.'))
+                    || matches!(bytes.get(i), Some(b'e' | b'E')
+                        if matches!(bytes.get(i + 1), Some(d) if d.is_ascii_digit() || *d == b'+' || *d == b'-'));
+                if is_hex_float || is_dec_float {
+                    // Consume the rest of the float literal: hex digits, `.`,
+                    // exponent, sign, and the `0xK`-style type letter.
+                    i += 1; // the `.`, `x`, or `e`
+                    // Optional `0xK`/`0xH`/`0xL`/`0xM`/`0xR` extended-precision tag.
+                    if is_hex_float && matches!(bytes.get(i), Some(b'K' | b'H' | b'L' | b'M' | b'R')) {
+                        i += 1;
+                    }
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_hexdigit()
+                            || matches!(bytes[i], b'.' | b'+' | b'-' | b'e' | b'E'))
+                    {
+                        i += 1;
+                    }
+                    out.push(Tok::Float(str_of(&bytes[start..i])));
+                } else {
+                    let text = str_of(&bytes[start..i]);
+                    let n: i128 = text
+                        .parse()
+                        .map_err(|_| Error::parse(format!("bad integer literal `{text}`")))?;
+                    out.push(Tok::Int(n));
+                }
             }
             _ if is_word_start(b) => {
                 let start = i;
@@ -178,6 +211,25 @@ mod tests {
                 Tok::Word("x".into()),
                 Tok::Word("i32".into()),
                 Tok::Punct(']'),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    /// Float literals must lex as one `Float` token — hex (`0x…`, `0xK…`),
+    /// decimal, and exponent forms — while plain decimal integers stay `Int`.
+    #[test]
+    fn lexes_float_literals() {
+        assert_eq!(
+            lex_no_nl("0x3E70000000000000 1.5 1.0e10 -2.5E-3 0xK4000C000000000000000 42 -7"),
+            vec![
+                Tok::Float("0x3E70000000000000".into()),
+                Tok::Float("1.5".into()),
+                Tok::Float("1.0e10".into()),
+                Tok::Float("-2.5E-3".into()),
+                Tok::Float("0xK4000C000000000000000".into()),
+                Tok::Int(42),
+                Tok::Int(-7),
                 Tok::Eof,
             ]
         );
