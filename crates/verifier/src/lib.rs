@@ -67,18 +67,31 @@ impl Default for Config {
 /// Interprocedural: function summaries are computed once and used so that calls
 /// preserve pointer provenance and respect the callee's memory effects.
 pub fn verify_module(module: &Module, config: &Config) -> ModuleReport {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    verify_module_with_threads(module, config, threads)
+}
+
+/// As [`verify_module`], with an explicit worker-thread count (`1` = serial).
+///
+/// The result is **independent of the thread count** — bit-for-bit. Functions are
+/// verified in isolation (each builds its own solver context; there is no shared
+/// mutable state), and obligation ids are assigned by a *serial* renumbering pass
+/// in function order after the fact, so completion order cannot leak into the
+/// output. The determinism test (`parallel_matches_serial`) is the oracle for this,
+/// the role Miri plays for the MIR lowering. The count trades only latency.
+pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usize) -> ModuleReport {
     let summaries = config.use_symbolic.then(|| summarize_module(module));
+    let mut functions = verify_functions(module, summaries.as_ref(), config, threads);
+
+    // Assign global obligation ids by a serial pass in function order — this
+    // reproduces exactly the sequential ids a serial run would give, regardless of
+    // the order in which the workers finished.
     let mut next_id: u32 = 0;
-    let mut functions = Vec::with_capacity(module.functions.len());
-    for f in &module.functions {
-        let contracts = module.contracts_for(f);
-        functions.push(verify_function_with(
-            f,
-            summaries.as_ref(),
-            &contracts,
-            config,
-            &mut next_id,
-        ));
+    for fr in &mut functions {
+        for o in &mut fr.outcomes {
+            o.obligation.id = ObligationId(next_id);
+            next_id += 1;
+        }
     }
 
     // Functions a frontend could not lower are reported as UNKNOWN (never a
@@ -127,6 +140,56 @@ pub fn verify_module(module: &Module, config: &Config) -> ModuleReport {
         functions,
         assumptions,
     }
+}
+
+/// Verify one function in isolation with a *local* obligation-id counter (the
+/// caller renumbers globally). Self-contained: its own solver context, read-only
+/// summaries/contracts/config — so it is safe to run on any worker thread.
+fn verify_one_function(
+    module: &Module,
+    summaries: Option<&HashMap<FuncId, Summary>>,
+    config: &Config,
+    f: &Function,
+) -> FunctionReport {
+    let contracts = module.contracts_for(f);
+    let mut local_id = 0u32;
+    verify_function_with(f, summaries, &contracts, config, &mut local_id)
+}
+
+/// Verify every function, distributing them over `threads` workers. Work is pulled
+/// from a shared atomic index (not fixed chunks), so a few slow functions do not
+/// stall a whole worker — scalable to the machine's cores. Results are returned in
+/// function order (sorted by index), so the caller's renumbering is deterministic.
+fn verify_functions(
+    module: &Module,
+    summaries: Option<&HashMap<FuncId, Summary>>,
+    config: &Config,
+    threads: usize,
+) -> Vec<FunctionReport> {
+    let fns = &module.functions;
+    let n = fns.len();
+    if threads <= 1 || n <= 1 {
+        return fns.iter().map(|f| verify_one_function(module, summaries, config, f)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::<(usize, FunctionReport)>::with_capacity(n));
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(n) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let r = verify_one_function(module, summaries, config, &fns[i]);
+                // Recover from a poisoned lock (a worker panicked) rather than
+                // cascading the panic — the collected data is still valid.
+                out.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((i, r));
+            });
+        }
+    });
+    let mut v = out.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    v.sort_by_key(|&(i, _)| i);
+    v.into_iter().map(|(_, r)| r).collect()
 }
 
 /// Expand a known assumption id into its full record for the report.

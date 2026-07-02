@@ -961,3 +961,37 @@ fn mir_obligations_carry_their_own_source_line() {
         "an in-bounds obligation rendered a wrong line: {in_bounds_locs:?}"
     );
 }
+
+/// The determinism oracle for parallelisation: a module of many functions (mixed
+/// PASS/UNKNOWN, a loop) verified at 1 vs 16 threads must be **bit-for-bit
+/// identical** — same verdicts, obligation ids, locations, and witnesses (all in
+/// the rendered text). A divergence would be an isolation leak (shared mutable
+/// state or completion-order dependence). Run several times to catch a timing-only
+/// leak that a single run might miss.
+#[test]
+fn parallel_verification_matches_serial() {
+    use csolver_report::render_text;
+    use csolver_verifier::verify_module_with_threads;
+
+    let bases = [CHECKED, SLICE, REAL_SUM_LOOP, REAL_UNCHECKED];
+    let mut module = csolver_ir::Module::new("determinism");
+    let mut fid = 0u32;
+    for _ in 0..12 {
+        for src in bases {
+            for mut f in lower(src, "f").functions {
+                f.id = csolver_ir::FuncId(fid);
+                f.name = format!("f{fid}");
+                module.functions.push(f);
+                fid += 1;
+            }
+        }
+    }
+    assert!(module.functions.len() >= 40, "enough functions to stress the worker pool");
+
+    let config = Config::default();
+    let serial = render_text(&verify_module_with_threads(&module, &config, 1));
+    for run in 0..3 {
+        let parallel = render_text(&verify_module_with_threads(&module, &config, 16));
+        assert_eq!(serial, parallel, "parallel run {run} diverges from serial (isolation leak)");
+    }
+}

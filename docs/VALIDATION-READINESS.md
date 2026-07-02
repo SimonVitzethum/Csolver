@@ -98,7 +98,13 @@ the inner layers build. **~150–250 LOC** + the coverage report.
    coverage-completeness trap is guarded: a not-lowered function is named, never
    folded into a flattering count. **Follow-up:** a whole crate *directory* (cargo
    orchestration over dependencies/workspace, picking the crate's own MIR).
-4. **Parallelism** — with the serial-vs-parallel determinism test.
+4. **✓ Parallelism** — done. Functions are verified over a work-stealing thread
+   pool (`std::thread::scope` + an atomic index, scaling to the machine's cores,
+   dependency-free); obligation ids are assigned by a serial renumbering pass in
+   function order, so the result is independent of thread count. **nom 12.9 s → 1.3 s
+   (~10× on 20 cores)**, verdicts unchanged, differential 0. Pinned by the
+   determinism oracle `parallel_verification_matches_serial` (1 vs 16 threads,
+   bit-for-bit identical over 40+ functions, 3 runs) — the role Miri plays for MIR.
 5. **Verdict cache** — last, with the changed-function positive control.
 
 ## Why this is not "just usability"
