@@ -44,6 +44,11 @@ pub struct LParam {
     pub name: String,
     /// `dereferenceable(N)`: bytes guaranteed valid behind a pointer.
     pub deref: Option<u64>,
+    /// `sret(T)` / `byval(T)`: the pointer refers to a caller-provided buffer of
+    /// `sizeof(T)` bytes (the ABI for returning / passing an aggregate by value).
+    /// Semantically a `dereferenceable(sizeof(T))`; kept as the type so the
+    /// lowering computes the size with its layout.
+    pub abi_buf: Option<LType>,
     /// `align N`.
     pub align: Option<u32>,
     /// `readonly`.
@@ -405,11 +410,12 @@ impl Parser {
     /// Parse a parameter's attributes (up to its `%name` / `,` / `)`),
     /// capturing the memory-safety-relevant ones and skipping the rest.
     #[allow(clippy::type_complexity)]
-    fn param_attrs(&mut self) -> Result<(Option<u64>, Option<u32>, bool, bool)> {
+    fn param_attrs(&mut self) -> Result<(Option<u64>, Option<u32>, bool, bool, Option<LType>)> {
         let mut deref = None;
         let mut align = None;
         let mut readonly = false;
         let mut writeonly = false;
+        let mut abi_buf = None;
         loop {
             match self.peek() {
                 Tok::Local(_) | Tok::Punct(',') | Tok::Punct(')') | Tok::Eof => break,
@@ -425,6 +431,24 @@ impl Parser {
                             }
                         }
                         "dereferenceable" => deref = Some(self.paren_u64()?),
+                        // `sret(T)` / `byval(T)`: a caller-provided buffer of
+                        // `sizeof(T)` bytes — capture the type for a size contract.
+                        // An unparseable payload (e.g. a named struct type) falls
+                        // back to skipping: no contract, never a dropped function.
+                        "sret" | "byval" if matches!(self.peek(), Tok::Punct('(')) => {
+                            let open = self.pos;
+                            self.pos += 1; // '('
+                            match self.ltype() {
+                                Ok(ty) if matches!(self.peek(), Tok::Punct(')')) => {
+                                    self.pos += 1; // ')'
+                                    abi_buf = Some(ty);
+                                }
+                                _ => {
+                                    self.pos = open;
+                                    self.skip_balanced('(', ')')?;
+                                }
+                            }
+                        }
                         "readonly" => readonly = true,
                         "writeonly" => writeonly = true,
                         // `dereferenceable_or_null`, `byval(T)`, `captures(...)`,
@@ -439,7 +463,7 @@ impl Parser {
                 _ => self.pos += 1,
             }
         }
-        Ok((deref, align, readonly, writeonly))
+        Ok((deref, align, readonly, writeonly, abi_buf))
     }
 
     /// Skip a call argument's attributes up to its operand. Crucially, `align
@@ -562,13 +586,13 @@ impl Parser {
         if !matches!(self.peek(), Tok::Punct(')')) {
             loop {
                 let ty = self.ltype()?;
-                let (deref, align, readonly, writeonly) = self.param_attrs()?;
+                let (deref, align, readonly, writeonly, abi_buf) = self.param_attrs()?;
                 let name = if let Tok::Local(_) = self.peek() {
                     self.local()?
                 } else {
                     String::new() // unnamed parameter
                 };
-                params.push(LParam { ty, name, deref, align, readonly, writeonly });
+                params.push(LParam { ty, name, deref, abi_buf, align, readonly, writeonly });
                 if matches!(self.peek(), Tok::Punct(',')) {
                     self.pos += 1;
                 } else {

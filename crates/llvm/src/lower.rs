@@ -148,10 +148,20 @@ fn lower_function(
                 },
             )
         };
-        if let Some(n) = p.deref {
+        // `sret(T)`/`byval(T)` guarantee a caller-provided buffer of `sizeof(T)`
+        // bytes — semantically a `dereferenceable`. Checking it *before* the
+        // slice heuristic matters: an sret pointer followed by an integer
+        // parameter is *not* a `(ptr, len)` slice, and mispairing it sized the
+        // region by an arbitrary value — a false FAIL on every sret store.
+        let abi_size = p.abi_buf.as_ref().and_then(|t| lower_type(t).size_bytes(&LAYOUT));
+        if let Some(n) = p.deref.or(abi_size) {
             contracts.push(common(SizeSpec::Bytes(n)));
-        } else if let Some((len_param, elem_size)) = detect_slice(f, idx) {
-            contracts.push(common(SizeSpec::ParamElements { len_param, elem_size }));
+        } else if p.abi_buf.is_none() {
+            // The slice heuristic never applies to an sret/byval pointer, even
+            // when its buffer size could not be computed.
+            if let Some((len_param, elem_size)) = detect_slice(f, idx) {
+                contracts.push(common(SizeSpec::ParamElements { len_param, elem_size }));
+            }
         }
     }
     for b in &f.blocks {

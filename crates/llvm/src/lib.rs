@@ -269,4 +269,35 @@ start:
             .count();
         assert_eq!(stores, 1, "the store into the alloca must be preserved");
     }
+
+    /// `sret([N x i8])` marks a caller-provided N-byte return buffer (rustc's ABI
+    /// for returning aggregates — pervasive). It must become a `dereferenceable`-
+    /// style size contract, and must *never* be paired with the next integer
+    /// parameter by the slice heuristic: that sized the buffer by an arbitrary
+    /// runtime value and refuted every store into it — a false FAIL on
+    /// `RangeInclusive::new` and friends (a certain-wrong verdict, the worst kind).
+    #[test]
+    fn sret_buffer_gets_a_size_contract_not_a_slice_pairing() {
+        let src = r#"
+define void @new(ptr sret([24 x i8]) align 8 %_0, i64 %start1, i64 %end) {
+start:
+  store i64 %start1, ptr %_0, align 8
+  %0 = getelementptr inbounds i8, ptr %_0, i64 8
+  store i64 %end, ptr %0, align 8
+  %1 = getelementptr inbounds i8, ptr %_0, i64 16
+  store i8 0, ptr %1, align 8
+  ret void
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let contracts: Vec<_> = module.param_contracts.values().collect();
+        assert_eq!(contracts.len(), 1, "the sret param must carry exactly one contract");
+        assert!(
+            matches!(contracts[0].size, csolver_ir::SizeSpec::Bytes(24)),
+            "sret([24 x i8]) must be a 24-byte contract, not a slice pairing: {:?}",
+            contracts[0].size
+        );
+    }
 }
