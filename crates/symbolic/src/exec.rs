@@ -1673,8 +1673,47 @@ impl Explorer<'_> {
             }
             Inst::MemIntrinsic { kind, dst, src, len } => {
                 self.check_mem_intrinsic((block, idx), *kind, dst, src.as_ref(), len, state);
+                // Model the bulk *write*. Clearing the heap alone is not enough:
+                // the destination bytes are now written, and forgetting that made
+                // every later load from a fresh alloca a "definite uninitialized
+                // read" — a false FAIL on rustc's pervasive aggregate-copy pattern
+                // (`store; memcpy; load`).
+                let concrete_len = match len {
+                    Operand::Const(Const::Int(bv)) => u64::try_from(bv.unsigned()).ok(),
+                    _ => None,
+                };
+                // For a concrete-length copy, forward the source value (read
+                // *before* the heap is invalidated): a `Must`-aliasing source
+                // store supplies the actually-copied value, keeping the path
+                // exact. Anything else yields a fresh unknown.
+                let value_ty = Type::int(concrete_len.map_or(64, |n| (n * 8).clamp(8, 128) as u32));
+                let forwarded = match (kind, src, concrete_len) {
+                    (MemKind::Copy | MemKind::Move, Some(s), Some(n)) => {
+                        let sp = self.eval_pointer(s, state);
+                        let (v, origin) = self.load_value(&sp, n, &value_ty, state);
+                        Some((v, matches!(origin, LoadOrigin::Stored)))
+                    }
+                    _ => None,
+                };
                 // A bulk write invalidates the symbolic heap's stored values.
                 state.heap.clear();
+                match concrete_len {
+                    Some(n) => {
+                        let dstp = self.eval_pointer(dst, state);
+                        let (value, exact) = forwarded.unwrap_or_else(|| {
+                            (self.fresh_value(&value_ty, POrigin::Load), false)
+                        });
+                        // A fresh stand-in for the written bytes must not feed an
+                        // "exact" counterexample witness.
+                        if !exact {
+                            state.exact = false;
+                        }
+                        state.heap.push(StoreRecord { target: dstp, value, size: n });
+                    }
+                    // Unknown extent: the destination is written but no record can
+                    // size it soundly — no definite (witnessed) verdicts past here.
+                    None => state.exact = false,
+                }
             }
             Inst::Intrinsic { dst: None, .. } | Inst::Asm { .. } => {}
         }
@@ -2608,6 +2647,57 @@ mod tests {
             .expect("ValidRead obligation for the load");
         assert!(!d.proven, "an uninitialized read must not be proven");
         assert!(d.refutation.is_some(), "it is refuted with a witness: {d:?}");
+    }
+
+    /// `store 7 -> a; memcpy(b, a, 4); load b`: the copy *initializes* `b`, so
+    /// the load must not be refuted as an uninitialized read. Before the bulk
+    /// write was modelled, the heap was merely cleared and the load looked
+    /// never-written — a definite-UB verdict on rustc's pervasive aggregate-copy
+    /// pattern (a false FAIL on `Result::map_err` et al.).
+    #[test]
+    fn memcpy_transfers_initialization() {
+        let a = RegId(0);
+        let b = RegId(1);
+        let v = RegId(2);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        for dst in [a, b] {
+            bb0.insts.push(Inst::Alloc {
+                dst,
+                region: RegionKind::Stack,
+                elem: Type::int(32),
+                count: Operand::int(64, 1),
+                align: 4,
+            });
+        }
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(a),
+            value: Operand::int(32, 7),
+            align: 4,
+        });
+        bb0.insts.push(Inst::MemIntrinsic {
+            kind: MemKind::Copy,
+            dst: Operand::Reg(b),
+            src: Some(Operand::Reg(a)),
+            len: Operand::int(64, 4),
+        });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(b), align: 4 });
+        let f = Function {
+            id: FuncId(0),
+            name: "copy_init".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let r = discharge_function(&f);
+        let d = r
+            .mem_decision(BlockId(0), 4, SafetyProperty::ValidRead)
+            .expect("ValidRead obligation for the load");
+        assert!(
+            d.refutation.is_none(),
+            "a load of memcpy-initialized bytes must not be refuted: {d:?}"
+        );
     }
 
     /// `init()`: `buf = alloc i32*4; store 7 -> buf; v = load buf` — read after

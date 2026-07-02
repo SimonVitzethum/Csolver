@@ -300,4 +300,32 @@ start:
             contracts[0].size
         );
     }
+
+    /// An integer parameter that merely sits next to a pointer (`fn(&mut State,
+    /// skipped: u64)`) is not a slice length: it neither indexes the pointer nor
+    /// appears in a comparison. Pairing it sized the pointee by an arbitrary
+    /// runtime value — refuting real field accesses (false FAIL, seen on memchr's
+    /// `PrefilterState::update`) and able to *prove* an OOB against the phantom
+    /// size (false PASS). No contract may be emitted.
+    #[test]
+    fn adjacent_integer_param_is_not_a_slice_length() {
+        let src = r#"
+define void @update(ptr align 4 %self, i64 %skipped) {
+start:
+  %a = load i32, ptr %self, align 4
+  %p = getelementptr inbounds i8, ptr %self, i64 4
+  store i32 %a, ptr %p, align 4
+  ret void
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        assert!(
+            module.param_contracts.is_empty(),
+            "no length evidence — no slice contract: {:?}",
+            module.param_contracts
+        );
+    }
+
 }
