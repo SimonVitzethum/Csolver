@@ -222,6 +222,16 @@ fn detect_slice(f: &LFunc, idx: usize) -> Option<(u32, u64)> {
     if pointer_indexed_and_dereferenced_by(f, &p.name, &len.name) {
         return None;
     }
+    // Beyond the negative check, pairing needs *positive* evidence that the
+    // integer is a length: it indexes the pointer (the one-past-end pattern) or
+    // is compared (a bounds check). An adjacent-but-unrelated integer parameter
+    // (`fn(&mut State, skipped: u64)`) must not size the pointee — that both
+    // refutes real in-bounds accesses (a false FAIL, seen on memchr) and, worse,
+    // could *prove* an out-of-bounds access against the phantom size (a false
+    // PASS, since the [slice-abi] contract is trusted).
+    if !used_as_length(f, &p.name, &len.name) {
+        return None;
+    }
     let elem_size = slice_elem_size(f, &p.name)?;
     Some(((idx + 1) as u32, elem_size))
 }
@@ -237,6 +247,26 @@ fn pointer_indexed_and_dereferenced_by(f: &LFunc, ptr_name: &str, cand: &str) ->
         matches!(inst,
             LInst::Gep { dst, base: LValue::Local(base), index: LValue::Local(ix), .. }
             if base == ptr_name && ix == cand && is_dereferenced(f, dst))
+    })
+}
+
+/// Positive evidence that `cand` acts as a length for `ptr_name`: it is the
+/// index of a `getelementptr` on the pointer (forming the one-past-end bound) or
+/// an operand of some comparison (a bounds check). Mere adjacency in the
+/// parameter list is not enough to trust the `(ptr, len)` slice ABI.
+fn used_as_length(f: &LFunc, ptr_name: &str, cand: &str) -> bool {
+    if cand.is_empty() {
+        return false;
+    }
+    f.blocks.iter().flat_map(|b| &b.insts).any(|inst| match inst {
+        LInst::Gep { base: LValue::Local(base), index: LValue::Local(ix), .. } => {
+            base == ptr_name && ix == cand
+        }
+        LInst::Icmp { a, b, .. } => {
+            matches!(a, LValue::Local(n) if n == cand)
+                || matches!(b, LValue::Local(n) if n == cand)
+        }
+        _ => false,
     })
 }
 

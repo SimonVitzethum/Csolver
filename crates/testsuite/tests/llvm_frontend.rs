@@ -609,3 +609,25 @@ fn llvm_out_of_bounds_store_is_not_pass() {
     // Soundness: must not be PASS (the access can exceed the 8-element buffer).
     assert_ne!(report.verdict, Verdict::Pass);
 }
+
+/// Positive control for every "0 FAILs on the real-crate sweep" claim: a
+/// *definite* (constant-index) out-of-bounds store through the LLVM path must
+/// verify to `FAIL` — not merely non-PASS. If this stops failing, a clean FAIL
+/// column in a sweep is a muted engine, not a clean corpus.
+#[test]
+fn llvm_definite_oob_store_fails() {
+    let src = r#"
+define void @oob() {
+start:
+  %buf = alloca [4 x i32], align 4
+  %p = getelementptr inbounds i32, ptr %buf, i64 5
+  store i32 0, ptr %p, align 4
+  ret void
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "oob".into() })
+        .expect("frontend lowers the .ll");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Fail, "a definite OOB store must FAIL");
+}
