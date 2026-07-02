@@ -132,11 +132,22 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
         map.insert(f.id, summarize_fn(f));
     }
 
+    // A call in a block that ends `Unreachable` is *diverging* (rustc's panic
+    // shape: `call @panic…; unreachable`): control never returns past it, so no
+    // caller-side code can observe its effects — the block's own path dies at
+    // the terminator, and an unwinding path re-enters only through an `invoke`
+    // cleanup edge, whose block does *not* end `Unreachable` and therefore still
+    // contaminates. Exempting these calls keeps one panic check from poisoning
+    // the effect summary of everything above it.
+    let observable = |b: &csolver_ir::BasicBlock| {
+        !matches!(b.term, csolver_ir::Terminator::Unreachable)
+    };
+
     // Any non-direct call (external symbol / indirect) may do anything.
     for f in &module.functions {
-        let opaque_call = f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            matches!(i, Inst::Call { callee, .. } if !matches!(callee, Callee::Direct(_)))
-        });
+        let opaque_call = f.blocks.iter().filter(|b| observable(b)).flat_map(|b| &b.insts).any(
+            |i| matches!(i, Inst::Call { callee, .. } if !matches!(callee, Callee::Direct(_))),
+        );
         if opaque_call {
             if let Some(s) = map.get_mut(&f.id) {
                 s.writes = true;
@@ -151,7 +162,7 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
         for f in &module.functions {
             let mut writes = map.get(&f.id).is_some_and(|s| s.writes);
             let mut frees = map.get(&f.id).is_some_and(|s| s.frees);
-            for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            for inst in f.blocks.iter().filter(|b| observable(b)).flat_map(|b| &b.insts) {
                 if let Inst::Call { callee: Callee::Direct(g), .. } = inst {
                     if let Some(sg) = map.get(g) {
                         writes |= sg.writes;
@@ -176,16 +187,30 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
 }
 
 fn summarize_fn(f: &Function) -> Summary {
-    let writes = f
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::Store { .. }));
-    let frees = f
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::Dealloc { .. }));
+    // A write/free is *caller-visible* only through memory the caller can also
+    // reach: anything but the function's own allocations. A store into a local
+    // alloca (rustc's debug IR round-trips every value through one) cannot alias
+    // any region the caller tracks — distinct allocations never alias — so it
+    // must not force the caller to discard its heap knowledge.
+    let local = local_alloc_regs(f);
+    let is_local = |op: &Operand| matches!(op, Operand::Reg(r) if local.contains(r));
+    let mut writes = false;
+    let mut frees = false;
+    for i in f.blocks.iter().flat_map(|b| &b.insts) {
+        match i {
+            Inst::Store { ptr, .. } => writes |= !is_local(ptr),
+            // A bulk write is a write (previously missed: a callee memcpy-ing
+            // into a parameter looked pure — stale caller heap, false-PASS
+            // material). Inline asm is opaque: assume both effects.
+            Inst::MemIntrinsic { dst, .. } => writes |= !is_local(dst),
+            Inst::Asm { .. } => {
+                writes = true;
+                frees = true;
+            }
+            Inst::Dealloc { ptr, .. } => frees |= !is_local(ptr),
+            _ => {}
+        }
+    }
 
     // Return characterization only for single-block functions (the common
     // wrapper/accessor shape); anything more is conservatively Unknown.
@@ -196,6 +221,41 @@ fn summarize_fn(f: &Function) -> Summary {
     };
 
     Summary { ret, writes, frees }
+}
+
+/// The registers that provably hold pointers into the function's *own*
+/// allocations: `Alloc` results, closed under `PtrOffset` / `Assign(Use)` /
+/// `Assign(Cast)` to a fixpoint. Conservative in the right direction — a
+/// register not in the set (a parameter, a loaded value, a block parameter, a
+/// call result) counts as caller-visible.
+fn local_alloc_regs(f: &Function) -> std::collections::HashSet<RegId> {
+    let mut set = std::collections::HashSet::new();
+    loop {
+        let mut changed = false;
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            let derived = match inst {
+                Inst::Alloc { dst, .. } => Some(*dst),
+                Inst::PtrOffset { dst, base: Operand::Reg(b), .. } if set.contains(b) => {
+                    Some(*dst)
+                }
+                Inst::Assign { dst, value, .. } => match value {
+                    RValue::Use(Operand::Reg(r)) | RValue::Cast { operand: Operand::Reg(r), .. }
+                        if set.contains(r) =>
+                    {
+                        Some(*dst)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(d) = derived {
+                changed |= set.insert(d);
+            }
+        }
+        if !changed {
+            return set;
+        }
+    }
 }
 
 fn ret_of_block(f: &Function) -> RetSummary {
@@ -287,6 +347,76 @@ fn eval_operand(op: &Operand, env: &HashMap<RegId, AbsVal>) -> AbsVal {
 mod tests {
     use super::*;
     use csolver_ir::{BasicBlock, BlockId, Terminator, Type};
+
+    /// A callee that memcpys into a *parameter* writes caller-visible memory —
+    /// before, only `Inst::Store` counted and such a callee looked pure, letting
+    /// the caller keep stale heap knowledge across the call (false-PASS
+    /// material). A callee that only writes its *own* alloca stays pure: rustc's
+    /// debug IR round-trips every local through one, and treating that as a
+    /// visible write would havoc the caller on every helper call.
+    #[test]
+    fn memcpy_to_a_parameter_is_a_visible_write_but_own_allocas_are_not() {
+        let p = RegId(0);
+        let buf = RegId(1);
+        let make = |dst_reg: RegId| {
+            let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+            bb0.insts.push(Inst::Alloc {
+                dst: buf,
+                region: csolver_core::RegionKind::Stack,
+                elem: Type::int(32),
+                count: Operand::int(64, 1),
+                align: 4,
+            });
+            bb0.insts.push(Inst::MemIntrinsic {
+                kind: csolver_ir::MemKind::Set,
+                dst: Operand::Reg(dst_reg),
+                src: None,
+                len: Operand::int(64, 4),
+            });
+            Function {
+                id: FuncId(0),
+                name: "m".into(),
+                params: vec![(p, Type::ptr(Type::int(32)))],
+                ret_ty: Type::Unit,
+                blocks: vec![bb0],
+                entry: BlockId(0),
+            }
+        };
+        assert!(summarize_fn(&make(p)).writes, "memset to a parameter is a visible write");
+        assert!(!summarize_fn(&make(buf)).writes, "memset to an own alloca is not");
+    }
+
+    /// A call in an `Unreachable`-terminated block (rustc's `call @panic…;
+    /// unreachable` shape) never returns control, so its effects are
+    /// unobservable by any caller — it must not contaminate the effect summary.
+    /// The same call in a *returning* block must.
+    #[test]
+    fn diverging_calls_do_not_contaminate_the_effect_summary() {
+        let make = |term: Terminator| {
+            let mut bb0 = BasicBlock::new(BlockId(0), term);
+            bb0.insts.push(Inst::Call {
+                dst: None,
+                callee: Callee::Symbol("core::panicking::panic".into()),
+                args: vec![],
+                ret_ty: Type::Unit,
+            });
+            let f = Function {
+                id: FuncId(0),
+                name: "p".into(),
+                params: vec![],
+                ret_ty: Type::Unit,
+                blocks: vec![bb0],
+                entry: BlockId(0),
+            };
+            let mut m = Module::new("m");
+            m.functions.push(f);
+            m
+        };
+        let diverging = summarize_module(&make(Terminator::Unreachable));
+        assert!(diverging[&FuncId(0)].is_pure(), "a diverging call's effects are unobservable");
+        let returning = summarize_module(&make(Terminator::Return(None)));
+        assert!(!returning[&FuncId(0)].is_pure(), "a returning opaque call must contaminate");
+    }
 
     #[test]
     fn pointer_wrapper_summary() {
