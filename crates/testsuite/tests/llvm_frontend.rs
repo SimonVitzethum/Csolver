@@ -676,3 +676,139 @@ start:
         "the store through the helper's return must prove via the summary: {caller:?}"
     );
 }
+
+/// Interprocedural contract synthesis: `@init` is `define internal`, its
+/// address is never taken, and both call sites pass constant-size allocas
+/// (32 B and 16 B). The synthesized contract is the *weakest* guarantee —
+/// 16 bytes — so `@init`'s store at offset 8 proves PASS, and the proof
+/// surfaces the dedicated `internal-call-contract` assumption.
+#[test]
+fn llvm_internal_callee_gets_a_call_site_contract() {
+    let src = r#"
+define internal void @init(ptr %p) {
+start:
+  %q = getelementptr inbounds i8, ptr %p, i64 8
+  store i32 7, ptr %q, align 4
+  ret void
+}
+
+define void @a() {
+start:
+  %buf = alloca [32 x i8], align 8
+  call void @init(ptr %buf)
+  ret void
+}
+
+define void @b() {
+start:
+  %buf = alloca [16 x i8], align 8
+  call void @init(ptr %buf)
+  ret void
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("frontend lowers the .ll");
+    let report = verify_module(&module, &Config::default());
+    let callee = report.functions.iter().find(|f| f.function == "init").expect("init");
+    assert_eq!(callee.verdict, Verdict::Pass, "store within the weakest call-site contract: {callee:?}");
+    assert!(
+        report.assumptions.iter().any(|a| a.id == "internal-call-contract"),
+        "the synthesized contract names its own trust basis"
+    );
+}
+
+/// The four ways synthesis must refuse, each a soundness condition:
+/// an *exported* callee (external callers unknown), an internal callee whose
+/// *address is taken* (indirect calls unknown), a call site whose argument is
+/// *not statically derivable*, and — the weakest-contract check — an access
+/// beyond the *minimum* of the site guarantees must stay unproven.
+#[test]
+fn llvm_contract_synthesis_refuses_unsound_cases() {
+    let verdict_of = |src: &str, fname: &str| {
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let report = verify_module(&module, &Config::default());
+        report.functions.iter().find(|f| f.function == fname).expect(fname).verdict
+    };
+
+    // Exported: not internal — external callers could pass anything.
+    let exported = r#"
+define void @init(ptr %p) {
+start:
+  store i32 7, ptr %p, align 4
+  ret void
+}
+define void @a() {
+start:
+  %buf = alloca [16 x i8], align 8
+  call void @init(ptr %buf)
+  ret void
+}
+"#;
+    assert_ne!(verdict_of(exported, "init"), Verdict::Pass, "exported callee must not inherit");
+
+    // Address taken: `@init` escapes as a value — unseen indirect call sites.
+    let escaped = r#"
+define internal void @init(ptr %p) {
+start:
+  store i32 7, ptr %p, align 4
+  ret void
+}
+define void @a() {
+start:
+  %buf = alloca [16 x i8], align 8
+  call void @init(ptr %buf)
+  call void @register(ptr @init)
+  ret void
+}
+"#;
+    assert_ne!(verdict_of(escaped, "init"), Verdict::Pass, "address-taken callee must not inherit");
+
+    // Underivable site: one caller passes a *loaded* pointer.
+    let underivable = r#"
+define internal void @init(ptr %p) {
+start:
+  store i32 7, ptr %p, align 4
+  ret void
+}
+define void @a() {
+start:
+  %buf = alloca [16 x i8], align 8
+  call void @init(ptr %buf)
+  ret void
+}
+define void @b(ptr %h) {
+start:
+  %p = load ptr, ptr %h, align 8
+  call void @init(ptr %p)
+  ret void
+}
+"#;
+    assert_ne!(verdict_of(underivable, "init"), Verdict::Pass, "one underivable site poisons");
+
+    // Weakest contract: sites pass 32 B and 8 B; the access at offset 8..12
+    // exceeds the 8-byte minimum and must stay unproven.
+    let min_fold = r#"
+define internal void @init(ptr %p) {
+start:
+  %q = getelementptr inbounds i8, ptr %p, i64 8
+  store i32 7, ptr %q, align 4
+  ret void
+}
+define void @a() {
+start:
+  %buf = alloca [32 x i8], align 8
+  call void @init(ptr %buf)
+  ret void
+}
+define void @b() {
+start:
+  %buf = alloca [8 x i8], align 8
+  call void @init(ptr %buf)
+  ret void
+}
+"#;
+    assert_ne!(verdict_of(min_fold, "init"), Verdict::Pass, "access beyond the minimum site size");
+}

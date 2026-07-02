@@ -36,6 +36,9 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
                 }
+                if f.internal {
+                    module.internal.insert(fid);
+                }
                 module.functions.push(func);
             }
             // Per-function lowering recovery: record and move on.
@@ -141,6 +144,7 @@ fn lower_function(
             (
                 idx as u32,
                 PtrContract {
+                    assumption: None,
                     size,
                     align: p.align.unwrap_or(1),
                     readable: !p.writeonly,

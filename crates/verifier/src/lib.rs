@@ -22,6 +22,7 @@
 //! emitted obligations is vacuously `PASS` *over the obligations present* — the
 //! report is always relative to the checks the frontend emitted.
 
+mod contracts;
 mod report;
 
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
@@ -81,7 +82,10 @@ pub fn verify_module(module: &Module, config: &Config) -> ModuleReport {
 /// the role Miri plays for the MIR lowering. The count trades only latency.
 pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usize) -> ModuleReport {
     let summaries = config.use_symbolic.then(|| summarize_module(module));
-    let mut functions = verify_functions(module, summaries.as_ref(), config, threads);
+    // Interprocedural: contracts synthesized from the (complete) call sites of
+    // internal functions overlay the declared ones (declared always wins).
+    let synthesized = contracts::synthesize(module);
+    let mut functions = verify_functions(module, summaries.as_ref(), &synthesized, config, threads);
 
     // Assign global obligation ids by a serial pass in function order — this
     // reproduces exactly the sequential ids a serial run would give, regardless of
@@ -148,10 +152,16 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
 fn verify_one_function(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
+    synthesized: &HashMap<(FuncId, u32), PtrContract>,
     config: &Config,
     f: &Function,
 ) -> FunctionReport {
-    let contracts = module.contracts_for(f);
+    let mut contracts = module.contracts_for(f);
+    for (i, slot) in contracts.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = synthesized.get(&(f.id, i as u32)).copied();
+        }
+    }
     let mut local_id = 0u32;
     verify_function_with(f, summaries, &contracts, config, &mut local_id)
 }
@@ -163,13 +173,17 @@ fn verify_one_function(
 fn verify_functions(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
+    synthesized: &HashMap<(FuncId, u32), PtrContract>,
     config: &Config,
     threads: usize,
 ) -> Vec<FunctionReport> {
     let fns = &module.functions;
     let n = fns.len();
     if threads <= 1 || n <= 1 {
-        return fns.iter().map(|f| verify_one_function(module, summaries, config, f)).collect();
+        return fns
+            .iter()
+            .map(|f| verify_one_function(module, summaries, synthesized, config, f))
+            .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out = std::sync::Mutex::new(Vec::<(usize, FunctionReport)>::with_capacity(n));
@@ -180,7 +194,7 @@ fn verify_functions(
                 if i >= n {
                     break;
                 }
-                let r = verify_one_function(module, summaries, config, &fns[i]);
+                let r = verify_one_function(module, summaries, synthesized, config, &fns[i]);
                 // Recover from a poisoned lock (a worker panicked) rather than
                 // cascading the panic — the collected data is still valid.
                 out.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((i, r));
@@ -229,6 +243,19 @@ fn assumption_record(id: String) -> Assumption {
                             (`&[T]`, `&mut [T; N]`, …), which the compiler guarantees and \
                             emits as LLVM parameter attributes; the proof is relative to \
                             the caller upholding the reference's validity"
+                .into(),
+        },
+        contracts::INTERNAL_CALL_CONTRACT => Assumption {
+            id,
+            statement: "an internal function's pointer parameter satisfies the weakest \
+                        contract its call sites guarantee (minimum size and alignment, \
+                        intersected permissions)"
+                .into(),
+            justification: "the function has internal linkage and its address is never \
+                            taken, so the module's direct call sites are provably all of \
+                            its call sites; every one passes a live region with at least \
+                            the synthesized size (a constant-size stack allocation or a \
+                            parameter with a declared contract, borrowed for the call)"
                 .into(),
         },
         "slice-abi" => Assumption {

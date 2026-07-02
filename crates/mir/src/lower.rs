@@ -127,6 +127,7 @@ fn lower_function(
                     contracts.push((
                         idx as u32,
                         PtrContract {
+                            assumption: None,
                             size: SizeSpec::Bytes(size),
                             align: pointee_align(inner),
                             readable: true,
@@ -140,6 +141,7 @@ fn lower_function(
                     contracts.push((
                         idx as u32,
                         PtrContract {
+                            assumption: None,
                             size: SizeSpec::Opaque,
                             align: 1,
                             readable: true,
@@ -159,6 +161,7 @@ fn lower_function(
         contracts.push((
             ptr_pos,
             PtrContract {
+                assumption: None,
                 size: SizeSpec::ParamElements { len_param: len_pos, elem_size: stride },
                 align: stride as u32,
                 readable: true,

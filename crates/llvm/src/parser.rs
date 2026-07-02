@@ -34,6 +34,9 @@ pub struct LFunc {
     pub params: Vec<LParam>,
     /// Basic blocks in textual order (the first is the entry).
     pub blocks: Vec<LBlock>,
+    /// `define internal`/`private`: the function is not visible outside this
+    /// module, so the module's call sites are all its call sites.
+    pub internal: bool,
 }
 
 /// A parsed function parameter with the attributes relevant to memory safety.
@@ -676,8 +679,12 @@ impl Parser {
 
     fn function(&mut self) -> Result<LFunc> {
         self.expect_word("define")?;
-        // Skip linkage/visibility/return attributes (`dso_local`, `noundef`,
-        // `signext`, `dereferenceable(N)`, …) up to the return type.
+        // Linkage: `internal`/`private` mean the function is invisible outside
+        // this module — captured, because it licenses call-site contract
+        // synthesis. Everything else up to the return type is skipped
+        // (`dso_local`, `noundef`, `signext`, `dereferenceable(N)`, …).
+        let internal =
+            matches!(self.peek(), Tok::Word(w) if w == "internal" || w == "private");
         self.skip_to_type()?;
         let ret = self.ltype()?;
         let name = self.global()?;
@@ -709,7 +716,7 @@ impl Parser {
         self.expect_punct('{')?;
         let blocks = self.blocks()?;
         self.expect_punct('}')?;
-        Ok(LFunc { name, ret, params, blocks })
+        Ok(LFunc { name, ret, params, blocks, internal })
     }
 
     fn blocks(&mut self) -> Result<Vec<LBlock>> {

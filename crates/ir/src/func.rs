@@ -169,6 +169,10 @@ pub struct PtrContract {
     pub readable: bool,
     /// Whether the pointee is writable (false for `readonly`).
     pub writable: bool,
+    /// Overrides the assumption id a proof resting on this contract surfaces
+    /// (`None` = the id implied by `size`, e.g. `param-contracts`). Synthesized
+    /// contracts (derived rather than declared) must name their own trust basis.
+    pub assumption: Option<&'static str>,
 }
 
 /// A module: a collection of functions plus the target data layout.
@@ -186,6 +190,12 @@ pub struct Module {
     /// `(name, reason)`. They are reported as `UNKNOWN` so the module verdict
     /// reflects that they were not verified — never a silent omission.
     pub unanalyzed: Vec<(String, String)>,
+    /// Functions with *internal linkage*: not visible outside this module, so
+    /// the module's direct call sites are provably **all** their call sites
+    /// (unless the address is taken). This is what licenses synthesizing a
+    /// parameter contract from the call sites. Frontends without linkage
+    /// information leave it empty — the sound default.
+    pub internal: std::collections::HashSet<FuncId>,
 }
 
 impl Module {
@@ -197,6 +207,7 @@ impl Module {
             layout: DataLayout::default(),
             param_contracts: HashMap::new(),
             unanalyzed: Vec::new(),
+            internal: std::collections::HashSet::new(),
         }
     }
 

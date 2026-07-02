@@ -265,7 +265,10 @@ fn discharge_inner(
                 write: c.writable,
                 exec: false,
             },
-            contract: Some(assumption),
+            // A synthesized contract names its own trust basis (e.g. the
+            // internal-call-site derivation) instead of the declared-attribute
+            // assumption its `SizeSpec` would imply.
+            contract: Some(c.assumption.unwrap_or(assumption)),
             size_nowrap: nowrap,
         });
         env.insert(
