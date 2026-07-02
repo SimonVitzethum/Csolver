@@ -51,6 +51,11 @@ struct Ctx<'a> {
     blocks: HashMap<String, BlockId>,
     func: &'a LFunc,
     func_ids: &'a HashMap<String, FuncId>,
+    /// Checked-arithmetic tuples: the result reg of an
+    /// `llvm.{s,u}{add,sub,mul}.with.overflow` call → its `(op, a, b)`, so a later
+    /// `extractvalue`'s field 0 recovers the arithmetic (field 1 is the overflow
+    /// flag, which only feeds the panic branch and stays opaque).
+    checked_arith: HashMap<String, (BinOp, LValue, LValue)>,
 }
 
 impl Ctx<'_> {
@@ -110,6 +115,7 @@ fn lower_function(
         blocks: HashMap::new(),
         func: f,
         func_ids,
+        checked_arith: checked_arith_map(f),
     };
 
     // Pre-pass: assign block ids and register ids for every defined value
@@ -319,9 +325,44 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                 to: lower_type(to),
             },
         },
+        LInst::ExtractValue { dst, agg, index } => {
+            let dst_reg = ctx.reg(dst)?;
+            // Field 0 of a checked-arith tuple is the arithmetic result; anything
+            // else (the overflow flag, or a non-checked aggregate) stays opaque —
+            // sound, and the flag only guards the panic branch.
+            let checked = match agg {
+                LValue::Local(name) if *index == 0 => ctx.checked_arith.get(name),
+                _ => None,
+            };
+            match checked {
+                Some((op, a, b)) => Inst::Assign {
+                    dst: dst_reg,
+                    ty: Type::int(64),
+                    value: RValue::Bin {
+                        op: *op,
+                        lhs: ctx.operand(a, 64)?,
+                        rhs: ctx.operand(b, 64)?,
+                    },
+                },
+                None => Inst::Assign {
+                    dst: dst_reg,
+                    ty: Type::int(64),
+                    value: RValue::Use(Operand::Const(Const::Undef)),
+                },
+            }
+        }
         LInst::Call { dst, ret, callee, args } => {
             let dst = dst.as_deref().map(|d| ctx.reg(d)).transpose()?;
-            if is_noop_intrinsic(callee) {
+            if let (Some(_), Some(d)) = (overflow_intrinsic_op(callee), dst) {
+                // A checked-arithmetic intrinsic is pure arithmetic; its tuple
+                // result is recovered field-wise at `extractvalue`, so the tuple
+                // register itself is never read — an opaque placeholder.
+                Inst::Assign {
+                    dst: d,
+                    ty: Type::int(64),
+                    value: RValue::Use(Operand::Const(Const::Undef)),
+                }
+            } else if is_noop_intrinsic(callee) {
                 // Modelled as a no-op (does not touch caller-visible memory).
                 Inst::Intrinsic { dst, name: callee.clone(), args: Vec::new() }
             } else if let Some(kind) = mem_kind(callee) {
@@ -429,6 +470,7 @@ fn inst_dst(inst: &LInst) -> Option<&str> {
         | LInst::Gep { dst, .. }
         | LInst::Bin { dst, .. }
         | LInst::Icmp { dst, .. }
+        | LInst::ExtractValue { dst, .. }
         | LInst::Cast { dst, .. } => Some(dst),
         LInst::Call { dst, .. } => dst.as_deref(),
         LInst::Store { .. } => None,
@@ -446,7 +488,43 @@ fn lower_type(ty: &LType) -> Type {
             elem: Box::new(lower_type(elem)),
             len: *n,
         },
+        // An aggregate value (e.g. a checked-arith `{iN, i1}`) is never used
+        // directly — only destructured by `extractvalue` — so a scalar placeholder
+        // suffices for the intermediate register's type.
+        LType::Struct(_) => Type::int(64),
     }
+}
+
+/// The `(op, a, b)` of every checked-arithmetic tuple in `f`, keyed by the
+/// intrinsic call's result register — so a later `extractvalue`, field 0, recovers
+/// the arithmetic (field 1, the overflow flag, stays opaque).
+fn checked_arith_map(f: &LFunc) -> HashMap<String, (BinOp, LValue, LValue)> {
+    let mut m = HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let LInst::Call { dst: Some(dst), callee, args, .. } = inst {
+                if let (Some(op), [a, b]) = (overflow_intrinsic_op(callee), args.as_slice()) {
+                    m.insert(dst.clone(), (op, a.clone(), b.clone()));
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Map `llvm.{s,u}{add,sub,mul}.with.overflow.iN` to its arithmetic op (signed vs
+/// unsigned is the same bitvector operation for memory-safety reasoning).
+fn overflow_intrinsic_op(callee: &str) -> Option<BinOp> {
+    let kind = callee.strip_prefix("llvm.")?;
+    if !kind.contains(".with.overflow.") {
+        return None;
+    }
+    Some(match kind.split('.').next()? {
+        "sadd" | "uadd" => BinOp::Add,
+        "ssub" | "usub" => BinOp::Sub,
+        "smul" | "umul" => BinOp::Mul,
+        _ => return None,
+    })
 }
 
 /// Memory-effect-free intrinsics that are modelled as no-ops (they must not

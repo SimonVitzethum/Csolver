@@ -131,4 +131,39 @@ entry:
             module.param_contracts
         );
     }
+
+    /// rustc's checked arithmetic (`x + 1` in debug) is a `{iN, i1}`
+    /// `llvm.sadd.with.overflow` + `extractvalue`; field 0 must recover the
+    /// addition (so a later use as an index/bound can be reasoned about), field 1
+    /// (the overflow flag) stays opaque.
+    #[test]
+    fn checked_arithmetic_recovers_the_operation() {
+        let src = r#"
+define i32 @add_one(i32 %x) {
+start:
+  %0 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %x, i32 1)
+  %s = extractvalue { i32, i1 } %0, 0
+  %o = extractvalue { i32, i1 } %0, 1
+  br i1 %o, label %panic, label %ok
+ok:
+  ret i32 %s
+panic:
+  ret i32 0
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let has_add = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| {
+                matches!(i, csolver_ir::Inst::Assign {
+                    value: csolver_ir::RValue::Bin { op: csolver_ir::BinOp::Add, .. }, ..
+                })
+            });
+        assert!(has_add, "checked-add field 0 must recover the addition");
+    }
 }

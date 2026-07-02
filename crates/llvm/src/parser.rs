@@ -89,6 +89,9 @@ pub enum LType {
     Array(Box<LType>, u64),
     /// `<N x T>` (a vector — modelled by its byte size).
     Vector(Box<LType>, u64),
+    /// `{ T, T, … }` (an aggregate — e.g. the `{iN, i1}` of a checked-arithmetic
+    /// intrinsic; destructured by `extractvalue`, not used directly).
+    Struct(Vec<LType>),
 }
 
 /// A parsed operand value.
@@ -143,6 +146,10 @@ pub enum LInst {
     Cast { dst: String, op: LCast, val: LValue, to: LType },
     /// `[dst =] call ret @callee(args)`.
     Call { dst: Option<String>, ret: LType, callee: String, args: Vec<LValue> },
+    /// `dst = extractvalue AGG %agg, index` — a field of an aggregate value (the
+    /// first index only; nested indices are skipped). Used to recover a
+    /// checked-arithmetic tuple's sum (index 0) and overflow flag (index 1).
+    ExtractValue { dst: String, agg: LValue, index: u32 },
 }
 
 /// A parsed terminator.
@@ -271,6 +278,20 @@ impl Parser {
                 let elem = self.ltype()?;
                 self.expect_punct('>')?;
                 LType::Vector(Box::new(elem), n as u64)
+            }
+            Tok::Punct('{') => {
+                let mut fields = Vec::new();
+                if !matches!(self.peek(), Tok::Punct('}')) {
+                    loop {
+                        fields.push(self.ltype()?);
+                        if !matches!(self.peek(), Tok::Punct(',')) {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                }
+                self.expect_punct('}')?;
+                LType::Struct(fields)
             }
             other => return Err(Error::unsupported(format!("type starting with {other:?}"))),
         };
@@ -680,6 +701,18 @@ impl Parser {
                 self.expect_punct(',')?;
                 let b = self.value()?;
                 LInst::Icmp { dst: need_dst()?, pred, ty, a, b }
+            }
+            "extractvalue" => {
+                let _agg_ty = self.ltype()?;
+                let agg = self.value()?;
+                self.expect_punct(',')?;
+                let index = self.int()? as u32;
+                // Skip nested indices (`, j, k`); the checked-arith tuple is flat.
+                while matches!(self.peek(), Tok::Punct(',')) {
+                    self.pos += 1;
+                    let _ = self.int();
+                }
+                LInst::ExtractValue { dst: need_dst()?, agg, index }
             }
             "call" => self.call(dst)?,
             "phi" => {
