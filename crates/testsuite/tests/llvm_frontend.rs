@@ -271,10 +271,10 @@ done:
   ret void
 }
 
-define i32 @uses_select(i1 %c, i32 %a, i32 %b) {
+define i32 @uses_atomic(ptr %p, i32 %v) {
 entry:
-  %r = select i1 %c, i32 %a, i32 %b
-  ret i32 %r
+  %old = atomicrmw add ptr %p, i32 %v seq_cst
+  ret i32 %old
 }
 "#;
 
@@ -290,14 +290,14 @@ fn llvm_per_function_recovery() {
     // The supported function lowered; the other is recorded as unanalyzed.
     assert_eq!(module.functions.len(), 1);
     assert_eq!(module.functions[0].name, "good");
-    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_select"));
+    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_atomic"));
 
     let report = verify_module(&module, &Config::default());
     // Module is UNKNOWN (one function not analyzed), but `good` is PASS.
     assert_eq!(report.verdict, Verdict::Unknown);
     let good = report.functions.iter().find(|f| f.function == "good").unwrap();
     assert_eq!(good.verdict, Verdict::Pass);
-    let bad = report.functions.iter().find(|f| f.function == "uses_select").unwrap();
+    let bad = report.functions.iter().find(|f| f.function == "uses_atomic").unwrap();
     assert_eq!(bad.verdict, Verdict::Unknown);
 }
 

@@ -195,4 +195,39 @@ cleanup:
         );
         assert_eq!(module.functions.len(), 1);
     }
+
+    /// `invoke` (a call with an unwind edge) plus a `getelementptr`/`inttoptr`
+    /// constant-expression argument — both pervasive in rustc IR. The function must
+    /// lower (not be dropped), and the invoke must branch to *both* its normal and
+    /// unwind-cleanup successors (so the cleanup path is analysed, not ignored).
+    #[test]
+    fn invoke_and_const_expr_do_not_drop_the_function() {
+        let src = r#"
+define i32 @f(ptr %p) personality ptr @rust_eh_personality {
+start:
+  %r = invoke i32 @g(ptr %p, ptr inttoptr (i64 7 to ptr)) to label %ok unwind label %cleanup
+ok:
+  ret i32 %r
+cleanup:
+  %e = landingpad { ptr, i32 } cleanup
+  resume { ptr, i32 } %e
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        assert!(
+            module.unanalyzed.is_empty(),
+            "invoke + const-expr must not drop the function: {:?}",
+            module.unanalyzed
+        );
+        let f = &module.functions[0];
+        // The invoke's block branches to both successors (CondBr), not just the
+        // normal one — the unwind edge is modelled.
+        let start = f.blocks.iter().find(|b| b.id == csolver_ir::BlockId(0)).unwrap();
+        assert!(
+            matches!(start.term, csolver_ir::Terminator::CondBr { .. }),
+            "invoke must branch to both its normal and unwind successors"
+        );
+    }
 }

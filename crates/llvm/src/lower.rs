@@ -163,12 +163,18 @@ fn lower_function(
                 ctx.define(dst);
             }
         }
+        // `invoke` is a terminator that also *defines* a value (`%r = invoke …`);
+        // register it here too, else the normal successor's use is undefined.
+        if let LTerm::Invoke { dst: Some(dst), .. } = &b.term {
+            ctx.define(dst);
+        }
     }
 
-    // Lower blocks.
+    // Lower blocks. (`&mut ctx`: `invoke` needs a fresh register for its
+    // unconstrained unwind-branch condition.)
     let mut blocks = Vec::with_capacity(f.blocks.len());
     for (i, b) in f.blocks.iter().enumerate() {
-        blocks.push(lower_block(&ctx, b, BlockId(i as u32))?);
+        blocks.push(lower_block(&mut ctx, b, BlockId(i as u32))?);
     }
 
     let function = Function {
@@ -248,7 +254,7 @@ fn slice_elem_size(f: &LFunc, ptr_name: &str) -> Option<u64> {
     None
 }
 
-fn lower_block(ctx: &Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
+fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
     let block_params: Vec<(RegId, Type)> = b
         .phis
         .iter()
@@ -260,7 +266,43 @@ fn lower_block(ctx: &Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         insts.push(lower_inst(ctx, inst)?);
     }
 
-    let term = lower_term(ctx, &b.label, &b.term)?;
+    let term = match &b.term {
+        // `invoke`: emit the call, then branch to *both* the normal and the
+        // unwind-cleanup successor via an unconstrained condition (a fresh,
+        // never-defined register), so the cleanup path — which may run `Drop`
+        // code — is analysed, not dropped. Modelling only the normal edge would be
+        // a false-PASS hole.
+        LTerm::Invoke { dst, ret, callee, args, ok, cleanup } => {
+            let call_dst = dst.as_deref().map(|d| ctx.reg(d)).transpose()?;
+            let callee_ir = match ctx.func_ids.get(callee) {
+                Some(id) => Callee::Direct(*id),
+                None => Callee::Symbol(callee.clone()),
+            };
+            let call_args = args
+                .iter()
+                .map(|a| ctx.operand(a, 64))
+                .collect::<Result<Vec<_>>>()?;
+            insts.push(Inst::Call {
+                dst: call_dst,
+                callee: callee_ir,
+                args: call_args,
+                ret_ty: lower_type(ret),
+            });
+            let then_args = branch_args(ctx, &b.label, ok)?;
+            let else_args = branch_args(ctx, &b.label, cleanup)?;
+            let then_blk = ctx.block(ok)?;
+            let else_blk = ctx.block(cleanup)?;
+            let cond = ctx.fresh();
+            Terminator::CondBr {
+                cond: Operand::Reg(cond),
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            }
+        }
+        _ => lower_term(ctx, &b.label, &b.term)?,
+    };
 
     Ok(BasicBlock {
         id,
@@ -439,6 +481,9 @@ fn lower_term(ctx: &Ctx, from: &str, term: &LTerm) -> Result<Terminator> {
             }
         }
         LTerm::Unreachable => Terminator::Unreachable,
+        // Handled in `lower_block` (it needs to append the call instruction);
+        // defensive and sound if ever reached directly.
+        LTerm::Invoke { .. } => Terminator::Unreachable,
     })
 }
 

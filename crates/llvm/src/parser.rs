@@ -179,6 +179,18 @@ pub enum LTerm {
     },
     /// `unreachable`.
     Unreachable,
+    /// `[dst =] invoke ret @callee(args) to label %ok unwind label %cleanup` — a
+    /// call with a normal and an unwind successor. Lowered to a `Call` instruction
+    /// plus a branch to *both* edges (the unwind/cleanup path may run `Drop` code,
+    /// whose memory safety must still be checked).
+    Invoke {
+        dst: Option<String>,
+        ret: LType,
+        callee: String,
+        args: Vec<LValue>,
+        ok: String,
+        cleanup: String,
+    },
 }
 
 /// Parse a `.ll` source into an [`LModule`].
@@ -331,6 +343,21 @@ impl Parser {
                 self.skip_balanced('{', '}')?;
                 return Ok(LValue::Undef);
             }
+            // A constant expression: an operator word (+ flags) then a
+            // parenthesised body — `getelementptr inbounds (…)`, `bitcast (…)`,
+            // `inttoptr (…)`, … . The value is opaque (memory safety needs the
+            // access, not the constant address), so consume the body and forget it.
+            Tok::Word(w) if !matches!(w.as_str(), "null" | "undef" | "poison" | "true" | "false") => {
+                let mut j = self.pos;
+                while matches!(self.toks.get(j), Some(Tok::Word(_))) {
+                    j += 1;
+                }
+                if matches!(self.toks.get(j), Some(Tok::Punct('('))) {
+                    self.pos = j;
+                    self.skip_balanced('(', ')')?;
+                    return Ok(LValue::Undef);
+                }
+            }
             _ => {}
         }
         match self.bump() {
@@ -338,7 +365,9 @@ impl Parser {
             Tok::Int(n) => Ok(LValue::Int(n)),
             Tok::Global(s) => Ok(LValue::Global(s)),
             Tok::Word(w) if w == "null" => Ok(LValue::Null),
-            Tok::Word(w) if w == "undef" || w == "poison" => Ok(LValue::Undef),
+            Tok::Word(w) if w == "undef" || w == "poison" || w == "zeroinitializer" => {
+                Ok(LValue::Undef)
+            }
             Tok::Word(w) if w == "true" => Ok(LValue::Int(1)),
             Tok::Word(w) if w == "false" => Ok(LValue::Int(0)),
             other => Err(Error::unsupported(format!("operand value {other:?}"))),
@@ -420,7 +449,14 @@ impl Parser {
                 | Tok::Punct('[')
                 | Tok::Punct('{')
                 | Tok::Eof => break,
-                Tok::Word(w) if matches!(w.as_str(), "null" | "undef" | "poison" | "true" | "false") => {
+                // A value has begun: a literal, or a constant-expression operator
+                // (whose `(…)` body would otherwise be mistaken for an attribute).
+                Tok::Word(w)
+                    if matches!(w.as_str(),
+                        "null" | "undef" | "poison" | "true" | "false" | "zeroinitializer"
+                        | "getelementptr" | "bitcast" | "inttoptr" | "ptrtoint"
+                        | "addrspacecast" | "trunc" | "zext" | "sext" | "blockaddress") =>
+                {
                     break
                 }
                 Tok::Word(w) if w == "align" => {
@@ -588,10 +624,59 @@ impl Parser {
     }
 
     fn try_terminator(&mut self) -> Result<Option<LTerm>> {
+        // `invoke` is a terminator that may bind a result: `%dst = invoke …`.
+        // Detect that form (3-token lookahead) and consume the `%dst =` prefix.
+        let invoke_dst = if matches!(self.peek(), Tok::Local(_))
+            && matches!(self.peek2(), Tok::Punct('='))
+            && matches!(self.toks.get(self.pos + 2), Some(Tok::Word(w)) if w == "invoke")
+        {
+            let d = self.local()?;
+            self.expect_punct('=')?;
+            Some(d)
+        } else {
+            None
+        };
         let kw = match self.peek() {
             Tok::Word(w) => w.clone(),
             _ => return Ok(None),
         };
+        if kw == "invoke" {
+            {
+                self.pos += 1;
+                self.skip_to_type()?;
+                let ret = self.ltype()?;
+                let callee = self.global()?;
+                self.expect_punct('(')?;
+                let mut args = Vec::new();
+                if !matches!(self.peek(), Tok::Punct(')')) {
+                    loop {
+                        let _ty = self.ltype()?;
+                        self.skip_arg_attrs()?;
+                        args.push(self.value()?);
+                        if matches!(self.peek(), Tok::Punct(',')) {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(')')?;
+                // Skip function attributes / newlines up to the `to` clause (which
+                // continues onto the next line).
+                while !matches!(self.peek(), Tok::Word(w) if w == "to")
+                    && !matches!(self.peek(), Tok::Eof | Tok::Punct('}'))
+                {
+                    self.pos += 1;
+                }
+                self.expect_word("to")?;
+                self.expect_word("label")?;
+                let ok = self.local()?;
+                self.expect_word("unwind")?;
+                self.expect_word("label")?;
+                let cleanup = self.local()?;
+                return Ok(Some(LTerm::Invoke { dst: invoke_dst, ret, callee, args, ok, cleanup }));
+            }
+        }
         match kw.as_str() {
             "ret" => {
                 self.pos += 1;
@@ -753,6 +838,20 @@ impl Parser {
                 self.skip_landingpad_clauses();
                 LInst::Opaque { dst: need_dst()? }
             }
+            "select" => {
+                // `select i1 %c, T %a, T %b`. Modelled opaquely: sound, and precise
+                // ite-recovery (to prove a select-of-in-bounds-indices) is a later
+                // refinement, not a soundness need.
+                let _cty = self.ltype()?;
+                let _c = self.value()?;
+                self.expect_punct(',')?;
+                let _aty = self.ltype()?;
+                let _a = self.value()?;
+                self.expect_punct(',')?;
+                let _bty = self.ltype()?;
+                let _b = self.value()?;
+                LInst::Opaque { dst: need_dst()? }
+            }
             "insertvalue" => {
                 // `insertvalue AGG %agg, T %val, idx…` — the resulting aggregate is
                 // modelled opaquely (its fields are recovered by `extractvalue` when
@@ -777,8 +876,8 @@ impl Parser {
             }
             other => {
                 if let Some(bop) = bin_op(other) {
-                    // Skip flags like `nuw`, `nsw`, `exact`.
-                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "exact")) {
+                    // Skip flags like `nuw`, `nsw`, `exact`, `disjoint`.
+                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "exact" | "disjoint")) {
                         self.pos += 1;
                     }
                     let ty = self.ltype()?;
