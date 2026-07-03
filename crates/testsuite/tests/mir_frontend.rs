@@ -995,3 +995,80 @@ fn parallel_verification_matches_serial() {
         assert_eq!(serial, parallel, "parallel run {run} diverges from serial (isolation leak)");
     }
 }
+
+/// A closure's `&[u8]` contract is a caller-established *precondition* (the
+/// guard lives at the call site — bytes' `get_u16` checks `remaining() >= 2`
+/// before invoking), so an unguarded fixed-size read inside the closure must
+/// NOT be refuted: the witness (`len = 1`) may never occur in the real
+/// program. The same body as a *named* (externally callable) function is a
+/// genuine finding — any safe caller can pass a 1-byte slice — and must FAIL.
+/// This pins both directions of `PtrContract::refutable`.
+#[test]
+fn mir_closure_precondition_is_prove_only_but_public_fn_still_fails() {
+    let closure = r#"
+fn Buf::get_u16::{closure#0}(_1: &[u8]) -> u8 {
+    let mut _0: u8;
+    let mut _2: usize;
+    bb0: {
+        _2 = const 1_usize;
+        _0 = (*_1)[_2];
+        return;
+    }
+}
+"#;
+    let module = lower(closure, "m");
+    let report = verify_module(&module, &Config::default());
+    let f = &report.functions[0];
+    assert!(f.function.contains("closure"), "fixture is a closure: {}", f.function);
+    assert_ne!(
+        f.verdict,
+        Verdict::Fail,
+        "a precondition contract must not be refuted: {f:?}"
+    );
+
+    let public = r#"
+fn second_byte(_1: &[u8]) -> u8 {
+    let mut _0: u8;
+    let mut _2: usize;
+    bb0: {
+        _2 = const 1_usize;
+        _0 = (*_1)[_2];
+        return;
+    }
+}
+"#;
+    let module = lower(public, "m");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(
+        report.functions[0].verdict,
+        Verdict::Fail,
+        "an externally callable fn reading s[1] of an arbitrary slice is a real finding"
+    );
+}
+
+/// Sibling closures must keep distinct names (`{closure#0}` vs `{closure#1}`)
+/// — a report that calls every closure "closure" cannot locate a finding.
+#[test]
+fn mir_sibling_closures_keep_distinct_names() {
+    let src = r#"
+fn A::f::{closure#0}(_1: i32) -> i32 {
+    let mut _0: i32;
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+
+fn A::f::{closure#1}(_1: i32) -> i32 {
+    let mut _0: i32;
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+"#;
+    let module = lower(src, "m");
+    let names: Vec<_> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"A::f{closure#0}"), "{names:?}");
+    assert!(names.contains(&"A::f{closure#1}"), "{names:?}");
+}

@@ -291,10 +291,30 @@ impl Parser {
         if self.peek() == &Tok::Punct('<') {
             self.skip_balanced_angle();
         }
+        // Accumulate the full path (`Buf::get_u16::{closure#0}::{closure#0}`),
+        // not just the last segment: distinct closures must keep distinct names,
+        // or every closure in a crate reports as "closure" and a finding cannot
+        // be located.
         let mut name = String::new();
         while !matches!(self.peek(), Tok::Punct('(') | Tok::Eof) {
-            if let Tok::Word(w) = self.peek() {
-                name = w.clone();
+            match self.peek() {
+                Tok::Word(w) => {
+                    if !name.is_empty() && !name.ends_with('{') {
+                        name.push_str("::");
+                    }
+                    name.push_str(w);
+                }
+                // `{closure#0}` / `{constant#0}` — anonymous item segments. The
+                // lexer drops the `#` sigil, so the index arrives as a bare Int
+                // inside the open brace group; keep it, or sibling closures
+                // collide.
+                Tok::Punct('{') => name.push('{'),
+                Tok::Int(n) if name.rfind('{') > name.rfind('}') => {
+                    name.push('#');
+                    name.push_str(&n.to_string());
+                }
+                Tok::Punct('}') => name.push('}'),
+                _ => {}
             }
             self.pos += 1;
         }

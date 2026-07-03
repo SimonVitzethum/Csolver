@@ -180,6 +180,7 @@ fn lower_function(
                 idx as u32,
                 PtrContract {
                     assumption: None,
+                    refutable: true,
                     size,
                     align: p.align.unwrap_or(1),
                     readable: !p.writeonly,

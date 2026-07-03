@@ -173,6 +173,15 @@ pub struct PtrContract {
     /// (`None` = the id implied by `size`, e.g. `param-contracts`). Synthesized
     /// contracts (derived rather than declared) must name their own trust basis.
     pub assumption: Option<&'static str>,
+    /// Whether a violation against this contract's size may be *refuted* (a
+    /// definite FAIL with a witness). True for the declared contract of an
+    /// externally-callable function — any safe caller can realize the witness.
+    /// **False when the contract is a caller-established precondition** (an
+    /// internal function or closure: the guard lives at the call sites, so a
+    /// witness picked freely from the parameter space may be infeasible in the
+    /// real program — refuting there is a false FAIL). Prove-only contracts
+    /// still prove; they never refute.
+    pub refutable: bool,
 }
 
 /// A module: a collection of functions plus the target data layout.

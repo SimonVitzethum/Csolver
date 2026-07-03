@@ -161,6 +161,15 @@ fn verify_one_function(
         if slot.is_none() {
             *slot = synthesized.get(&(f.id, i as u32)).copied();
         }
+        // An internal function's (or closure's) contract is a caller-established
+        // precondition: the guard lives at the call sites, so a witness picked
+        // freely from the parameter space may never occur in the real program.
+        // Prove-only — refuting it reported false FAILs on bytes' closures.
+        if module.internal.contains(&f.id) {
+            if let Some(c) = slot {
+                c.refutable = false;
+            }
+        }
     }
     let mut local_id = 0u32;
     verify_function_with(f, summaries, &contracts, &module.globals, config, &mut local_id)

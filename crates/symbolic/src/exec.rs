@@ -320,6 +320,10 @@ fn discharge_inner(
             // prove-only (no refutation — `size_nowrap = None`).
             SizeSpec::Opaque => (ex.fresh_scalar(PTR_WIDTH), STRUCT_ABI, None),
         };
+        // A precondition-style contract (internal function / closure /
+        // synthesized minimum) proves but never refutes: `size_nowrap = None`
+        // switches the in-bounds obligation to prove-only.
+        let nowrap = if c.refutable { nowrap } else { None };
         let zero = ex.ctx.int(PTR_WIDTH, 0);
         let nonneg = ex.ctx.cmp(SCmp::Sle, zero, size);
         facts.push(nonneg);

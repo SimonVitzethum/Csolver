@@ -35,6 +35,14 @@ pub(crate) fn lower_module(bodies: &[MirBody], failed: &[(String, String)], name
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
                 }
+                // A closure has an unnameable type: nothing outside its defining
+                // crate item can call it, so it has internal linkage in effect.
+                // Its parameter contracts are caller-established *preconditions*
+                // (the guard lives at the call site), which licenses treating
+                // them as prove-only (see `PtrContract::refutable`).
+                if body.name.contains("{closure") {
+                    module.internal.insert(fid);
+                }
                 module.functions.push(func);
             }
             Err(e) => module.unanalyzed.push((body.name.clone(), e.to_string())),
@@ -128,6 +136,7 @@ fn lower_function(
                         idx as u32,
                         PtrContract {
                             assumption: None,
+                            refutable: true,
                             size: SizeSpec::Bytes(size),
                             align: pointee_align(inner),
                             readable: true,
@@ -142,6 +151,7 @@ fn lower_function(
                         idx as u32,
                         PtrContract {
                             assumption: None,
+                            refutable: true,
                             size: SizeSpec::Opaque,
                             align: 1,
                             readable: true,
@@ -162,6 +172,7 @@ fn lower_function(
             ptr_pos,
             PtrContract {
                 assumption: None,
+                refutable: true,
                 size: SizeSpec::ParamElements { len_param: len_pos, elem_size: stride },
                 align: stride as u32,
                 readable: true,

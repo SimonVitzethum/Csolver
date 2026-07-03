@@ -167,6 +167,10 @@ fn synthesize_round(
                     readable: g.readable,
                     writable: g.writable,
                     assumption: Some(INTERNAL_CALL_CONTRACT),
+                    // A synthesized contract is the *weakest* call-site
+                    // guarantee; a witness against it may combine argument
+                    // values no single caller produces — prove-only.
+                    refutable: false,
                 },
             ))
         })
