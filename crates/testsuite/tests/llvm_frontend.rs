@@ -928,3 +928,102 @@ start:
 "#;
     assert_eq!(verdict_of(write_mut), Verdict::Pass, "a mutable global is writable");
 }
+
+/// Optimized-IR constructs, in one fixture: `icmp samesign`, `freeze`,
+/// `insertelement`, a `metadata` call argument, and a hyphenated block label
+/// (`bb9thread-pre-split.i`, from jump threading) — each previously dropped the
+/// whole function.
+#[test]
+fn llvm_optimized_ir_constructs_parse() {
+    let src = r#"
+define i64 @f(i64 %x, ptr %p) {
+start:
+  %c = icmp samesign ult i64 %x, 8
+  %fz = freeze i64 %x
+  %v = insertelement <2 x i64> poison, i64 %fz, i64 0
+  call void @llvm.experimental.noalias.scope.decl(metadata !3)
+  br i1 %c, label %bb9thread-pre-split.i, label %done
+bb9thread-pre-split.i:
+  ret i64 %fz
+done:
+  ret i64 0
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("lower");
+    assert!(module.unanalyzed.is_empty(), "all constructs parse: {:?}", module.unanalyzed);
+}
+
+/// A `switch`'s *default* edge carries `value != k` for every case. Without it
+/// a refutation on the default path could pick a case value — an infeasible
+/// witness, seen as a false FAIL on rustc's jump-threaded slice-length
+/// switches: `switch len [0 → ret, 1 → ret]; default: load slice[1]` is
+/// reachable only with `len >= 2`, so the load must NOT be refuted. The
+/// positive control: the same load *without* the switch guard stays refutable
+/// through the case edge that reaches it.
+#[test]
+fn llvm_switch_default_edge_constrains_the_scrutinee() {
+    let guarded = r#"
+define i8 @get(ptr align 1 %s, i64 %len) {
+start:
+  %c = icmp ult i64 1, %len
+  switch i64 %len, label %big [
+    i64 0, label %empty
+    i64 1, label %empty
+  ]
+big:
+  %p = getelementptr inbounds i8, ptr %s, i64 1
+  %v = load i8, ptr %p, align 1
+  ret i8 %v
+empty:
+  ret i8 0
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: guarded.into(), name: "m".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    let f = &report.functions[0];
+    assert!(
+        f.outcomes.iter().all(|o| o.verdict() != Verdict::Fail),
+        "the default edge implies len >= 2 — no obligation may be refuted: {f:?}"
+    );
+}
+
+/// A struct-field gep (`gep {S}, ptr, i64 %i, i32 K`) strides by `sizeof(S)`
+/// and lands on the *exact padded field offset*. `{ i32, i64 }` pads field 1
+/// to offset 8 (size 16): with `%i < 2` over a 32-byte table the access
+/// proves; without the guard it must not (the offset arithmetic is real).
+#[test]
+fn llvm_struct_field_gep_uses_the_padded_offset() {
+    let make = |guarded: bool| {
+        let guard = if guarded {
+            "  %c = icmp ult i64 %i, 2\n  br i1 %c, label %ok, label %out\nok:\n"
+        } else {
+            "  br label %ok\nok:\n"
+        };
+        format!(
+            r#"
+@table = internal constant [2 x {{ i32, i64 }}] zeroinitializer, align 8
+
+define i64 @snd(i64 %i) {{
+start:
+{guard}  %p = getelementptr inbounds {{ i32, i64 }}, ptr @table, i64 %i, i32 1
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+out:
+  ret i64 0
+}}
+"#
+        )
+    };
+    let verdict = |src: String| {
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src, name: "m".into() })
+            .expect("lower");
+        verify_module(&module, &Config::default()).verdict
+    };
+    assert_eq!(verdict(make(true)), Verdict::Pass, "guarded field access proves");
+    assert_ne!(verdict(make(false)), Verdict::Pass, "unguarded index must not prove");
+}

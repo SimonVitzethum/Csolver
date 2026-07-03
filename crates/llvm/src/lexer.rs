@@ -162,7 +162,10 @@ fn is_word_start(b: u8) -> bool {
 }
 
 fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$'
+    // `-` is a valid LLVM identifier byte (`%bb9thread-pre-split.i`, emitted by
+    // jump threading). A *leading* `-` still lexes as a number/punct, so
+    // negative literals are unaffected.
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$' || b == b'-'
 }
 
 fn str_of(bytes: &[u8]) -> String {

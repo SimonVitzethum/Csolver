@@ -1120,11 +1120,27 @@ impl Explorer<'_> {
                     });
                 }
                 if !self.is_back_edge(block, *default) {
-                    incoming.entry(*default).or_default().push(EdgeState {
-                        pred_state: state,
-                        guard: None,
-                        args: Vec::new(),
-                    });
+                    // The default edge carries `value != k` for every case.
+                    // Omitting it was sound for proofs (over-approximation) but
+                    // let a *refutation* on the default path pick a case value —
+                    // an infeasible witness, i.e. a false FAIL (seen on rustc's
+                    // jump-threaded slice-length switches).
+                    let ne: Vec<ExprId> = cases
+                        .iter()
+                        .map(|(cv, _)| {
+                            let k = self.ctx.constant(*cv);
+                            let eq = self.ctx.cmp(SCmp::Eq, ve, k);
+                            self.ctx.not(eq)
+                        })
+                        .collect();
+                    let guard = self.ctx.and(ne);
+                    if !self.branch_infeasible(guard, &state) {
+                        incoming.entry(*default).or_default().push(EdgeState {
+                            pred_state: state,
+                            guard: Some(guard),
+                            args: Vec::new(),
+                        });
+                    }
                 }
             }
         }

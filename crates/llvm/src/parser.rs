@@ -127,6 +127,9 @@ pub enum LType {
     /// Resolved by [`Parser::ltype`] against the collected definitions before it
     /// leaves the parser; reaching the lowering unresolved is a parser bug.
     Named(String),
+    /// `metadata` — a compiler-annotation operand (`llvm.assume`,
+    /// `llvm.experimental.noalias.scope.decl`, …). Zero-sized; never memory.
+    Metadata,
 }
 
 /// A parsed operand value.
@@ -195,6 +198,11 @@ pub enum LInst {
     /// first index only; nested indices are skipped). Used to recover a
     /// checked-arithmetic tuple's sum (index 0) and overflow flag (index 1).
     ExtractValue { dst: String, agg: LValue, index: u32 },
+    /// `dst = getelementptr {S}, ptr base, iN index, i32 field` — an array-of-
+    /// structs element's *field*: `base + index * sizeof(S) + offsetof(S, field)`.
+    /// Lowered as a two-step pointer-offset chain with the exact padded field
+    /// offset (a dropped field offset would misplace every subsequent access).
+    GepField { dst: String, struct_ty: LType, base: LValue, index: LValue, field: u32 },
     /// A value the frontend models opaquely — e.g. `landingpad`'s exception
     /// object, which carries no memory-safety content. Lowered to `undef` (sound;
     /// unconstrained), so a function that merely has an unwind-cleanup path is
@@ -396,6 +404,7 @@ impl Parser {
     fn ltype_raw(&mut self) -> Result<LType> {
         let mut ty = match self.bump() {
             Tok::Word(w) if w == "void" => LType::Void,
+            Tok::Word(w) if w == "metadata" => LType::Metadata,
             Tok::Word(w) if w == "ptr" => LType::Ptr,
             Tok::Word(w) if is_int_type(&w) => LType::Int(int_bits(&w)?),
             // Floating-point types carry no memory-safety content; model them as
@@ -507,6 +516,15 @@ impl Parser {
                 }
             }
             _ => {}
+        }
+        // A metadata reference (`!5`, `!name`, `!{…}`): an annotation, not a value.
+        if matches!(self.peek(), Tok::Punct('!')) {
+            self.pos += 1;
+            match self.peek() {
+                Tok::Punct('{') => self.skip_balanced('{', '}')?,
+                _ => self.pos += 1,
+            }
+            return Ok(LValue::Undef);
         }
         match self.bump() {
             Tok::Local(s) => Ok(LValue::Local(s)),
@@ -1145,6 +1163,8 @@ impl Parser {
             }
             "getelementptr" => self.gep(need_dst()?)?,
             "icmp" => {
+                // `samesign` is an optimization-hint flag, not a predicate.
+                let _ = self.eat_word("samesign");
                 let pred = self.pred()?;
                 let ty = self.ltype()?;
                 let a = self.value()?;
@@ -1205,6 +1225,12 @@ impl Parser {
                 let phi = self.phi(need_dst()?)?;
                 return Ok(InstOrPhi::Phi(phi));
             }
+            "insertelement" | "extractelement" | "shufflevector" | "freeze" => {
+                // Vector shuffling and `freeze` produce values with no
+                // memory-safety content of their own — opaque; the operands are
+                // consumed by the block loop's `skip_to_eol`.
+                LInst::Opaque { dst: need_dst()? }
+            }
             other if is_float_op(other) => {
                 // Float arithmetic/casts/compares produce an opaque scalar. The
                 // operands are left for `skip_to_eol` (run after every
@@ -1260,9 +1286,19 @@ impl Parser {
             (_, [idx]) => (base_ty.clone(), idx.clone()),
             // `gep [N x T], ptr, 0, idx` — array element.
             (LType::Array(elem, _), [_, idx]) => ((**elem).clone(), idx.clone()),
+            // `gep {S}, ptr, idx, K` — field K of the idx-th struct.
+            (LType::Struct(_), [idx, LValue::Int(k)]) if *k >= 0 => {
+                return Ok(LInst::GepField {
+                    dst,
+                    struct_ty: base_ty.clone(),
+                    base,
+                    index: idx.clone(),
+                    field: *k as u32,
+                });
+            }
             _ => {
                 return Err(Error::unsupported(
-                    "getelementptr with a shape outside {single index, [N x T] array}",
+                    "getelementptr with a shape outside {single index, [N x T] array, struct field}",
                 ))
             }
         };

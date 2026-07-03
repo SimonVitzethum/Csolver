@@ -342,6 +342,29 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
 
     let mut insts = Vec::new();
     for inst in &b.insts {
+        // A struct-field gep expands to a two-step chain: element stride, then
+        // the exact padded field offset (needs a fresh intermediate register,
+        // hence handled here rather than in the single-instruction lowering).
+        if let LInst::GepField { dst, struct_ty, base, index, field } = inst {
+            let s_ty = lower_type(struct_ty);
+            let off = struct_field_offset(&s_ty, *field).ok_or_else(|| {
+                Error::unsupported("struct-field gep with an unsizable field offset")
+            })?;
+            let tmp = ctx.fresh();
+            insts.push(Inst::PtrOffset {
+                dst: tmp,
+                base: ctx.operand(base, 64)?,
+                index: ctx.operand(index, 64)?,
+                elem: s_ty,
+            });
+            insts.push(Inst::PtrOffset {
+                dst: ctx.reg(dst)?,
+                base: Operand::Reg(tmp),
+                index: Operand::int(64, off as u128),
+                elem: Type::int(8),
+            });
+            continue;
+        }
         insts.push(lower_inst(ctx, inst)?);
     }
 
@@ -446,6 +469,10 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                 to: lower_type(to),
             },
         },
+        // Expanded to a two-instruction chain in `lower_block`; unreachable here.
+        LInst::GepField { .. } => {
+            return Err(Error::unsupported("struct-field gep outside lower_block"))
+        }
         LInst::Opaque { dst } => Inst::Assign {
             dst: ctx.reg(dst)?,
             ty: Type::int(64),
@@ -592,6 +619,22 @@ fn branch_args(ctx: &Ctx, from: &str, to: &str) -> Result<Vec<Operand>> {
     Ok(args)
 }
 
+/// The padded byte offset of `field` inside struct type `s` (LP64 layout) —
+/// the same alignment rule the IR's own `Type::Struct` sizing uses.
+fn struct_field_offset(s: &Type, field: u32) -> Option<u64> {
+    let Type::Struct { fields } = s else { return None };
+    let mut offset: u64 = 0;
+    for (i, f) in fields.iter().enumerate() {
+        let align = f.align_bytes(&LAYOUT)?.max(1);
+        offset = offset.checked_add(align - 1)? / align * align;
+        if i as u32 == field {
+            return Some(offset);
+        }
+        offset = offset.checked_add(f.size_bytes(&LAYOUT)?)?;
+    }
+    None
+}
+
 fn inst_dst(inst: &LInst) -> Option<&str> {
     match inst {
         LInst::Alloca { dst, .. }
@@ -601,6 +644,7 @@ fn inst_dst(inst: &LInst) -> Option<&str> {
         | LInst::Icmp { dst, .. }
         | LInst::ExtractValue { dst, .. }
         | LInst::Opaque { dst, .. }
+        | LInst::GepField { dst, .. }
         | LInst::Cast { dst, .. } => Some(dst),
         LInst::Call { dst, .. } => dst.as_deref(),
         LInst::Store { .. } => None,
@@ -610,6 +654,8 @@ fn inst_dst(inst: &LInst) -> Option<&str> {
 fn lower_type(ty: &LType) -> Type {
     match ty {
         LType::Void => Type::Unit,
+        // Compiler-annotation operands: zero-sized, never memory.
+        LType::Metadata => Type::Unit,
         LType::Int(bits) => Type::int(*bits),
         LType::Ptr => Type::ptr(Type::Unit),
         // A vector is modelled by its byte footprint, like an array of the same
