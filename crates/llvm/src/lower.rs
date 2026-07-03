@@ -263,11 +263,13 @@ fn detect_slice(f: &LFunc, idx: usize) -> Option<(u32, u64)> {
     }
     // Beyond the negative check, pairing needs *positive* evidence that the
     // integer is a length: it indexes the pointer (the one-past-end pattern) or
-    // is compared (a bounds check). An adjacent-but-unrelated integer parameter
-    // (`fn(&mut State, skipped: u64)`) must not size the pointee — that both
-    // refutes real in-bounds accesses (a false FAIL, seen on memchr) and, worse,
-    // could *prove* an out-of-bounds access against the phantom size (a false
-    // PASS, since the [slice-abi] contract is trusted).
+    // bounds a value that does (`icmp x, len` + `gep ptr, x`; see
+    // `used_as_length`). An adjacent-but-unrelated integer parameter — an index
+    // (`fn(&[T; N], i)`), a plain scalar (`fn(&mut State, skipped: u64)`), or a
+    // compared-but-never-indexing mask (hashbrown's `bucket_mask`) — must not
+    // size the pointee: that both refutes real in-bounds accesses (a false
+    // FAIL) and, worse, could *prove* an out-of-bounds access against the
+    // phantom size (a false PASS, since the [slice-abi] contract is trusted).
     if !used_as_length(f, &p.name, &len.name) {
         return None;
     }
@@ -297,15 +299,30 @@ fn used_as_length(f: &LFunc, ptr_name: &str, cand: &str) -> bool {
     if cand.is_empty() {
         return false;
     }
-    f.blocks.iter().flat_map(|b| &b.insts).any(|inst| match inst {
-        LInst::Gep { base: LValue::Local(base), index: LValue::Local(ix), .. } => {
-            base == ptr_name && ix == cand
-        }
-        LInst::Icmp { a, b, .. } => {
-            matches!(a, LValue::Local(n) if n == cand)
-                || matches!(b, LValue::Local(n) if n == cand)
-        }
-        _ => false,
+    let geps_ptr = |name: &str| {
+        f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+            matches!(inst,
+                LInst::Gep { base: LValue::Local(base), index: LValue::Local(ix), .. }
+                if base == ptr_name && ix == name)
+        })
+    };
+    // The one-past-end pattern: the length itself indexes the pointer.
+    if geps_ptr(cand) {
+        return true;
+    }
+    // The bounds-checked-index pattern: a value compared against `cand` must
+    // itself index the pointer. A comparison *alone* is not evidence —
+    // hashbrown's `(ptr %self, i64 %bucket_mask)` compares the mask against a
+    // loaded field without ever indexing `self` by it; pairing there sized the
+    // struct by the mask and refuted a real field access (a false FAIL).
+    f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+        let LInst::Icmp { a, b, .. } = inst else { return false };
+        let other = match (a, b) {
+            (LValue::Local(n), LValue::Local(o)) if n == cand => o,
+            (LValue::Local(o), LValue::Local(n)) if n == cand => o,
+            _ => return false,
+        };
+        geps_ptr(other)
     })
 }
 
@@ -342,6 +359,36 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
 
     let mut insts = Vec::new();
     for inst in &b.insts {
+        // An atomic RMW is, at this abstraction, a load (the returned old
+        // value — kept only for `atomicrmw`; cmpxchg's tuple stays opaque) plus
+        // a store of an unknown value. Both accesses carry their full memory
+        // obligations; an opaque placeholder would silently drop them (an
+        // unchecked OOB atomicrmw would be a false PASS one level up).
+        if let LInst::AtomicRmw { dst, ty, ptr, tuple } = inst {
+            let msir_ty = lower_type(ty);
+            let align = msir_ty.align_bytes(&LAYOUT).unwrap_or(1) as u32;
+            let old_dst = if *tuple { ctx.fresh() } else { ctx.reg(dst)? };
+            insts.push(Inst::Load {
+                dst: old_dst,
+                ty: msir_ty.clone(),
+                ptr: ctx.operand(ptr, 64)?,
+                align,
+            });
+            insts.push(Inst::Store {
+                ty: msir_ty,
+                ptr: ctx.operand(ptr, 64)?,
+                value: Operand::Const(Const::Undef),
+                align,
+            });
+            if *tuple {
+                insts.push(Inst::Assign {
+                    dst: ctx.reg(dst)?,
+                    ty: Type::int(64),
+                    value: RValue::Use(Operand::Const(Const::Undef)),
+                });
+            }
+            continue;
+        }
         // A struct-field gep expands to a two-step chain: element stride, then
         // the exact padded field offset (needs a fresh intermediate register,
         // hence handled here rather than in the single-instruction lowering).
@@ -469,9 +516,9 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                 to: lower_type(to),
             },
         },
-        // Expanded to a two-instruction chain in `lower_block`; unreachable here.
-        LInst::GepField { .. } => {
-            return Err(Error::unsupported("struct-field gep outside lower_block"))
+        // Expanded to instruction chains in `lower_block`; unreachable here.
+        LInst::GepField { .. } | LInst::AtomicRmw { .. } => {
+            return Err(Error::unsupported("multi-instruction lowering outside lower_block"))
         }
         LInst::Opaque { dst } => Inst::Assign {
             dst: ctx.reg(dst)?,
@@ -645,6 +692,7 @@ fn inst_dst(inst: &LInst) -> Option<&str> {
         | LInst::ExtractValue { dst, .. }
         | LInst::Opaque { dst, .. }
         | LInst::GepField { dst, .. }
+        | LInst::AtomicRmw { dst, .. }
         | LInst::Cast { dst, .. } => Some(dst),
         LInst::Call { dst, .. } => dst.as_deref(),
         LInst::Store { .. } => None,

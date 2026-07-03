@@ -271,9 +271,11 @@ done:
   ret void
 }
 
-define i32 @uses_atomic(ptr %p, i32 %v) {
+define i32 @uses_callbr(ptr %p, i32 %v) {
 entry:
-  %old = atomicrmw add ptr %p, i32 %v seq_cst
+  callbr void asm "", ""() to label %done []
+done:
+  %old = add i32 %v, 1
   ret i32 %old
 }
 "#;
@@ -290,14 +292,14 @@ fn llvm_per_function_recovery() {
     // The supported function lowered; the other is recorded as unanalyzed.
     assert_eq!(module.functions.len(), 1);
     assert_eq!(module.functions[0].name, "good");
-    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_atomic"));
+    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_callbr"));
 
     let report = verify_module(&module, &Config::default());
     // Module is UNKNOWN (one function not analyzed), but `good` is PASS.
     assert_eq!(report.verdict, Verdict::Unknown);
     let good = report.functions.iter().find(|f| f.function == "good").unwrap();
     assert_eq!(good.verdict, Verdict::Pass);
-    let bad = report.functions.iter().find(|f| f.function == "uses_atomic").unwrap();
+    let bad = report.functions.iter().find(|f| f.function == "uses_callbr").unwrap();
     assert_eq!(bad.verdict, Verdict::Unknown);
 }
 
@@ -1026,4 +1028,41 @@ out:
     };
     assert_eq!(verdict(make(true)), Verdict::Pass, "guarded field access proves");
     assert_ne!(verdict(make(false)), Verdict::Pass, "unguarded index must not prove");
+}
+
+/// `atomicrmw`/`cmpxchg` are read-modify-writes: both accesses carry their
+/// full memory obligations (an opaque placeholder would silently drop them —
+/// an unchecked OOB atomicrmw would be a false PASS one level up). A guarded
+/// in-bounds RMW on an alloca proves; a definitely-OOB one FAILs.
+#[test]
+fn llvm_atomic_rmw_keeps_obligations_both_directions() {
+    let verdict_of = |src: &str| {
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        verify_module(&module, &Config::default()).verdict
+    };
+
+    let ok = r#"
+define i64 @bump(i64 %v) {
+start:
+  %cell = alloca [8 x i8], align 8
+  store i64 0, ptr %cell, align 8
+  %old = atomicrmw add ptr %cell, i64 %v monotonic, align 8
+  %pair = cmpxchg ptr %cell, i64 0, i64 1 acquire acquire, align 8
+  ret i64 %old
+}
+"#;
+    assert_eq!(verdict_of(ok), Verdict::Pass, "in-bounds RMWs on a live alloca prove");
+
+    let oob = r#"
+define void @past(i32 %v) {
+start:
+  %cell = alloca [4 x i8], align 4
+  %p = getelementptr inbounds i8, ptr %cell, i64 2
+  %old = atomicrmw add ptr %p, i32 %v monotonic, align 4
+  ret void
+}
+"#;
+    assert_eq!(verdict_of(oob), Verdict::Fail, "an OOB atomicrmw (2..6 of 4) must FAIL");
 }

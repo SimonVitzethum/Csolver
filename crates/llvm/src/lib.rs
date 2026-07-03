@@ -326,6 +326,53 @@ start:
             "no length evidence — no slice contract: {:?}",
             module.param_contracts
         );
+
+        // hashbrown's shape: the integer is *compared* against a loaded field
+        // but never bounds anything that indexes the pointer — a mask, not a
+        // length. Comparison alone must not pair (it sized `*self` by the mask
+        // and refuted a real field access). The control: the same comparison
+        // against a value that *does* index the pointer is the genuine
+        // bounds-checked-slice pattern and must still pair.
+        let mask = r#"
+define void @move_next(ptr align 8 %self, i64 %bucket_mask) {
+start:
+  %f = getelementptr inbounds i8, ptr %self, i64 8
+  %v = load i64, ptr %f, align 8
+  %c = icmp ule i64 %v, %bucket_mask
+  ret void
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: mask.into(), name: "m".into() })
+            .expect("lower");
+        assert!(
+            module.param_contracts.is_empty(),
+            "a compared-but-never-indexing mask is not a length: {:?}",
+            module.param_contracts
+        );
+
+        let slice = r#"
+define i8 @get(ptr align 1 %s, i64 %len, i64 %i) {
+start:
+  %c = icmp ult i64 %i, %len
+  br i1 %c, label %ok, label %out
+ok:
+  %p = getelementptr inbounds i8, ptr %s, i64 %i
+  %v = load i8, ptr %p, align 1
+  ret i8 %v
+out:
+  ret i8 0
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: slice.into(), name: "m".into() })
+            .expect("lower");
+        assert_eq!(
+            module.param_contracts.len(),
+            1,
+            "the bounds-checked-index pattern still pairs: {:?}",
+            module.param_contracts
+        );
     }
 
     /// Named struct types (`%"core::fmt::rt::Argument<'_>" = type { … }`) must

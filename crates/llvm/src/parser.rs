@@ -198,6 +198,12 @@ pub enum LInst {
     /// first index only; nested indices are skipped). Used to recover a
     /// checked-arithmetic tuple's sum (index 0) and overflow flag (index 1).
     ExtractValue { dst: String, agg: LValue, index: u32 },
+    /// `dst = atomicrmw <op> ptr p, T v <ord>` / `dst = cmpxchg ptr p, T c, T n
+    /// <ord> <ord>` — an atomic read-modify-write of `sizeof(T)` bytes at `p`.
+    /// At this abstraction both are a *load* (the returned old value) plus a
+    /// *store* of an unknown value; `tuple` marks cmpxchg's `{T, i1}` result,
+    /// which stays opaque (destructured by `extractvalue`).
+    AtomicRmw { dst: String, ty: LType, ptr: LValue, tuple: bool },
     /// `dst = getelementptr {S}, ptr base, iN index, i32 field` — an array-of-
     /// structs element's *field*: `base + index * sizeof(S) + offsetof(S, field)`.
     /// Lowered as a two-step pointer-offset chain with the exact padded field
@@ -1224,6 +1230,34 @@ impl Parser {
             "phi" => {
                 let phi = self.phi(need_dst()?)?;
                 return Ok(InstOrPhi::Phi(phi));
+            }
+            "atomicrmw" => {
+                let _ = self.eat_word("volatile");
+                // The RMW operator (`add`, `xchg`, `umax`, …).
+                let _op = match self.bump() {
+                    Tok::Word(w) => w,
+                    other => return Err(Error::parse(format!("expected atomicrmw op, found {other:?}"))),
+                };
+                let _pty = self.ltype()?; // `ptr`
+                let ptr = self.value()?;
+                self.expect_punct(',')?;
+                let ty = self.ltype()?;
+                let _val = self.value()?;
+                self.skip_atomic_ordering();
+                LInst::AtomicRmw { dst: need_dst()?, ty, ptr, tuple: false }
+            }
+            "cmpxchg" => {
+                while self.eat_word("weak") || self.eat_word("volatile") {}
+                let _pty = self.ltype()?; // `ptr`
+                let ptr = self.value()?;
+                self.expect_punct(',')?;
+                let ty = self.ltype()?;
+                let _cmp = self.value()?;
+                self.expect_punct(',')?;
+                let _nty = self.ltype()?;
+                let _new = self.value()?;
+                self.skip_atomic_ordering(); // consumes both orderings
+                LInst::AtomicRmw { dst: need_dst()?, ty, ptr, tuple: true }
             }
             "insertelement" | "extractelement" | "shufflevector" | "freeze" => {
                 // Vector shuffling and `freeze` produce values with no
