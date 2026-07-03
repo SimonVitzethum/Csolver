@@ -393,7 +393,9 @@ fn eval_operand(op: &Operand, state: &IntervalState) -> Interval {
         // which unsoundly proved e.g. `-1 >= 0` (a false PASS).
         Operand::Const(Const::Int(bv)) => Interval::singleton(bv.signed()),
         Operand::Const(Const::Null) => Interval::singleton(0),
-        Operand::Const(Const::Undef) | Operand::Const(Const::Symbol(_)) => Interval::top(),
+        Operand::Const(Const::Undef)
+        | Operand::Const(Const::Symbol(_))
+        | Operand::Const(Const::SymbolOffset(..)) => Interval::top(),
     }
 }
 

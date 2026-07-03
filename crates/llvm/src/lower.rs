@@ -29,6 +29,26 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
     let mut module = Module::new(name);
     // Functions the parser already gave up on.
     module.unanalyzed = m.unanalyzed.clone();
+    // Sizable global definitions become known regions for the analysis; a
+    // definition whose size cannot be computed is simply not recorded (its
+    // symbol stays an opaque scalar).
+    for g in &m.globals {
+        // Packed structs have no padding: the exact size is the field sum.
+        let size = if g.packed {
+            let LType::Struct(fields) = &g.ty else { continue };
+            fields.iter().try_fold(0u64, |acc, f| {
+                lower_type(f).size_bytes(&LAYOUT).and_then(|s| acc.checked_add(s))
+            })
+        } else {
+            lower_type(&g.ty).size_bytes(&LAYOUT)
+        };
+        if let Some(size) = size.filter(|s| *s > 0) {
+            module.globals.insert(
+                g.name.clone(),
+                csolver_ir::GlobalDef { size, align: g.align.max(1), writable: g.writable },
+            );
+        }
+    }
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);
         match lower_function(f, fid, &func_ids) {
@@ -102,6 +122,21 @@ impl Ctx<'_> {
             LValue::Null => Operand::Const(Const::Null),
             LValue::Undef => Operand::Const(Const::Undef),
             LValue::Global(name) => Operand::Const(Const::Symbol(name.clone())),
+            // A folded constant gep keeps its base symbol and byte offset, so
+            // an access through it is checked against the global's region. An
+            // uncomputable stride degrades to an opaque symbol (never a guess).
+            LValue::GlobalOff { name, elem, index } => {
+                match lower_type(elem).size_bytes(&LAYOUT) {
+                    Some(stride) => {
+                        let off = (stride as i128).saturating_mul(*index);
+                        match i64::try_from(off) {
+                            Ok(off) => Operand::Const(Const::SymbolOffset(name.clone(), off)),
+                            Err(_) => Operand::Const(Const::Symbol(name.clone())),
+                        }
+                    }
+                    None => Operand::Const(Const::Symbol(name.clone())),
+                }
+            }
         })
     }
 }

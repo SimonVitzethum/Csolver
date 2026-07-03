@@ -163,7 +163,7 @@ fn verify_one_function(
         }
     }
     let mut local_id = 0u32;
-    verify_function_with(f, summaries, &contracts, config, &mut local_id)
+    verify_function_with(f, summaries, &contracts, &module.globals, config, &mut local_id)
 }
 
 /// Verify every function, distributing them over `threads` workers. Work is pulled
@@ -258,6 +258,13 @@ fn assumption_record(id: String) -> Assumption {
                             parameter with a declared contract, borrowed for the call)"
                 .into(),
         },
+        "global-memory" => Assumption {
+            id,
+            statement: "a global/static symbol points to a region of its declared                         size and alignment that lives for the whole program (writable                         unless declared `constant`) and is initialized"
+                .into(),
+            justification: "the size, alignment and mutability come from the module's                             own `@name = global/constant <type>` definition, the same                             trust level as the function bodies being verified"
+                .into(),
+        },
         "slice-abi" => Assumption {
             id,
             statement: "a `(ptr, usize len)` parameter pair is a Rust slice `&[T]`: \
@@ -280,7 +287,7 @@ fn assumption_record(id: String) -> Assumption {
 /// Verify a single function in isolation (no interprocedural summaries or
 /// parameter contracts), drawing obligation ids from `next_id`.
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
-    verify_function_with(f, None, &[], config, next_id)
+    verify_function_with(f, None, &[], &HashMap::new(), config, next_id)
 }
 
 /// Verify a single function, optionally using module-wide summaries for calls
@@ -289,12 +296,13 @@ fn verify_function_with(
     f: &Function,
     summaries: Option<&HashMap<FuncId, Summary>>,
     contracts: &[Option<PtrContract>],
+    globals: &HashMap<String, csolver_ir::GlobalDef>,
     config: &Config,
     next_id: &mut u32,
 ) -> FunctionReport {
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
-        Some(s) => discharge_full(f, s, contracts),
+        Some(s) => discharge_full(f, s, contracts, globals),
         None => discharge_function(f),
     });
 
@@ -558,5 +566,6 @@ fn render_operand(op: &Operand) -> String {
         Operand::Const(Const::Null) => "null".into(),
         Operand::Const(Const::Undef) => "undef".into(),
         Operand::Const(Const::Symbol(s)) => format!("@{s}"),
+        Operand::Const(Const::SymbolOffset(s, off)) => format!("@{s}+{off}"),
     }
 }

@@ -21,6 +21,28 @@ pub struct LModule {
     /// the caller can report them as `UNKNOWN` rather than silently dropping
     /// them.
     pub unanalyzed: Vec<(String, String)>,
+    /// Top-level global/static definitions (`@name = … global/constant <ty> …`).
+    /// Only definitions whose type parsed are recorded; anything else is skipped
+    /// (its symbol then stays an opaque scalar — the sound default).
+    pub globals: Vec<LGlobal>,
+}
+
+/// A parsed global definition.
+#[derive(Debug, Clone)]
+pub struct LGlobal {
+    /// Symbol name (without the `@`).
+    pub name: String,
+    /// The definition's type (its size is the region size).
+    pub ty: LType,
+    /// `false` for `constant` definitions.
+    pub writable: bool,
+    /// Declared `align` (1 if unspecified).
+    pub align: u32,
+    /// The type was a *packed* struct `<{ … }>`: its size is the plain sum of
+    /// the field sizes (no padding). Packed types stay rejected in instruction
+    /// contexts (a padded stand-in could oversize them); here the exact packed
+    /// size is computable, so global definitions can be recorded.
+    pub packed: bool,
 }
 
 /// A parsed function definition.
@@ -120,6 +142,16 @@ pub enum LValue {
     Undef,
     /// `@name`.
     Global(String),
+    /// A folded `getelementptr` constant expression into a global:
+    /// `@name` displaced by `index` elements of `elem`.
+    GlobalOff {
+        /// The base symbol.
+        name: String,
+        /// Element type of the constant gep (byte stride).
+        elem: LType,
+        /// Element index.
+        index: i128,
+    },
 }
 
 /// Integer binary operators.
@@ -218,10 +250,19 @@ pub fn parse_module(src: &str) -> Result<LModule> {
     p.pos = 0;
     let mut funcs = Vec::new();
     let mut unanalyzed = Vec::new();
+    let mut globals = Vec::new();
     loop {
         p.skip_newlines();
         match p.peek() {
             Tok::Eof => break,
+            // `@name = … global/constant <ty> <init>[, align N]` — a definition
+            // the analysis can size. An unparseable line is skipped whole (its
+            // symbol stays an opaque scalar).
+            Tok::Global(_) if matches!(p.peek2(), Tok::Punct('=')) => {
+                if let Some(g) = p.global_def() {
+                    globals.push(g);
+                }
+            }
             Tok::Word(w) if w == "define" => {
                 let start = p.pos;
                 match p.function() {
@@ -241,7 +282,7 @@ pub fn parse_module(src: &str) -> Result<LModule> {
             _ => p.skip_to_eol(),
         }
     }
-    Ok(LModule { funcs, unanalyzed })
+    Ok(LModule { funcs, unanalyzed, globals })
 }
 
 struct Parser {
@@ -444,12 +485,23 @@ impl Parser {
             // `inttoptr (…)`, … . The value is opaque (memory safety needs the
             // access, not the constant address), so consume the body and forget it.
             Tok::Word(w) if !matches!(w.as_str(), "null" | "undef" | "poison" | "true" | "false") => {
+                let is_gep = w == "getelementptr";
                 let mut j = self.pos;
                 while matches!(self.toks.get(j), Some(Tok::Word(_))) {
                     j += 1;
                 }
                 if matches!(self.toks.get(j), Some(Tok::Punct('('))) {
                     self.pos = j;
+                    // The folded global-displacement form —
+                    // `getelementptr inbounds (T, ptr @g, iN K)` — keeps its
+                    // base symbol and offset, so a load/store through it can be
+                    // checked against the global's region. Any other constant
+                    // expression is consumed opaquely.
+                    if is_gep {
+                        if let Some(v) = self.try_const_gep() {
+                            return Ok(v);
+                        }
+                    }
                     self.skip_balanced('(', ')')?;
                     return Ok(LValue::Undef);
                 }
@@ -487,6 +539,43 @@ impl Parser {
             "unordered" | "monotonic" | "acquire" | "release" | "acq_rel" | "seq_cst"))
         {
             self.pos += 1;
+        }
+    }
+
+    /// Try the folded constant-gep form `( T , ptr @g , iN K )` with the
+    /// opening paren as the next token. On success the group is consumed; on
+    /// any mismatch the position is restored (`None`) so the caller can skip
+    /// the group opaquely.
+    fn try_const_gep(&mut self) -> Option<LValue> {
+        let start = self.pos;
+        let mut attempt = || -> Option<LValue> {
+            self.expect_punct('(').ok()?;
+            let elem = self.ltype().ok()?;
+            self.expect_punct(',').ok()?;
+            let _pty = self.ltype().ok()?; // `ptr`
+            let name = match self.bump() {
+                Tok::Global(n) => n,
+                _ => return None,
+            };
+            self.expect_punct(',').ok()?;
+            let _ity = self.ltype().ok()?; // `iN`
+            let index = match self.bump() {
+                Tok::Int(k) => k,
+                _ => return None,
+            };
+            // Multi-index constant geps are not folded here — opaque.
+            if !matches!(self.peek(), Tok::Punct(')')) {
+                return None;
+            }
+            self.pos += 1;
+            Some(LValue::GlobalOff { name, elem, index })
+        };
+        match attempt() {
+            Some(v) => Some(v),
+            None => {
+                self.pos = start;
+                None
+            }
         }
     }
 
@@ -675,6 +764,96 @@ impl Parser {
             let _ = self.skip_balanced('{', '}');
         }
         name
+    }
+
+    /// Parse a top-level global definition line; `None` (with the line
+    /// consumed) when it is not a sizable definition (alias, ifunc, or an
+    /// unsupported type).
+    fn global_def(&mut self) -> Option<LGlobal> {
+        let name = match self.bump() {
+            Tok::Global(n) => n,
+            _ => unreachable!("caller matched Tok::Global"),
+        };
+        self.pos += 1; // '='
+        // Skip linkage/visibility/attribute words up to `global`/`constant`.
+        let writable = loop {
+            match self.peek() {
+                Tok::Word(w) if w == "constant" => {
+                    self.pos += 1;
+                    break false;
+                }
+                Tok::Word(w) if w == "global" => {
+                    self.pos += 1;
+                    break true;
+                }
+                // `alias`/`ifunc` (no sizable storage of their own) or anything
+                // unexpected: skip the line.
+                Tok::Word(w) if w == "alias" || w == "ifunc" => {
+                    self.skip_to_eol();
+                    return None;
+                }
+                Tok::Word(_) => self.pos += 1,
+                Tok::Punct('(') => {
+                    // e.g. `thread_local(localdynamic)`.
+                    if self.skip_balanced('(', ')').is_err() {
+                        self.skip_to_eol();
+                        return None;
+                    }
+                }
+                _ => {
+                    self.skip_to_eol();
+                    return None;
+                }
+            }
+        };
+        let snapshot = self.pos;
+        let (ty, packed) = match self.ltype() {
+            Ok(t) => (t, false),
+            // `<{ … }>` — a packed struct (ltype rejects it in instruction
+            // contexts). Its exact size is the unpadded field sum, so a global
+            // of this shape is still sizable.
+            Err(_) => {
+                self.pos = snapshot;
+                match self.packed_struct_type() {
+                    Some(fields) => (LType::Struct(fields), true),
+                    None => {
+                        self.skip_to_eol();
+                        return None;
+                    }
+                }
+            }
+        };
+        // Scan the initializer tail for `, align N`, then consume the line.
+        let mut align = 1u32;
+        while !matches!(self.peek(), Tok::Newline | Tok::Eof) {
+            if matches!(self.peek(), Tok::Word(w) if w == "align") {
+                if let Tok::Int(n) = *self.peek2() {
+                    align = n as u32;
+                }
+            }
+            self.pos += 1;
+        }
+        Some(LGlobal { name, ty, writable, align, packed })
+    }
+
+    /// Parse `<{ T, T, … }>` (a packed struct type), resolving named fields;
+    /// restores the position on any mismatch.
+    fn packed_struct_type(&mut self) -> Option<Vec<LType>> {
+        let start = self.pos;
+        let mut attempt = || -> Option<Vec<LType>> {
+            self.expect_punct('<').ok()?;
+            self.expect_punct('{').ok()?;
+            let fields = self.struct_fields().ok()?;
+            self.expect_punct('>').ok()?;
+            fields.iter().map(|f| self.resolve_named(f, 0).ok()).collect()
+        };
+        match attempt() {
+            Some(f) => Some(f),
+            None => {
+                self.pos = start;
+                None
+            }
+        }
     }
 
     fn function(&mut self) -> Result<LFunc> {

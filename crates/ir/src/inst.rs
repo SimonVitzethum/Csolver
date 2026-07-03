@@ -16,6 +16,9 @@ pub enum Const {
     Undef,
     /// The address of a named symbol (global / function).
     Symbol(String),
+    /// The address of a named symbol plus a constant byte offset — a folded
+    /// `getelementptr` constant expression into a global.
+    SymbolOffset(String, i64),
 }
 
 /// An instruction operand: either an SSA register or a constant.

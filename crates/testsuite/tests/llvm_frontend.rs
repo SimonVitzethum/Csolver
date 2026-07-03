@@ -847,3 +847,84 @@ start:
     let inner = report.functions.iter().find(|f| f.function == "inner").expect("inner");
     assert_eq!(inner.verdict, Verdict::Pass, "round-2 chain must ground: {inner:?}");
 }
+
+/// Global/static memory modelling: a `@table = constant [8 x i32]` is a live,
+/// initialized, readable region of its declared size. A guarded in-bounds read
+/// proves PASS (surfacing the `global-memory` assumption); the folded
+/// `getelementptr (i8, ptr @g, i64 16)` constant keeps its base and offset and
+/// is checked against the same region.
+#[test]
+fn llvm_global_reads_prove_against_the_declared_size() {
+    let src = r#"
+@table = internal unnamed_addr constant [8 x i32] zeroinitializer, align 4
+@pair = private unnamed_addr constant <{ [16 x i8], [16 x i8] }> zeroinitializer, align 16
+
+define i32 @first() {
+start:
+  %v = load i32, ptr @table, align 4
+  ret i32 %v
+}
+
+define i128 @second_half() {
+start:
+  %v = load i128, ptr getelementptr inbounds (i8, ptr @pair, i64 16), align 16
+  ret i128 %v
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "both global reads prove: {report:?}");
+    assert!(
+        report.assumptions.iter().any(|a| a.id == "global-memory"),
+        "proofs name the global-memory trust basis"
+    );
+}
+
+/// The soundness side of global modelling: an access *beyond* the declared
+/// size must not prove (the region is exactly as big as declared), and a store
+/// to a `constant` definition must not prove (no write permission).
+#[test]
+fn llvm_global_modelling_refuses_oob_and_constant_writes() {
+    let verdict_of = |src: &str| {
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        verify_module(&module, &Config::default()).verdict
+    };
+
+    let oob = r#"
+@small = internal constant [4 x i8] zeroinitializer, align 1
+
+define i32 @past_end() {
+start:
+  %v = load i32, ptr getelementptr inbounds (i8, ptr @small, i64 2), align 1
+  ret i32 %v
+}
+"#;
+    assert_ne!(verdict_of(oob), Verdict::Pass, "2..6 of a 4-byte global is OOB");
+
+    let write_const = r#"
+@ro = internal constant [4 x i8] zeroinitializer, align 4
+
+define void @clobber() {
+start:
+  store i32 7, ptr @ro, align 4
+  ret void
+}
+"#;
+    assert_ne!(verdict_of(write_const), Verdict::Pass, "a constant is not writable");
+
+    // A *mutable* global (`global`, not `constant`) accepts the same store.
+    let write_mut = r#"
+@rw = internal global [4 x i8] zeroinitializer, align 4
+
+define void @set() {
+start:
+  store i32 7, ptr @rw, align 4
+  ret void
+}
+"#;
+    assert_eq!(verdict_of(write_mut), Verdict::Pass, "a mutable global is writable");
+}

@@ -196,6 +196,24 @@ pub struct Module {
     /// parameter contract from the call sites. Frontends without linkage
     /// information leave it empty — the sound default.
     pub internal: std::collections::HashSet<FuncId>,
+    /// Global/static definitions by symbol name. A `Const::Symbol` referring to
+    /// one is a pointer to a region of the given size that lives for the whole
+    /// program (never freed). Frontends without global information leave it
+    /// empty — such symbols stay opaque scalars, the sound default.
+    pub globals: HashMap<String, GlobalDef>,
+}
+
+/// A global/static definition: what the analysis may assume about the memory
+/// behind its symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalDef {
+    /// Byte size of the definition's type.
+    pub size: u64,
+    /// Declared alignment (1 if unspecified — alignment proofs then fail
+    /// soundly rather than assuming).
+    pub align: u32,
+    /// `false` for `constant` definitions (stores to them are invalid).
+    pub writable: bool,
 }
 
 impl Module {
@@ -208,6 +226,7 @@ impl Module {
             param_contracts: HashMap::new(),
             unanalyzed: Vec::new(),
             internal: std::collections::HashSet::new(),
+            globals: HashMap::new(),
         }
     }
 

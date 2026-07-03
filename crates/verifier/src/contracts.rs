@@ -232,7 +232,7 @@ fn local_defs(
 fn address_taken_names(module: &Module) -> HashSet<String> {
     let mut names = HashSet::new();
     let mut op = |o: &Operand| {
-        if let Operand::Const(Const::Symbol(s)) = o {
+        if let Operand::Const(Const::Symbol(s)) | Operand::Const(Const::SymbolOffset(s, _)) = o {
             names.insert(s.clone());
         }
     };

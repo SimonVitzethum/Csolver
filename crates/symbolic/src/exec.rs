@@ -20,7 +20,8 @@ use csolver_core::{Model, RegionKind, SafetyProperty};
 use crate::summary::{Affine, RetSummary, Summary};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FuncId,
-    Function, Inst, MemKind, Operand, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
+    Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RegId, SizeSpec,
+    Terminator, Type,
 };
 use csolver_memory::{AliasResult, LifetimeState, Permissions};
 use csolver_solver::{
@@ -43,6 +44,9 @@ const ALLOC_SUCCEEDS: &str = "alloc-succeeds";
 const LINEAR_NO_OVERFLOW: &str = "linear-no-overflow";
 const PARAM_CONTRACTS: &str = "param-contracts";
 const SLICE_ABI: &str = "slice-abi";
+/// Proofs about accesses to global/static definitions rest on the module's
+/// declared global layout (size/alignment/mutability of `@name = global/constant …`).
+const GLOBAL_MEMORY: &str = "global-memory";
 const STRUCT_ABI: &str = "struct-abi";
 
 /// Whether a scalar `SafetyCheck` was discharged symbolically.
@@ -104,7 +108,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[])
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &HashMap::new())
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -113,7 +117,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &[])
+    discharge_inner(f, ExecLimits::default(), summaries, &[], &HashMap::new())
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -124,8 +128,9 @@ pub fn discharge_full(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
     contracts: &[Option<PtrContract>],
+    globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts)
+    discharge_inner(f, ExecLimits::default(), summaries, contracts, globals)
 }
 
 /// As [`discharge_function`], with explicit limits and no summaries.
@@ -136,7 +141,68 @@ pub fn discharge_full(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &[])
+    discharge_inner(f, limits, &HashMap::new(), &[], &HashMap::new())
+}
+
+/// Every symbol name referenced by an operand of `f` (`Const::Symbol` /
+/// `Const::SymbolOffset`), for seeding the referenced-globals regions.
+fn referenced_symbols(f: &Function) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut op = |o: &Operand| match o {
+        Operand::Const(Const::Symbol(n)) | Operand::Const(Const::SymbolOffset(n, _)) => {
+            out.push(n.clone())
+        }
+        _ => {}
+    };
+    for b in &f.blocks {
+        for inst in &b.insts {
+            match inst {
+                Inst::Alloc { count, .. } => op(count),
+                Inst::Load { ptr, .. } => op(ptr),
+                Inst::Store { ptr, value, .. } => {
+                    op(ptr);
+                    op(value);
+                }
+                Inst::PtrOffset { base, index, .. } => {
+                    op(base);
+                    op(index);
+                }
+                Inst::FieldPtr { base, .. } => op(base),
+                Inst::Assign { value, .. } => match value {
+                    RValue::Use(o) => op(o),
+                    RValue::Bin { lhs, rhs, .. } | RValue::Cmp { lhs, rhs, .. } => {
+                        op(lhs);
+                        op(rhs);
+                    }
+                    RValue::Cast { operand, .. } => op(operand),
+                },
+                Inst::Call { args, .. } | Inst::Intrinsic { args, .. } => {
+                    args.iter().for_each(&mut op)
+                }
+                Inst::MemIntrinsic { dst, src, len, .. } => {
+                    op(dst);
+                    if let Some(sp) = src {
+                        op(sp);
+                    }
+                    op(len);
+                }
+                Inst::Dealloc { ptr, .. } => op(ptr),
+                Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
+            }
+        }
+        match &b.term {
+            Terminator::Return(Some(o)) => op(o),
+            Terminator::CondBr { cond, then_args, else_args, .. } => {
+                op(cond);
+                then_args.iter().for_each(&mut op);
+                else_args.iter().for_each(&mut op);
+            }
+            Terminator::Br { args, .. } => args.iter().for_each(&mut op),
+            Terminator::Switch { value, .. } => op(value),
+            Terminator::Return(None) | Terminator::Unreachable => {}
+        }
+    }
+    out
 }
 
 fn discharge_inner(
@@ -144,6 +210,7 @@ fn discharge_inner(
     limits: ExecLimits,
     summaries: &HashMap<FuncId, Summary>,
     contracts: &[Option<PtrContract>],
+    globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
     let analysis = analyze_intervals(f);
     let zones = analyze_zones(f);
@@ -203,6 +270,7 @@ fn discharge_inner(
         field_offsets: HashMap::new(),
         field_frontier: HashMap::new(),
         scalar_ptr_cause: classify_scalar_ptr_defs(f),
+        global_rids: HashMap::new(),
         f,
     };
 
@@ -280,6 +348,33 @@ fn discharge_inner(
             }),
         );
     }
+    // Referenced global/static definitions become regions that live for the
+    // whole program: never freed, readable, writable iff not `constant`, with
+    // an initializer (so a load from one is *not* an uninitialized read).
+    // Sorted by name so region ids — and therefore every downstream id — are
+    // deterministic.
+    let mut names: Vec<String> = referenced_symbols(f)
+        .into_iter()
+        .filter(|n| globals.contains_key(n))
+        .collect();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let g = globals[&name];
+        let rid = regions.len();
+        let size = ex.ctx.int(PTR_WIDTH, g.size as u128);
+        let truth = ex.ctx.boolean(true);
+        regions.push(SymRegion {
+            kind: RegionKind::Global,
+            size,
+            state: LifetimeState::Live,
+            perms: Permissions { read: true, write: g.writable, exec: false },
+            contract: Some(GLOBAL_MEMORY),
+            size_nowrap: Some(truth),
+        });
+        ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
+    }
+
     let state = PathState {
         env,
         regions,
@@ -578,7 +673,9 @@ fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
                         }
                         RValue::Use(Operand::Const(c)) => match c {
                             Const::Undef => ScalarPtrCause::ConstUndef,
-                            Const::Symbol(_) => ScalarPtrCause::ConstSymbol,
+                            Const::Symbol(_) | Const::SymbolOffset(..) => {
+                                ScalarPtrCause::ConstSymbol
+                            }
                             Const::Int(_) => ScalarPtrCause::ConstInt,
                             Const::Null => ScalarPtrCause::ConstNull,
                         },
@@ -868,6 +965,10 @@ struct Explorer<'f> {
     /// Per-register classification of how a scalar-used-as-pointer was computed
     /// (diagnostic; tags the `ScalarAsPtr` provenance residual at scale).
     scalar_ptr_cause: HashMap<RegId, ScalarPtrCause>,
+    /// Referenced global definitions: symbol name → (region id, alignment).
+    /// The regions are created once at state initialization (sorted by name for
+    /// determinism) and are `Live` forever — globals are never freed.
+    global_rids: HashMap<String, (usize, u64)>,
     f: &'f Function,
 }
 
@@ -2361,8 +2462,36 @@ impl Explorer<'_> {
                 align: 1,
             }),
             Operand::Const(Const::Undef) => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
-            Operand::Const(Const::Symbol(name)) => {
-                SymValue::Scalar(self.ctx.symbol(format!("@{name}"), PTR_WIDTH))
+            Operand::Const(Const::Symbol(name)) => match self.global_rids.get(name) {
+                Some(&(rid, align)) => SymValue::Ptr(SymPointer {
+                    prov: Prov::Region(rid),
+                    offset: self.ctx.int(PTR_WIDTH, 0),
+                    align,
+                }),
+                // Not a known global (e.g. a function address): an opaque scalar.
+                None => SymValue::Scalar(self.ctx.symbol(format!("@{name}"), PTR_WIDTH)),
+            },
+            Operand::Const(Const::SymbolOffset(name, off)) => {
+                match self.global_rids.get(name) {
+                    Some(&(rid, align)) => {
+                        let offset = if *off >= 0 {
+                            self.ctx.int(PTR_WIDTH, *off as u128)
+                        } else {
+                            let zero = self.ctx.int(PTR_WIDTH, 0);
+                            let mag = self.ctx.int(PTR_WIDTH, (-*off) as u128);
+                            self.ctx.bin(BvOp::Sub, zero, mag)
+                        };
+                        // The interior pointer's alignment is what offset+align
+                        // imply, conservatively 1 unless the offset preserves it.
+                        let a = if *off >= 0 && (*off as u64).is_multiple_of(align) {
+                            align
+                        } else {
+                            1
+                        };
+                        SymValue::Ptr(SymPointer { prov: Prov::Region(rid), offset, align: a })
+                    }
+                    None => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
+                }
             }
         }
     }
