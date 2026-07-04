@@ -255,8 +255,21 @@ pub(crate) fn synthesize_fields(
             //  - `field_of`: a register that is `root + constant byte offset`,
             //    built from `PtrOffset` chains rooted at a known region.
             //  - `slot`: which `(root, byte offset)` provably holds a valid ptr.
+            //  - `escaped`: roots whose address may have leaked (passed to a call
+            //    or stored into memory), so a later callee could reach and rewrite
+            //    them — their slots are dropped on every subsequent call.
             let mut field_of: HashMap<RegId, (RegId, u64)> = HashMap::new();
             let mut slot: HashMap<(RegId, u64), SiteGuarantee> = HashMap::new();
+            let mut escaped: HashSet<RegId> = HashSet::new();
+            // The region root a pointer register refers to, if any (itself if it is
+            // a root, or the base of its constant-offset chain).
+            let root_of = |field_of: &HashMap<RegId, (RegId, u64)>, r: &RegId| -> Option<RegId> {
+                if defs.contains_key(r) {
+                    Some(*r)
+                } else {
+                    field_of.get(r).map(|(root, _)| *root)
+                }
+            };
             for inst in &block.insts {
                 match inst {
                     // Track a constant-offset pointer relative to a region root.
@@ -282,6 +295,13 @@ pub(crate) fn synthesize_fields(
                         }
                     }
                     Inst::Store { ptr: Operand::Reg(pr), value, .. } => {
+                        // A stored *value* that is a region pointer leaks that root.
+                        if let Operand::Reg(vr) = value {
+                            if let Some(r) = root_of(&field_of, vr) {
+                                escaped.insert(r);
+                                slot.retain(|(root, _), _| *root != r);
+                            }
+                        }
                         // Resolve the store target to a (root, offset) slot: either
                         // a tracked field pointer, or a region root itself (offset 0).
                         let target = field_of
@@ -289,46 +309,70 @@ pub(crate) fn synthesize_fields(
                             .copied()
                             .or_else(|| defs.contains_key(pr).then_some((*pr, 0)));
                         match target {
-                            Some(slotkey) => {
-                                match value {
-                                    Operand::Reg(vr) if defs.contains_key(vr) => {
-                                        slot.insert(slotkey, defs[vr]);
-                                    }
-                                    // Storing an unknown value clears that slot.
-                                    _ => {
-                                        slot.remove(&slotkey);
-                                    }
+                            Some(slotkey) => match value {
+                                Operand::Reg(vr) if defs.contains_key(vr) => {
+                                    slot.insert(slotkey, defs[vr]);
                                 }
-                            }
+                                // Storing an unknown value clears that slot.
+                                _ => {
+                                    slot.remove(&slotkey);
+                                }
+                            },
                             // A store through an untracked pointer could alias any
                             // field — conservatively discard everything.
                             None => slot.clear(),
                         }
                     }
                     Inst::Store { .. } => slot.clear(),
-                    Inst::Call { callee: Callee::Direct(g), args, .. } => {
-                        // Harvest before the call's own clobber.
-                        if args.len() == module.function(*g).map_or(usize::MAX, |c| c.params.len()) {
-                            for (i, arg) in args.iter().enumerate() {
-                                let key = (*g, i as u32);
-                                if !eligible(*g, i as u32) {
-                                    continue;
+                    // Every call — direct, indirect, or to an external symbol — may
+                    // write through the pointers it is handed. Harvest first (only a
+                    // resolved, eligible *direct* callee can be credited), then apply
+                    // the clobber for *all* call kinds so an external `clobber(&w)`
+                    // that could rewrite the field is never silently ignored.
+                    Inst::Call { callee, args, .. } => {
+                        if let Callee::Direct(g) = callee {
+                            // A root already escaped has no slots (cleared when it
+                            // leaked), so it contributes nothing.
+                            if args.len()
+                                == module.function(*g).map_or(usize::MAX, |c| c.params.len())
+                            {
+                                for (i, arg) in args.iter().enumerate() {
+                                    let key = (*g, i as u32);
+                                    if !eligible(*g, i as u32) {
+                                        continue;
+                                    }
+                                    let site: HashMap<u64, SiteGuarantee> = match arg {
+                                        Operand::Reg(root) if defs.contains_key(root) => slot
+                                            .iter()
+                                            .filter(|((r, _), _)| r == root)
+                                            .map(|((_, off), g)| (*off, *g))
+                                            .collect(),
+                                        // A non-region argument guarantees no fields.
+                                        _ => HashMap::new(),
+                                    };
+                                    intersect_site(folded.entry(key).or_insert(None), site);
                                 }
-                                let site: HashMap<u64, SiteGuarantee> = match arg {
-                                    Operand::Reg(root) if defs.contains_key(root) => slot
-                                        .iter()
-                                        .filter(|((r, _), _)| r == root)
-                                        .map(|((_, off), g)| (*off, *g))
-                                        .collect(),
-                                    // A non-region argument guarantees no fields.
-                                    _ => HashMap::new(),
-                                };
-                                intersect_site(folded.entry(key).or_insert(None), site);
                             }
                         }
-                        slot.clear();
+                        // This callee could write through any root it receives, or
+                        // through any root that previously escaped (it may hold a
+                        // stashed pointer). Drop exactly those roots' slots; a root
+                        // that never leaked and is not passed here is unreachable to
+                        // the callee, so its field guarantees survive.
+                        for arg in args {
+                            if let Operand::Reg(a) = arg {
+                                if let Some(r) = root_of(&field_of, a) {
+                                    escaped.insert(r);
+                                }
+                            }
+                        }
+                        slot.retain(|(root, _), _| !escaped.contains(root));
                     }
-                    Inst::MemIntrinsic { .. } | Inst::Dealloc { .. } => slot.clear(),
+                    // An intrinsic, `memcpy`/`memset`, or free may write through a
+                    // pointer we cannot resolve here — conservatively discard all.
+                    Inst::Intrinsic { .. } | Inst::MemIntrinsic { .. } | Inst::Dealloc { .. } => {
+                        slot.clear()
+                    }
                     _ => {}
                 }
             }

@@ -1393,3 +1393,43 @@ fn closed_world_member_provenance_declines_unwritten_field() {
         "an unwritten pointer field must leave the deref unprovable (no false PASS)"
     );
 }
+
+/// Soundness control for member-provenance escape tracking: after the caller
+/// fills the field, it passes the aggregate to an **external** function that
+/// could rewrite the field, then calls the member reader with no re-store. The
+/// field guarantee must be dropped — a raw external call is never silently
+/// ignored (that would be a false PASS).
+const MEMBER_PROV_ESCAPE: &str = r#"
+declare void @clobber(ptr)
+define i32 @read_member(ptr %w) {
+entry:
+  %f = getelementptr inbounds i8, ptr %w, i64 8
+  %data = load ptr, ptr %f, align 8
+  %v = load i32, ptr %data, align 4
+  ret i32 %v
+}
+define i32 @main() {
+entry:
+  %x = alloca i32, align 4
+  %w = alloca [16 x i8], align 8
+  store i32 7, ptr %x, align 4
+  %f = getelementptr inbounds i8, ptr %w, i64 8
+  store ptr %x, ptr %f, align 8
+  call void @clobber(ptr %w)
+  %r = call i32 @read_member(ptr %w)
+  ret i32 %r
+}
+"#;
+
+#[test]
+fn closed_world_member_provenance_respects_escape_via_external_call() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: MEMBER_PROV_ESCAPE.into(), name: "mpe".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "an external call that may rewrite the field must drop the guarantee (no false PASS)"
+    );
+}
