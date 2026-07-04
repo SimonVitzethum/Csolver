@@ -315,6 +315,23 @@ pub enum Inst {
         /// Arguments.
         args: Vec<Operand>,
     },
+    /// Materialise a *valid reference*: `dst` becomes a pointer to a fresh live
+    /// region of `size` bytes (`None` = statically-unknown, e.g. a slice/`str`),
+    /// readable and writable iff `writable`. Models a `&T`/`&mut T` value
+    /// obtained where the analysis cannot see its origin (a call result, or a
+    /// by-value aggregate field): Rust's reference invariant guarantees it is
+    /// valid for its pointee, so accesses through it prove — but it is a fresh
+    /// region (never aliases anything else), so this only ever *loses* precision.
+    RefWitness {
+        /// Destination register (the reference pointer).
+        dst: RegId,
+        /// Byte size of the pointee (`None` = unknown / unsized).
+        size: Option<u64>,
+        /// Alignment in bytes.
+        align: u32,
+        /// Whether the reference is mutable (`&mut T`).
+        writable: bool,
+    },
     /// A bulk memory operation (`memcpy`/`memmove`/`memset`): touches `len`
     /// bytes at `dst` (write) and, for copy/move, `len` bytes at `src` (read).
     MemIntrinsic {
@@ -368,7 +385,8 @@ impl Inst {
             | Inst::Load { dst, .. }
             | Inst::Alloc { dst, .. }
             | Inst::PtrOffset { dst, .. }
-            | Inst::FieldPtr { dst, .. } => Some(*dst),
+            | Inst::FieldPtr { dst, .. }
+            | Inst::RefWitness { dst, .. } => Some(*dst),
             Inst::Call { dst, .. } | Inst::Intrinsic { dst, .. } => *dst,
             Inst::Store { .. }
             | Inst::Dealloc { .. }

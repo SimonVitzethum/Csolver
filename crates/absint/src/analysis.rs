@@ -338,7 +338,8 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         Inst::Load { dst, .. }
         | Inst::Alloc { dst, .. }
         | Inst::PtrOffset { dst, .. }
-        | Inst::FieldPtr { dst, .. } => {
+        | Inst::FieldPtr { dst, .. }
+        | Inst::RefWitness { dst, .. } => {
             state.set(*dst, Interval::top());
         }
         Inst::Call { dst: Some(d), .. } | Inst::Intrinsic { dst: Some(d), .. } => {

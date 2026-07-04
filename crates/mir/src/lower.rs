@@ -532,6 +532,30 @@ impl Ctx {
 
     /// Materialise an operand as an MSIR scalar operand (loading a memory place
     /// into a fresh register if needed).
+    /// If `p` is a *by-value* field projection whose innermost ascribed type is
+    /// a reference (`&T`/`&mut T` — e.g. `(_6 as Some).0` of type `&u8`,
+    /// extracted from an aggregate the analysis cannot see into), materialise it
+    /// as a valid reference: Rust guarantees the value is a live, correctly-sized
+    /// reference regardless of where the aggregate came from. Returns the
+    /// pointer register, or `None` (the caller falls back to `undef`) for a
+    /// non-reference field or a raw-pointer field (`*const T` is not guaranteed
+    /// valid). A slice/unsized pointee has unknown size → an opaque region.
+    fn ref_witness_for(&mut self, p: &Place, out: &mut Vec<Inst>) -> Option<IrOp> {
+        if is_memory_place(p) {
+            return None; // a field *through a pointer* is a real load, not this.
+        }
+        let Place::Field(_, _, Some(MType::Ref(inner, mutable))) = p else {
+            return None;
+        };
+        let (size, align) = match pointee_size(inner) {
+            Some(n) => (Some(n), pointee_align(inner)),
+            None => (None, 1),
+        };
+        let dst = self.fresh();
+        out.push(Inst::RefWitness { dst, size, align, writable: *mutable });
+        Some(IrOp::Reg(dst))
+    }
+
     fn operand_value(&mut self, op: &Operand, out: &mut Vec<Inst>) -> IrOp {
         match op {
             Operand::Const(MConst::Int(n)) => IrOp::int(64, *n as u128),
@@ -552,7 +576,8 @@ impl Ctx {
                             if self.is_fat_ref(*k) {
                                 IrOp::Reg(RegId(*k))
                             } else {
-                                IrOp::Const(Const::Undef)
+                                self.ref_witness_for(p, out)
+                                    .unwrap_or(IrOp::Const(Const::Undef))
                             }
                         }),
                         _ => IrOp::Const(Const::Undef),
@@ -572,7 +597,7 @@ impl Ctx {
                         IrOp::Const(Const::Undef)
                     }
                 }
-                _ => IrOp::Const(Const::Undef),
+                _ => self.ref_witness_for(p, out).unwrap_or(IrOp::Const(Const::Undef)),
             },
         }
     }

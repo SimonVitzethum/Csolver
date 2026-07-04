@@ -47,6 +47,9 @@ const SLICE_ABI: &str = "slice-abi";
 /// Proofs about accesses to global/static definitions rest on the module's
 /// declared global layout (size/alignment/mutability of `@name = global/constant …`).
 const GLOBAL_MEMORY: &str = "global-memory";
+/// A `&T`/`&mut T` value is a valid reference to its pointee (Rust's reference
+/// invariant), even when the analysis cannot see where it came from.
+const VALID_REFERENCE: &str = "valid-reference";
 const STRUCT_ABI: &str = "struct-abi";
 
 /// Whether a scalar `SafetyCheck` was discharged symbolically.
@@ -168,6 +171,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                     op(index);
                 }
                 Inst::FieldPtr { base, .. } => op(base),
+                Inst::RefWitness { .. } => {}
                 Inst::Assign { value, .. } => match value {
                     RValue::Use(o) => op(o),
                     RValue::Bin { lhs, rhs, .. } | RValue::Cmp { lhs, rhs, .. } => {
@@ -1799,6 +1803,38 @@ impl Explorer<'_> {
                 let goal = self.eval_condition(condition, state);
                 let decision = self.decide(&[goal], state, RefuteMode::Definite, &[]);
                 self.record_scalar(block, idx, decision);
+            }
+            Inst::RefWitness { dst, size, align, writable } => {
+                // A fresh live region of the pointee's size. A known size is
+                // refutable (an OOB access through the reference is a real
+                // finding); an unknown size (slice/`str`) is prove-only. The
+                let (size_e, nowrap) = match size {
+                    Some(n) => {
+                        let truth = self.ctx.boolean(true);
+                        (self.ctx.int(PTR_WIDTH, *n as u128), Some(truth))
+                    }
+                    None => (self.fresh_scalar(PTR_WIDTH), None),
+                };
+                let zero = self.ctx.int(PTR_WIDTH, 0);
+                let nonneg = self.ctx.cmp(SCmp::Sle, zero, size_e);
+                state.facts.push(nonneg);
+                let rid = state.regions.len();
+                state.regions.push(SymRegion {
+                    kind: RegionKind::Global,
+                    size: size_e,
+                    state: LifetimeState::Live,
+                    perms: Permissions { read: true, write: *writable, exec: false },
+                    contract: Some(VALID_REFERENCE),
+                    size_nowrap: nowrap,
+                });
+                state.env.insert(
+                    *dst,
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Region(rid),
+                        offset: zero,
+                        align: (*align).max(1) as u64,
+                    }),
+                );
             }
             Inst::MemIntrinsic { kind, dst, src, len } => {
                 self.check_mem_intrinsic((block, idx), *kind, dst, src.as_ref(), len, state);

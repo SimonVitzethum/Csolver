@@ -255,6 +255,7 @@ fn address_taken_names(module: &Module) -> HashSet<String> {
                         op(index);
                     }
                     Inst::FieldPtr { base, .. } => op(base),
+                    Inst::RefWitness { .. } => {}
                     Inst::Assign { value, .. } => match value {
                         csolver_ir::RValue::Use(o) => op(o),
                         csolver_ir::RValue::Bin { lhs, rhs, .. }

@@ -267,6 +267,13 @@ fn assumption_record(id: String) -> Assumption {
                             parameter with a declared contract, borrowed for the call)"
                 .into(),
         },
+        "valid-reference" => Assumption {
+            id,
+            statement: "a `&T`/`&mut T` value points to a live, correctly-sized                         and -aligned `T`, readable (and writable for `&mut`)"
+                .into(),
+            justification: "Rust's reference invariant: a reference of type `&T` is                             always valid for its pointee, even when obtained where the                             analysis cannot see its origin (a call result, a by-value                             aggregate field). The region is modelled fresh, so it never                             aliases — the assumption only ever loses precision"
+                .into(),
+        },
         "global-memory" => Assumption {
             id,
             statement: "a global/static symbol points to a region of its declared                         size and alignment that lives for the whole program (writable                         unless declared `constant`) and is initialized"

@@ -1072,3 +1072,83 @@ fn A::f::{closure#1}(_1: i32) -> i32 {
     assert!(names.contains(&"A::f{closure#0}"), "{names:?}");
     assert!(names.contains(&"A::f{closure#1}"), "{names:?}");
 }
+
+/// A reference extracted from a by-value aggregate the analysis cannot see into
+/// (`(_2 as Some).0` of type `&u8` — e.g. `slice::split_first`'s result) is a
+/// *valid reference* by Rust's type invariant: a read through it proves (live,
+/// in-bounds, aligned), surfacing the `valid-reference` assumption. Before, the
+/// pointer was `undef` and every access UNKNOWN. `_2` is a call result, so its
+/// aggregate is genuinely opaque — the recovery is purely type-driven.
+#[test]
+fn mir_reference_from_opaque_aggregate_is_valid() {
+    let src = r#"
+fn read_first(_1: &[u8]) -> u8 {
+    let mut _0: u8;
+    let mut _2: std::option::Option<(&u8, &[u8])>;
+    let mut _3: &u8;
+    bb0: {
+        _2 = core::slice::<impl [u8]>::split_first(copy _1) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        _3 = copy (((_2 as Some).0: (&u8, &[u8])).0: &u8);
+        _0 = copy (*_3);
+        return;
+    }
+}
+"#;
+    let module = lower(src, "m");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.functions[0].verdict, Verdict::Pass, "{report:?}");
+    assert!(
+        report.assumptions.iter().any(|a| a.id == "valid-reference"),
+        "the read rests on the reference-validity invariant"
+    );
+}
+
+/// Soundness of the recovery, both directions. A shared reference `&u8` is
+/// **read-only**: writing through it must not prove (that write is UB Rust
+/// would reject). And the region is exactly `sizeof(pointee)`: an access one
+/// element past a `&u8` must not prove (the reference is valid for one byte,
+/// not two).
+#[test]
+fn mir_ref_witness_respects_mutability_and_size() {
+    // Write through a shared `&u8` field — must not PASS.
+    let shared_write = r#"
+fn clobber(_1: (&u8, u8)) -> () {
+    let mut _0: ();
+    let mut _2: &u8;
+    bb0: {
+        _2 = copy (_1.0: &u8);
+        (*_2) = const 7_u8;
+        return;
+    }
+}
+"#;
+    let module = lower(shared_write, "m");
+    let report = verify_module(&module, &Config::default());
+    assert_ne!(
+        report.functions[0].verdict,
+        Verdict::Pass,
+        "a write through a shared &u8 must not prove: {report:?}"
+    );
+
+    // A `&mut u8` field DOES grant the write.
+    let mut_write = r#"
+fn set(_1: (&mut u8, u8)) -> () {
+    let mut _0: ();
+    let mut _2: &mut u8;
+    bb0: {
+        _2 = copy (_1.0: &mut u8);
+        (*_2) = const 7_u8;
+        return;
+    }
+}
+"#;
+    let module = lower(mut_write, "m");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(
+        report.functions[0].verdict,
+        Verdict::Pass,
+        "a write through &mut u8 is granted: {report:?}"
+    );
+}
