@@ -40,8 +40,8 @@
 //! is different (derived from call-site completeness, not declared attributes).
 
 use csolver_ir::{
-    Callee, Condition, Const, FuncId, Inst, Module, Operand, PtrContract, RegId, SizeSpec,
-    Terminator,
+    Callee, Condition, Const, FieldContract, FuncId, Inst, Module, Operand, PtrContract, RegId,
+    SizeSpec, Terminator,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -206,6 +206,190 @@ fn synthesize_round(
             ))
         })
         .collect()
+}
+
+/// Interprocedural **member-provenance**: for each contracted pointer parameter,
+/// which of its aggregate fields provably holds a *valid pointer*, folded to the
+/// weakest guarantee across all (visible) call sites.
+///
+/// A raw pointer member (`Wrap.data: int32_t*`) carries no validity from its
+/// type — but if every call site builds the aggregate by storing `&valid` into
+/// that field before the call, the callee's load of it yields a valid pointer.
+/// This recovers that, resting on the same call-site-completeness basis as
+/// [`synthesize`] (internal linkage or closed-world). Returned per `(callee,
+/// param)`; only for parameters that already carry a region contract (declared
+/// or in `params`), so the engine has a region to attach the field to.
+///
+/// Soundness: a field is kept only if **every** site provably stores a valid
+/// pointer there, with no clobber between the store and the call. The caller
+/// scan is deliberately conservative — straight-line within a basic block, and
+/// any intervening call, `memcpy`/`memset`, or free discards the slots (they
+/// could rewrite the field) — so a missed store only ever *drops* a field
+/// (UNKNOWN), never asserts one that a caller does not establish.
+pub(crate) fn synthesize_fields(
+    module: &Module,
+    params: &HashMap<(FuncId, u32), PtrContract>,
+    closed_world: bool,
+) -> HashMap<(FuncId, u32), Vec<FieldContract>> {
+    let escaped = address_taken_names(module);
+    // (callee, param) → intersection of per-site field guarantees, keyed by byte
+    // offset. `None` once a site provides nothing (a non-region argument), which
+    // drops all fields.
+    let mut folded: HashMap<(FuncId, u32), Option<HashMap<u64, SiteGuarantee>>> = HashMap::new();
+
+    let eligible = |g: FuncId, i: u32| -> bool {
+        let Some(f) = module.function(g) else { return false };
+        let complete = closed_world || module.internal.contains(&f.id);
+        complete
+            && !escaped.contains(&f.name)
+            && f.params.get(i as usize).is_some_and(|(_, t)| t.is_ptr())
+            // The parameter must carry a region contract for a field to attach to.
+            && (params.contains_key(&(g, i)) || module.param_contracts.contains_key(&(g, i)))
+    };
+
+    for caller in &module.functions {
+        let defs = local_defs(caller, module, params);
+        for block in &caller.blocks {
+            // Per-block straight-line state (reset at each block entry, so
+            // cross-block field setup is conservatively not credited):
+            //  - `field_of`: a register that is `root + constant byte offset`,
+            //    built from `PtrOffset` chains rooted at a known region.
+            //  - `slot`: which `(root, byte offset)` provably holds a valid ptr.
+            let mut field_of: HashMap<RegId, (RegId, u64)> = HashMap::new();
+            let mut slot: HashMap<(RegId, u64), SiteGuarantee> = HashMap::new();
+            for inst in &block.insts {
+                match inst {
+                    // Track a constant-offset pointer relative to a region root.
+                    Inst::PtrOffset { dst, base: Operand::Reg(base), index, elem } => {
+                        let delta = match index {
+                            Operand::Const(Const::Int(bv)) => u64::try_from(bv.unsigned())
+                                .ok()
+                                .and_then(|n| n.checked_mul(elem.size_bytes(&module.layout)?)),
+                            _ => None,
+                        };
+                        match (delta, defs.contains_key(base), field_of.get(base).copied()) {
+                            // `root + delta`.
+                            (Some(d), true, _) => {
+                                field_of.insert(*dst, (*base, d));
+                            }
+                            // `(root + d0) + delta`.
+                            (Some(d), false, Some((root, d0))) => {
+                                if let Some(total) = d0.checked_add(d) {
+                                    field_of.insert(*dst, (root, total));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Inst::Store { ptr: Operand::Reg(pr), value, .. } => {
+                        // Resolve the store target to a (root, offset) slot: either
+                        // a tracked field pointer, or a region root itself (offset 0).
+                        let target = field_of
+                            .get(pr)
+                            .copied()
+                            .or_else(|| defs.contains_key(pr).then_some((*pr, 0)));
+                        match target {
+                            Some(slotkey) => {
+                                match value {
+                                    Operand::Reg(vr) if defs.contains_key(vr) => {
+                                        slot.insert(slotkey, defs[vr]);
+                                    }
+                                    // Storing an unknown value clears that slot.
+                                    _ => {
+                                        slot.remove(&slotkey);
+                                    }
+                                }
+                            }
+                            // A store through an untracked pointer could alias any
+                            // field — conservatively discard everything.
+                            None => slot.clear(),
+                        }
+                    }
+                    Inst::Store { .. } => slot.clear(),
+                    Inst::Call { callee: Callee::Direct(g), args, .. } => {
+                        // Harvest before the call's own clobber.
+                        if args.len() == module.function(*g).map_or(usize::MAX, |c| c.params.len()) {
+                            for (i, arg) in args.iter().enumerate() {
+                                let key = (*g, i as u32);
+                                if !eligible(*g, i as u32) {
+                                    continue;
+                                }
+                                let site: HashMap<u64, SiteGuarantee> = match arg {
+                                    Operand::Reg(root) if defs.contains_key(root) => slot
+                                        .iter()
+                                        .filter(|((r, _), _)| r == root)
+                                        .map(|((_, off), g)| (*off, *g))
+                                        .collect(),
+                                    // A non-region argument guarantees no fields.
+                                    _ => HashMap::new(),
+                                };
+                                intersect_site(folded.entry(key).or_insert(None), site);
+                            }
+                        }
+                        slot.clear();
+                    }
+                    Inst::MemIntrinsic { .. } | Inst::Dealloc { .. } => slot.clear(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    folded
+        .into_iter()
+        .filter_map(|(key, fields)| {
+            let fields = fields?;
+            if fields.is_empty() {
+                return None;
+            }
+            let mut v: Vec<FieldContract> = fields
+                .into_iter()
+                .map(|(offset, g)| FieldContract {
+                    offset,
+                    pointee: PtrContract {
+                        size: SizeSpec::Bytes(g.size),
+                        align: g.align,
+                        readable: g.readable,
+                        writable: g.writable,
+                        assumption: Some(if module.internal.contains(&key.0) {
+                            INTERNAL_CALL_CONTRACT
+                        } else {
+                            CLOSED_WORLD_CONTRACT
+                        }),
+                        refutable: false,
+                    },
+                })
+                .collect();
+            v.sort_by_key(|fc| fc.offset);
+            Some((key, v))
+        })
+        .collect()
+}
+
+/// Fold one call site's field guarantees into the running intersection: keep only
+/// byte offsets present at *every* site so far, each at the weakest guarantee.
+fn intersect_site(
+    acc: &mut Option<HashMap<u64, SiteGuarantee>>,
+    site: HashMap<u64, SiteGuarantee>,
+) {
+    match acc {
+        None => *acc = Some(site),
+        Some(cur) => {
+            cur.retain(|f, g| {
+                if let Some(s) = site.get(f) {
+                    *g = SiteGuarantee {
+                        size: g.size.min(s.size),
+                        align: g.align.min(s.align),
+                        readable: g.readable && s.readable,
+                        writable: g.writable && s.writable,
+                    };
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
 }
 
 /// What the caller statically guarantees about `arg`, if anything.

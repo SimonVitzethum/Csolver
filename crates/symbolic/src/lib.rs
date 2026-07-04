@@ -25,8 +25,8 @@ mod exec;
 mod summary;
 
 pub use exec::{
-    discharge_full, discharge_function, discharge_with, discharge_with_summaries, MemDecision,
-    SymOutcome, SymbolicReport,
+    discharge_full, discharge_function, discharge_with, discharge_with_fields,
+    discharge_with_summaries, MemDecision, SymOutcome, SymbolicReport,
 };
 pub use summary::{summarize_module, Affine, RetSummary, Summary};
 

@@ -1315,3 +1315,81 @@ fn closed_world_takes_weakest_call_site_guarantee() {
         "the weakest (8-byte) guarantee must leave the offset-8 read unprovable"
     );
 }
+
+/// Member-provenance: a raw pointer **member** is dereferenced in the callee but
+/// carries no validity from its type. Under closed-world the caller provably
+/// stores `&x` into that field (byte offset 8) before the call, so the callee's
+/// load of the field yields a valid pointer and the deref proves. `main` builds a
+/// `{ i64, ptr }` on the stack, writes `&x` into the pointer field, and calls.
+const MEMBER_PROV: &str = r#"
+define i32 @read_member(ptr %w) {
+entry:
+  %f = getelementptr inbounds i8, ptr %w, i64 8
+  %data = load ptr, ptr %f, align 8
+  %v = load i32, ptr %data, align 4
+  ret i32 %v
+}
+define i32 @main() {
+entry:
+  %x = alloca i32, align 4
+  %w = alloca [16 x i8], align 8
+  store i32 7, ptr %x, align 4
+  %f = getelementptr inbounds i8, ptr %w, i64 8
+  store ptr %x, ptr %f, align 8
+  %r = call i32 @read_member(ptr %w)
+  ret i32 %r
+}
+"#;
+
+#[test]
+fn closed_world_member_provenance_recovers_raw_pointer_member() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: MEMBER_PROV.into(), name: "mp".into() })
+        .expect("lower");
+
+    // Without member-provenance (open world) the dereferenced field pointer has
+    // no provenance → UNKNOWN.
+    assert_ne!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "a raw pointer member deref must not be recovered without whole-program info"
+    );
+    // Closed-world: the field is provably filled with &x at the sole call site.
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "member-provenance recovers the field pointer stored by the caller"
+    );
+}
+
+/// Soundness control: if a call site leaves the pointer field unwritten, the
+/// callee's deref must stay unprovable even under closed-world — no false PASS.
+const MEMBER_PROV_UNSET: &str = r#"
+define i32 @read_member(ptr %w) {
+entry:
+  %f = getelementptr inbounds i8, ptr %w, i64 8
+  %data = load ptr, ptr %f, align 8
+  %v = load i32, ptr %data, align 4
+  ret i32 %v
+}
+define i32 @main() {
+entry:
+  %w = alloca [16 x i8], align 8
+  %r = call i32 @read_member(ptr %w)
+  ret i32 %r
+}
+"#;
+
+#[test]
+fn closed_world_member_provenance_declines_unwritten_field() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: MEMBER_PROV_UNSET.into(), name: "mpu".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "an unwritten pointer field must leave the deref unprovable (no false PASS)"
+    );
+}

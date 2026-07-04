@@ -19,9 +19,9 @@ use csolver_cfg::{Dominators, Loops};
 use csolver_core::{Model, RegionKind, SafetyProperty};
 use crate::summary::{Affine, RetSummary, Summary};
 use csolver_ir::{
-    BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FuncId,
-    Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RefResult, RegId, SizeSpec,
-    Terminator, Type,
+    BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FieldContract,
+    FuncId, Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RefResult, RegId,
+    SizeSpec, Terminator, Type,
 };
 use csolver_memory::{AliasResult, LifetimeState, Permissions};
 use csolver_solver::{
@@ -111,7 +111,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &HashMap::new())
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -120,7 +120,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &[], &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &HashMap::new())
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -133,7 +133,23 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts, globals)
+    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], globals)
+}
+
+/// As [`discharge_full`], plus interprocedural **member-provenance**:
+/// `field_contracts[i]` lists the aggregate fields of parameter `i` that every
+/// call site provably fills with a valid pointer. Each is seeded as an initial
+/// store of a fresh valid region into that field's slot, so the callee's load of
+/// the field yields a pointer with provenance (proved under the field pointee's
+/// own trust basis).
+pub fn discharge_with_fields(
+    f: &Function,
+    summaries: &HashMap<FuncId, Summary>,
+    contracts: &[Option<PtrContract>],
+    field_contracts: &[Vec<FieldContract>],
+    globals: &HashMap<String, GlobalDef>,
+) -> SymbolicReport {
+    discharge_inner(f, ExecLimits::default(), summaries, contracts, field_contracts, globals)
 }
 
 /// As [`discharge_function`], with explicit limits and no summaries.
@@ -144,7 +160,7 @@ pub fn discharge_full(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &[], &HashMap::new())
+    discharge_inner(f, limits, &HashMap::new(), &[], &[], &HashMap::new())
 }
 
 /// Every symbol name referenced by an operand of `f` (`Const::Symbol` /
@@ -214,6 +230,7 @@ fn discharge_inner(
     limits: ExecLimits,
     summaries: &HashMap<FuncId, Summary>,
     contracts: &[Option<PtrContract>],
+    field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
     let analysis = analyze_intervals(f);
@@ -295,6 +312,10 @@ fn discharge_inner(
             env.insert(*reg, v);
         }
     }
+    // Member-provenance seed stores, filled alongside the param regions below and
+    // installed as the path's initial heap so the first load of each seeded field
+    // reads back a valid pointer.
+    let mut initial_heap: Vec<StoreRecord> = Vec::new();
     // Pass 2: contracted pointer parameters become known live regions.
     for (i, (reg, _ty)) in f.params.iter().enumerate() {
         let Some(c) = contracts.get(i).and_then(|c| c.as_ref()) else {
@@ -355,6 +376,40 @@ fn discharge_inner(
                 align: c.align.max(1) as u64,
             }),
         );
+        // Member-provenance: seed every field this parameter's call sites all fill
+        // with a valid pointer. The pointee is a fresh live region; its address is
+        // stored at the field's byte offset within this parameter's region — the
+        // very offset the callee's `PtrOffset` field access computes — so the
+        // load of the field reads back a pointer with provenance. Prove-only (a
+        // precondition), so the seeded region never refutes.
+        for fc in field_contracts.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+            let SizeSpec::Bytes(psize) = fc.pointee.size else { continue };
+            let psize_e = ex.ctx.int(PTR_WIDTH, psize as u128);
+            let prid = regions.len();
+            regions.push(SymRegion {
+                kind: RegionKind::Heap,
+                size: psize_e,
+                state: LifetimeState::Live,
+                perms: Permissions {
+                    read: fc.pointee.readable,
+                    write: fc.pointee.writable,
+                    exec: false,
+                },
+                contract: Some(fc.pointee.assumption.unwrap_or(PARAM_CONTRACTS)),
+                size_nowrap: None,
+            });
+            let palign = fc.pointee.align.max(1) as u64;
+            let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
+            initial_heap.push(StoreRecord {
+                target: SymPointer { prov: Prov::Region(rid), offset: off_e, align: palign },
+                value: SymValue::Ptr(SymPointer {
+                    prov: Prov::Region(prid),
+                    offset: zero,
+                    align: palign,
+                }),
+                size: PTR_WIDTH as u64 / 8,
+            });
+        }
     }
     // Referenced global/static definitions become regions that live for the
     // whole program: never freed, readable, writable iff not `constant`, with
@@ -388,7 +443,7 @@ fn discharge_inner(
         regions,
         pathcond: Vec::new(),
         facts,
-        heap: Vec::new(),
+        heap: initial_heap,
         exact: true,
     };
     ex.run_merged(state);

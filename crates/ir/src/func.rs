@@ -184,6 +184,21 @@ pub struct PtrContract {
     pub refutable: bool,
 }
 
+/// A contract on a *field* of a contracted pointer parameter: the pointer
+/// stored at **byte offset `offset`** behind the parameter points to a live
+/// region described by `pointee`. Synthesized interprocedurally — a raw pointer
+/// member carries no such guarantee from its type, only from the fact that every
+/// (visible) call site provably stores a valid pointer there. Keyed by byte
+/// offset (not field index) because the frontends address struct fields with
+/// byte `PtrOffset`s, so caller store and callee load line up on the offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldContract {
+    /// Byte offset of the pointer field within the parameter's aggregate.
+    pub offset: u64,
+    /// What the loaded field pointer points to (size, alignment, permissions).
+    pub pointee: PtrContract,
+}
+
 /// A module: a collection of functions plus the target data layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {

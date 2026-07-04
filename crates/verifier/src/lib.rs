@@ -33,9 +33,11 @@ use csolver_core::{
     Assumption, CounterExample, Location, Model, ObligationId, ObligationResult, ProofObligation,
     ResidualObligation, SafetyProperty, SourceLevel, SuggestedAssumption, Verdict,
 };
-use csolver_ir::{Condition, Const, FuncId, Function, Inst, Module, Operand, PtrContract};
+use csolver_ir::{
+    Condition, Const, FieldContract, FuncId, Function, Inst, Module, Operand, PtrContract,
+};
 use csolver_symbolic::{
-    discharge_full, discharge_function, summarize_module, Summary, SymOutcome, SymbolicReport,
+    discharge_function, discharge_with_fields, summarize_module, Summary, SymOutcome, SymbolicReport,
 };
 use std::collections::HashMap;
 
@@ -94,7 +96,11 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
     // Interprocedural: contracts synthesized from the (complete) call sites of
     // internal functions overlay the declared ones (declared always wins).
     let synthesized = contracts::synthesize(module, config.closed_world);
-    let mut functions = verify_functions(module, summaries.as_ref(), &synthesized, config, threads);
+    // Interprocedural member-provenance: which fields of a contracted parameter
+    // every call site fills with a valid pointer (empty unless internal/closed).
+    let field_synth = contracts::synthesize_fields(module, &synthesized, config.closed_world);
+    let mut functions =
+        verify_functions(module, summaries.as_ref(), &synthesized, &field_synth, config, threads);
 
     // Assign global obligation ids by a serial pass in function order — this
     // reproduces exactly the sequential ids a serial run would give, regardless of
@@ -162,6 +168,7 @@ fn verify_one_function(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
+    field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
     config: &Config,
     f: &Function,
 ) -> FunctionReport {
@@ -180,8 +187,20 @@ fn verify_one_function(
             }
         }
     }
+    // Per-parameter member-provenance field contracts (empty vec = none).
+    let field_contracts: Vec<Vec<FieldContract>> = (0..f.params.len())
+        .map(|i| field_synth.get(&(f.id, i as u32)).cloned().unwrap_or_default())
+        .collect();
     let mut local_id = 0u32;
-    verify_function_with(f, summaries, &contracts, &module.globals, config, &mut local_id)
+    verify_function_with(
+        f,
+        summaries,
+        &contracts,
+        &field_contracts,
+        &module.globals,
+        config,
+        &mut local_id,
+    )
 }
 
 /// Verify every function, distributing them over `threads` workers. Work is pulled
@@ -192,6 +211,7 @@ fn verify_functions(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
+    field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
     config: &Config,
     threads: usize,
 ) -> Vec<FunctionReport> {
@@ -200,7 +220,7 @@ fn verify_functions(
     if threads <= 1 || n <= 1 {
         return fns
             .iter()
-            .map(|f| verify_one_function(module, summaries, synthesized, config, f))
+            .map(|f| verify_one_function(module, summaries, synthesized, field_synth, config, f))
             .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -212,7 +232,8 @@ fn verify_functions(
                 if i >= n {
                     break;
                 }
-                let r = verify_one_function(module, summaries, synthesized, config, &fns[i]);
+                let r =
+                    verify_one_function(module, summaries, synthesized, field_synth, config, &fns[i]);
                 // Recover from a poisoned lock (a worker panicked) rather than
                 // cascading the panic — the collected data is still valid.
                 out.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((i, r));
@@ -333,7 +354,7 @@ fn assumption_record(id: String) -> Assumption {
 /// Verify a single function in isolation (no interprocedural summaries or
 /// parameter contracts), drawing obligation ids from `next_id`.
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
-    verify_function_with(f, None, &[], &HashMap::new(), config, next_id)
+    verify_function_with(f, None, &[], &[], &HashMap::new(), config, next_id)
 }
 
 /// Verify a single function, optionally using module-wide summaries for calls
@@ -342,13 +363,14 @@ fn verify_function_with(
     f: &Function,
     summaries: Option<&HashMap<FuncId, Summary>>,
     contracts: &[Option<PtrContract>],
+    field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, csolver_ir::GlobalDef>,
     config: &Config,
     next_id: &mut u32,
 ) -> FunctionReport {
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
-        Some(s) => discharge_full(f, s, contracts, globals),
+        Some(s) => discharge_with_fields(f, s, contracts, field_contracts, globals),
         None => discharge_function(f),
     });
 

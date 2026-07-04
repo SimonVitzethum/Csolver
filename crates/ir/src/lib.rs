@@ -33,7 +33,9 @@ pub mod inst;
 pub mod ty;
 
 pub use frontend::Frontend;
-pub use func::{BasicBlock, Function, GlobalDef, Module, PtrContract, SizeSpec, Terminator};
+pub use func::{
+    BasicBlock, FieldContract, Function, GlobalDef, Module, PtrContract, SizeSpec, Terminator,
+};
 pub use id::{BlockId, FuncId, RegId};
 pub use inst::{
     BinOp, Callee, CastOp, CmpOp, Condition, Const, Inst, MemKind, Operand, RValue, RefResult,
