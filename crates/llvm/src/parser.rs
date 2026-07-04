@@ -191,7 +191,7 @@ pub enum LInst {
     /// `dst = alloca ty[, align n]`.
     Alloca { dst: String, ty: LType, align: u32 },
     /// `dst = load ty, ptr p[, align n]`.
-    Load { dst: String, ty: LType, ptr: LValue, align: u32 },
+    Load { dst: String, ty: LType, ptr: LValue, align: u32, align_meta: Option<u32> },
     /// `store ty v, ptr p[, align n]`.
     Store { ty: LType, val: LValue, ptr: LValue, align: u32 },
     /// `dst = getelementptr [inbounds] elem, ptr base, i.. index`.
@@ -266,7 +266,7 @@ pub enum LTerm {
 pub fn parse_module(src: &str) -> Result<LModule> {
     let debuginfo = crate::debuginfo::parse(src);
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0, types: HashMap::new() };
+    let mut p = Parser { toks, pos: 0, types: HashMap::new(), meta_ints: scan_meta_ints(src) };
     // Pre-scan for `%"name" = type <T>` definitions: a definition may lexically
     // follow its first use, so the table must be complete before any function
     // parses. An unparseable definition is skipped — a function using it then
@@ -318,6 +318,38 @@ struct Parser {
     /// contain [`LType::Named`] references; [`Parser::resolve_named`] substitutes
     /// them at use time.
     types: HashMap<String, LType>,
+    /// Single-integer metadata nodes (`!N = !{iW V}`), pre-scanned so an
+    /// instruction's `!align !N` reference can be resolved to its value `V` while
+    /// the instruction is parsed (the node may lexically follow the use).
+    meta_ints: HashMap<u32, u64>,
+}
+
+/// Pre-scan single-integer metadata nodes (`!126 = !{i64 8}`) into a map from
+/// node id to value. Only exact `!{iW V}` shapes are recorded — enough for the
+/// `!align`/`!range`-style annotations the analysis reads; anything else is left
+/// out (a missing entry just means the annotation is not credited).
+fn scan_meta_ints(src: &str) -> HashMap<u32, u64> {
+    let mut m = HashMap::new();
+    for line in src.lines() {
+        let Some((id, after)) = line.trim().strip_prefix('!').and_then(|r| r.split_once(" = ")) else {
+            continue;
+        };
+        let Ok(id) = id.trim().parse::<u32>() else { continue };
+        let Some(inner) = after.trim().strip_prefix("!{").and_then(|s| s.strip_suffix('}')) else {
+            continue;
+        };
+        let mut parts = inner.split_whitespace();
+        match (parts.next(), parts.next(), parts.next()) {
+            // A single `iW V` element (no trailing tokens).
+            (Some(ty), Some(val), None) if ty.starts_with('i') => {
+                if let Ok(v) = val.trim_end_matches(',').parse::<u64>() {
+                    m.insert(id, v);
+                }
+            }
+            _ => {}
+        }
+    }
+    m
 }
 
 impl Parser {
@@ -621,6 +653,31 @@ impl Parser {
             self.pos += 2; // ',' 'align'
             if let Tok::Int(n) = self.bump() {
                 return Some(n as u32);
+            }
+        }
+        None
+    }
+
+    /// Scan the current instruction's trailing metadata (without consuming — the
+    /// block loop's `skip_to_eol` drops it) for `!align !N`, returning the node's
+    /// value from the pre-scanned integer-metadata table.
+    fn peek_load_align_meta(&self) -> Option<u32> {
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::Newline | Tok::Eof => break,
+                Tok::Punct('!') => {
+                    if matches!(self.toks.get(i + 1), Some(Tok::Word(w)) if w == "align") {
+                        if let Some(Tok::Int(n)) = self.toks.get(i + 3) {
+                            return u32::try_from(*n)
+                                .ok()
+                                .and_then(|id| self.meta_ints.get(&id))
+                                .and_then(|v| u32::try_from(*v).ok());
+                        }
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
             }
         }
         None
@@ -1180,7 +1237,11 @@ impl Parser {
                 let ptr = self.value()?;
                 self.skip_atomic_ordering();
                 let align = self.maybe_align().unwrap_or(0);
-                LInst::Load { dst: need_dst()?, ty, ptr, align }
+                // `!align !N` metadata states the *loaded pointer's* alignment — an
+                // LLVM guarantee independent of the pointee type, so it is recorded
+                // and later folded into the loaded reference's alignment.
+                let align_meta = self.peek_load_align_meta();
+                LInst::Load { dst: need_dst()?, ty, ptr, align, align_meta }
             }
             "store" => {
                 self.skip_memory_qualifiers();
@@ -1567,5 +1628,38 @@ done:
         let body = f.blocks.iter().find(|b| b.label == "body").unwrap();
         assert!(matches!(body.insts[0], LInst::Gep { .. }));
         assert!(matches!(body.insts[1], LInst::Store { .. }));
+    }
+
+    #[test]
+    fn scans_single_integer_metadata_nodes() {
+        let m = scan_meta_ints("!126 = !{i64 8}\n!7 = !{i32 4}\n!9 = !{}\n!5 = !{!1, !2}\n");
+        assert_eq!(m.get(&126), Some(&8));
+        assert_eq!(m.get(&7), Some(&4));
+        // An empty tuple and a multi-element tuple are not single integers.
+        assert_eq!(m.get(&9), None);
+        assert_eq!(m.get(&5), None);
+    }
+
+    #[test]
+    fn captures_load_align_metadata() {
+        let src = r#"
+define i64 @f(ptr %p) {
+entry:
+  %v = load ptr, ptr %p, align 8, !nonnull !0, !align !1
+  %w = load i64, ptr %p, align 8
+  ret i64 %w
+}
+!0 = !{}
+!1 = !{i64 16}
+"#;
+        let m = parse_module(src).expect("parse");
+        let f = &m.funcs[0];
+        // The pointer load records its `!align 16` guarantee; the plain load does not.
+        let mut loads = f.blocks[0].insts.iter().filter_map(|i| match i {
+            LInst::Load { align_meta, .. } => Some(*align_meta),
+            _ => None,
+        });
+        assert_eq!(loads.next(), Some(Some(16)));
+        assert_eq!(loads.next(), Some(None));
     }
 }

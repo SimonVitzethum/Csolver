@@ -519,13 +519,16 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         // then materialise its result as a valid reference — the loaded pointer
         // is a `&T`/`&mut T` by the field's declared type, so accesses through it
         // prove. Without this the loaded field pointer has lost provenance.
-        if let LInst::Load { dst, .. } = inst {
+        if let LInst::Load { dst, align_meta, .. } = inst {
             if let Some(&(size, align, writable)) = ctx.field_ref_loads.get(dst) {
                 insts.push(lower_inst(ctx, inst)?);
                 insts.push(Inst::RefWitness {
                     dst: ctx.reg(dst)?,
                     size: Some(size),
-                    align,
+                    // The DWARF pointee type gives a natural alignment; an `!align`
+                    // metadatum on the load is a stronger, explicit guarantee — take
+                    // the larger so an aligned access through the field proves.
+                    align: align.max(align_meta.unwrap_or(0)),
                     writable,
                 });
                 continue;
@@ -591,7 +594,7 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
             count: Operand::int(64, 1),
             align: align_or(*align, ty),
         },
-        LInst::Load { dst, ty, ptr, align } => Inst::Load {
+        LInst::Load { dst, ty, ptr, align, .. } => Inst::Load {
             dst: ctx.reg(dst)?,
             ty: lower_type(ty),
             ptr: ctx.operand(ptr, 64)?,
