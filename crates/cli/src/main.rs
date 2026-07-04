@@ -26,7 +26,11 @@ const HELP: &str = "\
 solver — CSolver memory-safety verifier
 
 USAGE:
-    solver verify <path> [--json]   verify a .rs (turnkey), .mir, .ll, .s, or ELF
+    solver verify <path> [--json] [--closed-world]
+                                    verify a .rs (turnkey), .mir, .ll, .s, or ELF
+                                    (--closed-world: treat the module as the whole
+                                    program — synthesize contracts for exported
+                                    functions from all their in-module call sites)
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
     solver report <result.json>     re-render a saved JSON report
     solver --help                   show this help
@@ -54,6 +58,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     };
 
     let json = args.iter().any(|a| a == "--json");
+    let closed_world = args.iter().any(|a| a == "--closed-world");
     match command.as_str() {
         "--help" | "-h" | "help" => {
             print!("{HELP}");
@@ -74,7 +79,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .get(1)
                 .filter(|a| !a.starts_with("--"))
                 .ok_or("`verify` needs a path argument")?;
-            verify_path(Path::new(path), json)
+            verify_path(Path::new(path), json, closed_world)
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
@@ -82,7 +87,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Dispatch a path to the appropriate frontend, then verify.
-fn verify_path(path: &Path, json: bool) -> Result<ExitCode, String> {
+fn verify_path(path: &Path, json: bool, closed_world: bool) -> Result<ExitCode, String> {
     // Turnkey: a `.rs` file is compiled to MIR by us, then verified with a
     // coverage report — the user does not hand-run rustc.
     if path.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -130,6 +135,7 @@ fn verify_path(path: &Path, json: bool) -> Result<ExitCode, String> {
         Ok(module) => {
             let config = Config {
                 level,
+                closed_world,
                 ..Config::default()
             };
             let report = verify_module(&module, &config);

@@ -51,6 +51,14 @@ pub struct Config {
     pub use_intervals: bool,
     /// Whether to escalate undecided checks to symbolic execution + the solver.
     pub use_symbolic: bool,
+    /// Treat the module as the **whole program** (closed world): assume the
+    /// module's direct call sites are *all* of every function's call sites, not
+    /// only those with internal linkage. This licenses call-site contract
+    /// synthesis for exported functions too — sound exactly when the assumption
+    /// holds (a self-contained program, LTO-style link, or a `main`-rooted
+    /// binary). Off by default: an open module (a library with unseen callers)
+    /// would be unsound, so it is opt-in.
+    pub closed_world: bool,
 }
 
 impl Default for Config {
@@ -59,6 +67,7 @@ impl Default for Config {
             level: SourceLevel::Llvm,
             use_intervals: true,
             use_symbolic: true,
+            closed_world: false,
         }
     }
 }
@@ -84,7 +93,7 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
     let summaries = config.use_symbolic.then(|| summarize_module(module));
     // Interprocedural: contracts synthesized from the (complete) call sites of
     // internal functions overlay the declared ones (declared always wins).
-    let synthesized = contracts::synthesize(module);
+    let synthesized = contracts::synthesize(module, config.closed_world);
     let mut functions = verify_functions(module, summaries.as_ref(), &synthesized, config, threads);
 
     // Assign global obligation ids by a serial pass in function order — this
@@ -265,6 +274,20 @@ fn assumption_record(id: String) -> Assumption {
                             its call sites; every one passes a live region with at least \
                             the synthesized size (a constant-size stack allocation or a \
                             parameter with a declared contract, borrowed for the call)"
+                .into(),
+        },
+        contracts::CLOSED_WORLD_CONTRACT => Assumption {
+            id,
+            statement: "in whole-program (closed-world) mode, an exported function's \
+                        pointer parameter satisfies the weakest contract its call sites \
+                        guarantee (minimum size and alignment, intersected permissions)"
+                .into(),
+            justification: "the run was told the module is the whole program \
+                            (`--closed-world`), so the module's direct call sites are \
+                            taken to be all of the function's call sites — the same \
+                            derivation as internal linkage, resting on the whole-program \
+                            assertion instead of on linkage; every seen call passes a \
+                            live region of at least the synthesized size"
                 .into(),
         },
         "debuginfo" => Assumption {

@@ -1230,3 +1230,88 @@ start:
         "the same `&`-named pointer under Rust is a reference → recovered"
     );
 }
+
+/// Closed-world contract synthesis: an **exported** (non-internal) function whose
+/// pointer parameter is uncontracted is UNKNOWN by default (its callers might be
+/// anywhere), but under `closed_world` the module's call sites are taken to be
+/// all of them — here the sole caller passes a live 16-byte alloca, so the two
+/// i64 loads become provable.
+const CLOSED_WORLD: &str = r#"
+define i64 @sum_pair(ptr %p) {
+entry:
+  %a = load i64, ptr %p, align 8
+  %q = getelementptr inbounds i8, ptr %p, i64 8
+  %b = load i64, ptr %q, align 8
+  %s = add i64 %a, %b
+  ret i64 %s
+}
+define i64 @main() {
+entry:
+  %buf = alloca [2 x i64], align 8
+  %r = call i64 @sum_pair(ptr %buf)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn closed_world_synthesizes_exported_contract() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: CLOSED_WORLD.into(), name: "cw".into() })
+        .expect("lower");
+
+    // Default (open world): the exported callee's `%p` is uncontracted → UNKNOWN.
+    assert_ne!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "an exported function's raw pointer parameter must not be recovered without closed-world"
+    );
+
+    // Closed-world: synthesized from the 16-byte-alloca call site → PASS.
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "closed-world recovers the exported parameter from its sole (16-byte) call site"
+    );
+}
+
+/// Soundness control for closed-world: the synthesized contract is the *weakest*
+/// guarantee across call sites. With one caller passing 16 bytes and another only
+/// 8, the offset-8 load must stay unprovable — no false PASS.
+const CLOSED_WORLD_WEAKEST: &str = r#"
+define i64 @sum_pair(ptr %p) {
+entry:
+  %a = load i64, ptr %p, align 8
+  %q = getelementptr inbounds i8, ptr %p, i64 8
+  %b = load i64, ptr %q, align 8
+  %s = add i64 %a, %b
+  ret i64 %s
+}
+define i64 @big() {
+entry:
+  %buf = alloca [2 x i64], align 8
+  %r = call i64 @sum_pair(ptr %buf)
+  ret i64 %r
+}
+define i64 @small() {
+entry:
+  %one = alloca i64, align 8
+  %r = call i64 @sum_pair(ptr %one)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn closed_world_takes_weakest_call_site_guarantee() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: CLOSED_WORLD_WEAKEST.into(), name: "cww".into() })
+        .expect("lower");
+    // Even under closed-world, one 8-byte caller caps the contract at 8 bytes,
+    // so reading at offset 8 cannot be proven — must NOT be a false PASS.
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "the weakest (8-byte) guarantee must leave the offset-8 read unprovable"
+    );
+}

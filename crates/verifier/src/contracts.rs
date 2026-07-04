@@ -11,9 +11,20 @@
 //! `dereferenceable` attributes: the callee's `ptr %self` has no declared
 //! contract, but every caller demonstrably passes (say) a live 32-byte alloca.
 //!
+//! ## Closed-world mode
+//!
+//! Internal linkage is one way to *prove* the call sites complete. When the
+//! caller declares the module to be the whole program (`Config::closed_world`),
+//! completeness is instead *assumed* for every function, so an exported function
+//! is contracted from its in-module call sites too. Every other condition below
+//! still holds (address-not-taken, statically-derivable arguments, ≥1 call
+//! site), and the trust basis is surfaced as the distinct `closed-world-contract`
+//! assumption rather than `internal-call-contract`.
+//!
 //! ## Soundness conditions (each enforced here)
 //!
-//! 1. The callee has internal linkage (`Module::internal`).
+//! 1. The callee has internal linkage (`Module::internal`), *or* closed-world
+//!    mode asserts the module is the whole program.
 //! 2. Its address is never taken — no `Const::Symbol(name)` operand anywhere in
 //!    the module (an escaped function pointer would mean unseen call sites).
 //! 3. Every call site's argument is *statically* derivable: the direct result
@@ -51,8 +62,15 @@ fn condition_operands(c: &Condition, op: &mut impl FnMut(&Operand)) {
     }
 }
 
-/// The assumption id surfaced by proofs that rest on a synthesized contract.
+/// The assumption id surfaced by proofs that rest on a synthesized contract for
+/// a function proven complete by **internal linkage**.
 pub(crate) const INTERNAL_CALL_CONTRACT: &str = "internal-call-contract";
+
+/// The assumption id for a synthesized contract whose call-site completeness
+/// rests on the **whole-program (closed-world)** assertion rather than on
+/// internal linkage — an *exported* function all of whose callers are taken to
+/// be visible because the module is declared to be the whole program.
+pub(crate) const CLOSED_WORLD_CONTRACT: &str = "closed-world-contract";
 
 /// What one call site guarantees about the region behind an argument.
 #[derive(Clone, Copy)]
@@ -73,10 +91,13 @@ struct SiteGuarantee {
 /// were final when they were computed). So no contract ever justifies itself
 /// through a cycle, values never change after creation, and the loop adds at
 /// least one parameter per round or stops.
-pub(crate) fn synthesize(module: &Module) -> HashMap<(FuncId, u32), PtrContract> {
+pub(crate) fn synthesize(
+    module: &Module,
+    closed_world: bool,
+) -> HashMap<(FuncId, u32), PtrContract> {
     let mut acc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
     loop {
-        let round = synthesize_round(module, &acc);
+        let round = synthesize_round(module, &acc, closed_world);
         let mut grew = false;
         for (k, v) in round {
             grew |= acc.insert(k, v).is_none();
@@ -92,14 +113,17 @@ pub(crate) fn synthesize(module: &Module) -> HashMap<(FuncId, u32), PtrContract>
 fn synthesize_round(
     module: &Module,
     prior: &HashMap<(FuncId, u32), PtrContract>,
+    closed_world: bool,
 ) -> HashMap<(FuncId, u32), PtrContract> {
     let escaped = address_taken_names(module);
 
-    // Eligible (callee, param-index) pairs: internal, address never taken,
+    // Eligible (callee, param-index) pairs: complete call sites (internal
+    // linkage, or *any* function under closed-world), address never taken,
     // pointer-typed, no declared contract.
     let mut candidates: HashSet<(FuncId, u32)> = HashSet::new();
     for f in &module.functions {
-        if !module.internal.contains(&f.id) || escaped.contains(&f.name) {
+        let complete = closed_world || module.internal.contains(&f.id);
+        if !complete || escaped.contains(&f.name) {
             continue;
         }
         for (i, (_, ty)) in f.params.iter().enumerate() {
@@ -159,6 +183,13 @@ fn synthesize_round(
         .into_iter()
         .filter_map(|(key, g)| {
             let g = g?;
+            // Trust basis: internal linkage *proves* the call sites complete;
+            // otherwise completeness rests on the closed-world assertion.
+            let assumption = if module.internal.contains(&key.0) {
+                INTERNAL_CALL_CONTRACT
+            } else {
+                CLOSED_WORLD_CONTRACT
+            };
             Some((
                 key,
                 PtrContract {
@@ -166,7 +197,7 @@ fn synthesize_round(
                     align: g.align,
                     readable: g.readable,
                     writable: g.writable,
-                    assumption: Some(INTERNAL_CALL_CONTRACT),
+                    assumption: Some(assumption),
                     // A synthesized contract is the *weakest* call-site
                     // guarantee; a witness against it may combine argument
                     // values no single caller produces — prove-only.
