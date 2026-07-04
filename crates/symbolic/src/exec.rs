@@ -20,7 +20,7 @@ use csolver_core::{Model, RegionKind, SafetyProperty};
 use crate::summary::{Affine, RetSummary, Summary};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FuncId,
-    Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RegId, SizeSpec,
+    Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RefResult, RegId, SizeSpec,
     Terminator, Type,
 };
 use csolver_memory::{AliasResult, LifetimeState, Permissions};
@@ -1792,8 +1792,8 @@ impl Explorer<'_> {
                 let p = self.eval_pointer(ptr, state);
                 self.check_dealloc(block, idx, &p, state);
             }
-            Inst::Call { dst, callee, args, ret_ty } => {
-                self.step_call(dst.as_ref(), callee, args, ret_ty, state);
+            Inst::Call { dst, callee, args, ret_ty, ret_ref } => {
+                self.step_call(dst.as_ref(), callee, args, ret_ty, *ret_ref, state);
             }
             Inst::Intrinsic { dst: Some(d), .. } => {
                 let s = self.fresh_scalar(PTR_WIDTH);
@@ -1805,28 +1805,11 @@ impl Explorer<'_> {
                 self.record_scalar(block, idx, decision);
             }
             Inst::RefWitness { dst, size, align, writable } => {
-                // A fresh live region of the pointee's size. A known size is
-                // refutable (an OOB access through the reference is a real
-                // finding); an unknown size (slice/`str`) is prove-only. The
-                let (size_e, nowrap) = match size {
-                    Some(n) => {
-                        let truth = self.ctx.boolean(true);
-                        (self.ctx.int(PTR_WIDTH, *n as u128), Some(truth))
-                    }
-                    None => (self.fresh_scalar(PTR_WIDTH), None),
-                };
+                // A valid reference to a fresh live region (see
+                // `materialize_ref_region`): a known size is refutable, an
+                // unknown size (slice/`str`) prove-only.
+                let rid = self.materialize_ref_region(*size, *writable, state);
                 let zero = self.ctx.int(PTR_WIDTH, 0);
-                let nonneg = self.ctx.cmp(SCmp::Sle, zero, size_e);
-                state.facts.push(nonneg);
-                let rid = state.regions.len();
-                state.regions.push(SymRegion {
-                    kind: RegionKind::Global,
-                    size: size_e,
-                    state: LifetimeState::Live,
-                    perms: Permissions { read: true, write: *writable, exec: false },
-                    contract: Some(VALID_REFERENCE),
-                    size_nowrap: nowrap,
-                });
                 state.env.insert(
                     *dst,
                     SymValue::Ptr(SymPointer {
@@ -1960,6 +1943,7 @@ impl Explorer<'_> {
         callee: &Callee,
         args: &[Operand],
         ret_ty: &Type,
+        ret_ref: Option<RefResult>,
         state: &mut PathState,
     ) {
         // A call is an over-approximation point (havoc'd heap/return unless a
@@ -2012,10 +1996,59 @@ impl Explorer<'_> {
                 Some(RetSummary::Scalar(aff)) => {
                     SymValue::Scalar(self.instantiate_affine(aff, &argvals))
                 }
+                // No precise summary, but the result type is a reference: it is
+                // valid by Rust's type invariant (a safe callee cannot return a
+                // dangling `&T`). Materialise a valid-reference region instead of
+                // an opaque pointer — the interprocedural counterpart of the
+                // by-value-aggregate `RefWitness`.
+                None if ret_ref.is_some() => {
+                    let RefResult { size, writable } = ret_ref.unwrap_or(RefResult {
+                        size: None,
+                        writable: false,
+                    });
+                    let rid = self.materialize_ref_region(size, writable, state);
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Region(rid),
+                        offset: self.ctx.int(PTR_WIDTH, 0),
+                        align: 1,
+                    })
+                }
                 _ => self.fresh_value(ret_ty, POrigin::Call),
             };
             state.env.insert(*d, value);
         }
+    }
+
+    /// Create a fresh live region modelling a valid reference (`&T`/`&mut T`):
+    /// exact pointee size (refutable) or unknown size (prove-only), readable and
+    /// writable per mutability, resting on the `valid-reference` assumption. The
+    /// same region shape [`Inst::RefWitness`] builds; returns the region id.
+    fn materialize_ref_region(
+        &mut self,
+        size: Option<u64>,
+        writable: bool,
+        state: &mut PathState,
+    ) -> usize {
+        let (size_e, nowrap) = match size {
+            Some(n) => {
+                let truth = self.ctx.boolean(true);
+                (self.ctx.int(PTR_WIDTH, n as u128), Some(truth))
+            }
+            None => (self.fresh_scalar(PTR_WIDTH), None),
+        };
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let nonneg = self.ctx.cmp(SCmp::Sle, zero, size_e);
+        state.facts.push(nonneg);
+        let rid = state.regions.len();
+        state.regions.push(SymRegion {
+            kind: RegionKind::Global,
+            size: size_e,
+            state: LifetimeState::Live,
+            perms: Permissions { read: true, write: writable, exec: false },
+            contract: Some(VALID_REFERENCE),
+            size_nowrap: nowrap,
+        });
+        rid
     }
 
     /// Rebuild a pointer return value `arg + offset(args)`, keeping `arg`'s
@@ -3478,6 +3511,7 @@ mod tests {
             callee: Callee::Symbol("unknown".into()),
             args: vec![],
             ret_ty: Type::Unit,
+            ret_ref: None,
         });
         bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 });
         Function {
@@ -3791,6 +3825,7 @@ mod tests {
             callee: csolver_ir::Callee::Direct(FuncId(9)),
             args: vec![Operand::Reg(buf)],
             ret_ty: Type::Unit,
+            ret_ref: None,
         });
         bb0.insts.push(Inst::Store {
             ty: Type::int(8),

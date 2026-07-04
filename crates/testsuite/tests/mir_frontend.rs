@@ -1218,3 +1218,55 @@ fn next_fn(_1: usize) -> usize {
     assert_eq!(names, vec!["takes_hasher", "next_fn"], "both parse, no desync: {names:?}");
     assert!(module.unanalyzed.is_empty(), "{:?}", module.unanalyzed);
 }
+
+/// A call returning `&T`/`&mut T` yields a *valid reference* (Rust's type
+/// invariant — even an external callee cannot return a dangling reference in
+/// safe code): a read through the returned reference proves, resting on
+/// `valid-reference`. A call returning a raw `*const T` gets no such guarantee
+/// and stays opaque (an access through it must not prove). This is the
+/// interprocedural counterpart of the by-value-aggregate reference witness.
+#[test]
+fn mir_reference_returning_call_yields_a_valid_reference() {
+    let ref_ret = r#"
+fn read(_1: usize) -> u8 {
+    let mut _0: u8;
+    let mut _2: &u8;
+    bb0: {
+        _2 = lookup(copy _1) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = copy (*_2);
+        return;
+    }
+}
+"#;
+    let module = lower(ref_ret, "m");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.functions[0].verdict, Verdict::Pass, "read via returned &u8: {report:?}");
+    assert!(
+        report.assumptions.iter().any(|a| a.id == "valid-reference"),
+        "the read rests on the reference-validity invariant"
+    );
+
+    // Raw-pointer return: no validity guarantee, the deref must not prove.
+    let ptr_ret = r#"
+fn read_raw(_1: usize) -> u8 {
+    let mut _0: u8;
+    let mut _2: *const u8;
+    bb0: {
+        _2 = leak(copy _1) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        _0 = copy (*_2);
+        return;
+    }
+}
+"#;
+    let module = lower(ptr_ret, "m");
+    let report = verify_module(&module, &Config::default());
+    assert_ne!(
+        report.functions[0].verdict,
+        Verdict::Pass,
+        "a deref of a raw *const u8 call result must not prove: {report:?}"
+    );
+}

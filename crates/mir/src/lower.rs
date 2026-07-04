@@ -13,7 +13,7 @@ use csolver_core::{Error, Result};
 use crate::parser::CalleeSpec;
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CmpOp, Const, DataLayout, FuncId, Function, Inst, Module,
-    Operand as IrOp, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
+    Operand as IrOp, PtrContract, RValue, RefResult, RegId, SizeSpec, Terminator, Type,
 };
 use std::collections::HashMap;
 
@@ -472,11 +472,28 @@ impl Ctx {
                     }
                     _ => Type::int(64),
                 };
+                // A call returning `&T`/`&mut T` yields a *valid reference* by
+                // Rust's type invariant (the callee — even external — cannot
+                // return a dangling reference in safe code). Absent a precise
+                // summary, the engine materialises it as a valid-reference
+                // region instead of an opaque pointer. Raw pointers are excluded
+                // (not guaranteed valid).
+                let ret_ref = match dst {
+                    Place::Local(d) => match self.local_types.get(d) {
+                        Some(MType::Ref(inner, mutable)) => Some(RefResult {
+                            size: pointee_size(inner),
+                            writable: *mutable,
+                        }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 out.push(Inst::Call {
                     dst: ir_dst,
                     callee: ir_callee,
                     args: ir_args,
                     ret_ty,
+                    ret_ref,
                 });
                 match target {
                     Some(t) => Terminator::Br { target: BlockId(*t as u32), args: vec![] },
@@ -518,6 +535,7 @@ impl Ctx {
                     callee: Callee::Symbol("drop".into()),
                     args: vec![],
                     ret_ty: Type::Unit,
+                    ret_ref: None,
                 });
                 match target {
                     Some(t) => Terminator::Br { target: BlockId(*t as u32), args: vec![] },

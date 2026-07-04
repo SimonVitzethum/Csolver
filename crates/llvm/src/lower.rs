@@ -437,6 +437,7 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 callee: callee_ir,
                 args: call_args,
                 ret_ty: lower_type(ret),
+                ret_ref: None,
             });
             let then_args = branch_args(ctx, &b.label, ok)?;
             let else_args = branch_args(ctx, &b.label, cleanup)?;
@@ -584,6 +585,7 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                         callee: Callee::Symbol(callee.clone()),
                         args: Vec::new(),
                         ret_ty: Type::Unit,
+                        ret_ref: None,
                     }
                 }
             } else {
@@ -595,7 +597,7 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                     .iter()
                     .map(|a| ctx.operand(a, 64))
                     .collect::<Result<_>>()?;
-                Inst::Call { dst, callee, args, ret_ty: lower_type(ret) }
+                Inst::Call { dst, callee, args, ret_ty: lower_type(ret), ret_ref: None }
             }
         }
     })

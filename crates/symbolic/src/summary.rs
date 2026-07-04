@@ -479,6 +479,7 @@ mod tests {
                 callee: Callee::Symbol("core::panicking::panic".into()),
                 args: vec![],
                 ret_ty: Type::Unit,
+                ret_ref: None,
             });
             let f = Function {
                 id: FuncId(0),
@@ -549,6 +550,7 @@ mod tests {
             callee: Callee::Symbol("check".into()),
             args: vec![],
             ret_ty: Type::Bool,
+            ret_ref: None,
         });
         let panic_blk = BasicBlock::new(BlockId(1), Terminator::Unreachable);
         let mut ok = BasicBlock::new(BlockId(2), Terminator::Return(Some(Operand::Reg(q))));
@@ -642,6 +644,7 @@ mod tests {
             callee: Callee::Symbol("check".into()),
             args: vec![],
             ret_ty: Type::Bool,
+            ret_ref: None,
         });
         let exit = BasicBlock::new(BlockId(2), Terminator::Return(Some(Operand::Reg(next))));
         let g = Function {

@@ -297,6 +297,13 @@ pub enum Inst {
         args: Vec<Operand>,
         /// Result type.
         ret_ty: Type,
+        /// When the result is a *reference* (`&T`/`&mut T`), the pointee's byte
+        /// size (`None` = unsized) and mutability. Rust guarantees a returned
+        /// reference is valid, so — absent a more precise callee summary — the
+        /// engine materialises it as a valid-reference region instead of an
+        /// opaque pointer. `None` for a non-reference result (raw pointer,
+        /// scalar): the callee could return anything.
+        ret_ref: Option<RefResult>,
     },
     /// Inline assembly, modelled opaquely unless a semantics is supplied.
     Asm {
@@ -353,6 +360,15 @@ pub enum Inst {
         /// A human note describing the origin (e.g. "slice index `a[i]`").
         note: String,
     },
+}
+
+/// The reference-validity facts a call's `&T`/`&mut T` result carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefResult {
+    /// Byte size of the pointee (`None` = unsized / slice).
+    pub size: Option<u64>,
+    /// Whether the reference is mutable.
+    pub writable: bool,
 }
 
 impl Inst {

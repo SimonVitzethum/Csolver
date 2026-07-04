@@ -61,6 +61,7 @@ fn interproc_caller() -> Function {
         callee: csolver_ir::Callee::Direct(FuncId(6)),
         args: vec![Operand::Reg(buf)],
         ret_ty: Type::ptr(Type::int(32)),
+        ret_ref: None,
     });
     bb0.insts.push(Inst::Store {
         ty: Type::int(32),

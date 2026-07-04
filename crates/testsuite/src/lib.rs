@@ -124,6 +124,7 @@ pub fn interproc_module() -> Module {
         callee: csolver_ir::Callee::Direct(FuncId(0)),
         args: vec![Operand::Reg(buf)],
         ret_ty: Type::ptr(Type::int(32)),
+        ret_ref: None,
     });
     eb.insts.push(Inst::Store {
         ty: Type::int(32),
