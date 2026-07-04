@@ -21,6 +21,7 @@
 //! is a concrete MSIR execution). The mapping is opcode-local and documented in
 //! [`lower`]; see `Verification/`.
 
+mod debuginfo;
 mod lexer;
 mod lower;
 mod parser;

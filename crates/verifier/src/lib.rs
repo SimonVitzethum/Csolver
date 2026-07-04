@@ -267,6 +267,13 @@ fn assumption_record(id: String) -> Assumption {
                             parameter with a declared contract, borrowed for the call)"
                 .into(),
         },
+        "debuginfo" => Assumption {
+            id,
+            statement: "a reference parameter points to a live object of its                         debug-info pointee type's size (readable, and writable for                         `&mut`/non-const)"
+                .into(),
+            justification: "recovered from the module's DWARF debug metadata (`!DI…`),                             which records the pointee type the opaque `ptr` erased. A                             contract is synthesized only for pointer kinds the source                             language guarantees valid — a Rust `&T`/`&mut T` or a C++                             `T&` — never a raw pointer, so it grants exactly what the                             type system already does"
+                .into(),
+        },
         "valid-reference" => Assumption {
             id,
             statement: "a `&T`/`&mut T` value points to a live, correctly-sized                         and -aligned `T`, readable (and writable for `&mut`)"

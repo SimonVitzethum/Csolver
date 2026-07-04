@@ -25,6 +25,9 @@ pub struct LModule {
     /// Only definitions whose type parsed are recorded; anything else is skipped
     /// (its symbol then stays an opaque scalar — the sound default).
     pub globals: Vec<LGlobal>,
+    /// The debug-info type graph (`!DI…`), for recovering opaque-pointer pointee
+    /// types. Empty when the module carries no debug info.
+    pub(crate) debuginfo: crate::debuginfo::DebugInfo,
 }
 
 /// A parsed global definition.
@@ -59,6 +62,9 @@ pub struct LFunc {
     /// `define internal`/`private`: the function is not visible outside this
     /// module, so the module's call sites are all its call sites.
     pub internal: bool,
+    /// The `!dbg !N` `DISubprogram` metadata id, if the function carries debug
+    /// info — the key into [`crate::debuginfo`] for recovering pointee types.
+    pub dbg: Option<u32>,
 }
 
 /// A parsed function parameter with the attributes relevant to memory safety.
@@ -254,6 +260,7 @@ pub enum LTerm {
 
 /// Parse a `.ll` source into an [`LModule`].
 pub fn parse_module(src: &str) -> Result<LModule> {
+    let debuginfo = crate::debuginfo::parse(src);
     let toks = lex(src)?;
     let mut p = Parser { toks, pos: 0, types: HashMap::new() };
     // Pre-scan for `%"name" = type <T>` definitions: a definition may lexically
@@ -296,7 +303,7 @@ pub fn parse_module(src: &str) -> Result<LModule> {
             _ => p.skip_to_eol(),
         }
     }
-    Ok(LModule { funcs, unanalyzed, globals })
+    Ok(LModule { funcs, unanalyzed, globals, debuginfo })
 }
 
 struct Parser {
@@ -912,14 +919,22 @@ impl Parser {
         }
         self.expect_punct(')')?;
         // Skip everything up to the opening brace (attributes, `unnamed_addr`,
-        // `#0`, etc.).
+        // `#0`, …), capturing the `!dbg !N` DISubprogram id along the way.
+        let mut dbg = None;
         while !matches!(self.peek(), Tok::Punct('{') | Tok::Eof) {
+            if matches!(self.peek(), Tok::Punct('!'))
+                && matches!(self.peek2(), Tok::Word(w) if w == "dbg")
+            {
+                if let Some(Tok::Int(n)) = self.toks.get(self.pos + 3) {
+                    dbg = u32::try_from(*n).ok();
+                }
+            }
             self.pos += 1;
         }
         self.expect_punct('{')?;
         let blocks = self.blocks()?;
         self.expect_punct('}')?;
-        Ok(LFunc { name, ret, params, blocks, internal })
+        Ok(LFunc { name, ret, params, blocks, internal, dbg })
     }
 
     fn blocks(&mut self) -> Result<Vec<LBlock>> {
@@ -951,6 +966,13 @@ impl Parser {
             let mut insts = Vec::new();
             let term = loop {
                 self.skip_newlines();
+                // A `-g` debug record (`#dbg_declare(…)` / `#dbg_value(…)`) is
+                // interleaved in the instruction stream but is not an
+                // instruction — skip the whole line.
+                if matches!(self.peek(), Tok::Punct('#')) {
+                    self.skip_to_eol();
+                    continue;
+                }
                 if let Some(t) = self.try_terminator()? {
                     self.skip_to_eol(); // drop trailing metadata (`, !dbg !N`)
                     break t;

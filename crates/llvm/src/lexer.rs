@@ -75,8 +75,11 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Tok>> {
                 i = ni;
                 out.push(Tok::Word(s));
             }
+            // `|` occurs only in debug-metadata flag unions (`spFlags: A | B`),
+            // on lines the parser skips wholesale; lex it as punctuation so a
+            // debug-info (`-g`) module tokenises rather than erroring.
             b'(' | b')' | b'{' | b'}' | b'[' | b']' | b',' | b'=' | b':' | b'*' | b'<' | b'>'
-            | b'#' | b'!' => {
+            | b'#' | b'!' | b'|' => {
                 out.push(Tok::Punct(b as char));
                 i += 1;
             }

@@ -1066,3 +1066,46 @@ start:
 "#;
     assert_eq!(verdict_of(oob), Verdict::Fail, "an OOB atomicrmw (2..6 of 4) must FAIL");
 }
+
+/// DWARF debug-info recovery: LLVM's opaque `ptr` erases the pointee type, but
+/// `-g` metadata (`!DIDerivedType(DW_TAG_pointer_type, name: "&mut T", …)`)
+/// records it. A reference parameter with no `dereferenceable` attribute is
+/// recovered as a live region of the pointee's size — so accesses through it
+/// prove, resting on the `debuginfo` assumption. This is the cross-language
+/// lever (rustc/clang/swiftc all emit `!DI…`). A raw pointer is NOT recovered.
+#[test]
+fn llvm_debuginfo_recovers_reference_pointee_size() {
+    let with_di = r#"
+define i64 @read_self(ptr align 8 %self) !dbg !7 {
+start:
+  %f = getelementptr inbounds i8, ptr %self, i64 8
+  %v = load i64, ptr %f, align 8
+  ret i64 %v
+}
+!7 = distinct !DISubprogram(name: "read_self", spFlags: DISPFlagLocalToUnit | DISPFlagDefinition)
+!42 = !DILocalVariable(name: "self", arg: 1, scope: !7, type: !39)
+!39 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "&mut Rand32", baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "Rand32", size: 128)
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: with_di.into(), name: "m".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "the field read proves via DWARF: {report:?}");
+    assert!(
+        report.assumptions.iter().any(|a| a.id == "debuginfo"),
+        "the proof discloses its debug-info trust basis"
+    );
+
+    // The soundness control: the same IR *without* the debug metadata leaves the
+    // pointer uncontracted, so the access cannot be proved (UNKNOWN, not PASS).
+    let without_di = with_di.lines().take_while(|l| !l.starts_with("!")).collect::<Vec<_>>().join("\n");
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: without_di, name: "m".into() })
+        .expect("lower");
+    assert_ne!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "without debug info the pointee size is unknown — must not prove"
+    );
+}

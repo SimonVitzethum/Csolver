@@ -51,7 +51,7 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
     }
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);
-        match lower_function(f, fid, &func_ids) {
+        match lower_function(f, fid, &func_ids, &m.debuginfo) {
             Ok((func, contracts)) => {
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
@@ -146,6 +146,7 @@ fn lower_function(
     f: &LFunc,
     id: FuncId,
     func_ids: &HashMap<String, FuncId>,
+    debuginfo: &crate::debuginfo::DebugInfo,
 ) -> Result<(Function, Vec<(u32, PtrContract)>)> {
     let mut ctx = Ctx {
         regs: HashMap::new(),
@@ -197,10 +198,29 @@ fn lower_function(
         if let Some(n) = p.deref.or(abi_size) {
             contracts.push(common(SizeSpec::Bytes(n)));
         } else if p.abi_buf.is_none() {
-            // The slice heuristic never applies to an sret/byval pointer, even
-            // when its buffer size could not be computed.
+            // The slice heuristic; else fall back to debug info.
             if let Some((len_param, elem_size)) = detect_slice(f, idx) {
                 contracts.push(common(SizeSpec::ParamElements { len_param, elem_size }));
+            } else if let Some(c) = f
+                .dbg
+                .and_then(|sp| debuginfo.param_ref(sp, idx as u32 + 1))
+            {
+                // Debug info recovered a *reference* pointee (`&T`/`&mut T`, C++
+                // `T&`) that the opaque `ptr` erased: a live region of the
+                // pointee's size, resting on `debuginfo` as its trust basis. Raw
+                // pointers get no contract (see `crate::debuginfo`). The `&mut`
+                // write access is intersected with any `readonly` attribute.
+                contracts.push((
+                    idx as u32,
+                    PtrContract {
+                        assumption: Some("debuginfo"),
+                        refutable: true,
+                        size: SizeSpec::Bytes(c.size),
+                        align: p.align.unwrap_or(1),
+                        readable: !p.writeonly,
+                        writable: c.writable && !p.readonly,
+                    },
+                ));
             }
         }
     }
