@@ -1152,3 +1152,37 @@ fn set(_1: (&mut u8, u8)) -> () {
         "a write through &mut u8 is granted: {report:?}"
     );
 }
+
+/// rustc appends data/vtable `alloc` blocks after the function bodies. An entry
+/// like `alloc297 (fn: promotable_odd_clone)` contains a `fn` token that is NOT
+/// a function item — landing on it produced a phantom empty-named `UNKNOWN`
+/// function, polluting the coverage report with items that do not exist. The
+/// scanner must skip it (a real header is `fn <name>(` / `fn <impl…>`).
+#[test]
+fn mir_vtable_alloc_entries_do_not_become_phantom_functions() {
+    let src = r#"
+fn real(_1: usize) -> usize {
+    let mut _0: usize;
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+
+alloc296 (static: PROMOTABLE_ODD_VTABLE, size: 40, align: 8) {
+    0x00 │ ╾──────alloc297───────╼ ╾──────alloc298───────╼ │ ╾──────╼╾──────╼
+}
+
+alloc297 (fn: promotable_odd_clone)
+
+alloc298 (fn: promotable_odd_to_vec)
+"#;
+    let module = lower(src, "m");
+    let names: Vec<_> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["real"], "only the real fn is a function: {names:?}");
+    assert!(
+        module.unanalyzed.is_empty(),
+        "the alloc `(fn: …)` entries are not phantom unanalyzed functions: {:?}",
+        module.unanalyzed
+    );
+}
