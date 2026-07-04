@@ -47,6 +47,11 @@ pub(crate) enum Place {
     Local(Local),
     Deref(Box<Place>),
     Index(Box<Place>, Local),
+    /// A *constant* index projection `PLACE[N of M]` (MIR's `ConstantIndex`):
+    /// element `N` of an array/slice of at least `M` elements. Distinct from
+    /// `Index` (a runtime local index) because the offset is a compile-time
+    /// constant.
+    ConstIndex(Box<Place>, u64),
     /// A field projection `.N`, carrying the field's type from the place's type
     /// ascription (`((*_1).0: i32)`) when present — the field type gives its size
     /// and alignment, which is all the layout a field access needs.
@@ -766,9 +771,34 @@ impl Parser {
         // Projections: `[_M]`, `.N`, `.field`.
         loop {
             if self.eat_punct('[') {
-                let idx = self.local()?;
-                self.expect_punct(']')?;
-                base = Place::Index(Box::new(base), idx);
+                // `[_M]` (runtime local), `[N of M]` / `[N]` (constant index), or
+                // a subslice range `[from:to]` / `[from:]` / `[:to]` / `[:]`
+                // (MIR's `Subslice`), modelled by its *start* element pointer —
+                // sound for the pointer; the length change is over-approximated.
+                if self.eat_punct(':') {
+                    // `[:to]` — starts at 0.
+                    if matches!(self.peek(), Tok::Int(_)) { self.pos += 1; }
+                    self.expect_punct(']')?;
+                    base = Place::ConstIndex(Box::new(base), 0);
+                } else if let Tok::Int(n) = *self.peek() {
+                    self.pos += 1;
+                    if self.eat_punct(':') {
+                        // `[from:to]` / `[from:]` — start element is `from`.
+                        if matches!(self.peek(), Tok::Int(_)) { self.pos += 1; }
+                        self.expect_punct(']')?;
+                    } else {
+                        // `[N of M]` — the `of M` min-length is discarded.
+                        if self.eat_word("of") {
+                            let _ = self.int_lit();
+                        }
+                        self.expect_punct(']')?;
+                    }
+                    base = Place::ConstIndex(Box::new(base), n as u64);
+                } else {
+                    let idx = self.local()?;
+                    self.expect_punct(']')?;
+                    base = Place::Index(Box::new(base), idx);
+                }
             } else if self.eat_punct('.') {
                 let field = self.field_index()?;
                 base = Place::Field(Box::new(base), field, None);

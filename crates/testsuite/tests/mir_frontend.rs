@@ -1339,3 +1339,30 @@ fn cleanup_oob(_1: &mut [i32; 4]) -> () {
         "an OOB store on the cleanup path must not be a (false) PASS: {report:?}"
     );
 }
+
+/// MIR's constant and range place projections — `PLACE[N of M]` (`ConstantIndex`)
+/// and `PLACE[from:to]`/`[from:]`/`[:to]` (`Subslice`) — the last frontend parse
+/// gaps. `[N of M]` accesses element N; a subslice is modelled by its *start*
+/// element pointer (sound for the pointer; the length change is
+/// over-approximated). Both must parse and lower to a real, checked access.
+#[test]
+fn mir_constant_and_subslice_index_projections_parse() {
+    let src = r#"
+fn first_of(_1: &[u8]) -> u8 {
+    let mut _0: u8;
+    let mut _2: &[u8];
+    bb0: {
+        _0 = copy (*_1)[0 of 1];
+        _2 = &(*_1)[1:];
+        return;
+    }
+}
+"#;
+    let module = lower(src, "m");
+    assert!(module.unanalyzed.is_empty(), "both projections parse: {:?}", module.unanalyzed);
+    // The `[0 of 1]` read lowers to a real memory access (a PtrOffset + Load).
+    let f = &module.functions[0];
+    let has_offset = f.blocks.iter().flat_map(|b| &b.insts)
+        .any(|i| matches!(i, csolver_ir::Inst::PtrOffset { .. }));
+    assert!(has_offset, "the constant index is a real element access");
+}

@@ -263,7 +263,7 @@ impl Ctx {
             // Memory destination: `(*_p)[..] = …` / `*_p = …` / `(*_p).f = …`.
             // A *by-value* field write (`_3.0 = …`) is an opaque aggregate update
             // with no memory effect, so it is skipped soundly.
-            Place::Deref(_) | Place::Index(_, _) | Place::Field(_, _, _) => {
+            Place::Deref(_) | Place::Index(_, _) | Place::ConstIndex(_, _) | Place::Field(_, _, _) => {
                 if !is_memory_place(place) {
                     return Ok(());
                 }
@@ -357,7 +357,7 @@ impl Ctx {
                     // `&(*_p)[i]` is the element address; `&((*_p).f)` /
                     // `&(((*_p) as V).f)` is a struct/enum-variant field address —
                     // both lower to the access pointer.
-                    Place::Index(_, _) => {
+                    Place::Index(_, _) | Place::ConstIndex(_, _) => {
                         if let Some((ptr, _)) = self.place_access(place, out) {
                             out.push(assign(dst, RValue::Use(IrOp::Reg(ptr))));
                         } else {
@@ -638,6 +638,38 @@ impl Ctx {
     }
 
     /// Emit the pointer to a memory `place` and return `(pointer reg, elem type)`.
+    /// Resolve the base pointer and element type for an index projection
+    /// `base[..]` — shared by the runtime-`Index` and constant-`ConstIndex`
+    /// arms. `base` is either `*_p` (the array/slice behind a pointer) or an
+    /// outer index/field yielding a pointer-to-array.
+    fn index_base(&mut self, base: &Place, out: &mut Vec<Inst>) -> Option<(IrOp, Type)> {
+        match base {
+            Place::Deref(inner) => match inner.as_ref() {
+                Place::Local(p) => {
+                    Some((IrOp::Reg(RegId(*p)), self.index_elem(*p).unwrap_or_else(|| Type::int(8))))
+                }
+                _ => {
+                    self.lowering_failed = true;
+                    None
+                }
+            },
+            Place::Index(_, _) | Place::ConstIndex(_, _) | Place::Field(_, _, _) => {
+                let (inner_ptr, inner_ty) = self.place_access(base, out)?;
+                match array_elem(&inner_ty) {
+                    Some(elem) => Some((IrOp::Reg(inner_ptr), elem)),
+                    None => {
+                        self.lowering_failed = true;
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.lowering_failed = true;
+                None
+            }
+        }
+    }
+
     fn place_access(&mut self, place: &Place, out: &mut Vec<Inst>) -> Option<(RegId, Type)> {
         match place {
             // `base[i]`: a pointer to element 0 of the array/slice `base` denotes,
@@ -647,46 +679,25 @@ impl Ctx {
             // array, which this level indexes again. The strides come from the
             // array element types, which are unambiguous (no struct-layout needed).
             Place::Index(base, idx) => {
-                let (base_ptr, elem) = match base.as_ref() {
-                    // `(*_p)[i]`: an unknown element type falls back to one byte —
-                    // the access is still emitted (and so checked) through the real
-                    // pointer, never dropped.
-                    Place::Deref(inner) => match inner.as_ref() {
-                        Place::Local(p) => (
-                            IrOp::Reg(RegId(*p)),
-                            self.index_elem(*p).unwrap_or_else(|| Type::int(8)),
-                        ),
-                        _ => {
-                            self.lowering_failed = true;
-                            return None;
-                        }
-                    },
-                    // `…[i][j]` or a field of array type `(*_p).f[i]`: lower the
-                    // inner place to a pointer-to-array and its array type, then
-                    // index that array's element. (The field's `[u32; 4]`-typed
-                    // pointer comes from the FieldPtr the `Field` arm emits.)
-                    Place::Index(_, _) | Place::Field(_, _, _) => {
-                        let (inner_ptr, inner_ty) = self.place_access(base, out)?;
-                        match array_elem(&inner_ty) {
-                            Some(elem) => (IrOp::Reg(inner_ptr), elem),
-                            // A non-array inner type (or a 1-byte fallback) has no
-                            // sound stride here, so reject rather than guess.
-                            None => {
-                                self.lowering_failed = true;
-                                return None;
-                            }
-                        }
-                    }
-                    _ => {
-                        self.lowering_failed = true;
-                        return None;
-                    }
-                };
+                let (base_ptr, elem) = self.index_base(base, out)?;
                 let dst = self.fresh();
                 out.push(Inst::PtrOffset {
                     dst,
                     base: base_ptr,
                     index: IrOp::Reg(RegId(*idx)),
+                    elem: elem.clone(),
+                });
+                Some((dst, elem))
+            }
+            // `base[N of M]` — a constant element index (same base resolution as
+            // `Index`, but the offset is the compile-time constant `N`).
+            Place::ConstIndex(base, n) => {
+                let (base_ptr, elem) = self.index_base(base, out)?;
+                let dst = self.fresh();
+                out.push(Inst::PtrOffset {
+                    dst,
+                    base: base_ptr,
+                    index: IrOp::int(64, *n as u128),
                     elem: elem.clone(),
                 });
                 Some((dst, elem))
@@ -845,7 +856,9 @@ fn is_memory_place(p: &Place) -> bool {
         // pointer: `(*_p)[i]` and `(*_p).f[i]` are memory, but indexing a by-value
         // local array (`_l[i]`, `_l.0[i]`) is a bounds-checked stack value, not a
         // heap access — modelled opaquely, with no memory obligation.
-        Place::Index(base, _) | Place::Field(base, _, _) => is_memory_place(base),
+        Place::ConstIndex(base, _) | Place::Index(base, _) | Place::Field(base, _, _) => {
+            is_memory_place(base)
+        }
     }
 }
 
@@ -853,9 +866,10 @@ fn is_memory_place(p: &Place) -> bool {
 fn place_base_local(p: &Place) -> Option<u32> {
     match p {
         Place::Local(n) => Some(*n),
-        Place::Deref(inner) | Place::Field(inner, _, _) | Place::Index(inner, _) => {
-            place_base_local(inner)
-        }
+        Place::Deref(inner)
+        | Place::Field(inner, _, _)
+        | Place::Index(inner, _)
+        | Place::ConstIndex(inner, _) => place_base_local(inner),
     }
 }
 
@@ -871,7 +885,9 @@ fn block_locals(b: &MBlock) -> Vec<u32> {
                     out.push(*n);
                     break;
                 }
-                Place::Deref(inner) | Place::Field(inner, _, _) => cur = inner,
+                Place::Deref(inner) | Place::Field(inner, _, _) | Place::ConstIndex(inner, _) => {
+                    cur = inner
+                }
                 Place::Index(inner, idx) => {
                     out.push(*idx);
                     cur = inner;
