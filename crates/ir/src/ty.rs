@@ -43,6 +43,11 @@ pub enum Type {
     Struct {
         /// Field types in declaration order.
         fields: Vec<Type>,
+        /// `true` for a *packed* struct (`<{ … }>`): no inter-field padding and
+        /// byte alignment. Modelling a packed struct as padded would oversize it
+        /// and misplace its fields — a false-PASS hole — so the flag is honoured
+        /// in the size/alignment/offset queries.
+        packed: bool,
     },
 }
 
@@ -77,16 +82,16 @@ impl Type {
                 let stride = elem.stride_bytes(layout)?;
                 stride.checked_mul(*len)?
             }
-            Type::Struct { fields } => {
+            Type::Struct { fields, packed } => {
                 let mut offset: u64 = 0;
                 let mut max_align: u64 = 1;
                 for field in fields {
-                    let a = field.align_bytes(layout)?;
+                    let a = if *packed { 1 } else { field.align_bytes(layout)? };
                     max_align = max_align.max(a);
                     offset = align_up(offset, a)?;
                     offset = offset.checked_add(field.size_bytes(layout)?)?;
                 }
-                // Tail-pad to the struct's own alignment.
+                // Tail-pad to the struct's own alignment (packed ⇒ align 1 ⇒ none).
                 align_up(offset, max_align)?
             }
         })
@@ -104,12 +109,16 @@ impl Type {
             Type::Opaque { align, .. } => *align,
             Type::Ptr { .. } => layout.pointer_align,
             Type::Array { elem, .. } => elem.align_bytes(layout)?,
-            Type::Struct { fields } => {
-                let mut a = 1;
-                for f in fields {
-                    a = a.max(f.align_bytes(layout)?);
+            Type::Struct { fields, packed } => {
+                if *packed {
+                    1
+                } else {
+                    let mut a = 1;
+                    for f in fields {
+                        a = a.max(f.align_bytes(layout)?);
+                    }
+                    a
                 }
-                a
             }
         })
     }
@@ -172,7 +181,8 @@ impl fmt::Display for Type {
             Type::Opaque { bytes, .. } => write!(f, "opaque{bytes}"),
             Type::Ptr { pointee } => write!(f, "*{pointee}"),
             Type::Array { elem, len } => write!(f, "[{elem}; {len}]"),
-            Type::Struct { fields } => {
+            Type::Struct { fields, packed } => {
+                if *packed { f.write_str("<")?; }
                 f.write_str("{")?;
                 for (i, field) in fields.iter().enumerate() {
                     if i > 0 {
@@ -180,7 +190,9 @@ impl fmt::Display for Type {
                     }
                     write!(f, "{field}")?;
                 }
-                f.write_str("}")
+                f.write_str("}")?;
+                if *packed { f.write_str(">")?; }
+                Ok(())
             }
         }
     }
@@ -216,6 +228,7 @@ mod tests {
         let l = DataLayout::LP64;
         // { i8, i32 } -> i8 at 0, pad to 4, i32 at 4, size 8, align 4.
         let s = Type::Struct {
+            packed: false,
             fields: vec![Type::int(8), Type::int(32)],
         };
         assert_eq!(s.align_bytes(&l), Some(4));
@@ -223,6 +236,7 @@ mod tests {
 
         // { i8, ptr } -> i8 at 0, pad to 8, ptr at 8, size 16, align 8.
         let s2 = Type::Struct {
+            packed: false,
             fields: vec![Type::int(8), Type::ptr(Type::Unit)],
         };
         assert_eq!(s2.align_bytes(&l), Some(8));

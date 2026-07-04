@@ -129,6 +129,10 @@ pub enum LType {
     /// `{ T, T, … }` (an aggregate — e.g. the `{iN, i1}` of a checked-arithmetic
     /// intrinsic; destructured by `extractvalue`, not used directly).
     Struct(Vec<LType>),
+    /// `<{ T, T, … }>` — a *packed* struct (no inter-field padding, byte
+    /// alignment). Modelled with an exact packed layout, so — unlike a padded
+    /// stand-in — it never oversizes. Swift lowers every type to a packed struct.
+    PackedStruct(Vec<LType>),
     /// `%"name"` — a reference to a top-level `%"name" = type { … }` definition.
     /// Resolved by [`Parser::ltype`] against the collected definitions before it
     /// leaves the parser; reaching the lowering unresolved is a parser bug.
@@ -403,6 +407,9 @@ impl Parser {
             LType::Struct(fs) => LType::Struct(
                 fs.iter().map(|f| self.resolve_named(f, depth + 1)).collect::<Result<_>>()?,
             ),
+            LType::PackedStruct(fs) => LType::PackedStruct(
+                fs.iter().map(|f| self.resolve_named(f, depth + 1)).collect::<Result<_>>()?,
+            ),
             other => other.clone(),
         })
     }
@@ -437,13 +444,10 @@ impl Parser {
                 LType::Array(Box::new(elem), n as u64)
             }
             Tok::Punct('<') => {
-                // `<{ … }>` is a *packed* struct (no padding). Modelling it with
-                // the ordinary (padded) layout could only *enlarge* the size —
-                // an in-bounds proof against phantom padding bytes would be a
-                // false PASS — so it is rejected. (rustc uses packed structs only
-                // in global constant initializers, which are skipped anyway.)
+                // `<{ … }>` — a packed struct (exact unpadded layout, so sound).
                 if matches!(self.peek(), Tok::Punct('{')) {
-                    return Err(Error::unsupported("packed struct type"));
+                    self.pos += 1;
+                    return Ok(LType::PackedStruct(self.struct_fields()?));
                 }
                 let n = self.int()?;
                 self.expect_word("x")?;
@@ -1342,8 +1346,8 @@ impl Parser {
             (_, [idx]) => (base_ty.clone(), idx.clone()),
             // `gep [N x T], ptr, 0, idx` — array element.
             (LType::Array(elem, _), [_, idx]) => ((**elem).clone(), idx.clone()),
-            // `gep {S}, ptr, idx, K` — field K of the idx-th struct.
-            (LType::Struct(_), [idx, LValue::Int(k)]) if *k >= 0 => {
+            // `gep {S}, ptr, idx, K` — field K of the idx-th struct (packed too).
+            (LType::Struct(_) | LType::PackedStruct(_), [idx, LValue::Int(k)]) if *k >= 0 => {
                 return Ok(LInst::GepField {
                     dst,
                     struct_ty: base_ty.clone(),

@@ -790,10 +790,10 @@ fn branch_args(ctx: &Ctx, from: &str, to: &str) -> Result<Vec<Operand>> {
 /// The padded byte offset of `field` inside struct type `s` (LP64 layout) —
 /// the same alignment rule the IR's own `Type::Struct` sizing uses.
 fn struct_field_offset(s: &Type, field: u32) -> Option<u64> {
-    let Type::Struct { fields } = s else { return None };
+    let Type::Struct { fields, packed } = s else { return None };
     let mut offset: u64 = 0;
     for (i, f) in fields.iter().enumerate() {
-        let align = f.align_bytes(&LAYOUT)?.max(1);
+        let align = if *packed { 1 } else { f.align_bytes(&LAYOUT)?.max(1) };
         offset = offset.checked_add(align - 1)? / align * align;
         if i as u32 == field {
             return Some(offset);
@@ -837,7 +837,12 @@ fn lower_type(ty: &LType) -> Type {
         // exact padded size/alignment — a `gep %"T", ptr, i64 N` strides by
         // `sizeof(T)`, and an under-sized placeholder would misplace every
         // subsequent access.
-        LType::Struct(fields) => Type::Struct { fields: fields.iter().map(lower_type).collect() },
+        LType::Struct(fields) => {
+            Type::Struct { fields: fields.iter().map(lower_type).collect(), packed: false }
+        }
+        LType::PackedStruct(fields) => {
+            Type::Struct { fields: fields.iter().map(lower_type).collect(), packed: true }
+        }
         // Unreachable: the parser resolves every named reference or fails the
         // function. A total function is cheaper to keep correct than a panic; a
         // zero-size type can never *prove* an access in-bounds.
