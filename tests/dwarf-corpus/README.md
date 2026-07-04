@@ -1,6 +1,6 @@
 # Cross-language DWARF recovery corpus
 
-Real inputs (C, C++, D, Zig, Swift; more to follow) compiled to `-g` LLVM IR,
+Real inputs (C, C++, D, Zig, Swift, Objective-C; more to follow) compiled to `-g` LLVM IR,
 validating that CSolver recovers opaque-pointer pointee types from DWARF `!DI…`
 metadata — the lever making it usable for any LLVM frontend, not just Rust.
 
@@ -12,6 +12,7 @@ Regenerate the `.ll`:
     ldc2 -g -output-ll -c d_types.d               -of=d_types.ll
     zig build-obj -femit-llvm-ir=z.ll -fno-emit-bin z*.zig   # emits DW_LANG_C99
     swiftc -g -emit-ir swift_types.swift          -o swift_types.ll
+    clang -O1 -g -emit-llvm -S -x objective-c objc_ptrs.m -o objc_ptrs.ll
 
 ## The recovery is language-aware (sound per language)
 
@@ -26,6 +27,7 @@ guarantee, read from `DICompileUnit(language: DW_LANG_…)`:
 | D     | `ref` (`DW_TAG_reference_type`)                   | `T*`, `class` refs (nullable) |
 | Zig   | — (emits `DW_LANG_C99`, indistinguishable from C) | `*const T` |
 | Swift | `inout T` (LLVM `dereferenceable(N)` attribute)   | `class` refs (plain `ptr`, non-null by ABI but no IR evidence) |
+| ObjC  | — (`DW_LANG_ObjC`; object pointers are nullable)  | `T*`, `id`, `Class` |
 
 So `sum_ref(Point&)` (C++) verifies PASS; `sum_pair(Pair*)` (C/D/Zig) is soundly
 UNKNOWN — never a false PASS. A `DW_TAG_reference_type` is a valid reference in
