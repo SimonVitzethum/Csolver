@@ -1186,3 +1186,35 @@ alloc298 (fn: promotable_odd_to_vec)
         module.unanalyzed
     );
 }
+
+/// A higher-ranked trait-object type `&dyn for<'a> core::ops::Fn(&'a T) -> R`
+/// (rustc emits it for boxed/`dyn` closures, e.g. hashbrown's rehash hasher).
+/// The `for<'a>` binder prefixes the trait; treating `for` as the trait name
+/// stopped the type scan at the binder and left `core::ops::Fn(…)` unconsumed,
+/// desyncing the parser into the *next* function (a phantom drop). Both a
+/// parameter and a local of this type must parse.
+#[test]
+fn mir_higher_ranked_trait_object_type_parses() {
+    let src = r#"
+fn takes_hasher(_1: usize, _2: &dyn for<'a> core::ops::Fn(&'a mut R, usize) -> u64) -> usize {
+    let mut _0: usize;
+    let mut _7: &dyn for<'a> core::ops::Fn(&'a mut R, usize) -> u64;
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+
+fn next_fn(_1: usize) -> usize {
+    let mut _0: usize;
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+"#;
+    let module = lower(src, "m");
+    let names: Vec<_> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["takes_hasher", "next_fn"], "both parse, no desync: {names:?}");
+    assert!(module.unanalyzed.is_empty(), "{:?}", module.unanalyzed);
+}

@@ -1177,6 +1177,17 @@ impl Parser {
     /// to bare words, the `'` being dropped by the lexer).
     fn skip_trait_bounds(&mut self) {
         loop {
+            // A higher-ranked binder (`for<'a>`) prefixes the trait, not a trait
+            // itself: consume the `<…>` and fall through to the real trait
+            // (`dyn for<'a> core::ops::Fn(&'a T) -> R`). Without this, `for` was
+            // taken as the trait name and the binder stopped the scan, leaving
+            // the trait path unconsumed and desyncing the parser.
+            if matches!(self.peek(), Tok::Word(w) if w == "for") {
+                self.pos += 1;
+                if self.peek() == &Tok::Punct('<') {
+                    self.skip_balanced_angle();
+                }
+            }
             if matches!(self.peek(), Tok::Word(_)) {
                 self.pos += 1;
                 self.skip_path_tail();
