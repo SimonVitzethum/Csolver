@@ -1082,6 +1082,7 @@ start:
   %v = load i64, ptr %f, align 8
   ret i64 %v
 }
+!5 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !6)
 !7 = distinct !DISubprogram(name: "read_self", spFlags: DISPFlagLocalToUnit | DISPFlagDefinition)
 !42 = !DILocalVariable(name: "self", arg: 1, scope: !7, type: !39)
 !39 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "&mut Rand32", baseType: !9, size: 64)
@@ -1127,6 +1128,7 @@ start:
   %v = load i8, ptr %inner, align 1
   ret i8 %v
 }
+!5 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !6)
 !7 = distinct !DISubprogram(name: "read_field", spFlags: DISPFlagDefinition)
 !42 = !DILocalVariable(name: "self", arg: 1, scope: !7, type: !39)
 !39 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "&mut Wrap", baseType: !9, size: 64)
@@ -1184,4 +1186,47 @@ start:
     let report = verify_module(&module, &Config::default());
     assert_eq!(report.verdict, Verdict::Pass, "C++ reference param recovered: {report:?}");
     assert!(report.assumptions.iter().any(|a| a.id == "debuginfo"));
+}
+
+/// Language-aware soundness: a `*const T` pointer named `&`-style would be a
+/// Rust reference, but under a *non-Rust* compile unit (C/D/Zig emit
+/// `DW_TAG_pointer_type` for raw pointers) it must NOT be recovered — those
+/// pointers can dangle. Only `DW_TAG_reference_type` (C++ `T&`, D `ref`) is
+/// recovered without a Rust language tag. Guards against a cross-language
+/// false PASS.
+#[test]
+fn llvm_debuginfo_non_rust_raw_pointer_not_recovered() {
+    // A `DW_TAG_pointer_type` under a C compile unit — a raw pointer, even though
+    // (hypothetically) `&`-named — must not be contracted.
+    let c_like = r#"
+define i64 @f(ptr align 8 %0) !dbg !7 {
+start:
+  %v = load i64, ptr %0, align 8
+  ret i64 %v
+}
+!5 = distinct !DICompileUnit(language: DW_LANG_C11, file: !6)
+!42 = !DILocalVariable(name: "p", arg: 1, scope: !7, type: !39)
+!7 = distinct !DISubprogram(name: "f")
+!39 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "&whatever", baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "S", size: 128)
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: c_like.into(), name: "m".into() })
+        .expect("lower");
+    assert_ne!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "a raw pointer under a non-Rust language must not be recovered"
+    );
+
+    // The same node under a Rust compile unit IS a reference → recovered.
+    let rust = c_like.replace("DW_LANG_C11", "DW_LANG_Rust");
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: rust, name: "m".into() })
+        .expect("lower");
+    assert_eq!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "the same `&`-named pointer under Rust is a reference → recovered"
+    );
 }

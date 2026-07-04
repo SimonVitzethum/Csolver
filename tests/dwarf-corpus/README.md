@@ -1,26 +1,33 @@
 # Cross-language DWARF recovery corpus
 
-Real C/C++ (later Swift, other LLVM frontends) inputs validating that CSolver
-recovers opaque-pointer pointee types from DWARF `!DI…` metadata — the mechanism
-that makes it usable beyond Rust.
+Real inputs (C, C++, D; Swift + others to follow) compiled to `-g` LLVM IR,
+validating that CSolver recovers opaque-pointer pointee types from DWARF `!DI…`
+metadata — the lever making it usable for any LLVM frontend, not just Rust.
 
-Regenerate the `.ll` with debug info (any LLVM version):
+Regenerate the `.ll`:
 
-    clang   -O1 -g -emit-llvm -S c_structs.c        -o c_structs.ll
-    clang++ -O1 -g -emit-llvm -S cpp_refs.cpp        -o cpp_refs.ll
-    clang++ -O1 -g -emit-llvm -S cpp_refmember.cpp   -o cpp_refmember.ll
+    clang   -O1 -g -emit-llvm -S c_structs.c      -o c_structs.ll
+    clang++ -O1 -g -emit-llvm -S cpp_refs.cpp     -o cpp_refs.ll
+    clang++ -O1 -g -emit-llvm -S cpp_refmember.cpp -o cpp_refmember.ll
+    ldc2 -g -output-ll -c d_types.d               -of=d_types.ll
+    zig build-obj -femit-llvm-ir=z.ll -fno-emit-bin z*.zig   # emits DW_LANG_C99
 
-Then `solver verify <file>.ll`.
+## The recovery is language-aware (sound per language)
 
-## Expected, and why (soundness is language-specific)
+The pointee *size* alone never makes a pointer valid; validity is the *language's*
+guarantee, read from `DICompileUnit(language: DW_LANG_…)`:
 
-- **C++ references** (`T&`, `DW_TAG_reference_type`): recovered as valid regions
-  — `sum_ref(Point&)` verifies PASS. This is the type-system guarantee.
-- **C raw pointers** (`T*`, `DW_TAG_pointer_type`, unnamed): NOT recovered —
-  a C pointer may dangle, so `sum_pair(Pair*)` is soundly UNKNOWN (never a false
-  PASS). This is correct C semantics, not a tool gap.
-- **C++ reference struct members** (`Cell& cell`): the loaded field pointer is
-  recovered as a valid reference; size/bounds/liveness/read prove. The alignment
-  obligation stays UNKNOWN when clang omits `align:` on the pointee composite
-  (a sound limitation — alignment cannot be assumed without the info).
-- **C/C++ raw-pointer members** (`Point* inner`): not recovered (raw pointer).
+| Language | Valid reference (recovered) | Raw pointer (NOT recovered — may dangle) |
+|---|---|---|
+| Rust  | `&T`/`&mut T` (`DW_TAG_pointer_type` named `&…`) | `*const T`/`*mut T` |
+| C++   | `T&` (`DW_TAG_reference_type`)                   | `T*` |
+| C     | — (none)                                          | `T*` |
+| D     | `ref` (`DW_TAG_reference_type`)                   | `T*`, `class` refs (nullable) |
+| Zig   | — (emits `DW_LANG_C99`, indistinguishable from C) | `*const T` |
+
+So `sum_ref(Point&)` (C++) verifies PASS; `sum_pair(Pair*)` (C/D/Zig) is soundly
+UNKNOWN — never a false PASS. A `DW_TAG_reference_type` is a valid reference in
+every language that emits it, so it is recovered regardless of the language tag;
+the Rust `&…` naming rule is gated to `DW_LANG_Rust`.
+
+Verify: `solver verify <file>.ll`.

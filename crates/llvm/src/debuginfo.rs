@@ -38,6 +38,24 @@ pub(crate) struct DebugInfo {
     nodes: HashMap<u32, DiNode>,
     /// `(subprogram id, 1-based arg index) -> parameter's type node id`.
     params: HashMap<(u32, u32), u32>,
+    /// The module's source language (`DICompileUnit(language:)`), which fixes
+    /// what pointer kinds are *valid* — the recovery applies each language's own
+    /// guarantee, not one hard-coded rule (see `is_valid_ref`).
+    lang: Lang,
+}
+
+/// The source language, as far as pointer-validity semantics go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Lang {
+    /// Rust: `&T`/`&mut T` references (`DW_TAG_pointer_type` named `&…`) are
+    /// valid; raw `*const T`/`*mut T` are not.
+    Rust,
+    /// Anything else (C, C++, D, Zig-as-C99, Swift, …): a `DW_TAG_pointer_type`
+    /// is a raw pointer that may be null/dangling and is **not** recovered. A
+    /// `DW_TAG_reference_type` (C++ `T&`, D `ref`) is a valid reference in every
+    /// language that emits it, so it is recovered regardless of `lang`.
+    #[default]
+    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -75,12 +93,25 @@ impl DebugInfo {
     /// unknown-size pointee, or missing debug info.
     pub(crate) fn param_ref(&self, subprogram: u32, arg: u32) -> Option<RefContract> {
         let ty = *self.params.get(&(subprogram, arg))?;
-        let (base, writable) = match self.nodes.get(&ty)? {
-            DiNode::Pointer { base, reference: true, writable } => (*base, *writable),
-            DiNode::Reference { base, writable } => (*base, *writable),
-            _ => return None, // a raw pointer / non-reference: not contracted.
-        };
+        let (base, writable) = self.valid_ref(ty)?;
         Some(RefContract { size: self.sized_bytes(base)?, align: self.sized_align(base), writable })
+    }
+
+    /// The pointee node and writability of a type node **iff** it is a valid
+    /// reference for this module's language: a Rust `&T`/`&mut T`
+    /// (`DW_TAG_pointer_type` named `&…`, only when `lang == Rust`), or a
+    /// `DW_TAG_reference_type` (C++ `T&`, D `ref` — a valid reference in any
+    /// language that emits it). A raw `DW_TAG_pointer_type` (C/C++/D/Zig `T*`,
+    /// Rust `*const T`) is never valid — it may dangle, so recovering it would
+    /// be a false-PASS hole. `None` otherwise.
+    fn valid_ref(&self, ty: u32) -> Option<(u32, bool)> {
+        match self.nodes.get(&ty)? {
+            DiNode::Pointer { base, reference: true, writable } if self.lang == Lang::Rust => {
+                Some((*base, *writable))
+            }
+            DiNode::Reference { base, writable } => Some((*base, *writable)),
+            _ => None,
+        }
     }
 
     /// Follow typedef/qualifier chains to a concrete byte size (a bounded walk).
@@ -119,12 +150,7 @@ impl DebugInfo {
     /// StructT` param points at — so field loads through it can resolve members.
     pub(crate) fn param_pointee(&self, subprogram: u32, arg: u32) -> Option<u32> {
         let ty = *self.params.get(&(subprogram, arg))?;
-        match self.nodes.get(&ty)? {
-            DiNode::Pointer { base, reference: true, .. } | DiNode::Reference { base, .. } => {
-                Some(*base)
-            }
-            _ => None,
-        }
+        self.valid_ref(ty).map(|(base, _)| base)
     }
 
     /// The recovered contract for the member of struct type `struct_id` at byte
@@ -137,11 +163,7 @@ impl DebugInfo {
         for &m in members {
             if let Some(DiNode::Member { offset_bytes, base }) = self.nodes.get(&m) {
                 if *offset_bytes == offset {
-                    let (pointee, writable) = match self.nodes.get(base)? {
-                        DiNode::Pointer { base, reference: true, writable } => (*base, *writable),
-                        DiNode::Reference { base, writable } => (*base, *writable),
-                        _ => return None,
-                    };
+                    let (pointee, writable) = self.valid_ref(*base)?;
                     return Some(RefContract {
                         size: self.sized_bytes(pointee)?,
                         align: self.sized_align(pointee),
@@ -182,7 +204,12 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
         // prefixes the node body and must be stripped before the tag match.
         let body = body.strip_prefix("distinct ").unwrap_or(body);
 
-        if let Some(args) = tag_body(body, "!DILocalVariable(") {
+        if let Some(args) = tag_body(body, "!DICompileUnit(") {
+            // The source language fixes pointer-validity semantics (see `Lang`).
+            if let Some(l) = field_word(args, "language:") {
+                di.lang = if l == "DW_LANG_Rust" { Lang::Rust } else { Lang::Other };
+            }
+        } else if let Some(args) = tag_body(body, "!DILocalVariable(") {
             // `arg: k, scope: !N, type: !T` — only parameters (those with `arg:`).
             if let (Some(arg), Some(scope), Some(ty)) =
                 (field_int(args, "arg:"), field_ref(args, "scope:"), field_ref(args, "type:"))
@@ -347,6 +374,7 @@ mod tests {
     use super::*;
 
     const SRC: &str = r#"
+!0 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !1)
 define float @f(ptr align 8 %self) !dbg !7 {
 start:
   ret float 0.0
@@ -377,6 +405,7 @@ start:
     }
 
     const STRUCT_SRC: &str = r#"
+!0 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !1)
 !7 = distinct !DISubprogram(name: "f")
 !42 = !DILocalVariable(name: "self", arg: 1, scope: !7, type: !39)
 !39 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "&mut Wrap", baseType: !9, size: 64)
