@@ -963,6 +963,15 @@ impl Parser {
         let mut params = Vec::new();
         if !matches!(self.peek(), Tok::Punct(')')) {
             loop {
+                // A variadic marker `...` is always the final "parameter" and
+                // carries nothing for the analysis (the fixed parameters are what
+                // is checked) — consume it and end the list, so variadic functions
+                // (`printf`-style wrappers, logging) are analyzed rather than
+                // dropped whole.
+                if matches!(self.peek(), Tok::Word(w) if w == "...") {
+                    self.pos += 1;
+                    break;
+                }
                 let ty = self.ltype()?;
                 let (deref, align, readonly, writeonly, abi_buf) = self.param_attrs()?;
                 let name = if let Tok::Local(_) = self.peek() {
@@ -993,12 +1002,12 @@ impl Parser {
             self.pos += 1;
         }
         self.expect_punct('{')?;
-        let blocks = self.blocks()?;
+        let blocks = self.blocks(params.len())?;
         self.expect_punct('}')?;
         Ok(LFunc { name, ret, params, blocks, internal, dbg })
     }
 
-    fn blocks(&mut self) -> Result<Vec<LBlock>> {
+    fn blocks(&mut self, param_count: usize) -> Result<Vec<LBlock>> {
         let mut blocks = Vec::new();
         let mut auto = 0;
         loop {
@@ -1017,6 +1026,14 @@ impl Parser {
                 };
                 self.expect_punct(':')?;
                 l
+            } else if blocks.is_empty() {
+                // The *entry* block is often unlabeled. LLVM still assigns it an
+                // implicit value number — the next after the (numbered) parameters
+                // — and a `phi` in a later block can name it as a predecessor
+                // (`[ v, %<n> ]`). Use that number as its label so the reference
+                // resolves; otherwise the phi dangles and the whole function is
+                // dropped (it did, for any `goto`/loop entry that a phi refers to).
+                param_count.to_string()
             } else {
                 let l = format!("__bb{auto}");
                 auto += 1;
@@ -1638,6 +1655,38 @@ done:
         // An empty tuple and a multi-element tuple are not single integers.
         assert_eq!(m.get(&9), None);
         assert_eq!(m.get(&5), None);
+    }
+
+    #[test]
+    fn parses_variadic_function() {
+        // `...` is the trailing variadic marker; the fixed params are kept and the
+        // function is analyzed rather than dropped whole.
+        let src = "define i64 @sum(i32 %0, ...) {\nentry:\n  ret i64 0\n}\n";
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.unanalyzed.len(), 0, "variadic fn must not be dropped");
+        assert_eq!(m.funcs[0].params.len(), 1, "only the fixed i32 param is kept");
+    }
+
+    #[test]
+    fn numbers_unlabeled_entry_block_as_phi_predecessor() {
+        // The entry block is unlabeled; its implicit LLVM number is the parameter
+        // count (2 here → `%2`), and a later phi names it as a predecessor. It must
+        // resolve — otherwise the whole function is dropped.
+        let src = r#"
+define i64 @f(ptr %0, i32 %1) {
+  %3 = icmp sgt i32 %1, 0
+  br i1 %3, label %4, label %5
+4:
+  br label %5
+5:
+  %6 = phi i64 [ 0, %2 ], [ 7, %4 ]
+  ret i64 %6
+}
+"#;
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.unanalyzed.len(), 0, "entry-referencing phi must not drop the fn");
+        // The entry block is labeled with its implicit number "2".
+        assert_eq!(m.funcs[0].blocks[0].label, "2");
     }
 
     #[test]
