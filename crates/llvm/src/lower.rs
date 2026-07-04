@@ -83,7 +83,7 @@ struct Ctx<'a> {
     /// *field* of a DWARF-typed struct (`load ptr, gep(&mut StructT, offset)`
     /// where the member at `offset` is a `&T`). Such a loaded pointer is a valid
     /// reference — `lower_block` materialises it with a `RefWitness`.
-    field_ref_loads: HashMap<String, (u64, bool)>,
+    field_ref_loads: HashMap<String, (u64, u32, bool)>,
 }
 
 impl Ctx<'_> {
@@ -282,7 +282,7 @@ fn lower_function(
 fn dwarf_field_loads(
     f: &LFunc,
     di: &crate::debuginfo::DebugInfo,
-) -> HashMap<String, (u64, bool)> {
+) -> HashMap<String, (u64, u32, bool)> {
     let mut out = HashMap::new();
     let Some(sp) = f.dbg else { return out };
 
@@ -318,7 +318,7 @@ fn dwarf_field_loads(
                 // A load of a recorded reference field: record its result.
                 if let Some(&(struct_id, off)) = field_at.get(slot) {
                     if let Some(c) = di.member_ref(struct_id, off) {
-                        out.insert(dst.clone(), (c.size, c.writable));
+                        out.insert(dst.clone(), (c.size, c.align, c.writable));
                     }
                 }
             }
@@ -520,12 +520,12 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         // is a `&T`/`&mut T` by the field's declared type, so accesses through it
         // prove. Without this the loaded field pointer has lost provenance.
         if let LInst::Load { dst, .. } = inst {
-            if let Some(&(size, writable)) = ctx.field_ref_loads.get(dst) {
+            if let Some(&(size, align, writable)) = ctx.field_ref_loads.get(dst) {
                 insts.push(lower_inst(ctx, inst)?);
                 insts.push(Inst::RefWitness {
                     dst: ctx.reg(dst)?,
                     size: Some(size),
-                    align: 1,
+                    align,
                     writable,
                 });
                 continue;

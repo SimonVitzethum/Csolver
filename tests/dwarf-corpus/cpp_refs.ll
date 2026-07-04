@@ -1,0 +1,174 @@
+; ModuleID = 'tests/dwarf-corpus/cpp_refs.cpp'
+source_filename = "tests/dwarf-corpus/cpp_refs.cpp"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-pc-linux-gnu"
+
+; Function Attrs: mustprogress nofree norecurse nosync nounwind sspstrong willreturn memory(argmem: read) uwtable
+define dso_local noundef i64 @_Z7sum_refR5Point(ptr noundef nonnull readonly align 8 captures(none) dereferenceable(16) %0) local_unnamed_addr #0 !dbg !104 {
+    #dbg_value(ptr %0, !113, !DIExpression(), !114)
+  %2 = load i64, ptr %0, align 8, !dbg !115, !tbaa !116
+  %3 = getelementptr inbounds nuw i8, ptr %0, i64 8, !dbg !119
+  %4 = load i64, ptr %3, align 8, !dbg !119, !tbaa !120
+  %5 = add nsw i64 %4, %2, !dbg !121
+  ret i64 %5, !dbg !122
+}
+
+; Function Attrs: mustprogress nofree norecurse nosync nounwind sspstrong willreturn memory(read, inaccessiblemem: none, target_mem0: none, target_mem1: none) uwtable
+define dso_local noundef i64 @_Z10via_memberR6Holder(ptr noundef nonnull readonly align 8 captures(none) dereferenceable(16) %0) local_unnamed_addr #1 !dbg !123 {
+    #dbg_value(ptr %0, !133, !DIExpression(), !134)
+  %2 = getelementptr inbounds nuw i8, ptr %0, i64 8, !dbg !135
+  %3 = load ptr, ptr %2, align 8, !dbg !135, !tbaa !136
+  %4 = load i64, ptr %3, align 8, !dbg !140, !tbaa !116
+  ret i64 %4, !dbg !141
+}
+
+attributes #0 = { mustprogress nofree norecurse nosync nounwind sspstrong willreturn memory(argmem: read) uwtable "min-legal-vector-width"="0" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
+attributes #1 = { mustprogress nofree norecurse nosync nounwind sspstrong willreturn memory(read, inaccessiblemem: none, target_mem0: none, target_mem1: none) uwtable "min-legal-vector-width"="0" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!92, !93, !94, !95, !96, !97, !98}
+!llvm.ident = !{!99}
+!llvm.errno.tbaa = !{!100}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C_plus_plus_14, file: !1, producer: "clang version 22.1.6", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug, imports: !2, splitDebugInlining: false, nameTableKind: None)
+!1 = !DIFile(filename: "tests/dwarf-corpus/cpp_refs.cpp", directory: "/home/simon/Schreibtisch/CSolver", checksumkind: CSK_MD5, checksum: "29bcf6a9be881a0f3dbd6e17cf9b6f0d")
+!2 = !{!3, !11, !15, !19, !23, !26, !28, !30, !32, !36, !39, !42, !45, !48, !50, !55, !59, !63, !67, !69, !71, !73, !75, !78, !81, !84, !87, !90}
+!3 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !5, file: !10, line: 53)
+!4 = !DINamespace(name: "std", scope: null)
+!5 = !DIDerivedType(tag: DW_TAG_typedef, name: "int8_t", file: !6, line: 24, baseType: !7)
+!6 = !DIFile(filename: "/usr/include/bits/stdint-intn.h", directory: "", checksumkind: CSK_MD5, checksum: "10d5fe006d042c979d10252beb26dc83")
+!7 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int8_t", file: !8, line: 37, baseType: !9)
+!8 = !DIFile(filename: "/usr/include/bits/types.h", directory: "", checksumkind: CSK_MD5, checksum: "bcb6d4a34cad6d89d16a897638e8f5b7")
+!9 = !DIBasicType(name: "signed char", size: 8, encoding: DW_ATE_signed_char)
+!10 = !DIFile(filename: "/usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/cstdint", directory: "", checksumkind: CSK_MD5, checksum: "b0f89841b96bd238101e6f600b663bd2")
+!11 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !12, file: !10, line: 54)
+!12 = !DIDerivedType(tag: DW_TAG_typedef, name: "int16_t", file: !6, line: 25, baseType: !13)
+!13 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int16_t", file: !8, line: 39, baseType: !14)
+!14 = !DIBasicType(name: "short", size: 16, encoding: DW_ATE_signed)
+!15 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !16, file: !10, line: 55)
+!16 = !DIDerivedType(tag: DW_TAG_typedef, name: "int32_t", file: !6, line: 26, baseType: !17)
+!17 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int32_t", file: !8, line: 41, baseType: !18)
+!18 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!19 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !20, file: !10, line: 56)
+!20 = !DIDerivedType(tag: DW_TAG_typedef, name: "int64_t", file: !6, line: 27, baseType: !21)
+!21 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int64_t", file: !8, line: 44, baseType: !22)
+!22 = !DIBasicType(name: "long", size: 64, encoding: DW_ATE_signed)
+!23 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !24, file: !10, line: 58)
+!24 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_fast8_t", file: !25, line: 51, baseType: !9)
+!25 = !DIFile(filename: "/usr/include/stdint.h", directory: "", checksumkind: CSK_MD5, checksum: "271af118c99df098fe315fa3d1c635c4")
+!26 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !27, file: !10, line: 59)
+!27 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_fast16_t", file: !25, line: 53, baseType: !22)
+!28 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !29, file: !10, line: 60)
+!29 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_fast32_t", file: !25, line: 54, baseType: !22)
+!30 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !31, file: !10, line: 61)
+!31 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_fast64_t", file: !25, line: 55, baseType: !22)
+!32 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !33, file: !10, line: 63)
+!33 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_least8_t", file: !34, line: 25, baseType: !35)
+!34 = !DIFile(filename: "/usr/include/bits/stdint-least.h", directory: "", checksumkind: CSK_MD5, checksum: "9ef0a15f8285e72202931255f60d6d40")
+!35 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int_least8_t", file: !8, line: 52, baseType: !7)
+!36 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !37, file: !10, line: 64)
+!37 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_least16_t", file: !34, line: 26, baseType: !38)
+!38 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int_least16_t", file: !8, line: 54, baseType: !13)
+!39 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !40, file: !10, line: 65)
+!40 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_least32_t", file: !34, line: 27, baseType: !41)
+!41 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int_least32_t", file: !8, line: 56, baseType: !17)
+!42 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !43, file: !10, line: 66)
+!43 = !DIDerivedType(tag: DW_TAG_typedef, name: "int_least64_t", file: !34, line: 28, baseType: !44)
+!44 = !DIDerivedType(tag: DW_TAG_typedef, name: "__int_least64_t", file: !8, line: 58, baseType: !21)
+!45 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !46, file: !10, line: 68)
+!46 = !DIDerivedType(tag: DW_TAG_typedef, name: "intmax_t", file: !25, line: 94, baseType: !47)
+!47 = !DIDerivedType(tag: DW_TAG_typedef, name: "__intmax_t", file: !8, line: 72, baseType: !22)
+!48 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !49, file: !10, line: 69)
+!49 = !DIDerivedType(tag: DW_TAG_typedef, name: "intptr_t", file: !25, line: 80, baseType: !22)
+!50 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !51, file: !10, line: 71)
+!51 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint8_t", file: !52, line: 24, baseType: !53)
+!52 = !DIFile(filename: "/usr/include/bits/stdint-uintn.h", directory: "", checksumkind: CSK_MD5, checksum: "ec277c3090dac8ed1009245094b87678")
+!53 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint8_t", file: !8, line: 38, baseType: !54)
+!54 = !DIBasicType(name: "unsigned char", size: 8, encoding: DW_ATE_unsigned_char)
+!55 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !56, file: !10, line: 72)
+!56 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint16_t", file: !52, line: 25, baseType: !57)
+!57 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint16_t", file: !8, line: 40, baseType: !58)
+!58 = !DIBasicType(name: "unsigned short", size: 16, encoding: DW_ATE_unsigned)
+!59 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !60, file: !10, line: 73)
+!60 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint32_t", file: !52, line: 26, baseType: !61)
+!61 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint32_t", file: !8, line: 42, baseType: !62)
+!62 = !DIBasicType(name: "unsigned int", size: 32, encoding: DW_ATE_unsigned)
+!63 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !64, file: !10, line: 74)
+!64 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint64_t", file: !52, line: 27, baseType: !65)
+!65 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint64_t", file: !8, line: 45, baseType: !66)
+!66 = !DIBasicType(name: "unsigned long", size: 64, encoding: DW_ATE_unsigned)
+!67 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !68, file: !10, line: 76)
+!68 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_fast8_t", file: !25, line: 64, baseType: !54)
+!69 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !70, file: !10, line: 77)
+!70 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_fast16_t", file: !25, line: 66, baseType: !66)
+!71 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !72, file: !10, line: 78)
+!72 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_fast32_t", file: !25, line: 67, baseType: !66)
+!73 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !74, file: !10, line: 79)
+!74 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_fast64_t", file: !25, line: 68, baseType: !66)
+!75 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !76, file: !10, line: 81)
+!76 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_least8_t", file: !34, line: 31, baseType: !77)
+!77 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint_least8_t", file: !8, line: 53, baseType: !53)
+!78 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !79, file: !10, line: 82)
+!79 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_least16_t", file: !34, line: 32, baseType: !80)
+!80 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint_least16_t", file: !8, line: 55, baseType: !57)
+!81 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !82, file: !10, line: 83)
+!82 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_least32_t", file: !34, line: 33, baseType: !83)
+!83 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint_least32_t", file: !8, line: 57, baseType: !61)
+!84 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !85, file: !10, line: 84)
+!85 = !DIDerivedType(tag: DW_TAG_typedef, name: "uint_least64_t", file: !34, line: 34, baseType: !86)
+!86 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uint_least64_t", file: !8, line: 59, baseType: !65)
+!87 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !88, file: !10, line: 86)
+!88 = !DIDerivedType(tag: DW_TAG_typedef, name: "uintmax_t", file: !25, line: 95, baseType: !89)
+!89 = !DIDerivedType(tag: DW_TAG_typedef, name: "__uintmax_t", file: !8, line: 73, baseType: !66)
+!90 = !DIImportedEntity(tag: DW_TAG_imported_declaration, scope: !4, entity: !91, file: !10, line: 87)
+!91 = !DIDerivedType(tag: DW_TAG_typedef, name: "uintptr_t", file: !25, line: 83, baseType: !66)
+!92 = !{i32 7, !"Dwarf Version", i32 5}
+!93 = !{i32 2, !"Debug Info Version", i32 3}
+!94 = !{i32 1, !"wchar_size", i32 4}
+!95 = !{i32 8, !"PIC Level", i32 2}
+!96 = !{i32 7, !"PIE Level", i32 2}
+!97 = !{i32 7, !"uwtable", i32 2}
+!98 = !{i32 7, !"debug-info-assignment-tracking", i1 true}
+!99 = !{!"clang version 22.1.6"}
+!100 = !{!101, !101, i64 0}
+!101 = !{!"int", !102, i64 0}
+!102 = !{!"omnipotent char", !103, i64 0}
+!103 = !{!"Simple C++ TBAA"}
+!104 = distinct !DISubprogram(name: "sum_ref", linkageName: "_Z7sum_refR5Point", scope: !1, file: !1, line: 7, type: !105, scopeLine: 7, flags: DIFlagPrototyped | DIFlagAllCallsDescribed, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0, retainedNodes: !112, keyInstructions: true)
+!105 = !DISubroutineType(types: !106)
+!106 = !{!20, !107}
+!107 = !DIDerivedType(tag: DW_TAG_reference_type, baseType: !108, size: 64)
+!108 = distinct !DICompositeType(tag: DW_TAG_structure_type, name: "Point", file: !1, line: 4, size: 128, flags: DIFlagTypePassByValue, elements: !109, identifier: "_ZTS5Point")
+!109 = !{!110, !111}
+!110 = !DIDerivedType(tag: DW_TAG_member, name: "x", scope: !108, file: !1, line: 4, baseType: !20, size: 64)
+!111 = !DIDerivedType(tag: DW_TAG_member, name: "y", scope: !108, file: !1, line: 4, baseType: !20, size: 64, offset: 64)
+!112 = !{!113}
+!113 = !DILocalVariable(name: "p", arg: 1, scope: !104, file: !1, line: 7, type: !107)
+!114 = !DILocation(line: 0, scope: !104)
+!115 = !DILocation(line: 8, column: 14, scope: !104)
+!116 = !{!117, !118, i64 0}
+!117 = !{!"_ZTS5Point", !118, i64 0, !118, i64 8}
+!118 = !{!"long", !102, i64 0}
+!119 = !DILocation(line: 8, column: 20, scope: !104)
+!120 = !{!117, !118, i64 8}
+!121 = !DILocation(line: 8, column: 16, scope: !104, atomGroup: 1, atomRank: 2)
+!122 = !DILocation(line: 8, column: 5, scope: !104, atomGroup: 1, atomRank: 1)
+!123 = distinct !DISubprogram(name: "via_member", linkageName: "_Z10via_memberR6Holder", scope: !1, file: !1, line: 14, type: !124, scopeLine: 14, flags: DIFlagPrototyped | DIFlagAllCallsDescribed, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0, retainedNodes: !132, keyInstructions: true)
+!124 = !DISubroutineType(types: !125)
+!125 = !{!20, !126}
+!126 = !DIDerivedType(tag: DW_TAG_reference_type, baseType: !127, size: 64)
+!127 = distinct !DICompositeType(tag: DW_TAG_structure_type, name: "Holder", file: !1, line: 11, size: 128, flags: DIFlagTypePassByValue, elements: !128, identifier: "_ZTS6Holder")
+!128 = !{!129, !130}
+!129 = !DIDerivedType(tag: DW_TAG_member, name: "n", scope: !127, file: !1, line: 11, baseType: !20, size: 64)
+!130 = !DIDerivedType(tag: DW_TAG_member, name: "inner", scope: !127, file: !1, line: 11, baseType: !131, size: 64, offset: 64)
+!131 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !108, size: 64)
+!132 = !{!133}
+!133 = !DILocalVariable(name: "h", arg: 1, scope: !123, file: !1, line: 14, type: !126)
+!134 = !DILocation(line: 0, scope: !123)
+!135 = !DILocation(line: 15, column: 14, scope: !123)
+!136 = !{!137, !138, i64 8}
+!137 = !{!"_ZTS6Holder", !118, i64 0, !138, i64 8}
+!138 = !{!"p1 _ZTS5Point", !139, i64 0}
+!139 = !{!"any pointer", !102, i64 0}
+!140 = !DILocation(line: 15, column: 21, scope: !123, atomGroup: 1, atomRank: 2)
+!141 = !DILocation(line: 15, column: 5, scope: !123, atomGroup: 1, atomRank: 1)

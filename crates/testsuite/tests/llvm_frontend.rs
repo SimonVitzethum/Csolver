@@ -1156,3 +1156,32 @@ start:
         "a raw-pointer field grants no validity — the deref must not prove"
     );
 }
+
+/// Cross-language DWARF recovery on clang-format metadata: a C++ reference
+/// parameter (`Point&`, a `DW_TAG_reference_type`) — with clang's `distinct`
+/// node prefix — is recovered as a valid region, so field reads prove. Validated
+/// against real clang++ output in `tests/dwarf-corpus`; this pins the format.
+#[test]
+fn llvm_debuginfo_recovers_cpp_reference_clang_format() {
+    let src = r#"
+define i64 @sum_ref(ptr align 8 %0) !dbg !7 {
+start:
+  %a = load i64, ptr %0, align 8
+  %p = getelementptr inbounds i8, ptr %0, i64 8
+  %b = load i64, ptr %p, align 8
+  %s = add i64 %a, %b
+  ret i64 %s
+}
+!7 = distinct !DISubprogram(name: "sum_ref", spFlags: DISPFlagDefinition)
+!117 = !DILocalVariable(name: "p", arg: 1, scope: !7, type: !107)
+!107 = !DIDerivedType(tag: DW_TAG_reference_type, baseType: !108, size: 64)
+!108 = distinct !DICompositeType(tag: DW_TAG_structure_type, name: "Point", size: 128, align: 64, elements: !109)
+!109 = !{}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "C++ reference param recovered: {report:?}");
+    assert!(report.assumptions.iter().any(|a| a.id == "debuginfo"));
+}

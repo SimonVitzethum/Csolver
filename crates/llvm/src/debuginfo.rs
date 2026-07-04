@@ -48,21 +48,23 @@ enum DiNode {
     /// A `DW_TAG_reference_type` (C++ `T&`): always a valid reference.
     Reference { base: u32, writable: bool },
     /// A struct/union (`DICompositeType`): its `elements` metadata-list id (the
-    /// members) and byte size.
-    Composite { elements: Option<u32>, size_bytes: Option<u64> },
+    /// members), byte size, and byte alignment.
+    Composite { elements: Option<u32>, size_bytes: Option<u64>, align_bytes: Option<u32> },
     /// A struct member (`DIDerivedType(tag: DW_TAG_member)`): its byte offset in
     /// the enclosing struct and its type.
     Member { offset_bytes: u64, base: u32 },
     /// A `!{…}` metadata tuple (a struct's element list): the member node ids.
     Tuple(Vec<u32>),
     /// Any other sized type node (basic type / typedef|qualifier chain): its byte
-    /// size and, for a typedef/qualifier, the underlying type to follow.
-    Sized { size_bytes: Option<u64>, follows: Option<u32> },
+    /// size and alignment and, for a typedef/qualifier, the underlying type to
+    /// follow.
+    Sized { size_bytes: Option<u64>, align_bytes: Option<u32>, follows: Option<u32> },
 }
 
 /// A pointer parameter's recovered contract: pointee byte size + write access.
 pub(crate) struct RefContract {
     pub size: u64,
+    pub align: u32,
     pub writable: bool,
 }
 
@@ -78,7 +80,7 @@ impl DebugInfo {
             DiNode::Reference { base, writable } => (*base, *writable),
             _ => return None, // a raw pointer / non-reference: not contracted.
         };
-        Some(RefContract { size: self.sized_bytes(base)?, writable })
+        Some(RefContract { size: self.sized_bytes(base)?, align: self.sized_align(base), writable })
     }
 
     /// Follow typedef/qualifier chains to a concrete byte size (a bounded walk).
@@ -86,7 +88,7 @@ impl DebugInfo {
         for _ in 0..16 {
             match self.nodes.get(&id)? {
                 DiNode::Sized { size_bytes: Some(n), .. } => return Some(*n),
-                DiNode::Sized { size_bytes: None, follows: Some(next) } => id = *next,
+                DiNode::Sized { size_bytes: None, follows: Some(next), .. } => id = *next,
                 DiNode::Composite { size_bytes: Some(n), .. } => return Some(*n),
                 // A pointer/reference *pointee* that is itself a pointer is 8
                 // bytes (a thin pointer's storage), the sound size for it.
@@ -95,6 +97,22 @@ impl DebugInfo {
             }
         }
         None
+    }
+
+    /// The byte alignment of a type node (following typedef chains); 1 when not
+    /// recorded (a conservative default — an alignment obligation then fails
+    /// soundly rather than assuming).
+    fn sized_align(&self, mut id: u32) -> u32 {
+        for _ in 0..16 {
+            match self.nodes.get(&id) {
+                Some(DiNode::Sized { align_bytes: Some(a), .. }) => return *a,
+                Some(DiNode::Composite { align_bytes: Some(a), .. }) => return *a,
+                Some(DiNode::Sized { align_bytes: None, follows: Some(next), .. }) => id = *next,
+                Some(DiNode::Pointer { .. } | DiNode::Reference { .. }) => return 8,
+                _ => return 1,
+            }
+        }
+        1
     }
 
     /// The **pointee** type node of a reference parameter — the struct a `&mut
@@ -124,7 +142,11 @@ impl DebugInfo {
                         DiNode::Reference { base, writable } => (*base, *writable),
                         _ => return None,
                     };
-                    return Some(RefContract { size: self.sized_bytes(pointee)?, writable });
+                    return Some(RefContract {
+                        size: self.sized_bytes(pointee)?,
+                        align: self.sized_align(pointee),
+                        writable,
+                    });
                 }
             }
         }
@@ -152,10 +174,13 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
     let mut di = DebugInfo::default();
     for line in src.lines() {
         let line = line.trim_start();
-        // A metadata definition: `!123 = !DI…(…)`.
+        // A metadata definition: `!123 = [distinct] !DI…(…)`.
         let Some(rest) = line.strip_prefix('!') else { continue };
         let Some((id_str, body)) = rest.split_once(" = ") else { continue };
         let Ok(id) = id_str.parse::<u32>() else { continue };
+        // clang marks structs and subprograms `distinct` (a uniquing hint); it
+        // prefixes the node body and must be stripped before the tag match.
+        let body = body.strip_prefix("distinct ").unwrap_or(body);
 
         if let Some(args) = tag_body(body, "!DILocalVariable(") {
             // `arg: k, scope: !N, type: !T` — only parameters (those with `arg:`).
@@ -173,10 +198,18 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
                 DiNode::Composite {
                     elements: field_ref(args, "elements:"),
                     size_bytes: bits_to_bytes(args),
+                    align_bytes: bits_to_bytes_u32(args, "align:"),
                 },
             );
         } else if let Some(args) = tag_body(body, "!DIBasicType(") {
-            di.nodes.insert(id, DiNode::Sized { size_bytes: bits_to_bytes(args), follows: None });
+            di.nodes.insert(
+                id,
+                DiNode::Sized {
+                    size_bytes: bits_to_bytes(args),
+                    align_bytes: bits_to_bytes_u32(args, "align:"),
+                    follows: None,
+                },
+            );
         } else if let Some(members) = tuple_refs(body) {
             // A `!{!a, !b, …}` metadata tuple — a struct's element list.
             di.nodes.insert(id, DiNode::Tuple(members));
@@ -231,7 +264,11 @@ fn insert_derived(di: &mut DebugInfo, id: u32, args: &str) {
         _ => {
             di.nodes.insert(
                 id,
-                DiNode::Sized { size_bytes: bits_to_bytes(args), follows: base },
+                DiNode::Sized {
+                    size_bytes: bits_to_bytes(args),
+                    align_bytes: bits_to_bytes_u32(args, "align:"),
+                    follows: base,
+                },
             );
         }
     }
@@ -268,6 +305,12 @@ fn field_str<'a>(args: &'a str, field: &str) -> Option<&'a str> {
 fn bits_to_bytes(args: &str) -> Option<u64> {
     let bits: u64 = field_raw(args, "size:")?.parse().ok()?;
     Some(bits / 8)
+}
+
+/// A named bit field (`align:`) converted to whole bytes as a `u32`.
+fn bits_to_bytes_u32(args: &str, field: &str) -> Option<u32> {
+    let bits: u32 = field_raw(args, field)?.parse().ok()?;
+    Some((bits / 8).max(1))
 }
 
 /// The raw token of `field:` — up to the next comma or end, trimmed. Handles a
