@@ -1433,3 +1433,73 @@ fn closed_world_member_provenance_respects_escape_via_external_call() {
         "an external call that may rewrite the field must drop the guarantee (no false PASS)"
     );
 }
+
+/// Contract synthesis through a constant `getelementptr`: C passes an array
+/// argument as `&a[0]` (a gep into the alloca), never the alloca itself. Under
+/// closed-world the callee's parameter must still be contracted from that gep —
+/// here `reads` (two i64 loads) is called with `&a[0]` of a `[2 x i64]`, so it
+/// gets a 16-byte region and proves.
+const GEP_ARG: &str = r#"
+define i64 @reads(ptr %p) {
+entry:
+  %a = load i64, ptr %p, align 8
+  %q = getelementptr i64, ptr %p, i64 1
+  %b = load i64, ptr %q, align 8
+  %s = add i64 %a, %b
+  ret i64 %s
+}
+define i64 @main() {
+entry:
+  %arr = alloca [2 x i64], align 8
+  %p0 = getelementptr i64, ptr %arr, i64 0
+  %r = call i64 @reads(ptr %p0)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn closed_world_synthesizes_through_constant_gep_arg() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: GEP_ARG.into(), name: "gep".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "an array argument passed as &a[0] must contract the parameter"
+    );
+}
+
+/// Soundness control: a gep to `&a[1]` of a two-element array leaves only 8 bytes,
+/// so a callee reading `p[1]` (offset 8) is out of bounds — the reduced-size
+/// guarantee must keep it unprovable, never a false PASS.
+const GEP_ARG_OOB: &str = r#"
+define i64 @reads(ptr %p) {
+entry:
+  %a = load i64, ptr %p, align 8
+  %q = getelementptr i64, ptr %p, i64 1
+  %b = load i64, ptr %q, align 8
+  %s = add i64 %a, %b
+  ret i64 %s
+}
+define i64 @main() {
+entry:
+  %arr = alloca [2 x i64], align 8
+  %p1 = getelementptr i64, ptr %arr, i64 1
+  %r = call i64 @reads(ptr %p1)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn closed_world_gep_arg_reduces_size_soundly() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: GEP_ARG_OOB.into(), name: "gepoob".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "&a[1] leaves 8 bytes; reading p[1] past it must not be a false PASS"
+    );
+}

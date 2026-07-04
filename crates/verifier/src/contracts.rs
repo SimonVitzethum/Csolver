@@ -486,6 +486,49 @@ fn local_defs(
             );
         }
     }
+    // A constant `PtrOffset` into a known region (`&a[k]` — C passes an array
+    // argument as `&a[0]`, a getelementptr into the alloca, never the alloca
+    // itself) still points into that region: it guarantees the remaining
+    // `size - offset` bytes. A bounded fixpoint chains multi-step geps
+    // (`&outer.arr[0]`); a negative or past-end offset is simply not derivable.
+    loop {
+        let mut grew = false;
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            let Inst::PtrOffset {
+                dst,
+                base: Operand::Reg(b),
+                index: Operand::Const(Const::Int(bv)),
+                elem,
+            } = inst
+            else {
+                continue;
+            };
+            if defs.contains_key(dst) {
+                continue;
+            }
+            let Some(base) = defs.get(b).copied() else { continue };
+            let Some(elem_size) = elem.size_bytes(&module.layout) else { continue };
+            let Ok(idx) = u64::try_from(bv.unsigned()) else { continue };
+            let Some(off) = idx.checked_mul(elem_size) else { continue };
+            let Some(size) = base.size.checked_sub(off) else { continue };
+            // Alignment at `base + off`: unchanged at offset 0, else the exact
+            // 2-power common to the base alignment and the offset (a lower bound,
+            // so sound).
+            let align = if off == 0 {
+                base.align
+            } else {
+                1u32 << off.trailing_zeros().min(base.align.trailing_zeros())
+            };
+            defs.insert(
+                *dst,
+                SiteGuarantee { size, align, readable: base.readable, writable: base.writable },
+            );
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
     defs
 }
 
