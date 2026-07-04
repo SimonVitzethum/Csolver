@@ -79,6 +79,11 @@ struct Ctx<'a> {
     /// `extractvalue`'s field 0 recovers the arithmetic (field 1 is the overflow
     /// flag, which only feeds the panic branch and stays opaque).
     checked_arith: HashMap<String, (BinOp, LValue, LValue)>,
+    /// From debug info: the *result* local of a `load ptr` that reads a reference
+    /// *field* of a DWARF-typed struct (`load ptr, gep(&mut StructT, offset)`
+    /// where the member at `offset` is a `&T`). Such a loaded pointer is a valid
+    /// reference — `lower_block` materialises it with a `RefWitness`.
+    field_ref_loads: HashMap<String, (u64, bool)>,
 }
 
 impl Ctx<'_> {
@@ -155,6 +160,7 @@ fn lower_function(
         func: f,
         func_ids,
         checked_arith: checked_arith_map(f),
+        field_ref_loads: dwarf_field_loads(f, debuginfo),
     };
 
     // Pre-pass: assign block ids and register ids for every defined value
@@ -256,6 +262,81 @@ fn lower_function(
         entry: BlockId(0),
     };
     Ok((function, contracts))
+}
+
+/// A per-function pre-pass over debug info: the *result* locals of `load ptr`
+/// instructions that read a **reference field** of a DWARF-typed struct
+/// parameter, mapped to the field's `(pointee size, writable)`. The connecting
+/// dataflow is intra-block and mechanical (exactly what rustc emits):
+///
+/// ```text
+/// store ptr %self, %self.dbg.spill        ; the debug spill …
+/// %r = load ptr, %self.dbg.spill          ; … reloaded (keeps %self's struct)
+/// %f = getelementptr i8, ptr %r, i64 OFF  ; a byte offset into the struct
+/// %fld = load ptr, ptr %f                 ; the field pointer — a valid ref
+/// ```
+///
+/// Only the `&T`/`&mut T` fields are recorded (via `member_ref`); a raw-pointer
+/// field is left opaque, so the recovery is sound (it grants exactly the
+/// reference validity the type system guarantees).
+fn dwarf_field_loads(
+    f: &LFunc,
+    di: &crate::debuginfo::DebugInfo,
+) -> HashMap<String, (u64, bool)> {
+    let mut out = HashMap::new();
+    let Some(sp) = f.dbg else { return out };
+
+    // `local -> DWARF struct type id it points to (at offset 0)`. Seed the
+    // reference parameters whose pointee is a struct.
+    let mut struct_of: HashMap<String, u32> = HashMap::new();
+    for (i, p) in f.params.iter().enumerate() {
+        if !p.name.is_empty() {
+            if let Some(s) = di.param_pointee(sp, i as u32 + 1) {
+                struct_of.insert(p.name.clone(), s);
+            }
+        }
+    }
+
+    // The single lowering pass follows spill round-trips and field geps in
+    // program order (rustc emits the spill store/reload adjacent, so one pass
+    // over the flattened instruction stream suffices).
+    // `slot -> source local` for `store ptr %src, %slot`.
+    let mut spill_src: HashMap<String, String> = HashMap::new();
+    // `gep-result local -> (struct id, byte offset)`.
+    let mut field_at: HashMap<String, (u32, u64)> = HashMap::new();
+
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst {
+            LInst::Store { val: LValue::Local(src), ptr: LValue::Local(slot), .. } => {
+                spill_src.insert(slot.clone(), src.clone());
+            }
+            LInst::Load { dst, ptr: LValue::Local(slot), .. } => {
+                // A reload of a spilled struct pointer inherits the struct.
+                if let Some(s) = spill_src.get(slot).and_then(|src| struct_of.get(src)).copied() {
+                    struct_of.insert(dst.clone(), s);
+                }
+                // A load of a recorded reference field: record its result.
+                if let Some(&(struct_id, off)) = field_at.get(slot) {
+                    if let Some(c) = di.member_ref(struct_id, off) {
+                        out.insert(dst.clone(), (c.size, c.writable));
+                    }
+                }
+            }
+            // `gep i8, ptr %base, i64 OFF` — a byte offset into a struct.
+            LInst::Gep {
+                dst,
+                elem,
+                base: LValue::Local(base),
+                index: LValue::Int(off),
+            } if matches!(elem, LType::Int(8)) && *off >= 0 => {
+                if let Some(&s) = struct_of.get(base) {
+                    field_at.insert(dst.clone(), (s, *off as u64));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Detect a Rust slice parameter: a `ptr` (with an `align` attribute, as `rustc`
@@ -432,6 +513,23 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 elem: Type::int(8),
             });
             continue;
+        }
+                // A `load ptr` that reads a *reference field* of a DWARF-typed struct
+        // (see `dwarf_field_loads`): keep the load (it checks the field access),
+        // then materialise its result as a valid reference — the loaded pointer
+        // is a `&T`/`&mut T` by the field's declared type, so accesses through it
+        // prove. Without this the loaded field pointer has lost provenance.
+        if let LInst::Load { dst, .. } = inst {
+            if let Some(&(size, writable)) = ctx.field_ref_loads.get(dst) {
+                insts.push(lower_inst(ctx, inst)?);
+                insts.push(Inst::RefWitness {
+                    dst: ctx.reg(dst)?,
+                    size: Some(size),
+                    align: 1,
+                    writable,
+                });
+                continue;
+            }
         }
         insts.push(lower_inst(ctx, inst)?);
     }

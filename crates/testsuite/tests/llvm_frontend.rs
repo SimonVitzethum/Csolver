@@ -1109,3 +1109,50 @@ start:
         "without debug info the pointee size is unknown — must not prove"
     );
 }
+
+/// DWARF struct-member recovery: a `load ptr` reading a *reference field* of a
+/// debug-typed struct (`load ptr, gep(&mut Wrap, offset)` where the member at
+/// that offset is a `&u8`) yields a valid reference, so a read through it
+/// proves. LLVM's opaque `ptr` erased the field type; the `!DI…` members recover
+/// it. This is the pattern that dominates reference-heavy code — C structs with
+/// pointer members, C++ classes with `T&`/`T*` fields, Rust structs holding
+/// borrows. A raw-pointer field is NOT recovered (validity not guaranteed).
+#[test]
+fn llvm_debuginfo_recovers_reference_struct_member() {
+    let src = r#"
+define i8 @read_field(ptr align 8 %self) !dbg !7 {
+start:
+  %f = getelementptr inbounds i8, ptr %self, i64 8
+  %inner = load ptr, ptr %f, align 8
+  %v = load i8, ptr %inner, align 1
+  ret i8 %v
+}
+!7 = distinct !DISubprogram(name: "read_field", spFlags: DISPFlagDefinition)
+!42 = !DILocalVariable(name: "self", arg: 1, scope: !7, type: !39)
+!39 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "&mut Wrap", baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "Wrap", size: 128, elements: !12)
+!12 = !{!13, !15}
+!13 = !DIDerivedType(tag: DW_TAG_member, name: "tag", baseType: !14, size: 64, offset: 0)
+!14 = !DIBasicType(name: "u64", size: 64)
+!15 = !DIDerivedType(tag: DW_TAG_member, name: "inner", baseType: !16, size: 64, offset: 64)
+!16 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "&u8", baseType: !17, size: 64)
+!17 = !DIBasicType(name: "u8", size: 8)
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    assert_eq!(report.verdict, Verdict::Pass, "read through the recovered field ref proves: {report:?}");
+
+    // Reading a raw-pointer field must not be recovered (a `*const u8` member):
+    // the deref through it stays unproven.
+    let raw = src.replace(r#"name: "&u8""#, r#"name: "*const u8""#);
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: raw, name: "m".into() })
+        .expect("lower");
+    assert_ne!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "a raw-pointer field grants no validity — the deref must not prove"
+    );
+}
