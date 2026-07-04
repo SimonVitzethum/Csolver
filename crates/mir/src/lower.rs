@@ -424,6 +424,29 @@ impl Ctx {
         }
     }
 
+    /// The terminator after a call/drop, given its normal-return and
+    /// unwind-cleanup targets. Both present → a two-way branch on a *fresh
+    /// unconstrained* condition, so both the normal successor and the cleanup
+    /// block are explored (the cleanup runs on the panic path; its memory ops —
+    /// drops and writes — must be checked, not silently left undecided). The
+    /// cleanup edge sees the post-call state (the call's conservative havoc), a
+    /// sound over-approximation of the partially-unwound state. Mirrors the LLVM
+    /// `invoke` lowering.
+    fn call_edges(&mut self, target: Option<usize>, unwind: Option<usize>) -> Terminator {
+        match (target, unwind) {
+            (Some(t), Some(u)) => Terminator::CondBr {
+                cond: IrOp::Reg(self.fresh()),
+                then_blk: BlockId(t as u32),
+                then_args: vec![],
+                else_blk: BlockId(u as u32),
+                else_args: vec![],
+            },
+            (Some(t), None) => Terminator::Br { target: BlockId(t as u32), args: vec![] },
+            (None, Some(u)) => Terminator::Br { target: BlockId(u as u32), args: vec![] },
+            (None, None) => Terminator::Unreachable,
+        }
+    }
+
     fn lower_term(&mut self, t: &MTerm, out: &mut Vec<Inst>) -> Result<Terminator> {
         Ok(match t {
             MTerm::Return => Terminator::Return(None),
@@ -443,7 +466,7 @@ impl Ctx {
                     else_args: vec![],
                 }
             }
-            MTerm::Call { dst, callee, args, target } => {
+            MTerm::Call { dst, callee, args, target, unwind } => {
                 // A call is an MSIR *instruction* followed by an edge to the
                 // return block (or divergence if the call cannot return). The
                 // verifier applies a known function's summary or havocs an
@@ -495,10 +518,7 @@ impl Ctx {
                     ret_ty,
                     ret_ref,
                 });
-                match target {
-                    Some(t) => Terminator::Br { target: BlockId(*t as u32), args: vec![] },
-                    None => Terminator::Unreachable,
-                }
+                self.call_edges(*target, *unwind)
             }
             MTerm::SwitchInt(op, cases, otherwise) => {
                 let value = self.operand_value(op, out);
@@ -521,7 +541,7 @@ impl Ctx {
                     Terminator::Switch { value, cases, default: BlockId(*otherwise as u32) }
                 }
             }
-            MTerm::Drop { target } => {
+            MTerm::Drop { target, unwind } => {
                 // A drop runs the value's destructor, which may free what the value
                 // owns (a `Vec`/`Box` buffer, or a raw pointer a custom `Drop`
                 // frees). Model it as a freeing call: an unknown `Symbol` callee,
@@ -537,10 +557,7 @@ impl Ctx {
                     ret_ty: Type::Unit,
                     ret_ref: None,
                 });
-                match target {
-                    Some(t) => Terminator::Br { target: BlockId(*t as u32), args: vec![] },
-                    None => Terminator::Unreachable,
-                }
+                self.call_edges(*target, *unwind)
             }
             MTerm::Unsupported => {
                 return Err(Error::unsupported("MIR terminator outside the modelled subset"))

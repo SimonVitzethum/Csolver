@@ -127,12 +127,12 @@ pub(crate) enum MTerm {
     Assert { cond: Operand, expected: bool, target: usize },
     /// `_d = callee(args) -> [return: bb, …]`: a function call (`target` is
     /// `None` for a diverging call with no return edge).
-    Call { dst: Place, callee: CalleeSpec, args: Vec<Operand>, target: Option<usize> },
+    Call { dst: Place, callee: CalleeSpec, args: Vec<Operand>, target: Option<usize>, unwind: Option<usize> },
     /// `drop(place) -> [return: bb, …]`: runs the value's destructor, which may
     /// free what it owns. Modelled as a freeing call (`target` is `None` for a
     /// diverging drop). The dropped place itself is not needed — the conservative
     /// free invalidates every owned region's liveness regardless.
-    Drop { target: Option<usize> },
+    Drop { target: Option<usize>, unwind: Option<usize> },
     Unreachable,
     /// A terminator outside the modelled subset (`call`, `drop`, …): the whole
     /// function is rejected (recorded unanalyzed) rather than mis-modelled.
@@ -528,8 +528,8 @@ impl Parser {
             args.push(self.operand()?);
             let _ = self.eat_punct(',');
         }
-        let target = self.return_edge()?;
-        Ok(MTerm::Call { dst, callee, args, target })
+        let (target, unwind) = self.return_edge()?;
+        Ok(MTerm::Call { dst, callee, args, target, unwind })
     }
 
     /// The callee of a call: an indirect function-pointer local (`move _N`), or
@@ -561,18 +561,23 @@ impl Parser {
     }
 
     /// The `return`/`success` target of a call's edges (`None` ⇒ diverging).
-    fn return_edge(&mut self) -> Result<Option<usize>> {
+    fn return_edge(&mut self) -> Result<(Option<usize>, Option<usize>)> {
         if self.peek() == &Tok::Arrow {
             self.pos += 1;
         }
         if self.eat_punct('[') {
             let mut target = None;
+            let mut unwind = None;
             while !self.eat_punct(']') {
                 let key = self.word()?;
                 if self.eat_punct(':') {
                     let bb = self.arrow_block_bare()?;
                     if key == "return" || key == "success" {
                         target = Some(bb);
+                    } else if key == "unwind" {
+                        // `unwind: bbN` — the cleanup block. Model it so its
+                        // memory ops (drops/writes on the panic path) are checked.
+                        unwind = Some(bb);
                     }
                 } else if matches!(self.peek(), Tok::Word(_)) {
                     self.pos += 1; // an unwind action without a block
@@ -582,7 +587,7 @@ impl Parser {
                 }
                 let _ = self.eat_punct(',');
             }
-            Ok(target)
+            Ok((target, unwind))
         } else if self.eat_word("unwind") {
             // A diverging call `-> unwind continue` / `unwind unreachable` /
             // `unwind terminate(…)` (e.g. `_ = panic(…) -> unwind continue`): no
@@ -593,10 +598,10 @@ impl Parser {
                     self.skip_balanced_paren();
                 }
             }
-            Ok(None)
+            Ok((None, None))
         } else {
             let w = self.word()?;
-            Ok(bb_index(&w))
+            Ok((bb_index(&w), None))
         }
     }
 
@@ -634,8 +639,8 @@ impl Parser {
         self.expect_punct('(')?;
         let _ = self.place()?;
         self.expect_punct(')')?;
-        let target = self.return_edge()?;
-        Ok(MTerm::Drop { target })
+        let (target, unwind) = self.return_edge()?;
+        Ok(MTerm::Drop { target, unwind })
     }
 
     fn assert_term(&mut self) -> Result<MTerm> {
