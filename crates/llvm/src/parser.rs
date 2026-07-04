@@ -1464,6 +1464,17 @@ impl Parser {
         while self.eat_word("tail") || self.eat_word("notail") || self.eat_word("musttail") {}
         self.skip_to_type()?;
         let ret = self.ltype()?;
+        // A variadic (or explicitly-typed) call prints the *full function type*
+        // before the callee — `call i64 (i32, ...) @f(args)` — with an optional
+        // trailing `*` in pre-opaque-pointer IR. Skip that parenthesized signature
+        // so the callee parses; without this the whole caller was dropped (and
+        // with it every contract its call sites would have synthesized).
+        if matches!(self.peek(), Tok::Punct('(')) {
+            self.skip_balanced('(', ')')?;
+            if matches!(self.peek(), Tok::Punct('*')) {
+                self.pos += 1;
+            }
+        }
         let callee = self.callee_name()?;
         self.expect_punct('(')?;
         let mut args = Vec::new();
@@ -1687,6 +1698,28 @@ define i64 @f(ptr %0, i32 %1) {
         assert_eq!(m.unanalyzed.len(), 0, "entry-referencing phi must not drop the fn");
         // The entry block is labeled with its implicit number "2".
         assert_eq!(m.funcs[0].blocks[0].label, "2");
+    }
+
+    #[test]
+    fn parses_variadic_call_with_explicit_function_type() {
+        // A variadic call prints the full function type before the callee:
+        // `call i64 (i32, ...) @f(...)`. The caller must not be dropped (which
+        // would erase the call sites every contract synthesis depends on).
+        let src = r#"
+define i64 @caller() {
+entry:
+  %r = call i64 (i32, ...) @printf_like(i32 0, i64 1, i64 2)
+  ret i64 %r
+}
+"#;
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.unanalyzed.len(), 0, "variadic call must not drop the caller");
+        // The call parsed with its fixed + variadic arguments and callee.
+        let call = m.funcs[0].blocks[0].insts.iter().find_map(|i| match i {
+            LInst::Call { callee, args, .. } => Some((callee.clone(), args.len())),
+            _ => None,
+        });
+        assert_eq!(call, Some(("printf_like".to_string(), 3)));
     }
 
     #[test]
