@@ -125,6 +125,11 @@ impl Function {
         self.blocks.iter().find(|b| b.id == id)
     }
 
+    /// Mutable access to the block with the given id (for MSIR→MSIR passes).
+    pub fn block_mut(&mut self, id: BlockId) -> Option<&mut BasicBlock> {
+        self.blocks.iter_mut().find(|b| b.id == id)
+    }
+
     /// The number of blocks.
     pub fn block_count(&self) -> usize {
         self.blocks.len()

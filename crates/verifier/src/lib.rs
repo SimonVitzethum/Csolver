@@ -23,6 +23,7 @@
 //! report is always relative to the checks the frontend emitted.
 
 mod contracts;
+mod mem2reg;
 mod report;
 
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
@@ -92,6 +93,12 @@ pub fn verify_module(module: &Module, config: &Config) -> ModuleReport {
 /// output. The determinism test (`parallel_matches_serial`) is the oracle for this,
 /// the role Miri plays for the MIR lowering. The count trades only latency.
 pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usize) -> ModuleReport {
+    // Promote non-escaping scalar stack slots to SSA first: unoptimized front-end
+    // output spills locals (loop counters, pointer parameters) to allocas, which
+    // defeats induction bounds and store-load provenance. Semantics-preserving, so
+    // sound; it only lets the analysis see what `-O1` would have.
+    let promoted = mem2reg::promote_module(module);
+    let module = &promoted;
     let summaries = config.use_symbolic.then(|| summarize_module(module));
     // Interprocedural: contracts synthesized from the (complete) call sites of
     // internal functions overlay the declared ones (declared always wins).

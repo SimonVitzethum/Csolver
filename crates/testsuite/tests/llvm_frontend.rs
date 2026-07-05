@@ -1503,3 +1503,109 @@ fn closed_world_gep_arg_reduces_size_soundly() {
         "&a[1] leaves 8 bytes; reading p[1] past it must not be a false PASS"
     );
 }
+
+/// mem2reg promotes spilled locals to SSA, so an `-O0`-style loop — pointer and
+/// counter both spilled to allocas and reloaded each iteration — becomes
+/// analyzable: the counter is an induction variable again, so `p[i]` (i in
+/// [0,4), region 4×i64) proves in bounds under closed-world.
+const SPILLED_LOOP: &str = r#"
+define i64 @sum4(ptr %p) {
+entry:
+  %pa = alloca ptr, align 8
+  %sa = alloca i64, align 8
+  %ia = alloca i64, align 8
+  store ptr %p, ptr %pa, align 8
+  store i64 0, ptr %sa, align 8
+  store i64 0, ptr %ia, align 8
+  br label %head
+head:
+  %i = load i64, ptr %ia, align 8
+  %c = icmp slt i64 %i, 4
+  br i1 %c, label %body, label %exit
+body:
+  %pv = load ptr, ptr %pa, align 8
+  %iv = load i64, ptr %ia, align 8
+  %q = getelementptr i64, ptr %pv, i64 %iv
+  %x = load i64, ptr %q, align 8
+  %sv = load i64, ptr %sa, align 8
+  %sn = add i64 %sv, %x
+  store i64 %sn, ptr %sa, align 8
+  %in = add i64 %iv, 1
+  store i64 %in, ptr %ia, align 8
+  br label %head
+exit:
+  %r = load i64, ptr %sa, align 8
+  ret i64 %r
+}
+define i64 @main() {
+entry:
+  %arr = alloca [4 x i64], align 8
+  %p0 = getelementptr i64, ptr %arr, i64 0
+  %r = call i64 @sum4(ptr %p0)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn mem2reg_promotes_spilled_loop_to_provable() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: SPILLED_LOOP.into(), name: "spill".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "a spilled -O0 counter loop must become provable after mem2reg"
+    );
+}
+
+/// Soundness control for mem2reg: promoting the counter must not mask a genuine
+/// out-of-bounds access. `sum` reads `p[0..8)` but the caller supplies only 4
+/// elements — the bounds obligation must remain unproven (no false PASS).
+const SPILLED_LOOP_OOB: &str = r#"
+define i64 @sum8(ptr %p) {
+entry:
+  %sa = alloca i64, align 8
+  %ia = alloca i64, align 8
+  store i64 0, ptr %sa, align 8
+  store i64 0, ptr %ia, align 8
+  br label %head
+head:
+  %i = load i64, ptr %ia, align 8
+  %c = icmp slt i64 %i, 8
+  br i1 %c, label %body, label %exit
+body:
+  %iv = load i64, ptr %ia, align 8
+  %q = getelementptr i64, ptr %p, i64 %iv
+  %x = load i64, ptr %q, align 8
+  %sv = load i64, ptr %sa, align 8
+  %sn = add i64 %sv, %x
+  store i64 %sn, ptr %sa, align 8
+  %in = add i64 %iv, 1
+  store i64 %in, ptr %ia, align 8
+  br label %head
+exit:
+  %r = load i64, ptr %sa, align 8
+  ret i64 %r
+}
+define i64 @main() {
+entry:
+  %arr = alloca [4 x i64], align 8
+  %p0 = getelementptr i64, ptr %arr, i64 0
+  %r = call i64 @sum8(ptr %p0)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn mem2reg_preserves_out_of_bounds_obligation() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: SPILLED_LOOP_OOB.into(), name: "spilloob".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "promoting the counter must not hide the p[0..8) over-read of a 4-element buffer"
+    );
+}
