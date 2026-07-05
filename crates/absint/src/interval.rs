@@ -131,6 +131,46 @@ impl Interval {
         }
     }
 
+    /// Intersection: the tightest interval contained in both (`Bottom` if they
+    /// are disjoint). Used to apply a branch guard to an incoming edge.
+    pub fn meet(&self, other: &Interval) -> Interval {
+        match (self, other) {
+            (Interval::Bottom, _) | (_, Interval::Bottom) => Interval::Bottom,
+            (Interval::Range(l1, h1), Interval::Range(l2, h2)) => {
+                let lo = Bound::max(*l1, *l2);
+                let hi = Bound::min(*h1, *h2);
+                if Bound::le(lo, hi) {
+                    Interval::Range(lo, hi)
+                } else {
+                    Interval::Bottom
+                }
+            }
+        }
+    }
+
+    /// The half-line `(-∞, upper]` (`< self`'s max when `strict`). Used to bound a
+    /// value that a guard proves is `≤`/`<` this interval.
+    pub fn as_upper_constraint(&self, strict: bool) -> Interval {
+        match self.upper() {
+            Some(hi) => {
+                let hi = if strict { Bound::add(hi, Bound::Fin(-1)) } else { hi };
+                Interval::Range(Bound::NegInf, hi)
+            }
+            None => Interval::Bottom,
+        }
+    }
+
+    /// The half-line `[lower, +∞)` (`> self`'s min when `strict`).
+    pub fn as_lower_constraint(&self, strict: bool) -> Interval {
+        match self.lower() {
+            Some(lo) => {
+                let lo = if strict { Bound::add(lo, Bound::Fin(1)) } else { lo };
+                Interval::Range(lo, Bound::PosInf)
+            }
+            None => Interval::Bottom,
+        }
+    }
+
     /// The lower bound, if not bottom.
     pub fn lower(&self) -> Option<Bound> {
         match self {

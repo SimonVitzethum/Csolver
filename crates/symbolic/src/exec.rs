@@ -1493,6 +1493,7 @@ impl Explorer<'_> {
             .get(&header)
             .cloned()
             .unwrap_or_default();
+        let modified_set: HashSet<RegId> = modified.iter().copied().collect();
         for reg in modified {
             match state.env.get(&reg) {
                 Some(SymValue::Ptr(_)) => {
@@ -1529,6 +1530,48 @@ impl Explorer<'_> {
                     state.env.insert(reg, SymValue::Scalar(s));
                 }
                 None => {} // not live at the header; defined fresh in the body
+            }
+        }
+
+        // A register live at the header but *not* modified by the loop (a bound
+        // computed before it — e.g. a clamped length `n = min(n, cap)`) keeps its
+        // symbolic value, so it is not havoc'd above; but its sound interval bound
+        // at the header still holds every iteration. Assert it, so a body access
+        // guarded by it (`i < n`, with `n <= cap` known only to the interval
+        // domain after guard refinement) can be proved. Deterministic order.
+        let live_scalars: Vec<RegId> = {
+            let mut v: Vec<RegId> = state
+                .env
+                .iter()
+                .filter(|(r, val)| !modified_set.contains(r) && matches!(val, SymValue::Scalar(_)))
+                .map(|(r, _)| *r)
+                .collect();
+            v.sort_unstable_by_key(|r| r.0);
+            v
+        };
+        for reg in live_scalars {
+            let Some(&SymValue::Scalar(s)) = state.env.get(&reg) else { continue };
+            // Constrain at the *value's own width* — an `i1` (a boolean like
+            // `buf == end`) carries no useful numeric bound and comparing it to a
+            // 64-bit constant is ill-typed, so skip narrow values.
+            let w = self.ctx.width(s);
+            if w <= 1 {
+                continue;
+            }
+            let iv = self.analysis.entry_interval(header, reg);
+            if let Some(Bound::Fin(lo)) = iv.lower() {
+                if lo >= 0 {
+                    let k = self.ctx.int(w, lo as u128);
+                    let fact = self.ctx.cmp(SCmp::Sge, s, k);
+                    state.facts.push(fact);
+                }
+            }
+            if let Some(Bound::Fin(hi)) = iv.upper() {
+                if hi >= 0 {
+                    let k = self.ctx.int(w, hi as u128);
+                    let fact = self.ctx.cmp(SCmp::Sle, s, k);
+                    state.facts.push(fact);
+                }
             }
         }
 

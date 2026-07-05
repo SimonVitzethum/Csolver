@@ -1609,3 +1609,68 @@ fn mem2reg_preserves_out_of_bounds_obligation() {
         "promoting the counter must not hide the p[0..8) over-read of a 4-element buffer"
     );
 }
+
+/// Interval guard refinement + loop-bound import: a clamped variable-length loop
+/// `if (n>4) n=4; for(i=0;i<n;i++) p[i]` is safe because the clamp bounds `n<=4`
+/// and the region is 4 elements. The interval domain derives `n<=4` from the
+/// `else` edge of the clamp; the symbolic loop imports that bound, so `i<n<=4`
+/// proves `p[i]` in bounds under closed-world.
+const CLAMPED_LOOP: &str = r#"
+define i64 @clamped(ptr %p, i64 %n) {
+entry:
+  %c = icmp sgt i64 %n, 4
+  br i1 %c, label %clamp, label %pre
+clamp:
+  br label %pre
+pre:
+  %nb = phi i64 [ 4, %clamp ], [ %n, %entry ]
+  br label %head
+head:
+  %i = phi i64 [ 0, %pre ], [ %inext, %body ]
+  %lt = icmp slt i64 %i, %nb
+  br i1 %lt, label %body, label %exit
+body:
+  %q = getelementptr i64, ptr %p, i64 %i
+  %x = load i64, ptr %q, align 8
+  %inext = add i64 %i, 1
+  br label %head
+exit:
+  ret i64 0
+}
+define i64 @main() {
+entry:
+  %arr = alloca [4 x i64], align 8
+  %p0 = getelementptr i64, ptr %arr, i64 0
+  %r = call i64 @clamped(ptr %p0, i64 8)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn guard_refinement_proves_clamped_loop() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: CLAMPED_LOOP.into(), name: "clamp".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "a loop whose bound is clamped to the region size must prove via guard refinement"
+    );
+}
+
+/// Soundness control: the same loop clamped to 8 over a 4-element region reads out
+/// of bounds — the refined bound `n<=8` does not prove `i<4`, so it stays UNKNOWN.
+#[test]
+fn guard_refinement_over_clamp_is_not_pass() {
+    let src = CLAMPED_LOOP.replace("sgt i64 %n, 4", "sgt i64 %n, 8").replace("[ 4, %clamp ]", "[ 8, %clamp ]");
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src, name: "clampoob".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "a bound clamped larger than the region must not falsely prove in-bounds"
+    );
+}

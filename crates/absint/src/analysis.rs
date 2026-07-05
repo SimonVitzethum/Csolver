@@ -1,10 +1,12 @@
 //! The interval analysis: MSIR transfer functions wired to the solver.
 //!
-//! This is intentionally *sound but unrefined* at M0: it does not yet narrow
-//! register ranges using branch conditions (that arrives with the verifier's
-//! M1 slice and/or the symbolic engine). It already establishes loop
-//! invariants via widening, which is enough to discharge many in-bounds
-//! obligations whose index is derived from constants and monotone updates.
+//! Loop invariants come from widening; branch conditions **refine** each taken
+//! edge (`transfer_edge`): the `then` edge asserts the guard and the `else` edge
+//! its negation, tightening the operands' intervals (and propagating along copy
+//! chains a promoted spill leaves behind). This is what lets a clamped bound
+//! (`if (n>cap) n=cap;`) reach the loop as `n <= cap`. Refinement is sound for
+//! signed comparisons; unsigned and `!=` are left unrefined. Note it narrows
+//! *edges*, not the widened loop-header fixpoint itself.
 
 use crate::engine::{solve, Solution};
 use crate::env::IntervalState;
@@ -230,15 +232,116 @@ pub fn analyze_intervals(f: &Function) -> IntervalAnalysis {
     let dominators = Dominators::new(&cfg);
     let loops = Loops::detect(&cfg, &dominators);
 
+    // The comparison behind each `i1` register, so a `CondBr` on it can refine the
+    // taken edge (`then` asserts it, `else` its negation). Plus copy chains, so a
+    // guard on a copy (`%c = n; if %c > 8`) also refines the original — which the
+    // block parameter downstream actually carries.
+    let cmps = collect_cmps(f);
+    let copies = collect_copies(f);
+
     let solution = solve(
         &cfg,
         &loops,
         IntervalState::top(),
         |node, in_state| transfer_block(f, &cfg, node, in_state),
-        |from, to, from_exit| transfer_edge(f, &cfg, from, to, from_exit),
+        |from, to, from_exit| transfer_edge(f, &cfg, from, to, from_exit, &cmps, &copies),
     );
 
     IntervalAnalysis { solution, cfg }
+}
+
+/// Map each `i1` register to the comparison that defines it.
+fn collect_cmps(f: &Function) -> std::collections::HashMap<RegId, (CmpOp, Operand, Operand)> {
+    let mut m = std::collections::HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Inst::Assign { dst, value: RValue::Cmp { op, lhs, rhs }, .. } = inst {
+                m.insert(*dst, (*op, lhs.clone(), rhs.clone()));
+            }
+        }
+    }
+    m
+}
+
+/// Map each register defined as a plain register copy (`dst = src`) to its source
+/// — for propagating a refinement to the equal register (mem2reg leaves such
+/// copies when a promoted load feeds a comparison).
+fn collect_copies(f: &Function) -> std::collections::HashMap<RegId, RegId> {
+    let mut m = std::collections::HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Inst::Assign { dst, value: RValue::Use(Operand::Reg(src)), .. } = inst {
+                m.insert(*dst, *src);
+            }
+        }
+    }
+    m
+}
+
+/// Refine `state` by asserting a comparison `lhs OP rhs` holds (or its negation),
+/// tightening the intervals of its register operands. Sound for signed
+/// comparisons; unsigned and disequality are left unrefined (still sound).
+fn refine_by_cmp(
+    state: &mut IntervalState,
+    op: CmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    negate: bool,
+    copies: &std::collections::HashMap<RegId, RegId>,
+) {
+    let op = if negate { negate_cmp(op) } else { op };
+    let li = eval_operand(lhs, state);
+    let ri = eval_operand(rhs, state);
+    // (new lhs bound source, new rhs bound source) via the half-line constraints.
+    let (nl, nr) = match op {
+        CmpOp::Slt => (Some(ri.as_upper_constraint(true)), Some(li.as_lower_constraint(true))),
+        CmpOp::Sle => (Some(ri.as_upper_constraint(false)), Some(li.as_lower_constraint(false))),
+        CmpOp::Sgt => (Some(ri.as_lower_constraint(true)), Some(li.as_upper_constraint(true))),
+        CmpOp::Sge => (Some(ri.as_lower_constraint(false)), Some(li.as_upper_constraint(false))),
+        CmpOp::Eq => (Some(ri), Some(li)),
+        // Unsigned comparisons and `!=` are not soundly refined on the signed
+        // interval lattice here — leave the operands as-is.
+        _ => (None, None),
+    };
+    if let (Operand::Reg(r), Some(c)) = (lhs, nl) {
+        refine_reg(state, *r, &li.meet(&c), copies);
+    }
+    if let (Operand::Reg(r), Some(c)) = (rhs, nr) {
+        refine_reg(state, *r, &ri.meet(&c), copies);
+    }
+}
+
+/// Set `reg` to `iv`, and propagate the same bound along its copy chain (`reg`
+/// was defined `= src`, so they are equal). Bounded to avoid a cycle.
+fn refine_reg(
+    state: &mut IntervalState,
+    mut reg: RegId,
+    iv: &Interval,
+    copies: &std::collections::HashMap<RegId, RegId>,
+) {
+    for _ in 0..64 {
+        let cur = state.get(reg);
+        state.set(reg, cur.meet(iv));
+        match copies.get(&reg) {
+            Some(&src) if src != reg => reg = src,
+            _ => break,
+        }
+    }
+}
+
+fn negate_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Slt => CmpOp::Sge,
+        CmpOp::Sle => CmpOp::Sgt,
+        CmpOp::Sgt => CmpOp::Sle,
+        CmpOp::Sge => CmpOp::Slt,
+        CmpOp::Ult => CmpOp::Uge,
+        CmpOp::Ule => CmpOp::Ugt,
+        CmpOp::Ugt => CmpOp::Ule,
+        CmpOp::Uge => CmpOp::Ult,
+        CmpOp::Eq => CmpOp::Ne,
+        CmpOp::Ne => CmpOp::Eq,
+    }
 }
 
 /// Apply the straight-line body of block `node` to `in_state`.
@@ -272,6 +375,8 @@ fn transfer_edge(
     from: usize,
     to: usize,
     from_exit: &IntervalState,
+    cmps: &std::collections::HashMap<RegId, (CmpOp, Operand, Operand)>,
+    copies: &std::collections::HashMap<RegId, RegId>,
 ) -> IntervalState {
     if !from_exit.is_reachable() {
         return IntervalState::Unreachable;
@@ -279,6 +384,23 @@ fn transfer_edge(
     let from_block = f.block(cfg.block_id(from)).expect("from block");
     let to_id = cfg.block_id(to);
     let to_block = f.block(to_id).expect("to block");
+
+    // Apply the branch guard: on a `CondBr`, the `then` edge asserts the condition
+    // and the `else` edge its negation, tightening the operands' intervals before
+    // block-parameter binding (and before this edge's contribution is joined).
+    let mut refined = from_exit.clone();
+    if let Terminator::CondBr { cond: Operand::Reg(c), then_blk, else_blk, .. } = &from_block.term {
+        if let Some((op, lhs, rhs)) = cmps.get(c) {
+            let is_then = *then_blk == to_id;
+            let is_else = *else_blk == to_id;
+            // Only refine when the edge is unambiguously one side (a self-loop
+            // `then == else` would assert both, so refine neither).
+            if is_then ^ is_else {
+                refine_by_cmp(&mut refined, *op, lhs, rhs, is_else, copies);
+            }
+        }
+    }
+    let from_exit = &refined;
 
     let arg_lists = matching_args(&from_block.term, to_id);
     if arg_lists.is_empty() {
@@ -593,15 +715,16 @@ mod tests {
 
     #[test]
     fn loop_terminates_with_sound_invariant() {
-        // The analysis must terminate (widening) and infer a sound invariant.
-        // Without guard refinement, the induction variable widens to [0, +inf],
-        // which is a sound over-approximation: i is always >= 0.
+        // The analysis must terminate (widening) and infer a sound invariant. Even
+        // with guard refinement on the body edge, the *loop-header* value widens to
+        // [0, +inf] (widening subsumes the refined back-edge without narrowing) — a
+        // sound over-approximation: i is always >= 0.
         let f = counting_loop();
         let a = analyze_intervals(&f);
         let header_i = a.entry_interval(BlockId(1), RegId(0));
         assert!(!header_i.is_bottom(), "header must be reachable");
         assert!(header_i.is_at_least(0), "i >= 0 is a sound invariant, got {header_i}");
-        // It is NOT spuriously bounded above (we did not refine by the guard).
+        // It is NOT bounded above at the header (widening, no narrowing there).
         assert!(!header_i.is_strictly_below(10));
     }
 }
