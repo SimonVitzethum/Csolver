@@ -24,6 +24,7 @@
 
 mod contracts;
 mod mem2reg;
+pub mod precond;
 mod report;
 
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
@@ -316,6 +317,18 @@ fn assumption_record(id: String) -> Assumption {
                             derivation as internal linkage, resting on the whole-program \
                             assertion instead of on linkage; every seen call passes a \
                             live region of at least the synthesized size"
+                .into(),
+        },
+        "precondition" => Assumption {
+            id,
+            statement: "a caller-declared parameter precondition holds: the pointer is a \
+                        valid, non-null region of the declared size (readable, and writable \
+                        if so declared)"
+                .into(),
+            justification: "supplied by the user as an opt-in precondition annotation (a \
+                            sidecar `--pre` file), the way a `_Nonnull` / `access` attribute \
+                            documents an API contract; the callee may assume it, and every \
+                            caller is obliged to establish it — so it proves but never refutes"
                 .into(),
         },
         "debuginfo" => Assumption {

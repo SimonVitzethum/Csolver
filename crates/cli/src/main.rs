@@ -13,7 +13,7 @@
 //!
 //! Exit codes: `0` = PASS, `1` = FAIL, `2` = UNKNOWN, `3` = tool error.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use csolver_core::{SourceLevel, Verdict};
@@ -26,11 +26,13 @@ const HELP: &str = "\
 solver — CSolver memory-safety verifier
 
 USAGE:
-    solver verify <path> [--json] [--closed-world]
+    solver verify <path> [--json] [--closed-world] [--pre <file>]
                                     verify a .rs (turnkey), .mir, .ll, .s, or ELF
                                     (--closed-world: treat the module as the whole
                                     program — synthesize contracts for exported
-                                    functions from all their in-module call sites)
+                                    functions from all their in-module call sites;
+                                    --pre <file>: apply parameter preconditions from
+                                    a sidecar, e.g. `sum 0 elements 1 8`)
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
     solver report <result.json>     re-render a saved JSON report
     solver --help                   show this help
@@ -59,6 +61,12 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     let json = args.iter().any(|a| a == "--json");
     let closed_world = args.iter().any(|a| a == "--closed-world");
+    // `--pre <file>`: an opt-in parameter-precondition sidecar.
+    let pre_file = args
+        .iter()
+        .position(|a| a == "--pre")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
     match command.as_str() {
         "--help" | "-h" | "help" => {
             print!("{HELP}");
@@ -75,11 +83,15 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             Ok(verdict_code(report.verdict))
         }
         "verify" => {
+            // The path is the first non-flag argument that is not a flag's value
+            // (`--pre <file>`).
+            let pre_value = pre_file.as_ref().and_then(|p| p.to_str());
             let path = args
-                .get(1)
-                .filter(|a| !a.starts_with("--"))
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--") && Some(a.as_str()) != pre_value)
                 .ok_or("`verify` needs a path argument")?;
-            verify_path(Path::new(path), json, closed_world)
+            verify_path(Path::new(path), json, closed_world, pre_file.as_deref())
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
@@ -87,7 +99,12 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Dispatch a path to the appropriate frontend, then verify.
-fn verify_path(path: &Path, json: bool, closed_world: bool) -> Result<ExitCode, String> {
+fn verify_path(
+    path: &Path,
+    json: bool,
+    closed_world: bool,
+    pre_file: Option<&Path>,
+) -> Result<ExitCode, String> {
     // Turnkey: a `.rs` file is compiled to MIR by us, then verified with a
     // coverage report — the user does not hand-run rustc.
     if path.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -132,7 +149,16 @@ fn verify_path(path: &Path, json: bool, closed_world: bool) -> Result<ExitCode, 
     };
 
     match lowering {
-        Ok(module) => {
+        Ok(mut module) => {
+            // Apply an opt-in precondition sidecar before verification.
+            if let Some(pf) = pre_file {
+                let text = std::fs::read_to_string(pf).map_err(|e| e.to_string())?;
+                let preconds = csolver_verifier::precond::parse(&text)?;
+                let n = csolver_verifier::precond::apply(&mut module, &preconds)?;
+                if !json {
+                    eprintln!("applied {n} precondition(s) from {}", pf.display());
+                }
+            }
             let config = Config {
                 level,
                 closed_world,

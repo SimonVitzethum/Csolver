@@ -1732,3 +1732,46 @@ fn member_provenance_dropped_by_memset_of_the_field() {
         "a memset that overwrites the pointer field must drop the guarantee (no false PASS)"
     );
 }
+
+/// The precondition sidecar: an annotated buffer API `sum(p, n)` whose pointer is
+/// uncontracted (UNKNOWN in isolation) verifies once the caller-declared
+/// precondition "`p` is valid for `n` 8-byte elements" is applied — the `i < n`
+/// loop then proves `p[i]` in bounds, resting on the `precondition` assumption.
+const BUFFER_API: &str = r#"
+define i64 @sum(ptr %p, i64 %n) {
+entry:
+  br label %head
+head:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %acc = phi i64 [ 0, %entry ], [ %nacc, %body ]
+  %lt = icmp slt i64 %i, %n
+  br i1 %lt, label %body, label %exit
+body:
+  %q = getelementptr i64, ptr %p, i64 %i
+  %x = load i64, ptr %q, align 8
+  %nacc = add i64 %acc, %x
+  %inext = add i64 %i, 1
+  br label %head
+exit:
+  ret i64 %acc
+}
+"#;
+
+#[test]
+fn precondition_sidecar_verifies_annotated_buffer_api() {
+    let mut module = LlvmFrontend
+        .lower(LlvmInput { source: BUFFER_API.into(), name: "api".into() })
+        .expect("lower");
+    // Uncontracted in isolation → UNKNOWN.
+    assert_ne!(verify_module(&module, &Config::default()).verdict, Verdict::Pass);
+
+    // With the precondition `sum 0 elements 1 8` → PASS.
+    let pre = csolver_verifier::precond::parse("sum 0 elements 1 8").expect("parse");
+    let n = csolver_verifier::precond::apply(&mut module, &pre).expect("apply");
+    assert_eq!(n, 1, "one precondition applied");
+    assert_eq!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "the declared buffer precondition proves the indexed loop"
+    );
+}
