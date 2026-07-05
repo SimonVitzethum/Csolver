@@ -1674,3 +1674,61 @@ fn guard_refinement_over_clamp_is_not_pass() {
         "a bound clamped larger than the region must not falsely prove in-bounds"
     );
 }
+
+/// Member-provenance through a double pointer, past an unrelated `memset`: `**pp`
+/// where the caller stores `&v` into `vp` and passes `&vp`. A local buffer
+/// initializer (`memset buf`) between the store and the call must not wipe the
+/// field guarantee — it writes `buf`, not `vp` — so `*pp` stays a valid pointer.
+const DOUBLE_PTR_MEMSET: &str = r#"
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+define i64 @f_pp(ptr %pp) {
+entry:
+  %inner = load ptr, ptr %pp, align 8
+  %val = load i64, ptr %inner, align 8
+  ret i64 %val
+}
+define i64 @main() {
+entry:
+  %v = alloca i64, align 8
+  %vp = alloca ptr, align 8
+  %buf = alloca [16 x i8], align 8
+  store i64 5, ptr %v, align 8
+  store ptr %v, ptr %vp, align 8
+  call void @llvm.memset.p0.i64(ptr %buf, i8 0, i64 16, i1 false)
+  %r = call i64 @f_pp(ptr %vp)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn member_provenance_survives_unrelated_memset() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: DOUBLE_PTR_MEMSET.into(), name: "pp".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "a memset of an unrelated buffer must not drop the double-pointer field guarantee"
+    );
+}
+
+/// Soundness control: a `memset` of the field's own slot (`memset vp`) *does*
+/// overwrite the stored pointer, so the guarantee is correctly dropped and the
+/// dereference stays UNKNOWN — no false PASS.
+#[test]
+fn member_provenance_dropped_by_memset_of_the_field() {
+    let src = DOUBLE_PTR_MEMSET.replace(
+        "call void @llvm.memset.p0.i64(ptr %buf, i8 0, i64 16, i1 false)",
+        "call void @llvm.memset.p0.i64(ptr %vp, i8 0, i64 8, i1 false)",
+    );
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src, name: "ppc".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "a memset that overwrites the pointer field must drop the guarantee (no false PASS)"
+    );
+}

@@ -368,8 +368,22 @@ pub(crate) fn synthesize_fields(
                         }
                         slot.retain(|(root, _), _| !escaped.contains(root));
                     }
-                    // An intrinsic, `memcpy`/`memset`, or free may write through a
-                    // pointer we cannot resolve here — conservatively discard all.
+                    // A `memcpy`/`memset` writes only through its destination — the
+                    // root that pointer denotes (plus escaped roots). A local buffer
+                    // initializer (`char buf[16] = {0}` → a `memset` of `buf`) must
+                    // not wipe an unrelated field guarantee. If the destination does
+                    // not root to a known region, conservatively discard everything.
+                    Inst::MemIntrinsic { dst: Operand::Reg(d), .. } => {
+                        match root_of(&field_of, d) {
+                            Some(r) => {
+                                escaped.insert(r);
+                                slot.retain(|(root, _), _| !escaped.contains(root));
+                            }
+                            None => slot.clear(),
+                        }
+                    }
+                    // An intrinsic, an unresolvable memcpy target, or a free may
+                    // write through a pointer we cannot resolve — discard all.
                     Inst::Intrinsic { .. } | Inst::MemIntrinsic { .. } | Inst::Dealloc { .. } => {
                         slot.clear()
                     }
