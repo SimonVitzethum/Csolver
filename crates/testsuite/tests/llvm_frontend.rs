@@ -712,6 +712,75 @@ declare void @kfree(ptr)
         "a kmalloc'd buffer freed twice must FAIL (double free)");
 }
 
+/// Bug-finding mode: an OOB whose index is a genuine parameter, reached *after* an
+/// init loop that makes the path inexact, is refuted (FAIL + witness) only under
+/// `bug_finding` — strict verification stays UNKNOWN (the exact-path gate). The
+/// safe, guarded sibling must NOT become a false positive under `bug_finding`.
+#[test]
+fn bug_finding_refutes_oob_past_an_init_loop() {
+    // `p = malloc(64); for(k<8) p[k]=k; return p[i];` — OOB when i >= 8, i genuine.
+    let oob = r#"
+define i64 @f(i64 %i) {
+entry:
+  %p = call ptr @malloc(i64 64)
+  br label %head
+head:
+  %k = phi i64 [ 0, %entry ], [ %kn, %body ]
+  %done = icmp uge i64 %k, 8
+  br i1 %done, label %after, label %body
+body:
+  %pk = getelementptr i64, ptr %p, i64 %k
+  store i64 %k, ptr %pk, align 8
+  %kn = add i64 %k, 1
+  br label %head
+after:
+  %q = getelementptr i64, ptr %p, i64 %i
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+declare ptr @malloc(i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: oob.into(), name: "b".into() }).expect("lower");
+    // Strict: the init loop makes the path inexact, so refutation is off → UNKNOWN.
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "strict mode does not refute past an inexact (loop) path");
+    // Bug-finding: the OOB index is a genuine parameter, so the witness is reachable.
+    let bugs = Config { bug_finding: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &bugs).verdict, Verdict::Fail,
+        "bug-finding refutes an OOB reached by a genuine input past an init loop");
+
+    // The safe, guarded sibling: `if (i < 8) p[i]` — must NOT be a false positive.
+    let safe = r#"
+define i64 @f(i64 %i) {
+entry:
+  %p = call ptr @malloc(i64 64)
+  br label %head
+head:
+  %k = phi i64 [ 0, %entry ], [ %kn, %body ]
+  %done = icmp uge i64 %k, 8
+  br i1 %done, label %after, label %body
+body:
+  %pk = getelementptr i64, ptr %p, i64 %k
+  store i64 %k, ptr %pk, align 8
+  %kn = add i64 %k, 1
+  br label %head
+after:
+  %ok = icmp ult i64 %i, 8
+  br i1 %ok, label %in, label %out
+in:
+  %q = getelementptr i64, ptr %p, i64 %i
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+out:
+  ret i64 -1
+}
+declare ptr @malloc(i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: safe.into(), name: "s".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &bugs).verdict, Verdict::Fail,
+        "a guarded index must not be a false positive even in bug-finding mode");
+}
+
 /// Soundness control: a *zeroing* allocator (`kzalloc`/`calloc`) returns initialized
 /// memory, so it is deliberately NOT modeled as a plain `Alloc` (that region reads as
 /// uninitialized). Reading a freshly-`kzalloc`'d buffer must therefore NOT be a false

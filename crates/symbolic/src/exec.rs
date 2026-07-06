@@ -25,7 +25,7 @@ use csolver_ir::{
 };
 use csolver_memory::{AliasResult, LifetimeState, Permissions};
 use csolver_solver::{
-    bitprecise, prove_implies_method, BvOp, CmpOp as SCmp, ExprCtx, ExprId, ProofMethod,
+    bitprecise, prove_implies_method, BvOp, CmpOp as SCmp, ExprCtx, ExprId, Node, ProofMethod,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -148,8 +148,10 @@ pub fn discharge_with_fields(
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, GlobalDef>,
+    bug_finding: bool,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts, field_contracts, globals)
+    let limits = ExecLimits { bug_finding, ..ExecLimits::default() };
+    discharge_inner(f, limits, summaries, contracts, field_contracts, globals)
 }
 
 /// As [`discharge_function`], with explicit limits and no summaries.
@@ -277,6 +279,7 @@ fn discharge_inner(
     let mut ex = Explorer {
         ctx: ExprCtx::new(),
         fresh: 0,
+        bug_finding: limits.bug_finding,
         visits: 0,
         truncated: false,
         limits,
@@ -1015,6 +1018,11 @@ enum RefuteMode {
 struct Explorer<'f> {
     ctx: ExprCtx,
     fresh: u32,
+    /// Bug-finding mode: relax the memory-refutation gate so a spatial violation
+    /// whose offset/size depend only on genuine inputs (parameters) is reported
+    /// even on a globally-inexact path (e.g. after an init loop). Off by default
+    /// (verification stays strict — refute only on an exact path). See `decide`.
+    bug_finding: bool,
     visits: usize,
     truncated: bool,
     limits: ExecLimits,
@@ -2692,12 +2700,59 @@ impl Explorer<'_> {
         if conjuncts.iter().all(|&g| self.prove(g, state)) {
             return Decision::Proven;
         }
-        if mode != RefuteMode::Off && state.exact {
+        // Refute on an exact path (the strict, always-sound gate); OR, in
+        // bug-finding mode, on an inexact path when the goal depends only on
+        // genuine inputs — the violating witness is then genuinely reachable
+        // (see `goal_is_genuine`). Restricted to `Possible` (memory) refutation:
+        // scalar `Definite` checks keep the strict gate.
+        let gate = state.exact
+            || (self.bug_finding
+                && mode == RefuteMode::Possible
+                && conjuncts.iter().all(|&g| self.goal_is_genuine(g)));
+        if mode != RefuteMode::Off && gate {
             if let Some(model) = self.try_refute(conjuncts, state, mode, extra) {
                 return Decision::Refuted(model);
             }
         }
         Decision::Unknown
+    }
+
+    /// Whether every symbolic leaf of `goal` is a **genuine input** — a function
+    /// parameter (named `arg…`), as opposed to an over-approximated value (loop
+    /// havoc / opaque call / undetermined load, all named `?…`, or a global `@…`).
+    /// A goal built only from genuine inputs and constants is exactly refutable
+    /// even on an over-approximated path: the path condition constrains genuine
+    /// inputs only through real branch guards (never dropped by havoc, which only
+    /// replaces the values it modifies), so a witness violating such a goal is a
+    /// genuinely reachable input. Stateless — the name records the value's origin.
+    fn goal_is_genuine(&self, goal: ExprId) -> bool {
+        let mut stack = vec![goal];
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        while let Some(e) = stack.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            match self.ctx.node(e) {
+                Node::Sym { name, .. } => {
+                    if !name.starts_with("arg") {
+                        return false;
+                    }
+                }
+                Node::Const(_) | Node::Bool(_) => {}
+                Node::Not(a) => stack.push(*a),
+                Node::Bin { a, b, .. } | Node::Cmp { a, b, .. } => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Node::And(xs) | Node::Or(xs) => stack.extend(xs.iter().copied()),
+                Node::Ite { c, t, e } => {
+                    stack.push(*c);
+                    stack.push(*t);
+                    stack.push(*e);
+                }
+            }
+        }
+        true
     }
 
     /// On an exact path, return a concrete witness of a violation, or `None`.
@@ -3685,6 +3740,7 @@ mod tests {
             crate::ExecLimits {
                 max_visits: usize::MAX,
                 time_budget: Some(std::time::Duration::ZERO),
+                ..Default::default()
             },
         );
         assert!(r.truncated, "a zero time budget must truncate");

@@ -47,6 +47,14 @@ pub struct ExecLimits {
     /// no verdict. Tightening it trades the `PASS` of a slow-but-provable function
     /// for a snappier `UNKNOWN` — a precision-for-latency choice, left to the caller.
     pub time_budget: Option<std::time::Duration>,
+    /// Bug-finding mode: report a spatial memory violation (OOB) whose offset and
+    /// size depend only on genuine inputs (parameters) even on an over-approximated
+    /// path — e.g. an OOB access reached after an init loop, where the loop havoc
+    /// made the path inexact but the violating index is a free parameter, so the
+    /// witness is genuinely reachable. Trades a small false-positive risk (a branch
+    /// on an over-approximated value that is actually infeasible) for far higher
+    /// recall on real code. Off by default: verification stays strict.
+    pub bug_finding: bool,
 }
 
 impl Default for ExecLimits {
@@ -54,6 +62,7 @@ impl Default for ExecLimits {
         ExecLimits {
             max_visits: 200_000,
             time_budget: Some(std::time::Duration::from_secs(30)),
+            bug_finding: false,
         }
     }
 }

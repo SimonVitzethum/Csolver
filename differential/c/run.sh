@@ -33,16 +33,26 @@ SAN_FLAGS="-fsanitize=address,bounds,alignment,null,pointer-overflow,object-size
 # cannot be a broken metric. Feed the classifier a synthetic (CSolver=PASS,
 # oracle=UB) row and assert it is flagged; a clean row must not be.
 if [ "${1:-}" = "--selftest" ]; then
-    classify() { # $1=cs $2=san -> "VIOLATION" | "ok"
-        if [ "$2" = "UB" ] && [ "$1" = "PASS" ]; then echo VIOLATION; else echo ok; fi
+    classify() { # $1=cs $2=san -> "VIOLATION" | "FALSEPOS" | "ok"
+        if [ "$2" = "UB" ] && [ "$1" = "PASS" ]; then echo VIOLATION
+        elif [ "$2" = "CLEAN" ] && [ "$1" = "FAIL" ]; then echo FALSEPOS
+        else echo ok; fi
     }
     fail=0
-    [ "$(classify PASS UB)" = "VIOLATION" ] || { echo "selftest: UB+PASS not flagged"; fail=1; }
-    [ "$(classify UNKNOWN UB)" = "ok" ]     || { echo "selftest: UB+UNKNOWN misflagged"; fail=1; }
-    [ "$(classify PASS CLEAN)" = "ok" ]     || { echo "selftest: CLEAN+PASS misflagged"; fail=1; }
-    [ "$fail" -eq 0 ] && echo "selftest: OK (violation detector fires exactly on UB+PASS)"
+    [ "$(classify PASS UB)" = "VIOLATION" ]  || { echo "selftest: UB+PASS not flagged"; fail=1; }
+    [ "$(classify FAIL CLEAN)" = "FALSEPOS" ] || { echo "selftest: CLEAN+FAIL not flagged as false positive"; fail=1; }
+    [ "$(classify UNKNOWN UB)" = "ok" ]      || { echo "selftest: UB+UNKNOWN misflagged"; fail=1; }
+    [ "$(classify PASS CLEAN)" = "ok" ]      || { echo "selftest: CLEAN+PASS misflagged"; fail=1; }
+    [ "$(classify FAIL UB)" = "ok" ]         || { echo "selftest: UB+FAIL misflagged"; fail=1; }
+    [ "$fail" -eq 0 ] && echo "selftest: OK (violation on UB+PASS, false-positive on CLEAN+FAIL)"
     exit "$fail"
 fi
+
+# `--bugs` runs CSolver in bug-finding mode (higher recall, so more FAILs; the
+# CLEAN+FAIL = false-positive column is the thing to watch there).
+SOLVER_FLAGS=""
+MODE="verify (strict)"
+if [ "${1:-}" = "--bugs" ]; then SOLVER_FLAGS="--bugs"; MODE="bug-finding (--bugs)"; fi
 
 echo "== building the solver CLI =="
 (cd "$ROOT" && cargo build -q -p csolver-cli) || { echo "build failed"; exit 2; }
@@ -51,7 +61,7 @@ SOLVER="$ROOT/target/debug/solver"
 echo "== CSolver: verifying the corpus (clang -O0 -g -emit-llvm) =="
 clang -O0 -g -emit-llvm -S "$DIR/corpus.c" -o "$DIR/corpus.ll" 2>/dev/null \
     || { echo "clang emit-llvm failed"; exit 2; }
-CS_OUT="$("$SOLVER" verify "$DIR/corpus.ll" 2>&1)"
+CS_OUT="$("$SOLVER" verify "$DIR/corpus.ll" $SOLVER_FLAGS 2>&1)"
 
 # Corpus entries = the `f_*` definitions in corpus.c.
 FNS=$(grep -oE '^int64_t f_[a-z_]+' "$DIR/corpus.c" | sed 's/int64_t //')
@@ -62,8 +72,8 @@ echo "== building the sanitizer driver (ASan+UBSan, -no-pie) =="
 clang -O0 -g $SAN_FLAGS "$DIR/corpus.c" "$DIR/drive.c" -o "$DIR/drive" 2>/dev/null \
     || { echo "sanitizer build failed"; exit 2; }
 
-echo "== ASan+UBSan: fuzzing each function ($FUZZ_CASES cases) =="
-violations=0; precise=0; miss=0; sound_caught=0
+echo "== ASan+UBSan: fuzzing each function ($FUZZ_CASES cases) — CSolver mode: $MODE =="
+violations=0; false_pos=0; precise=0; miss=0; bug_found=0; sound_miss=0
 printf "%-20s %-9s %-7s  %s\n" "function" "CSolver" "Sanitizer" "result"
 printf -- "------------------------------------------------------------\n"
 for fn in $FNS; do
@@ -79,8 +89,14 @@ for fn in $FNS; do
 
     if [ "$san" = "UB" ] && [ "$cs" = "PASS" ]; then
         res="!! SOUNDNESS VIOLATION (false PASS)"; violations=$((violations+1))
+    elif [ "$san" = "CLEAN" ] && [ "$cs" = "FAIL" ]; then
+        res="!! FALSE POSITIVE (false FAIL on safe code)"; false_pos=$((false_pos+1))
     elif [ "$san" = "UB" ] || [ "$san" = "CRASH" ]; then
-        res="ok (UB caught / unknown)"; sound_caught=$((sound_caught+1))
+        if [ "$cs" = "FAIL" ]; then
+            res="ok (BUG FOUND — FAIL + witness)"; bug_found=$((bug_found+1))
+        else
+            res="ok (UB unknown — sound but missed)"; sound_miss=$((sound_miss+1))
+        fi
     elif [ "$cs" = "PASS" ]; then
         res="ok (precise)"; precise=$((precise+1))
     else
@@ -90,11 +106,14 @@ for fn in $FNS; do
 done
 
 echo
-echo "== summary =="
-echo "soundness violations : $violations   (must be 0)"
-echo "UB caught/unknown    : $sound_caught"
-echo "safe & precise (PASS): $precise"
-echo "safe & unknown       : $miss"
-[ "$violations" -eq 0 ] && echo "RESULT: SOUND (no false PASS on this corpus)" \
-                        || echo "RESULT: UNSOUND — investigate the violations above"
-exit "$violations"
+echo "== summary ($MODE) =="
+echo "soundness violations (false PASS): $violations   (must be 0)"
+echo "false positives      (false FAIL): $false_pos   (must be 0)"
+echo "bugs FOUND (FAIL + witness)      : $bug_found"
+echo "UB sound-but-missed  (UNKNOWN)   : $sound_miss"
+echo "safe & precise (PASS)            : $precise"
+echo "safe & unknown                   : $miss"
+bad=$((violations + false_pos))
+[ "$bad" -eq 0 ] && echo "RESULT: SOUND (no false PASS, no false FAIL on this corpus)" \
+                 || echo "RESULT: UNSOUND — $violations false PASS, $false_pos false FAIL"
+exit "$bad"

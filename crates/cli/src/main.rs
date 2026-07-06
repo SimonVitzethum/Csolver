@@ -26,11 +26,14 @@ const HELP: &str = "\
 solver — CSolver memory-safety verifier
 
 USAGE:
-    solver verify <path> [--json] [--closed-world] [--pre <file>]
+    solver verify <path> [--json] [--closed-world] [--bugs] [--pre <file>]
                                     verify a .rs (turnkey), .mir, .ll, .s, or ELF
                                     (--closed-world: treat the module as the whole
                                     program — synthesize contracts for exported
                                     functions from all their in-module call sites;
+                                    --bugs: bug-finding mode — report OOB reachable by
+                                    a genuine input even past a loop/opaque call (higher
+                                    recall, small false-positive risk; verify is strict);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
@@ -61,6 +64,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     let json = args.iter().any(|a| a == "--json");
     let closed_world = args.iter().any(|a| a == "--closed-world");
+    let bug_finding = args.iter().any(|a| a == "--bugs");
     // `--pre <file>`: an opt-in parameter-precondition sidecar.
     let pre_file = args
         .iter()
@@ -91,7 +95,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--") && Some(a.as_str()) != pre_value)
                 .ok_or("`verify` needs a path argument")?;
-            verify_path(Path::new(path), json, closed_world, pre_file.as_deref())
+            verify_path(Path::new(path), json, closed_world, bug_finding, pre_file.as_deref())
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
@@ -103,6 +107,7 @@ fn verify_path(
     path: &Path,
     json: bool,
     closed_world: bool,
+    bug_finding: bool,
     pre_file: Option<&Path>,
 ) -> Result<ExitCode, String> {
     // Turnkey: a `.rs` file is compiled to MIR by us, then verified with a
@@ -162,6 +167,7 @@ fn verify_path(
             let config = Config {
                 level,
                 closed_world,
+                bug_finding,
                 ..Config::default()
             };
             let report = verify_module(&module, &config);

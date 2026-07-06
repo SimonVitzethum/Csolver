@@ -63,6 +63,12 @@ pub struct Config {
     /// binary). Off by default: an open module (a library with unseen callers)
     /// would be unsound, so it is opt-in.
     pub closed_world: bool,
+    /// **Bug-finding mode.** Relax the memory-refutation gate: report a spatial
+    /// violation (OOB) whose offset/size depend only on genuine inputs even on an
+    /// over-approximated path (after an init loop, an opaque call, …), trading a
+    /// small false-positive risk for far higher recall. Off by default —
+    /// verification stays strict (a false FAIL is as bad as a false PASS there).
+    pub bug_finding: bool,
 }
 
 impl Default for Config {
@@ -72,6 +78,7 @@ impl Default for Config {
             use_intervals: true,
             use_symbolic: true,
             closed_world: false,
+            bug_finding: false,
         }
     }
 }
@@ -390,7 +397,9 @@ fn verify_function_with(
 ) -> FunctionReport {
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
-        Some(s) => discharge_with_fields(f, s, contracts, field_contracts, globals),
+        Some(s) => {
+            discharge_with_fields(f, s, contracts, field_contracts, globals, config.bug_finding)
+        }
         None => discharge_function(f),
     });
 
