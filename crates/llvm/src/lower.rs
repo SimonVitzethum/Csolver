@@ -536,6 +536,49 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 continue;
             }
         }
+        // A C/kernel allocator call becomes a heap `Alloc`/`Dealloc` (like `alloca`
+        // for the stack), so heap OOB / use-after-free / double-free are modelled
+        // and — crucially — the path stays *exact* (an `Inst::Call` would taint it,
+        // disabling refutation). Only when the result is used (`dst` present) for
+        // an allocator; a `free` needs no result.
+        if let LInst::Call { dst, callee, args, .. } = inst {
+            if let (Some(dst), Some(size)) = (dst, alloc_size(callee)) {
+                let count = match size {
+                    AllocSize::Bytes(i) => ctx.operand(&args[i], 64)?,
+                    AllocSize::Product(a, b) => {
+                        let tmp = ctx.fresh();
+                        insts.push(Inst::Assign {
+                            dst: tmp,
+                            ty: Type::int(64),
+                            value: RValue::Bin {
+                                op: BinOp::Mul,
+                                lhs: ctx.operand(&args[a], 64)?,
+                                rhs: ctx.operand(&args[b], 64)?,
+                            },
+                        });
+                        Operand::Reg(tmp)
+                    }
+                };
+                insts.push(Inst::Alloc {
+                    dst: ctx.reg(dst)?,
+                    region: RegionKind::Heap,
+                    elem: Type::int(8),
+                    count,
+                    // The malloc/kmalloc family guarantees alignment for any scalar;
+                    // 16 covers x86-64 `max_align_t`. Over-stating alignment can only
+                    // miss a misalignment bug, never fabricate a false FAIL.
+                    align: 16,
+                });
+                continue;
+            }
+            if let Some(i) = dealloc_ptr_arg(callee, args.len()) {
+                insts.push(Inst::Dealloc {
+                    region: RegionKind::Heap,
+                    ptr: ctx.operand(&args[i], 64)?,
+                });
+                continue;
+            }
+        }
         insts.push(lower_inst(ctx, inst)?);
     }
 
@@ -909,6 +952,51 @@ fn is_noop_intrinsic(name: &str) -> bool {
         || name.starts_with("llvm.invariant.")
         || name.starts_with("llvm.expect")
         || name == "llvm.assume"
+}
+
+/// How a recognized allocator computes its byte size from the call arguments.
+#[derive(Clone, Copy)]
+enum AllocSize {
+    /// A single byte-size argument (`malloc(n)`, `kmalloc(n, gfp)`).
+    Bytes(usize),
+    /// A count × element-size product (`kmalloc_array(n, size, gfp)`).
+    Product(usize, usize),
+}
+
+/// A C/kernel allocator recognized by name → the argument(s) giving its byte size.
+///
+/// **Only non-zeroing allocators are listed.** A zeroing allocator (`kzalloc`,
+/// `calloc`, …) returns *initialized* memory, but a plain `Alloc` region is modelled
+/// as uninitialized — so reading it would be a false "uninitialized read" FAIL. Those
+/// are deliberately left as opaque calls (sound UNKNOWN) until zero-init is modelled.
+/// The pointer size is byte-granular (`elem = i8`), so any later access is checked
+/// against the exact requested size.
+fn alloc_size(callee: &str) -> Option<AllocSize> {
+    Some(match callee {
+        "malloc" | "kmalloc" | "kmalloc_node" | "__kmalloc" | "vmalloc" | "vmalloc_node"
+        | "kvmalloc" | "kvmalloc_node" | "__vmalloc" | "aligned_alloc" | "kmalloc_noprof"
+        | "valloc" => AllocSize::Bytes(0),
+        // `aligned_alloc(align, size)` — the size is the second argument.
+        "memalign" => AllocSize::Bytes(1),
+        "kmalloc_array" | "kvmalloc_array" | "kmalloc_array_node" => AllocSize::Product(0, 1),
+        // `reallocarray(ptr, n, size)` — the fresh size is n × size.
+        "reallocarray" => AllocSize::Product(1, 2),
+        _ => return None,
+    })
+}
+
+/// A C/kernel deallocator recognized by name → the argument index of the freed
+/// pointer. `free(p)`, `kfree(p)` free argument 0; `kmem_cache_free(cache, p)` frees
+/// argument 1. `free(NULL)` is legal C, but a null free is a sound UNKNOWN, not a
+/// false FAIL, so it costs nothing here.
+fn dealloc_ptr_arg(callee: &str, argc: usize) -> Option<usize> {
+    let idx = match callee {
+        "free" | "kfree" | "vfree" | "kvfree" | "kfree_sensitive" | "kzfree" | "__kfree"
+        | "free_pages" | "__free_pages" | "kfree_const" => 0,
+        "kmem_cache_free" => 1,
+        _ => return None,
+    };
+    (idx < argc).then_some(idx)
 }
 
 fn type_width(ty: &LType) -> u32 {

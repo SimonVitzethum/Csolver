@@ -634,6 +634,104 @@ start:
     assert_eq!(report.verdict, Verdict::Fail, "a definite OOB store must FAIL");
 }
 
+/// A recognized C/kernel allocator (`malloc`/`kmalloc`/…) lowers to a heap `Alloc`,
+/// so a heap buffer's size is known and bugs through it are found. Four checks in one
+/// module: a guarded index PASSes, a constant-OOB read FAILs, a use-after-free FAILs,
+/// and a double-free FAILs — the temporal/spatial obligations a modeled allocation
+/// carries. (A `Call` to an opaque `malloc` would leave all four UNKNOWN.)
+#[test]
+fn allocator_calls_are_modeled_as_heap_allocations() {
+    let guarded = r#"
+define i64 @f(i64 %i) {
+entry:
+  %p = call ptr @malloc(i64 64)
+  store i64 7, ptr %p, align 8
+  %ok = icmp ult i64 %i, 8
+  br i1 %ok, label %in, label %out
+in:
+  %q = getelementptr i64, ptr %p, i64 %i
+  %v = load i64, ptr %q, align 8
+  call void @free(ptr %p)
+  ret i64 %v
+out:
+  call void @free(ptr %p)
+  ret i64 -1
+}
+declare ptr @malloc(i64)
+declare void @free(ptr)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: guarded.into(), name: "g".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &Config::default()).verdict, Verdict::Pass,
+        "a guarded index into a malloc'd buffer proves");
+
+    let oob = r#"
+define i64 @f() {
+entry:
+  %p = call ptr @malloc(i64 64)
+  %q = getelementptr i64, ptr %p, i64 9
+  %v = load i64, ptr %q, align 8
+  call void @free(ptr %p)
+  ret i64 %v
+}
+declare ptr @malloc(i64)
+declare void @free(ptr)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: oob.into(), name: "o".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "a constant OOB read past a malloc'd 64-byte buffer must FAIL");
+
+    let uaf = r#"
+define i64 @f() {
+entry:
+  %p = call ptr @malloc(i64 64)
+  store i64 7, ptr %p, align 8
+  call void @free(ptr %p)
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+declare ptr @malloc(i64)
+declare void @free(ptr)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: uaf.into(), name: "u".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "a read after free of a malloc'd buffer must FAIL");
+
+    let df = r#"
+define void @f() {
+entry:
+  %p = call ptr @kmalloc(i64 64, i64 0)
+  call void @kfree(ptr %p)
+  call void @kfree(ptr %p)
+  ret void
+}
+declare ptr @kmalloc(i64, i64)
+declare void @kfree(ptr)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: df.into(), name: "d".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "a kmalloc'd buffer freed twice must FAIL (double free)");
+}
+
+/// Soundness control: a *zeroing* allocator (`kzalloc`/`calloc`) returns initialized
+/// memory, so it is deliberately NOT modeled as a plain `Alloc` (that region reads as
+/// uninitialized). Reading a freshly-`kzalloc`'d buffer must therefore NOT be a false
+/// "uninitialized read" FAIL — it stays a sound non-FAIL.
+#[test]
+fn zeroing_allocator_is_not_a_false_uninit_fail() {
+    let src = r#"
+define i64 @f() {
+entry:
+  %p = call ptr @kzalloc(i64 64, i64 0)
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+declare ptr @kzalloc(i64, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "z".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "reading zero-initialized kzalloc memory must not be a false uninit FAIL");
+}
+
 /// End-to-end proof that *multi-block* return summaries reach verdicts: `@at`
 /// has rustc's guard shape (a checking call, a diverging panic block, then
 /// `ret gep(p, i)`), and `@caller` stores through its result. Only if the
