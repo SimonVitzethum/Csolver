@@ -271,7 +271,12 @@ fn discharge_inner(
                 }
             }
         }
-        loop_modified.insert(header, modified.into_iter().collect());
+        // Deterministic order: the havoc assigns fresh symbol ids in this order, and
+        // a witness names induction symbols (`ind…`), so a `HashSet`'s arbitrary order
+        // would make the reported counterexample non-deterministic.
+        let mut modified: Vec<RegId> = modified.into_iter().collect();
+        modified.sort_unstable_by_key(|r| r.0);
+        loop_modified.insert(header, modified);
         loop_frees.insert(header, frees);
         loop_bodies.insert(header, body);
     }
@@ -1642,7 +1647,16 @@ impl Explorer<'_> {
                     );
                 }
                 Some(SymValue::Scalar(_)) => {
-                    let s = self.fresh_scalar(PTR_WIDTH);
+                    // A unit-stride, single-exit counting induction reaches every value
+                    // its body guard admits, so model it as a GENUINE symbol (`ind…`):
+                    // the body path condition's guard on it is then an exact reachable
+                    // range, and an access it indexes can be refuted (an OOB there is a
+                    // real bug). Otherwise a plain over-approximated `?` symbol.
+                    let s = if self.sound_counting_induction(header, reg) {
+                        self.fresh_induction_scalar(PTR_WIDTH)
+                    } else {
+                        self.fresh_scalar(PTR_WIDTH)
+                    };
                     // Constrain by the sound interval invariant at the header
                     // (only faithfully-encodable, non-negative bounds).
                     let iv = self.analysis.entry_interval(header, reg);
@@ -1762,6 +1776,108 @@ impl Explorer<'_> {
     /// element, so the scan stops at or before it: `n < element_count`, hence
     /// `(n+1)·E ≤ size`. Every side-condition below is checked; if any fails,
     /// nothing is installed.
+    /// Is `reg` a **unit-stride, single-exit counting induction** at `header`? Such a
+    /// loop reaches *every* value its governing guard admits, so the guard that the
+    /// loop body's path condition already carries (entering the body requires it) is
+    /// the induction's *exact* reachable range — not an over-approximation. Then a
+    /// memory access indexed by the induction may be refuted: a witness value the
+    /// guard admits is genuinely reached, so an out-of-bounds there is a real bug
+    /// (e.g. an inclusive `for (i = 0; i <= N; i++) a[i]` writing `a[N]`).
+    ///
+    /// Requires, structurally: `reg` is a header parameter; its entry value is a
+    /// constant and its back-edge value is `reg + 1` (unit stride up); the header's
+    /// own branch is the loop's **only** exit and is governed by an upper-bound
+    /// comparison on `reg` (`reg < B` / `reg <= B`, signed or unsigned) that gates
+    /// entry to the body — so the body path condition bounds `reg` to the reached set.
+    fn sound_counting_induction(&self, header: BlockId, reg: RegId) -> bool {
+        let Some(hdr) = self.f.block(header) else { return false };
+        let Some(pos) = hdr.params.iter().position(|(r, _)| *r == reg) else { return false };
+        let mut def: HashMap<RegId, &Inst> = HashMap::new();
+        for b in &self.f.blocks {
+            for inst in &b.insts {
+                if let Some(d) = inst.defined_reg() {
+                    def.insert(d, inst);
+                }
+            }
+        }
+        // Unit-stride up: const entry, `reg + 1` back-edge.
+        let preds: Vec<BlockId> = self
+            .analysis
+            .cfg()
+            .predecessors(self.analysis.cfg().index_of(header).unwrap_or(usize::MAX))
+            .iter()
+            .map(|&p| self.analysis.cfg().block_id(p))
+            .collect();
+        let (mut const_entry, mut unit_backedge) = (false, false);
+        for &pred in &preds {
+            let Some(args) = edge_args(self.f, pred, header) else { continue };
+            let Some(arg) = args.get(pos) else { continue };
+            if self.is_back_edge(pred, header) {
+                if let Operand::Reg(m) = arg {
+                    if let Some(Inst::Assign { value: RValue::Bin { op: BinOp::Add, lhs, rhs }, .. }) =
+                        def.get(&resolve_copy(*m, &def))
+                    {
+                        let one = |o: &Operand| matches!(o, Operand::Const(Const::Int(bv)) if bv.unsigned() == 1);
+                        let is_r = |o: &Operand| matches!(o, Operand::Reg(r) if resolve_copy(*r, &def) == reg);
+                        unit_backedge = (is_r(lhs) && one(rhs)) || (is_r(rhs) && one(lhs));
+                    }
+                }
+            } else if matches!(arg, Operand::Const(Const::Int(_))) {
+                const_entry = true;
+            }
+        }
+        if !(const_entry && unit_backedge) {
+            return false;
+        }
+        // The header's branch is an upper-bound guard on `reg` gating body entry.
+        let Terminator::CondBr { cond: Operand::Reg(c), then_blk, else_blk, .. } = &hdr.term else {
+            return false;
+        };
+        let body = self.loop_bodies.get(&header).map(|b| b.as_slice()).unwrap_or(&[]);
+        let in_body = |b: &BlockId| body.contains(b);
+        let upper_on_reg = matches!(
+            def.get(&resolve_copy(*c, &def)),
+            Some(Inst::Assign { value: RValue::Cmp { op: CmpOp::Slt | CmpOp::Sle | CmpOp::Ult | CmpOp::Ule, lhs, rhs }, .. })
+                if matches!(lhs, Operand::Reg(r) if resolve_copy(*r, &def) == reg)
+                    && !matches!(rhs, Operand::Reg(r) if resolve_copy(*r, &def) == reg)
+        );
+        // The true edge must enter the loop (else the guard is inverted and the body
+        // pathcond would carry its negation — not a clean upper bound).
+        if !(upper_on_reg && in_body(then_blk) && !in_body(else_blk)) {
+            return false;
+        }
+        // Single exit: the header's guard is the loop's only way out. Any other
+        // body→outside edge (a `break`) means an iteration can be skipped, so a
+        // guard-admitted index is no longer guaranteed reached.
+        let body_set: HashSet<BlockId> = body.iter().copied().collect();
+        for &bid in body {
+            if bid == header {
+                continue;
+            }
+            let Some(b) = self.f.block(bid) else { continue };
+            let exits = match &b.term {
+                Terminator::Br { target, .. } => !body_set.contains(target),
+                Terminator::CondBr { then_blk, else_blk, .. } => {
+                    !body_set.contains(then_blk) || !body_set.contains(else_blk)
+                }
+                _ => true, // a return/unreachable inside the body is another exit
+            };
+            if exits {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A fresh **genuine induction** symbol (named `ind…`, accepted by
+    /// [`Explorer::goal_is_genuine`]): a unit-stride counter that reaches every value
+    /// its body guard admits, so an access it indexes is refutable within that range.
+    fn fresh_induction_scalar(&mut self, width: u32) -> ExprId {
+        let name = format!("ind{}", self.fresh);
+        self.fresh += 1;
+        self.ctx.symbol(name, width)
+    }
+
     fn install_sentinel_scan_bound(&mut self, header: BlockId, state: &mut PathState) {
         let Some(body) = self.loop_bodies.get(&header).cloned() else { return };
         let body_set: HashSet<BlockId> = body.iter().copied().collect();
@@ -2790,10 +2906,14 @@ impl Explorer<'_> {
             }
             match self.ctx.node(e) {
                 Node::Sym { name, .. } => {
-                    // Genuine inputs: parameters (`arg…`) and untrusted user data
-                    // (`user…`, from `copy_from_user`) — both fully attacker-chosen,
-                    // so a witness violating a goal over them is genuinely reachable.
-                    if !(name.starts_with("arg") || name.starts_with("user")) {
+                    // Genuine inputs: parameters (`arg…`), untrusted user data
+                    // (`user…`, from `copy_from_user`), and unit-stride counting
+                    // inductions (`ind…`, which reach every guard-admitted value) —
+                    // a witness violating a goal over them is genuinely reachable.
+                    if !(name.starts_with("arg")
+                        || name.starts_with("user")
+                        || name.starts_with("ind"))
+                    {
                         return false;
                     }
                 }

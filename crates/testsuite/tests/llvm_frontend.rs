@@ -712,6 +712,69 @@ declare void @kfree(ptr)
         "a kmalloc'd buffer freed twice must FAIL (double free)");
 }
 
+/// Bug-finding refutes an OOB indexed by a **unit-stride counting induction**: the
+/// inclusive `for (i = 0; i <= 16; i++) a[i]` writes `a[16]`, one past a 16-element
+/// array. Sound because a unit-stride single-exit loop reaches every guard-admitted
+/// index, so the witness `i = 16` is genuinely reached. The controls must NOT refute
+/// (false positive): a half-open (`i < 16`) safe loop, a stride-2 loop (skips indices),
+/// and an early-`break` loop (an iteration can be skipped, so not single-exit).
+#[test]
+fn bug_finding_refutes_off_by_one_loop() {
+    let bugs = Config { bug_finding: true, ..Config::default() };
+    let verdict = |src: &str| {
+        let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "l".into() }).expect("lower");
+        verify_module(&m, &bugs).verdict
+    };
+    // Inclusive `i <= 16` over a[16], unit stride, single exit → writes a[16] → FAIL.
+    let oob = r#"
+define i64 @f() {
+entry:
+  %a = alloca [16 x i64], align 16
+  br label %head
+head:
+  %k = phi i64 [ 0, %entry ], [ %kn, %body ]
+  %c = icmp sle i64 %k, 16
+  br i1 %c, label %body, label %after
+body:
+  %p = getelementptr [16 x i64], ptr %a, i64 0, i64 %k
+  store i64 %k, ptr %p, align 8
+  %kn = add i64 %k, 1
+  br label %head
+after:
+  ret i64 0
+}
+"#;
+    assert_eq!(verdict(oob), Verdict::Fail, "inclusive-bound unit-stride loop writes a[16]");
+
+    // Half-open `i < 16`: safe.
+    assert_ne!(verdict(&oob.replace("sle i64 %k, 16", "slt i64 %k, 16")), Verdict::Fail,
+        "a half-open loop is safe — no false positive");
+    // Stride 2: not every index is reached, so an OOB index is not guaranteed hit.
+    assert_ne!(verdict(&oob.replace("add i64 %k, 1", "add i64 %k, 2")), Verdict::Fail,
+        "a strided loop is not unit-stride — must not refute");
+    // Early break (a second exit from the body): an iteration can be skipped.
+    let brk = r#"
+define i64 @f() {
+entry:
+  %a = alloca [16 x i64], align 16
+  br label %head
+head:
+  %k = phi i64 [ 0, %entry ], [ %kn, %body ]
+  %c = icmp sle i64 %k, 16
+  br i1 %c, label %body, label %after
+body:
+  %p = getelementptr [16 x i64], ptr %a, i64 0, i64 %k
+  store i64 %k, ptr %p, align 8
+  %kn = add i64 %k, 1
+  %brk = icmp eq i64 %k, 3
+  br i1 %brk, label %after, label %head
+after:
+  ret i64 0
+}
+"#;
+    assert_ne!(verdict(brk), Verdict::Fail, "an early break breaks single-exit — must not refute");
+}
+
 /// Bug-finding mode also refutes a *temporal* violation (use-after-free) reached past
 /// an over-approximated path — a free after an init loop, then a read of the freed
 /// pointer. Strict verification stays UNKNOWN (the free/loop made the path inexact);
