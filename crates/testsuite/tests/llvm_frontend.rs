@@ -712,6 +712,48 @@ declare void @kfree(ptr)
         "a kmalloc'd buffer freed twice must FAIL (double free)");
 }
 
+/// Inline assembly must not drop the whole function (kernel C is saturated with it).
+/// It lowers to an opaque, memory-clobbering call: the function stays analyzed, an
+/// OOB past the asm is still found (bug-finding), and a pointer reloaded across an
+/// asm memory clobber loses provenance (no false PASS).
+#[test]
+fn inline_asm_is_an_opaque_havoc_not_a_dropped_function() {
+    // OOB store past an 8-elem local, with an intervening inline asm.
+    let oob = r#"
+define i64 @f(i64 %i) {
+entry:
+  %a = alloca [8 x i64], align 16
+  %junk = call i64 asm sideeffect "nop", "=r,~{memory}"()
+  %p = getelementptr [8 x i64], ptr %a, i64 0, i64 %i
+  store i64 %junk, ptr %p, align 8
+  %v = load i64, ptr %a, align 8
+  ret i64 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: oob.into(), name: "a".into() }).expect("lower");
+    assert!(m.unanalyzed.is_empty(), "inline asm must not drop the function: {:?}", m.unanalyzed);
+    let bugs = Config { bug_finding: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &bugs).verdict, Verdict::Fail,
+        "an OOB store past inline asm is found in bug-finding mode");
+
+    // Soundness: a pointer stored, then reloaded across an asm *memory* clobber, has
+    // lost provenance — its deref must NOT be a false PASS.
+    let clob = r#"
+define i64 @f(ptr %p) {
+entry:
+  %slot = alloca ptr, align 8
+  store ptr %p, ptr %slot, align 8
+  %junk = call i64 asm sideeffect "nop", "=r,~{memory}"()
+  %q = load ptr, ptr %slot, align 8
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: clob.into(), name: "c".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &bugs).verdict, Verdict::Pass,
+        "a pointer reloaded across an asm memory clobber must not verify");
+}
+
 /// Bug-finding mode: an OOB whose index is a genuine parameter, reached *after* an
 /// init loop that makes the path inexact, is refuted (FAIL + witness) only under
 /// `bug_finding` — strict verification stays UNKNOWN (the exact-path gate). The

@@ -42,6 +42,7 @@ int64_t f_off_by_one(void);
 int64_t f_heap_oob(int64_t);
 int64_t f_use_after_free(int64_t);
 int64_t f_double_free(int64_t);
+int64_t f_asm_then_oob(int64_t);
 int64_t f_negative_index(int64_t);
 
 // `sink` keeps the compiler from optimizing calls away.
@@ -70,6 +71,7 @@ DRIVE(f_off_by_one, f_off_by_one())
 DRIVE(f_heap_oob, f_heap_oob(next_range(-8, 24)))
 DRIVE(f_use_after_free, f_use_after_free(next_range(0, 8)))
 DRIVE(f_double_free, f_double_free(next_range(0, 8)))
+DRIVE(f_asm_then_oob, f_asm_then_oob(next_range(-8, 24)))
 DRIVE(f_negative_index, f_negative_index(next_range(-8, 8)))
 
 struct entry {
@@ -89,6 +91,7 @@ static const struct entry table[] = {
     {"f_heap_oob", drive_f_heap_oob},
     {"f_use_after_free", drive_f_use_after_free},
     {"f_double_free", drive_f_double_free},
+    {"f_asm_then_oob", drive_f_asm_then_oob},
     {"f_negative_index", drive_f_negative_index},
 };
 

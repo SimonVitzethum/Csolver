@@ -1475,7 +1475,34 @@ impl Parser {
                 self.pos += 1;
             }
         }
-        let callee = self.callee_name()?;
+        // Inline assembly: `<ret> asm [sideeffect|alignstack|inteldialect|unwind]
+        // "template", "constraints" (args)`. Model it as an opaque, memory-clobbering
+        // call (the callee name resolves to no function, so the lowering emits
+        // `Callee::Symbol` → the sound unknown-callee havoc). Without this the `asm`
+        // token failed the `@name` parse and the whole function was dropped — and
+        // kernel C is saturated with inline asm.
+        let callee = if matches!(self.peek(), Tok::Word(w) if w == "asm") {
+            self.pos += 1;
+            while matches!(self.peek(), Tok::Word(w)
+                if matches!(w.as_str(), "sideeffect" | "alignstack" | "inteldialect" | "unwind"))
+            {
+                self.pos += 1;
+            }
+            // The template and constraint strings (each a quoted `Word`), separated
+            // by a comma; tolerate either being absent.
+            if matches!(self.peek(), Tok::Word(_)) {
+                self.pos += 1;
+            }
+            if matches!(self.peek(), Tok::Punct(',')) {
+                self.pos += 1;
+                if matches!(self.peek(), Tok::Word(_)) {
+                    self.pos += 1;
+                }
+            }
+            "<inline asm>".to_string()
+        } else {
+            self.callee_name()?
+        };
         self.expect_punct('(')?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Tok::Punct(')')) {

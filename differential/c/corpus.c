@@ -144,6 +144,14 @@ int64_t f_double_free(int64_t i) {
     return 0;
 }
 
+// An unchecked index with an intervening inline asm (a memory barrier). The asm
+// must not drop the function from analysis — the OOB past it is still a bug.
+int64_t f_asm_then_oob(int64_t i) {
+    int64_t a[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    __asm__ volatile("" ::: "memory");
+    return a[i];
+}
+
 // A negative offset off a buffer interior — OOB below the allocation.
 int64_t f_negative_index(int64_t i) {
     int64_t a[8] = {0, 1, 2, 3, 4, 5, 6, 7};
