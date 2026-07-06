@@ -506,6 +506,13 @@ fn discharge_inner(
 enum Prov {
     Null,
     Region(usize),
+    /// A **join of two provenances** at a `select`/PHI, under a discriminator: the
+    /// pointer is `then` when `cond` holds and `else` otherwise (each a full
+    /// `SymPointer`, so nested joins compose). Instead of collapsing a `select`
+    /// of two regions to opaque, this keeps both, so an access through it is proved
+    /// in bounds for *each* alternative under its guard — the `va_arg`
+    /// register/overflow select, or any `cond ? &a[i] : &b[j]`. Language-agnostic.
+    Select { cond: ExprId, then_ptr: Box<SymPointer>, else_ptr: Box<SymPointer> },
     /// No tracked provenance, tagged with *why* — purely diagnostic (it does not
     /// affect equality or any verdict; see the manual `PartialEq`), so the scaling
     /// sweep can split the "requires known provenance" residual by origin and
@@ -833,7 +840,7 @@ impl Prov {
             Prov::Unknown(o) => o.residual(),
             // Unreachable at the emission sites (they fire on the non-Region else),
             // but a total function is cheaper to keep correct than a panic.
-            Prov::Region(_) => "pointer provenance is not tracked",
+            Prov::Region(_) | Prov::Select { .. } => "pointer provenance is not tracked",
         }
     }
 }
@@ -848,6 +855,10 @@ impl PartialEq for Prov {
             (Prov::Null, Prov::Null) => true,
             (Prov::Region(a), Prov::Region(b)) => a == b,
             (Prov::Unknown(_), Prov::Unknown(_)) => true,
+            (
+                Prov::Select { cond: c1, then_ptr: t1, else_ptr: e1 },
+                Prov::Select { cond: c2, then_ptr: t2, else_ptr: e2 },
+            ) => c1 == c2 && t1 == t2 && e1 == e2,
             _ => false,
         }
     }
@@ -1410,11 +1421,29 @@ impl Explorer<'_> {
                 offset: self.ctx.ite(d, pa.offset, pb.offset),
                 align: gcd(pa.align, pb.align),
             }),
-            (SymValue::Ptr(_), SymValue::Ptr(_)) => SymValue::Ptr(SymPointer {
-                prov: Prov::Unknown(POrigin::SelectJoin),
-                offset: self.ctx.int(PTR_WIDTH, 0),
-                align: 1,
-            }),
+            // Two different regions: keep both as a `Select` join (bounded depth,
+            // so a pathological chain of distinct selects degrades to opaque rather
+            // than growing without limit). An access through it is proved for each
+            // alternative under its guard (see `check_access`).
+            (SymValue::Ptr(pa), SymValue::Ptr(pb)) => {
+                if prov_select_depth(&pa.prov).max(prov_select_depth(&pb.prov)) >= 8 {
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Unknown(POrigin::SelectJoin),
+                        offset: self.ctx.int(PTR_WIDTH, 0),
+                        align: 1,
+                    })
+                } else {
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Select {
+                            cond: d,
+                            then_ptr: Box::new(pa.clone()),
+                            else_ptr: Box::new(pb.clone()),
+                        },
+                        offset: self.ctx.int(PTR_WIDTH, 0),
+                        align: gcd(pa.align, pb.align),
+                    })
+                }
+            }
             _ => self.fresh_value(ty, POrigin::SelectJoin),
         }
     }
@@ -2410,6 +2439,30 @@ impl Explorer<'_> {
     ) {
         use SafetyProperty::*;
         let (block, idx) = at;
+
+        // A `select`/PHI join: check each alternative under its guard and let the
+        // per-obligation records conjoin (an access is safe iff safe on both). The
+        // outer offset (any pointer arithmetic done on the join) adds to both.
+        if let Prov::Select { cond, then_ptr, else_ptr } = &p.prov {
+            let (cond, then_ptr, else_ptr) = (*cond, then_ptr.clone(), else_ptr.clone());
+            let ncond = self.ctx.not(cond);
+            let outer = p.offset;
+            let branch = |ex: &mut Self, sub: &SymPointer| SymPointer {
+                prov: sub.prov.clone(),
+                offset: ex.ctx.bin(BvOp::Add, sub.offset, outer),
+                align: sub.align,
+            };
+            let pa = branch(self, &then_ptr);
+            let pb = branch(self, &else_ptr);
+            let mut sa = state.clone();
+            sa.pathcond.push(cond);
+            let mut sb = state.clone();
+            sb.pathcond.push(ncond);
+            self.check_access(at, &pa, asize, aalign, perm_prop, &sa);
+            self.check_access(at, &pb, asize, aalign, perm_prop, &sb);
+            return;
+        }
+
         // Null.
         let non_null = matches!(p.prov, Prov::Region(_));
         self.record(block, idx, NoNullDeref, non_null, "pointer is non-null", "pointer may be null or have opaque provenance");
@@ -2466,6 +2519,27 @@ impl Explorer<'_> {
 
     fn check_ptr_arith(&mut self, block: BlockId, idx: usize, p: &SymPointer, state: &PathState) {
         use SafetyProperty::ValidPointerArith;
+        // A join: the arithmetic stays in-object iff it does for each alternative
+        // under its guard.
+        if let Prov::Select { cond, then_ptr, else_ptr } = &p.prov {
+            let (cond, then_ptr, else_ptr) = (*cond, then_ptr.clone(), else_ptr.clone());
+            let ncond = self.ctx.not(cond);
+            let outer = p.offset;
+            let branch = |ex: &mut Self, sub: &SymPointer| SymPointer {
+                prov: sub.prov.clone(),
+                offset: ex.ctx.bin(BvOp::Add, sub.offset, outer),
+                align: sub.align,
+            };
+            let pa = branch(self, &then_ptr);
+            let pb = branch(self, &else_ptr);
+            let mut sa = state.clone();
+            sa.pathcond.push(cond);
+            let mut sb = state.clone();
+            sb.pathcond.push(ncond);
+            self.check_ptr_arith(block, idx, &pa, &sa);
+            self.check_ptr_arith(block, idx, &pb, &sb);
+            return;
+        }
         let Prov::Region(rid) = p.prov else {
             self.record(block, idx, ValidPointerArith, false, "requires known provenance", p.prov.provenance_residual());
             return;
@@ -2987,6 +3061,16 @@ impl Explorer<'_> {
                 self.ctx.not(inner)
             }
         }
+    }
+}
+
+/// Nesting depth of a `Select` provenance (to cap join growth).
+fn prov_select_depth(p: &Prov) -> u32 {
+    match p {
+        Prov::Select { then_ptr, else_ptr, .. } => {
+            1 + prov_select_depth(&then_ptr.prov).max(prov_select_depth(&else_ptr.prov))
+        }
+        _ => 0,
     }
 }
 

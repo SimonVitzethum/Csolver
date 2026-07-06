@@ -1946,3 +1946,78 @@ entry:
         "an address the paths disagree on must not be provable after the merge"
     );
 }
+
+/// A pointer that is a `select`/PHI of two *different* valid regions (`c ? &a : &b`)
+/// is no longer opaque: an access through it is proved in bounds for each
+/// alternative under its guard. Language-agnostic (any `cond ? p : q`).
+const SELECT_PTR: &str = r#"
+define i64 @sel(ptr %a, ptr %b, i1 %c) {
+entry:
+  br i1 %c, label %ta, label %tb
+ta:
+  br label %m
+tb:
+  br label %m
+m:
+  %p = phi ptr [ %a, %ta ], [ %b, %tb ]
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+define i64 @main() {
+entry:
+  %x = alloca i64, align 8
+  %y = alloca i64, align 8
+  %r = call i64 @sel(ptr %x, ptr %y, i1 1)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn select_of_two_valid_pointers_verifies() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: SELECT_PTR.into(), name: "sel".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "an access through a select of two valid pointers is in bounds for both"
+    );
+}
+
+/// Soundness control: when one alternative is too small for the access, the join
+/// access must stay UNKNOWN — the multi-provenance proves *each* branch, so a
+/// branch that is out of bounds fails the conjunction (no false PASS).
+#[test]
+fn select_of_pointers_requires_both_in_bounds() {
+    let src = r#"
+define i64 @sel(ptr %a, ptr %b, i1 %c) {
+entry:
+  br i1 %c, label %ta, label %tb
+ta:
+  br label %m
+tb:
+  br label %m
+m:
+  %p = phi ptr [ %a, %ta ], [ %b, %tb ]
+  %q = getelementptr i64, ptr %p, i64 2
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+define i64 @main() {
+entry:
+  %arr = alloca [4 x i64], align 8
+  %a0 = getelementptr i64, ptr %arr, i64 0
+  %y = alloca i64, align 8
+  %r = call i64 @sel(ptr %a0, ptr %y, i1 1)
+  ret i64 %r
+}
+"#;
+    let module = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "seloob".into() }).expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "p[2] via the 1-element alternative is out of bounds — no false PASS"
+    );
+}
