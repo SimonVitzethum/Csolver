@@ -149,8 +149,9 @@ pub fn discharge_with_fields(
     field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, GlobalDef>,
     bug_finding: bool,
+    exported: bool,
 ) -> SymbolicReport {
-    let limits = ExecLimits { bug_finding, ..ExecLimits::default() };
+    let limits = ExecLimits { bug_finding, exported, ..ExecLimits::default() };
     discharge_inner(f, limits, summaries, contracts, field_contracts, globals)
 }
 
@@ -285,6 +286,7 @@ fn discharge_inner(
         ctx: ExprCtx::new(),
         fresh: 0,
         bug_finding: limits.bug_finding,
+        exported: limits.exported,
         visits: 0,
         truncated: false,
         limits,
@@ -1036,6 +1038,10 @@ struct Explorer<'f> {
     /// even on a globally-inexact path (e.g. after an init loop). Off by default
     /// (verification stays strict — refute only on an exact path). See `decide`.
     bug_finding: bool,
+    /// Whether this function is exported (externally reachable). In bug-finding mode
+    /// only an exported function's `arg…` parameters count as genuine adversarial
+    /// inputs (see `goal_is_genuine`); an internal function's are caller-constrained.
+    exported: bool,
     visits: usize,
     truncated: bool,
     limits: ExecLimits,
@@ -2906,14 +2912,17 @@ impl Explorer<'_> {
             }
             match self.ctx.node(e) {
                 Node::Sym { name, .. } => {
-                    // Genuine inputs: parameters (`arg…`), untrusted user data
-                    // (`user…`, from `copy_from_user`), and unit-stride counting
-                    // inductions (`ind…`, which reach every guard-admitted value) —
-                    // a witness violating a goal over them is genuinely reachable.
-                    if !(name.starts_with("arg")
-                        || name.starts_with("user")
-                        || name.starts_with("ind"))
-                    {
+                    // Genuine inputs a witness may freely take: untrusted user data
+                    // (`user…`, from `copy_from_user`) and unit-stride counting
+                    // inductions (`ind…`, which reach every guard-admitted value) are
+                    // always genuine; a parameter (`arg…`) only when the function is
+                    // **exported** — an internal function's parameters are supplied by
+                    // in-module callers (caller-constrained), so refuting on a freely
+                    // chosen value would be a false positive.
+                    let genuine = name.starts_with("user")
+                        || name.starts_with("ind")
+                        || (self.exported && name.starts_with("arg"));
+                    if !genuine {
                         return false;
                     }
                 }

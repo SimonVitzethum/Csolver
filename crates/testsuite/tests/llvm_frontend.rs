@@ -837,6 +837,46 @@ declare void @free(ptr)
         "a free with no later use must not be a false positive");
 }
 
+/// In bug-finding mode a scalar parameter is a genuine adversarial input only for an
+/// **exported** function (externally reachable, so an attacker may pick the value).
+/// An **internal** function's parameters are supplied by in-module callers
+/// (caller-constrained), so refuting on a freely-chosen index would be a false
+/// positive — the real cause of false FAILs on internal kernel helpers indexed by a
+/// bounded enum. Same body, two linkages: exported FAILs, internal does not.
+#[test]
+fn bug_finding_only_refutes_exported_function_params() {
+    let src = r#"
+define i64 @exported(i64 %i) {
+entry:
+  %a = alloca [8 x i64], align 8
+  %p = getelementptr [8 x i64], ptr %a, i64 0, i64 %i
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+define internal i64 @internal(i64 %i) {
+entry:
+  %a = alloca [8 x i64], align 8
+  %p = getelementptr [8 x i64], ptr %a, i64 0, i64 %i
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+define i64 @caller() {
+entry:
+  %r = call i64 @internal(i64 3)
+  ret i64 %r
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "x".into() }).expect("lower");
+    let bugs = Config { bug_finding: true, ..Config::default() };
+    let report = verify_module(&m, &bugs);
+    let verdict_of =
+        |name: &str| report.functions.iter().find(|f| f.function == name).map(|f| f.verdict);
+    assert_eq!(verdict_of("exported"), Some(Verdict::Fail),
+        "an exported function's unchecked index parameter is a bug candidate");
+    assert_ne!(verdict_of("internal"), Some(Verdict::Fail),
+        "an internal function's caller-constrained parameter must not be a false positive");
+}
+
 /// A **multi-level** nested gep (`gep %Outer, ptr, 0, 1, 2` — field 1 of Outer, then
 /// field/index 2 within it) must lower to the exact padded byte offset, not drop the
 /// whole function. Pervasive in real C/kernel IR. The offset must be correct, not just

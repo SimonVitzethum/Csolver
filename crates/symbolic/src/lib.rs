@@ -55,6 +55,14 @@ pub struct ExecLimits {
     /// on an over-approximated value that is actually infeasible) for far higher
     /// recall on real code. Off by default: verification stays strict.
     pub bug_finding: bool,
+    /// Whether this function is **exported** (externally reachable), so its
+    /// parameters may be attacker-controlled. In bug-finding mode only an exported
+    /// function's scalar parameters are treated as genuine adversarial inputs; an
+    /// *internal* function's parameters are supplied by in-module callers
+    /// (caller-constrained), so refuting on a freely-chosen value would report a
+    /// false positive (e.g. an internal helper indexed by a bounded enum). Default
+    /// `true`: an isolated function is treated as an entry point.
+    pub exported: bool,
 }
 
 impl Default for ExecLimits {
@@ -63,6 +71,7 @@ impl Default for ExecLimits {
             max_visits: 200_000,
             time_budget: Some(std::time::Duration::from_secs(30)),
             bug_finding: false,
+            exported: true,
         }
     }
 }

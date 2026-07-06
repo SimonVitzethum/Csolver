@@ -206,6 +206,7 @@ fn verify_one_function(
     let field_contracts: Vec<Vec<FieldContract>> = (0..f.params.len())
         .map(|i| field_synth.get(&(f.id, i as u32)).cloned().unwrap_or_default())
         .collect();
+    let exported = !module.internal.contains(&f.id);
     let mut local_id = 0u32;
     verify_function_with(
         f,
@@ -214,6 +215,7 @@ fn verify_one_function(
         &field_contracts,
         &module.globals,
         config,
+        exported,
         &mut local_id,
     )
 }
@@ -381,11 +383,12 @@ fn assumption_record(id: String) -> Assumption {
 /// Verify a single function in isolation (no interprocedural summaries or
 /// parameter contracts), drawing obligation ids from `next_id`.
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
-    verify_function_with(f, None, &[], &[], &HashMap::new(), config, next_id)
+    verify_function_with(f, None, &[], &[], &HashMap::new(), config, true, next_id)
 }
 
 /// Verify a single function, optionally using module-wide summaries for calls
 /// and per-parameter pointer contracts.
+#[allow(clippy::too_many_arguments)]
 fn verify_function_with(
     f: &Function,
     summaries: Option<&HashMap<FuncId, Summary>>,
@@ -393,13 +396,14 @@ fn verify_function_with(
     field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, csolver_ir::GlobalDef>,
     config: &Config,
+    exported: bool,
     next_id: &mut u32,
 ) -> FunctionReport {
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
-        Some(s) => {
-            discharge_with_fields(f, s, contracts, field_contracts, globals, config.bug_finding)
-        }
+        Some(s) => discharge_with_fields(
+            f, s, contracts, field_contracts, globals, config.bug_finding, exported,
+        ),
         None => discharge_function(f),
     });
 
