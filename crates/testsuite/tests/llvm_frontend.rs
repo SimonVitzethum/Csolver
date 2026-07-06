@@ -754,6 +754,60 @@ declare i64 @copy_from_user(ptr, ptr, i64)
         "a length-checked user-copy must not be a false positive");
 }
 
+/// The archetypal kernel bug: copy a struct from userspace, then use one of its
+/// fields as the length of a second copy into a fixed buffer. The field is untrusted
+/// (user-controlled) — a genuine adversarial input — so an unchecked length overruns
+/// the buffer (FAIL), while a length-checked sibling stays PASS (no false positive).
+/// Exercises user-taint propagation (`UserFill` region) + `zext` width handling (the
+/// `i32` field widens to the `i64` length).
+#[test]
+fn user_copy_field_used_as_length_is_an_overflow() {
+    let vuln = r#"
+%struct.req = type { i32, i32 }
+define i64 @f(ptr %uarg) {
+entry:
+  %r = alloca %struct.req, align 4
+  %buf = alloca [128 x i8], align 16
+  %e0 = call i64 @copy_from_user(ptr %r, ptr %uarg, i64 8)
+  %len32 = load i32, ptr %r, align 4
+  %len = zext i32 %len32 to i64
+  %e1 = call i64 @copy_from_user(ptr %buf, ptr %uarg, i64 %len)
+  %v = load i8, ptr %buf, align 1
+  %w = sext i8 %v to i64
+  ret i64 %w
+}
+declare i64 @copy_from_user(ptr, ptr, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: vuln.into(), name: "v".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &Config { bug_finding: true, ..Config::default() }).verdict, Verdict::Fail,
+        "a user-copied length field driving a second copy overruns the buffer");
+
+    let safe = r#"
+%struct.req = type { i32, i32 }
+define i64 @f(ptr %uarg) {
+entry:
+  %r = alloca %struct.req, align 4
+  %buf = alloca [128 x i8], align 16
+  %e0 = call i64 @copy_from_user(ptr %r, ptr %uarg, i64 8)
+  %len32 = load i32, ptr %r, align 4
+  %len = zext i32 %len32 to i64
+  %ok = icmp ule i64 %len, 128
+  br i1 %ok, label %do, label %skip
+do:
+  %e1 = call i64 @copy_from_user(ptr %buf, ptr %uarg, i64 %len)
+  %v = load i8, ptr %buf, align 1
+  %w = sext i8 %v to i64
+  ret i64 %w
+skip:
+  ret i64 -22
+}
+declare i64 @copy_from_user(ptr, ptr, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: safe.into(), name: "s".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config { bug_finding: true, ..Config::default() }).verdict, Verdict::Fail,
+        "a length-checked user field must not be a false positive (the guard on the widened value holds)");
+}
+
 /// Inline assembly must not drop the whole function (kernel C is saturated with it).
 /// It lowers to an opaque, memory-clobbering call: the function stays analyzed, an
 /// OOB past the asm is still found (bug-finding), and a pointer reloaded across an

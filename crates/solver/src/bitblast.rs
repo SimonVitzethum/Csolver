@@ -436,6 +436,14 @@ impl<'c> Blaster<'c> {
                     .map(|(&t, &e)| self.cnf.mux(cv[0], t, e))
                     .collect()
             }
+            Node::Zext(val) => {
+                // Low bits are the operand's; high bits are zero (unsigned widen).
+                let mut bits = self.encode(val)?;
+                while (bits.len() as u32) < width {
+                    bits.push(self.cnf.lit_false());
+                }
+                bits
+            }
         };
         self.memo.insert(id, bits.clone());
         Some(bits)

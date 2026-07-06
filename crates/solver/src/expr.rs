@@ -143,6 +143,9 @@ pub enum Node {
         /// Else value.
         e: ExprId,
     },
+    /// Zero-extend `val` to a wider bit width (the node's own width). The high bits
+    /// are zero, so numerically the value is unchanged (unsigned).
+    Zext(ExprId),
 }
 
 /// The boolean width sentinel.
@@ -215,6 +218,19 @@ impl ExprCtx {
     pub fn constant(&mut self, value: BitVector) -> ExprId {
         let w = value.width();
         self.intern(Node::Const(value), w)
+    }
+
+    /// Zero-extend `val` to `to` bits. Identity if already `to` bits or wider (a
+    /// wider value is returned unchanged — callers only widen). A constant is folded.
+    pub fn zext(&mut self, val: ExprId, to: u32) -> ExprId {
+        let w = self.width(val);
+        if w >= to {
+            return val;
+        }
+        if let Node::Const(bv) = self.node(val) {
+            return self.int(to, bv.unsigned());
+        }
+        self.intern(Node::Zext(val), to)
     }
 
     /// An integer constant of the given width.

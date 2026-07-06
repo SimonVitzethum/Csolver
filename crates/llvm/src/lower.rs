@@ -587,8 +587,12 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
             // model. The result (bytes-not-copied) is an opaque scalar.
             if let Some(kbuf) = user_copy_kernel_arg(callee) {
                 if let Some(bufop) = args.get(kbuf) {
+                    // `from_user` fills the kernel buffer with untrusted data
+                    // (`UserFill`, so reads back are genuine adversarial inputs);
+                    // `to_user` only reads it, so a plain bounded `Set` (no taint).
+                    let kind = if kbuf == 0 { MemKind::UserFill } else { MemKind::Set };
                     insts.push(Inst::MemIntrinsic {
-                        kind: MemKind::Set,
+                        kind,
                         dst: ctx.operand(bufop, 64)?,
                         src: None,
                         len: ctx.operand(&args[2.min(args.len().saturating_sub(1))], 64)?,

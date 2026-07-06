@@ -376,6 +376,7 @@ fn discharge_inner(
             contract: Some(c.assumption.unwrap_or(assumption)),
             size_nowrap: nowrap,
             sentinel: c.sentinel,
+            user_controlled: false,
         });
         env.insert(
             *reg,
@@ -407,6 +408,7 @@ fn discharge_inner(
                 contract: Some(fc.pointee.assumption.unwrap_or(PARAM_CONTRACTS)),
                 size_nowrap: None,
                 sentinel: None,
+                user_controlled: false,
             });
             let palign = fc.pointee.align.max(1) as u64;
             let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
@@ -445,6 +447,7 @@ fn discharge_inner(
             contract: Some(GLOBAL_MEMORY),
             size_nowrap: Some(truth),
             sentinel: None,
+            user_controlled: false,
         });
         ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
     }
@@ -896,6 +899,11 @@ struct SymRegion {
     /// over it is then bounded (it must stop at the sentinel), which lets a
     /// `strlen`-shaped loop be proved. `None` for an ordinary region.
     sentinel: Option<u64>,
+    /// `true` if the region has been filled with untrusted **user data** (via a
+    /// `copy_from_user`-style `MemIntrinsic::UserFill`). A value later loaded from
+    /// it is a *genuine adversarial input* — refutable like a parameter — so a
+    /// length read back from a user-copied struct can drive an out-of-bounds FAIL.
+    user_controlled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2069,6 +2077,7 @@ impl Explorer<'_> {
                     contract: None,
                     size_nowrap: Some(nowrap),
                     sentinel: None,
+                    user_controlled: false,
                 });
                 // The byte size is non-negative by construction.
                 let zero = self.ctx.int(PTR_WIDTH, 0);
@@ -2203,6 +2212,23 @@ impl Explorer<'_> {
             }
             Inst::MemIntrinsic { kind, dst, src, len } => {
                 self.check_mem_intrinsic((block, idx), *kind, dst, src.as_ref(), len, state);
+                // `copy_from_user` fills the destination with untrusted data: mark
+                // that region user-controlled, so values later loaded from it are
+                // genuine adversarial inputs (a length read back can drive an OOB).
+                if matches!(kind, MemKind::UserFill) {
+                    if let Prov::Region(rid) = self.eval_pointer(dst, state).prov {
+                        if let Some(r) = state.regions.get_mut(rid) {
+                            r.user_controlled = true;
+                        }
+                    }
+                    // The written bytes are untrusted user data; a load from the
+                    // now-user-controlled region yields a genuine symbol (see
+                    // `load_value`). Leave no stored value to intercept that read,
+                    // and keep the path exact — the value is genuinely free, not an
+                    // over-approximation. (Just invalidate stale stored values.)
+                    state.heap.clear();
+                    return;
+                }
                 // Model the bulk *write*. Clearing the heap alone is not enough:
                 // the destination bytes are now written, and forgetting that made
                 // every later load from a fresh alloca a "definite uninitialized
@@ -2291,6 +2317,10 @@ impl Explorer<'_> {
         // FAIL with a witness. The source (if any) is checked prove-only — a `Refuted`
         // on it would need its own region's no-wrap premise; the destination write is
         // the dominant overflow class and carries the refutation.
+        // A narrower length (a `zext i32 %n to i64` the executor kept at its source
+        // width) is zero-extended to pointer width, so the bounds arithmetic is
+        // width-consistent and the guard on the narrow value still applies.
+        let len_e = self.widen_to_ptr(len_e);
         let src_inb = match (need_src, &src, src_facts) {
             (false, _, _) => true,
             (true, Some(p), Some(f)) => self.prove_in_bounds_len(p.offset, len_e, f.size, state),
@@ -2446,6 +2476,7 @@ impl Explorer<'_> {
             contract: Some(VALID_REFERENCE),
             size_nowrap: nowrap,
             sentinel: None,
+            user_controlled: false,
         });
         rid
     }
@@ -2759,7 +2790,10 @@ impl Explorer<'_> {
             }
             match self.ctx.node(e) {
                 Node::Sym { name, .. } => {
-                    if !name.starts_with("arg") {
+                    // Genuine inputs: parameters (`arg…`) and untrusted user data
+                    // (`user…`, from `copy_from_user`) — both fully attacker-chosen,
+                    // so a witness violating a goal over them is genuinely reachable.
+                    if !(name.starts_with("arg") || name.starts_with("user")) {
                         return false;
                     }
                 }
@@ -2775,6 +2809,7 @@ impl Explorer<'_> {
                     stack.push(*t);
                     stack.push(*e);
                 }
+                Node::Zext(v) => stack.push(*v),
             }
         }
         true
@@ -2909,7 +2944,32 @@ impl Explorer<'_> {
                 AliasResult::May => return (self.fresh_value(ty, POrigin::Load), LoadOrigin::Uncertain),
             }
         }
+        // A load from a user-controlled region (filled by `copy_from_user`) reads
+        // untrusted data: a *genuine adversarial input*, so it may drive a refutable
+        // overflow. Model a scalar as a genuine symbol (like a parameter) rather than
+        // an over-approximated one. Reported as `Stored` so the path stays exact —
+        // the value is genuinely free, not an over-approximation to be distrusted.
+        let user = matches!(p.prov, Prov::Region(rid) if state.regions.get(rid).is_some_and(|r| r.user_controlled));
+        if user && !ty.is_ptr() {
+            return (SymValue::Scalar(self.fresh_genuine_scalar(type_width(ty))), LoadOrigin::Stored);
+        }
         (self.fresh_value(ty, POrigin::Load), LoadOrigin::Unwritten)
+    }
+
+    /// A fresh **genuine** input symbol (named `user…`, treated like a parameter by
+    /// [`Explorer::goal_is_genuine`]): an untrusted value an attacker fully controls,
+    /// so a violation it drives is genuinely reachable and refutable.
+    fn fresh_genuine_scalar(&mut self, width: u32) -> ExprId {
+        let name = format!("user{}", self.fresh);
+        self.fresh += 1;
+        self.ctx.symbol(name, width)
+    }
+
+    /// Zero-extend a scalar to pointer width (identity if already that wide) so a
+    /// narrower length — a `zext` the executor modelled as width-preserving — takes
+    /// part in pointer-width bounds arithmetic without a width mismatch.
+    fn widen_to_ptr(&mut self, e: ExprId) -> ExprId {
+        self.ctx.zext(e, PTR_WIDTH)
     }
 
     /// Does `p` point into a freshly-allocated region (one with no caller

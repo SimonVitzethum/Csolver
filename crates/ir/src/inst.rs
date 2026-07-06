@@ -185,6 +185,12 @@ pub enum MemKind {
     Move,
     /// `memset`: fill with a byte value.
     Set,
+    /// A `copy_from_user`-style bulk write of **untrusted user data** into the
+    /// destination (kernel) buffer: bounds-checked like `Set`, but it additionally
+    /// marks the destination region user-controlled, so a value later loaded from it
+    /// is a *genuine adversarial input* (an attacker picks it) — a length read back
+    /// from a user-copied struct can then drive a refutable overflow.
+    UserFill,
 }
 
 /// The target of a [`Inst::Call`].
@@ -385,7 +391,9 @@ impl Inst {
             Inst::Dealloc { .. } => &[NoDoubleFree],
             Inst::PtrOffset { .. } => &[ValidPointerArith],
             Inst::MemIntrinsic { kind, .. } => match kind {
-                MemKind::Set => &[NoNullDeref, NoUseAfterFree, InBounds, ValidWrite],
+                MemKind::Set | MemKind::UserFill => {
+                    &[NoNullDeref, NoUseAfterFree, InBounds, ValidWrite]
+                }
                 MemKind::Copy | MemKind::Move => {
                     &[NoNullDeref, NoUseAfterFree, InBounds, ValidRead, ValidWrite]
                 }
