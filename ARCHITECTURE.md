@@ -1,90 +1,104 @@
-# CSolver — Architektur
+# CSolver — Architecture
 
-> Formaler Speichersicherheits-Verifizierer für Rust (inkl. `unsafe`) auf den
-> Ebenen MIR, LLVM-IR, x86-64/AArch64-Assembly und ELF.
+> A formal memory-safety verifier for Rust (including `unsafe`), C, and C++ at the
+> MIR, LLVM-IR, x86-64/AArch64 assembly, and ELF levels — with an opt-in
+> **bug-finding mode** for kernel-style C.
 
-Dieses Dokument ist die **verbindliche Architektur**. Es wird *vor* der
-Implementierung einer Komponente gelesen und gepflegt. Jede Komponente
-verweist auf die hier definierten Schnittstellen.
-
----
-
-## 1. Ehrliche Einordnung (Scope & theoretische Grenzen)
-
-Vollständige Speichersicherheit beliebiger Maschinenprogramme ist **nicht
-entscheidbar** (Reduktion auf das Halteproblem; Rice-Theorem). CSolver kann
-daher *prinzipiell* nicht für jedes Programm automatisch „PASS“ liefern. Das
-ist kein Implementierungsmangel, sondern eine mathematische Grenze.
-
-Der Anspruch von CSolver ist deshalb präzise formuliert:
-
-1. **Soundness vor Completeness.** Ein `PASS` bedeutet: *bewiesen sicher unter
-   den explizit ausgewiesenen Annahmen*. Wir geben niemals wissentlich ein
-   `PASS` ohne Beweis aus. Wenn wir es nicht beweisen können, sagen wir
-   `UNKNOWN` (mit offenen Beweisverpflichtungen) oder `FAIL` (mit
-   Gegenbeispiel).
-2. **Jede Annahme ist explizit.** FFI-Grenzen, Inline-Assembly,
-   Nichtdeterminismus des Allokators, Hardware-Speicherordnung etc. erzeugen
-   *named assumptions*, die im Report erscheinen. Ein Beweis ist immer relativ
-   zu einer Annahmenmenge.
-3. **Drei Ausgänge pro Beweisverpflichtung:** `PASS` (Beweisbaum), `FAIL`
-   (Gegenbeispiel = konkretes Modell), `UNKNOWN` (verbleibende
-   Verpflichtungen + Vorschlag minimaler Zusatzannotationen).
-
-Was realistisch *vollständig* beweisbar ist: nicht-rekursive oder
-struktur-rekursive Funktionen mit beschränkten Schleifen über lineare
-Pointer-Arithmetik, deren Indizes durch Intervall-/Octagon-Invarianten und
-SMT entschieden werden können — also ein großer Teil von realem (auch
-`unsafe`) Rust-Code, der „eigentlich offensichtlich korrekt“ ist. Was *nicht*
-automatisch entscheidbar ist, wird im Report mit Begründung markiert.
+This document is the **authoritative architecture**. It is read *before*
+implementing a component and kept current. Each component points at the
+interfaces defined here.
 
 ---
 
-## 2. Leitidee: ein gemeinsames Memory-Safety-IR (MSIR)
+## 1. Honest framing (scope & theoretical limits)
 
-Der zentrale Architekturentscheid: **alle Frontends lowern in ein einziges,
-analyse-freundliches Zwischenformat — MSIR** (`csolver-ir`). Die teuren
-Analysen (Abstract Interpretation, symbolische Ausführung, Beweis-Generierung)
-werden **einmal** gegen MSIR geschrieben, nicht je Frontend dupliziert.
+Full memory safety of arbitrary machine programs is **undecidable** (reduction to
+the halting problem; Rice's theorem). CSolver therefore *cannot in principle*
+return "PASS" automatically for every program. This is a mathematical limit, not
+an implementation shortcoming.
+
+CSolver's claim is stated precisely:
+
+1. **Soundness before completeness.** A `PASS` means: *proven safe under the
+   explicitly reported assumptions*. We never knowingly emit a `PASS` without a
+   proof. When we cannot prove it we say `UNKNOWN` (with the open proof
+   obligations) or `FAIL` (with a counterexample).
+2. **Every assumption is explicit.** FFI boundaries, inline assembly, allocator
+   nondeterminism, hardware memory ordering, and so on produce *named assumptions*
+   that appear in the report. A proof is always relative to an assumption set.
+3. **Three outcomes per proof obligation:** `PASS` (proof tree), `FAIL`
+   (counterexample = a concrete model), `UNKNOWN` (residual obligations + a
+   suggestion of the minimal extra annotation that would close it).
+
+What is realistically *fully* provable: non-recursive or structurally-recursive
+functions with bounded loops over linear pointer arithmetic whose indices can be
+decided by interval/octagon invariants and the bit-precise solver — a large part
+of real (including `unsafe`) Rust and real C. What is *not* automatically
+decidable is flagged in the report with a reason.
+
+### 1a. Two modes: verification and bug-finding
+
+The same engine serves two goals, selected by a flag:
+
+- **Verification (default).** Soundness-first: a false `PASS` **and** a false
+  `FAIL` are both bugs. Refutation (a `FAIL`) is only emitted on an *exact* path,
+  where the path condition characterizes genuinely reachable states.
+- **Bug-finding (`--bugs`).** Recall-oriented: report a memory violation whose
+  offending value derives only from **genuine inputs** (function parameters,
+  `copy_from_user` data, or a unit-stride loop counter) even on an
+  over-approximated path. Every reported `FAIL` still carries a concrete witness.
+  The mode trades a small path-feasibility risk for far higher recall on real,
+  call- and loop-heavy code; a false `FAIL` still matters (a bug-finder that cries
+  wolf is useless), so the "no false FAIL" discipline is kept and measured against
+  a dynamic oracle (see §6).
+
+---
+
+## 2. Core idea: one common memory-safety IR (MSIR)
+
+The central architectural decision: **every frontend lowers into a single,
+analysis-friendly intermediate form — MSIR** (`csolver-ir`). The expensive
+analyses (abstract interpretation, symbolic execution, proof generation) are
+written **once** against MSIR, not duplicated per frontend.
 
 ```
             ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
-  Quelle →  │ csolver-mir│  │csolver-llvm│  │ csolver-asm│  │ csolver-elf│
+  Source →  │ csolver-mir│  │csolver-llvm│  │ csolver-asm│  │ csolver-elf│
             │  (Rust MIR)│  │ (LLVM IR)  │  │ x86/ARM64  │  │ Loader/    │
             └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  │ DWARF/Reloc│
                   │ lower         │ lower         │ lower   └─────┬──────┘
-                  └───────┬───────┴───────┬───────┘               │ liefert
-                          ▼               ▼                        ▼ Kontext
+                  └───────┬───────┴───────┬───────┘               │ context
+                          ▼               ▼                        ▼
                     ┌───────────────────────────────────────────────────┐
                     │                MSIR  (csolver-ir)                  │
-                    │  typisiertes, CFG-basiertes IR mit expliziten      │
-                    │  Memory-Ops + SafetyChecks (Beweisverpflichtungen) │
+                    │  typed, CFG-based IR with explicit memory ops      │
+                    │  + SafetyChecks (proof obligations)                │
                     └───────────────────────────┬───────────────────────┘
                                                 │
         ┌───────────────────┬───────────────────┼───────────────────┐
         ▼                   ▼                   ▼                   ▼
  ┌────────────┐     ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
  │ csolver-cfg│     │csolver-absint│    │csolver-symbol│    │csolver-memory│
- │ Dom/PostDom│     │ Domänen +    │    │ symbolische  │    │ Region/Ptr-  │
- │ Loops      │     │ Fixpunkt     │    │ Ausführung   │    │ Modell       │
+ │ Dom/PostDom│     │ domains +    │    │ symbolic     │    │ Region/Ptr   │
+ │ Loops      │     │ fixpoint     │    │ execution    │    │ model        │
  └─────┬──────┘     └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
        └───────────────────┴─────────┬─────────┴───────────────────┘
                                       ▼
                             ┌───────────────────┐     ┌──────────────┐
                             │  csolver-verifier │────▶│ csolver-solver│
-                            │ erzeugt & entlädt │     │ Constraint-IR │
-                            │ Beweisverpflicht. │◀────│ Simplify      │
+                            │ builds & discharges│     │ constraint IR │
+                            │ proof obligations │◀────│ simplify      │
                             └─────────┬─────────┘     └──────┬───────┘
                                       │                      ▼
                                       │               ┌──────────────┐
                                       │               │ csolver-smt  │
-                                      │               │ Z3/Bitwuzla/ │
-                                      │               │ CVC5         │
+                                      │               │ (fallback:   │
+                                      │               │  bit-precise)│
                                       ▼               └──────────────┘
                             ┌───────────────────┐
                             │  csolver-report   │  PASS / FAIL / UNKNOWN
-                            │  Beweisbaum,      │  + Beweisbaum / Gegenbsp.
-                            │  Gegenbeispiel    │  + offene Verpflichtungen
+                            │  proof tree,      │  + proof tree / counterexample
+                            │  counterexample   │  + open obligations
                             └─────────┬─────────┘
                                       ▼
                             ┌───────────────────┐
@@ -92,28 +106,27 @@ werden **einmal** gegen MSIR geschrieben, nicht je Frontend dupliziert.
                             └───────────────────┘
 ```
 
-**Warum ein gemeinsames IR statt N Analysen?** (a) Soundness lässt sich an
-*einer* Stelle argumentieren; (b) eine in MSIR formulierte Schleifeninvariante
-gilt unabhängig von der Quellebene; (c) Querverbindungen zwischen Ebenen
-(z. B. MIR-Borrow-Info als Hinweis für die LLVM-Analyse) laufen über MSIR-
-Metadaten statt über Ad-hoc-Kanäle.
+**Why one IR instead of N analyses?** (a) Soundness is argued in *one* place; (b)
+a loop invariant expressed in MSIR holds regardless of the source level; (c)
+cross-level links (e.g. MIR borrow info as a hint for the LLVM analysis) travel
+through MSIR metadata rather than ad-hoc channels.
 
-**Soundness des Lowerings.** Jedes Frontend muss eine *Refinement*-Eigenschaft
-erfüllen: jedes konkrete Verhalten des Originals ist ein konkretes Verhalten
-des MSIR (Über-Approximation der Zustände, Unter-Approximation der Garantien).
-Diese Pflicht steht je Frontend in dessen `Verification/`.
+**Soundness of lowering.** Every frontend must satisfy a *refinement* property:
+every concrete behaviour of the original is a concrete behaviour of the MSIR
+(over-approximate states, under-approximate guarantees). This obligation is
+recorded per frontend in its `Verification/`.
 
 ---
 
-## 3. Crate-Topologie und Abhängigkeiten
+## 3. Crate topology and dependencies
 
-Strikt azyklische Schichtung (Pfeile = „hängt ab von“):
+Strictly acyclic layering (arrows = "depends on"):
 
 ```
-                       csolver-core   (keine internen Deps)
+                       csolver-core   (no internal deps)
                           ▲   ▲   ▲
         ┌─────────────────┘   │   └──────────────────┐
-   csolver-ir            csolver-memory          (genutzt von allen)
+   csolver-ir            csolver-memory          (used by all)
    ▲    ▲    ▲                ▲
    │    │    └── csolver-cfg  │
    │    │            ▲        │
@@ -133,193 +146,195 @@ Strikt azyklische Schichtung (Pfeile = „hängt ab von“):
                             csolver-testsuite (dev, e2e)
 ```
 
-| Crate | Verantwortung | Hängt ab von |
+| Crate | Responsibility | Depends on |
 |---|---|---|
-| `csolver-core` | Verdikte, Beweisverpflichtung, Beweisbaum, IDs, Diagnostik, abstrakte Werte/Bitvektoren, `Result`/Fehler | — |
-| `csolver-ir` | MSIR: Typen, Funktionen, Basic Blocks, Instruktionen, Memory-Ops, `SafetyCheck` | core |
-| `csolver-cfg` | CFG-Konstruktion, Dominator-/Post-Dominator-Baum, natürliche Schleifen, SCCs | core, ir |
-| `csolver-parser` | geteilte Lexer-/Parser-Infrastruktur (Tokens, Spans, Fehlerbehebung) | core |
-| `csolver-mir` | Rust-MIR-Frontend → MSIR (nutzt Borrow-/Panic-Info) | core, ir, parser |
-| `csolver-llvm` | LLVM-IR-Frontend → MSIR (SSA, PHI, Intrinsics, MemorySSA-Hinweise) | core, ir, parser |
+| `csolver-core` | verdicts, proof obligations, proof tree, IDs, diagnostics, abstract values/bit-vectors, `Result`/errors | — |
+| `csolver-ir` | MSIR: types, functions, basic blocks, instructions, memory ops, `SafetyCheck` | core |
+| `csolver-cfg` | CFG construction, dominator/post-dominator tree, natural loops, SCCs | core, ir |
+| `csolver-parser` | shared lexer/parser infrastructure (tokens, spans, error recovery) | core |
+| `csolver-mir` | Rust-MIR frontend → MSIR (uses borrow/panic info) | core, ir, parser |
+| `csolver-llvm` | LLVM-IR frontend → MSIR (SSA, PHI, intrinsics, allocator/user-copy/asm modelling, DWARF field recovery) | core, ir, parser |
 | `csolver-asm` | x86-64 (Intel/AT&T) + AArch64 → MSIR | core, ir, parser |
-| `csolver-elf` | ELF/PE/Mach-O-Loader, Sections, Reloc, Symbole, DWARF, PLT/GOT/TLS, Exception-Tables | core, ir |
-| `csolver-memory` | symbolisches Speichermodell: Region, Pointer, Provenance, Permissions, Alignment, Lifetime | core |
-| `csolver-absint` | Abstract-Interpretation-Framework + Domänen (Interval, Congruence, Octagon, …), Widening/Narrowing | core, ir, cfg, memory |
-| `csolver-symbolic` | symbolische Ausführung: Path-Split/Merge, Lazy-Init, interprozedural, Summaries | core, ir, cfg, memory, solver |
-| `csolver-smt` | SMT-Backend-Abstraktion + Z3/Bitwuzla/CVC5 (+ portabler interner Fallback-Solver) | core |
-| `csolver-solver` | Constraint-IR, Simplifikation, Übersetzung in SMT | core, memory, smt |
-| `csolver-verifier` | Orchestrierung: erzeugt Beweisverpflichtungen aus MSIR+Analysen, entlädt sie, bildet Verdikte | core, ir, cfg, memory, absint, symbolic, solver, smt |
-| `csolver-report` | menschenlesbare & maschinenlesbare (JSON) Ausgabe, Beweisbaum, Gegenbeispiel | core |
-| `csolver-cli` | `solver`-Binary: `verify`, `report` | alle obigen |
-| `csolver-testsuite` | reale Rust-Programme mit `unsafe` als End-to-End-Fixtures | verifier, cli (dev) |
+| `csolver-elf` | ELF loader, sections, reloc, symbols, DWARF, PLT/GOT/TLS | core, ir |
+| `csolver-memory` | symbolic memory model: region, pointer, provenance, permissions, alignment, lifetime | core |
+| `csolver-absint` | abstract-interpretation framework + domains (interval, congruence, …), induction analysis, widening/narrowing | core, ir, cfg, memory |
+| `csolver-symbolic` | symbolic execution: merge-based path exploration, lazy init, interprocedural summaries, refutation | core, ir, cfg, memory, solver |
+| `csolver-smt` | SMT-backend abstraction (+ a portable internal fallback solver) | core |
+| `csolver-solver` | constraint IR (bit-vectors, zext, …), simplification, the bit-precise (bit-blasting) and linear procedures | core, memory, smt |
+| `csolver-verifier` | orchestration: builds proof obligations from MSIR+analyses, discharges them, forms verdicts; contract synthesis; precondition sidecar | core, ir, cfg, memory, absint, symbolic, solver, smt |
+| `csolver-report` | human- and machine-readable (JSON) output, proof tree, counterexample | core |
+| `csolver-cli` | the `solver` binary: `verify` (`--closed-world`, `--bugs`, `--pre`) | all of the above |
+| `csolver-testsuite` | real Rust/C programs with `unsafe`/raw pointers as end-to-end fixtures | verifier, cli (dev) |
 
-Externe Crates werden bewusst **spät** eingeführt und je Komponente in deren
-`Verification/Assumptions.md` begründet (z. B. `gimli`/`object` für DWARF/ELF,
-`iced-x86`/`yaxpeax` für Disassembly, `z3` für SMT). Das aktuelle Gerüst ist
-absichtlich `std`-only und damit offline reproduzierbar baubar.
+The current scaffold is deliberately `std`-only and therefore reproducibly
+buildable offline; external solver backends are introduced late and justified per
+component in its `Verification/`.
 
 ---
 
-## 4. Die zentralen Schnittstellen (Verträge)
+## 4. The central interfaces (contracts)
 
-Diese Typen/Traits sind die *Verträge* zwischen Komponenten. Details in den
-jeweiligen `lib.rs`-Doku-Kommentaren; hier der konzeptionelle Überblick.
+These types/traits are the *contracts* between components. Details live in the
+respective `lib.rs` doc comments; here is the conceptual overview.
 
-### 4.1 Verdikt & Beweis (`csolver-core`)
+### 4.1 Verdict & proof (`csolver-core`)
 
 ```rust
 enum Verdict { Pass, Fail, Unknown }
 
-struct ProofObligation { id, kind: SafetyProperty, location, predicate, .. }
-
-enum SafetyProperty {            // die Eigenschaften aus dem Auftrag
+enum SafetyProperty {            // the properties in scope
     InBounds, NoUseAfterFree, NoDoubleFree, NoDanglingDeref,
     NoNullDeref, StackIntegrity, ValidPointerArith, ValidReference,
     ValidWrite, ValidRead, NoForbiddenOverlap, Alignment,
     ValidStackFrame, ValidIndirectTarget,
 }
 
-enum ObligationResult {
-    Proven(ProofTree),
-    Refuted(CounterExample),
-    Open(Vec<ResidualObligation>, Vec<SuggestedAssumption>),
-}
+enum Decision { Proven(ProofTree), Refuted(Model), Unknown }
 ```
-
-`ProofTree`, `CounterExample`, `Assumption` sind ebenfalls in `core`, damit
-*jede* Komponente Beweise im gleichen Format produziert.
 
 ### 4.2 MSIR (`csolver-ir`)
 
-Ein typisiertes, blockbasiertes IR. Speicheroperationen sind **explizit** und
-tragen die nötige Information für Beweisverpflichtungen:
+A typed, block-argument SSA IR. Memory operations are **explicit** and carry the
+information needed for proof obligations:
 
 ```rust
 enum Inst {
-    Assign(Reg, RValue),
-    Load  { dst: Reg, ptr: Operand, ty: Type, align: Align },
-    Store { ptr: Operand, value: Operand, ty: Type, align: Align },
-    Alloc { dst: Reg, region: RegionKind, size: Operand, align: Align },
-    Dealloc { ptr: Operand, region: RegionKind },
-    PtrOffset { dst: Reg, base: Operand, offset: Operand, elem: Type },
-    Call  { .. }, Asm { .. }, Intrinsic { .. },
-    SafetyCheck(SafetyProperty, Predicate),  // explizite Beweisverpflichtung
+    Assign { dst, ty, value: RValue },
+    Load  { dst, ty, ptr, align },
+    Store { ty, ptr, value, align },
+    Alloc { dst, region: RegionKind, elem, count, align },
+    Dealloc { region: RegionKind, ptr },
+    PtrOffset { dst, base, index, elem },   // byte-offset gep
+    FieldPtr  { dst, base, field, size, align },
+    MemIntrinsic { kind: MemKind, dst, src, len }, // memcpy/memset/UserFill
+    Call { .. }, Intrinsic { .. }, Asm { .. },
+    SafetyCheck { condition, .. },           // explicit proof obligation
 }
 ```
 
-Jede `Load`/`Store`/`PtrOffset`/`Dealloc` impliziert kanonische
-`SafetyCheck`s; das Frontend darf zusätzliche aus Quellinformation (Borrow,
-Panic-Pfade) anhängen.
+Each `Load`/`Store`/`PtrOffset`/`Dealloc`/`MemIntrinsic` implies canonical
+`SafetyCheck`s (`Inst::implied_checks`); a frontend may attach more from source
+information (borrow, panic paths).
 
-### 4.3 Frontend-Vertrag
+### 4.3 Frontend contract
 
 ```rust
-trait Frontend {
-    type Input;
-    fn lower(&self, input: Self::Input) -> Result<ir::Module>;
-}
+trait Frontend { type Input; fn lower(&self, input: Self::Input) -> Result<ir::Module>; }
 ```
 
-### 4.4 Abstract-Interpretation-Vertrag (`csolver-absint`)
+A function that fails to lower is recorded in `Module::unanalyzed` (with a reason)
+and the rest of the module continues — per-function recovery, essential at kernel
+scale where one unsupported construct must not drop a whole translation unit.
+
+### 4.4 Abstract-interpretation contract (`csolver-absint`)
 
 ```rust
 trait AbstractDomain: Clone + PartialEq {
-    fn bottom() -> Self;  fn top() -> Self;
-    fn join(&self, other: &Self) -> Self;     // ⊔
-    fn meet(&self, other: &Self) -> Self;     // ⊓
-    fn widen(&self, other: &Self) -> Self;    // ∇  (Terminierung)
-    fn narrow(&self, other: &Self) -> Self;   // Δ  (Präzisionsrückgewinnung)
-    fn leq(&self, other: &Self) -> bool;      // ⊑
-}
-
-trait TransferFunction<D: AbstractDomain> {
-    fn apply(&self, inst: &ir::Inst, state: &D) -> D;
+    fn bottom() -> Self; fn top() -> Self;
+    fn join(&self, other: &Self) -> Self;    // ⊔
+    fn widen(&self, other: &Self) -> Self;   // ∇  (termination)
+    fn narrow(&self, other: &Self) -> Self;  // Δ  (precision recovery)
+    fn leq(&self, other: &Self) -> bool;     // ⊑
 }
 ```
 
-Der Fixpunkt-Iterator (Worklist + Widening an Schleifen-Headern, identifiziert
-von `csolver-cfg`) ist domänen-generisch.
+The fixpoint iterator (worklist + widening at loop headers identified by
+`csolver-cfg`) is domain-generic. `csolver-absint` also carries the induction
+analysis used to recognize counting loops.
 
-### 4.5 SMT-Vertrag (`csolver-smt`)
+### 4.5 Solver contract (`csolver-solver` / `csolver-smt`)
+
+The engine reasons over a hash-consed bit-vector expression DAG (`ExprCtx`), with
+two procedures: a **bit-precise** one (bit-blasting to SAT — exact, models
+wraparound and `zext`, used for refutation) and a **linear** one (integer, used
+for cheap proofs). External SMT backends (Z3/…) implement the same abstraction; a
+portable internal solver is the default and keeps CI offline.
+
+### 4.6 Verifier contract (`csolver-verifier`)
 
 ```rust
-trait SmtSolver {
-    fn declare(&mut self, sort: Sort) -> Term;
-    fn assert(&mut self, t: Term);
-    fn check(&mut self) -> SatResult;          // Sat(Model) | Unsat(UnsatCore) | Unknown
-    fn push(&mut self); fn pop(&mut self);
-}
+fn verify_module(module: &Module, config: &Config) -> ModuleReport;
 ```
 
-Backends (Z3/Bitwuzla/CVC5) implementieren denselben Trait; ein portabler,
-schwacher interner Bitvektor-Solver dient als Fallback und für CI ohne externe
-Solver. Theorien: `BV`, `Array`, `UF`, optional `Int`/`Real`.
+Per-obligation strategy (escalating, cheapest first):
+1. **Abstract interpretation** discharges the "obvious" checks (intervals).
+2. **Symbolic execution + the bit-precise solver** for what AI cannot close;
+   proves, or (per mode) refutes with a concrete model.
+3. Anything left open → `UNKNOWN` with a residual and a suggested minimal
+   annotation.
 
-### 4.6 Verifizierer-Vertrag (`csolver-verifier`)
-
-```rust
-fn verify_function(f: &ir::Function, cfg: &Config) -> FunctionReport;
-// FunctionReport { verdict, per_obligation: Vec<(ProofObligation, ObligationResult)> }
-```
-
-Strategie pro Verpflichtung (eskalierend, billigste zuerst):
-1. **Abstract Interpretation** entlädt „offensichtliche“ Checks (Intervalle).
-2. **Symbolische Ausführung + SMT** für das, was AI nicht schließt.
-3. Bleibt etwas offen → `UNKNOWN` mit Residual + Vorschlag minimaler Annotation.
+`Config` selects `closed_world` (whole-program contract synthesis) and
+`bug_finding` (see §1a). A **precondition sidecar** (`--pre`) supplies caller
+contracts C's types cannot express (`bytes`/`elements`/`cstring`/`sentinel`).
 
 ---
 
-## 5. Datenfluss eines `solver verify <binary>`
+## 5. Data flow of `solver verify <input>`
 
-1. `csolver-cli` erkennt Eingabetyp (ELF/`.ll`/`.s`/Crate) und wählt Frontend.
-2. `csolver-elf` lädt ELF, liefert Sections/Symbole/Reloc/DWARF an `csolver-asm`.
-3. `csolver-asm` disassembliert → MSIR; DWARF liefert Stack-Layout/Typen.
-4. `csolver-cfg` baut CFG, Dominatoren, Schleifen.
-5. `csolver-absint` berechnet Invarianten (Intervalle, Pointer-Domäne …).
-6. `csolver-verifier` erzeugt Beweisverpflichtungen, entlädt via AI, sonst via
-   `csolver-symbolic` + `csolver-solver`/`csolver-smt`.
-7. `csolver-report` rendert PASS/FAIL/UNKNOWN mit Beweisbaum bzw. Gegenbeispiel.
+1. `csolver-cli` detects the input kind (ELF/`.ll`/`.s`/`.rs`/`.mir`) and picks a
+   frontend.
+2. The frontend lowers to MSIR (LLVM: allocators → `Alloc`/`Dealloc`,
+   `copy_from_user` → `UserFill`, inline asm → opaque havoc, DWARF → field
+   pointee recovery). Un-lowerable functions go to `unanalyzed`.
+3. `csolver-cfg` builds the CFG, dominators, loops.
+4. `csolver-absint` computes invariants (intervals, inductions).
+5. `csolver-verifier` synthesizes contracts (closed-world), builds proof
+   obligations, and discharges them via AI, else via `csolver-symbolic` + the
+   solver.
+6. `csolver-report` renders PASS/FAIL/UNKNOWN with a proof tree or a
+   counterexample, plus the assumption set the result rests on.
 
-Für `.ll`/MIR/Crate analog, nur mit anderem Frontend; ab MSIR ist der Pfad
-identisch.
-
----
-
-## 6. Querschnitt: Performance & Inkrementalität
-
-- **Parallelität:** Funktionen sind die natürliche Parallelisierungseinheit
-  (interprozedural via Summaries, s. u.). Worklist-Fixpunkte je Funktion.
-- **Summaries:** interprozedurale Analyse nutzt zusammenfassende Pre-/
-  Postconditions je Funktion (kontextsensitiv per Call-String-Bound *k*).
-- **Caching/Inkrementell:** Verdikte werden über einen stabilen Hash des
-  MSIR-Funktionskörpers + Konfiguration gecacht; unveränderte Funktionen
-  werden nicht neu bewiesen.
-- Diese Mechanismen sind in `csolver-verifier` verortet; das Gerüst legt die
-  Schnittstellen an, die Implementierung folgt iterativ.
+From MSIR onward the path is identical across source levels.
 
 ---
 
-## 7. Verifikationsdokumentation pro Komponente
+## 6. Differential validation (the soundness oracles)
 
-Jede Crate hat einen Ordner `Verification/` mit den Abschnitten **Design,
-Spezifikation, Annahmen, Grenzen, Beweise, Teststrategie** (aktuell als ein
-`Verification/README.md` mit diesen sechs Abschnitten; bei Bedarf in
-Einzeldateien aufgeteilt). Dort steht insbesondere das *Soundness-Argument*
-der Komponente und welche Annahmen sie in den globalen Report einbringt.
+Verdicts are checked against **dynamic** oracles that observe real UB:
+
+- **Rust:** `differential/run.sh` runs CSolver against **Miri** over a curated,
+  fuzzed corpus. `Miri UB + CSolver PASS` is a soundness violation (must be zero).
+- **C:** `differential/c/run.sh` runs CSolver against **AddressSanitizer + the
+  memory subset of UBSan** (spatial + temporal; arithmetic-only UB is excluded on
+  purpose — CSolver proves memory safety, not overflow-freedom). It reports both
+  false `PASS` and, for `--bugs`, false `FAIL`; both must be zero. `--selftest`
+  positive-controls the violation detector so a reported "0" is not a broken metric.
+- **Kernel:** `scaling/kernel/run.sh` sweeps LLVM IR emitted from a real Linux
+  kernel build (`make LLVM=1 <file>.ll`) in `--bugs` mode and aggregates the FAIL
+  candidates (see its README).
 
 ---
 
-## 8. Roadmap (iterativ, je Stufe: Code + Tests + Doku + Verification)
+## 7. Cross-cutting: performance & incrementality
 
-- **M0 (dieser Stand):** Architektur, Workspace, `core`-Verträge, MSIR-Typen,
-  `cfg`-Dominatoren, `memory`-Pointermodell, `absint`-Intervalldomäne — alles
-  getestet und grün; übrige Crates als dokumentierte Interface-Stubs.
-- **M1:** Vertikaler Durchstich „LLVM-IR → In-Bounds-Beweis“ für eine
-  Funktion mit beschränkter Schleife (Interval-AI, ohne SMT).
-- **M2:** symbolische Ausführung + interner Bitvektor-Solver; `FAIL` mit
-  Gegenbeispiel.
-- **M3:** Z3-Backend; Array-Theorie für Heap; Use-after-Free/Double-Free.
-- **M4:** ELF+asm-Frontend (x86-64) für kleine Binaries; DWARF-Stacklayout.
-- **M5:** MIR-Frontend mit Borrow-/Panic-Info; interprozedurale Summaries.
+- **Parallelism:** functions are the natural unit (interprocedural via summaries).
+- **Merge-based exploration:** joins with N predecessors are analysed once, not
+  once per path, so wide CFGs do not blow up the path count.
+- **Bounded exploration:** `ExecLimits` caps visits and wall-clock per function so
+  an adversarial input cannot run unbounded.
 
-Reihenfolge nach M0 ist verhandelbar und wird mit dem Auftraggeber priorisiert.
+---
+
+## 8. Verification documentation per component
+
+Each crate has a `Verification/` folder with **Design, Specification, Assumptions,
+Limits, Proofs, Test strategy**. It records the component's *soundness argument*
+and which assumptions it contributes to the global report.
+
+---
+
+## 9. Status
+
+The common IR and the whole pipeline are implemented and audited: MSIR, CFG,
+memory model, interval + induction AI, merge-based symbolic execution with an
+alias-aware heap, interprocedural summaries, and the internal bit-precise/linear
+solver. The **Rust (MIR)** and **LLVM/C** frontends are mature; the LLVM frontend
+handles optimized IR, DWARF field recovery, C allocators, user-copies, and inline
+asm. **C++** is handled through the same LLVM path (DWARF-validated with clang).
+The **asm** and **ELF** frontends are the remaining frontend work.
+
+For memory safety CSolver proves spatial + temporal safety for constant, guarded,
+loop, and cross-call accesses, and — in `--bugs` mode — finds out-of-bounds,
+use-after-free, double-free, and `copy_from_user`-overflow bugs on kernel-style C,
+each validated against the ASan oracle. See `docs/STATUS.md` and the per-crate
+`Verification/` for the authoritative, current detail.

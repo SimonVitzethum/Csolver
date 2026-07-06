@@ -1,5 +1,41 @@
 # Status
 
+## Current state (summary)
+
+The common IR (MSIR) and the full verification pipeline are implemented and
+soundness-audited: merge-based symbolic execution, alias-aware heap, interval +
+induction abstract interpretation, interprocedural summaries, and the internal
+bit-precise (bit-blasting) / linear solver. Both the **Rust (MIR)** and **LLVM/C**
+frontends are mature.
+
+Highlights beyond the historical log below:
+
+- **C / C++ frontend.** The LLVM path handles optimized IR, DWARF field-pointee
+  recovery (C/C++), unions, bitfields, nested aggregates, function pointers,
+  switch, `memcpy`/`memset`, non-loop goto, variadic definitions/calls, and
+  `strlen`-shaped sentinel scans (via a precondition). Struct-field member
+  provenance works at `-O0` and `-O1`.
+- **Whole-program mode** (`--closed-world`): synthesizes parameter and field
+  contracts for exported functions from their in-module call sites.
+- **Precondition sidecar** (`--pre`): caller contracts C's types cannot express
+  (`bytes`/`elements`/`cstring`/`sentinel`).
+- **Bug-finding mode** (`--bugs`) for kernel-style C: C/kernel allocators
+  (`kmalloc`/`kfree`/… → heap regions), `copy_from_user`/`copy_to_user` bounds,
+  user-data taint (a length read from a user-copied struct is refutable), inline
+  asm as an opaque havoc (keeps the function analysable), refutable bulk copies,
+  and unit-stride loop-induction OOB (the off-by-one class). Finds all 8 memory-bug
+  classes in the C differential corpus with **zero false positives**.
+- **Oracles.** Rust vs **Miri** (`differential/`), C vs **ASan+UBSan**
+  (`differential/c/`), and a **kernel sweep** over real `make LLVM=1` IR
+  (`scaling/kernel/`).
+
+Known open frontend gap on real kernel IR: complex `getelementptr` shapes
+(multi-index / vector) still drop the enclosing function to `unanalyzed`.
+
+The historical, increment-by-increment log follows.
+
+---
+
 Milestone **M1 — symbolic execution + SMT (increment 1 done)**, on top of the
 completed **M0 — architecture + foundations**.
 
