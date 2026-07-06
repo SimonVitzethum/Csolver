@@ -850,15 +850,15 @@ define i64 @exported(i64 %i) {
 entry:
   %a = alloca [8 x i64], align 8
   %p = getelementptr [8 x i64], ptr %a, i64 0, i64 %i
-  %v = load i64, ptr %p, align 8
-  ret i64 %v
+  store i64 1, ptr %p, align 8
+  ret i64 0
 }
 define internal i64 @internal(i64 %i) {
 entry:
   %a = alloca [8 x i64], align 8
   %p = getelementptr [8 x i64], ptr %a, i64 0, i64 %i
-  %v = load i64, ptr %p, align 8
-  ret i64 %v
+  store i64 1, ptr %p, align 8
+  ret i64 0
 }
 define i64 @caller() {
 entry:

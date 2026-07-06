@@ -2878,12 +2878,17 @@ impl Explorer<'_> {
         if conjuncts.iter().all(|&g| self.prove(g, state)) {
             return Decision::Proven;
         }
-        // Refute on an exact path (the strict, always-sound gate); OR, in
-        // bug-finding mode, on an inexact path when the goal depends only on
-        // genuine inputs — the violating witness is then genuinely reachable
-        // (see `goal_is_genuine`). Restricted to `Possible` (memory) refutation:
-        // scalar `Definite` checks keep the strict gate.
-        let gate = state.exact
+        // Refute on an exact path (the strict, always-sound gate) — EXCEPT when the
+        // goal is a free choice of an **internal** function's parameter: those are
+        // caller-established (the guard lives at the in-module call sites), so a
+        // witness picked freely from the parameter space may never occur, exactly as
+        // an internal function's pointer contracts are prove-only. A constant OOB in
+        // an internal function still refutes (no caller can prevent it). OR, in
+        // bug-finding mode, refute on an inexact path when the goal depends only on
+        // genuine inputs (see `goal_is_genuine`), so the witness is genuinely reachable.
+        let internal_free_param =
+            !self.exported && conjuncts.iter().any(|&g| self.goal_has_param(g));
+        let gate = (state.exact && !internal_free_param)
             || (self.bug_finding
                 && mode == RefuteMode::Possible
                 && conjuncts.iter().all(|&g| self.goal_is_genuine(g)));
@@ -2903,6 +2908,37 @@ impl Explorer<'_> {
     /// inputs only through real branch guards (never dropped by havoc, which only
     /// replaces the values it modifies), so a witness violating such a goal is a
     /// genuinely reachable input. Stateless — the name records the value's origin.
+    /// Whether `goal` depends on a bare function parameter (`arg…`) — used to
+    /// suppress refuting an *internal* function's access on a freely-chosen
+    /// parameter value (caller-constrained). Constants and derived non-parameter
+    /// values do not count, so a definite (constant) violation still refutes.
+    fn goal_has_param(&self, goal: ExprId) -> bool {
+        let mut stack = vec![goal];
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        while let Some(e) = stack.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            match self.ctx.node(e) {
+                Node::Sym { name, .. } if name.starts_with("arg") => return true,
+                Node::Sym { .. } | Node::Const(_) | Node::Bool(_) => {}
+                Node::Not(a) => stack.push(*a),
+                Node::Bin { a, b, .. } | Node::Cmp { a, b, .. } => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Node::And(xs) | Node::Or(xs) => stack.extend(xs.iter().copied()),
+                Node::Ite { c, t, e } => {
+                    stack.push(*c);
+                    stack.push(*t);
+                    stack.push(*e);
+                }
+                Node::Zext(v) => stack.push(*v),
+            }
+        }
+        false
+    }
+
     fn goal_is_genuine(&self, goal: ExprId) -> bool {
         let mut stack = vec![goal];
         let mut seen: HashSet<ExprId> = HashSet::new();
