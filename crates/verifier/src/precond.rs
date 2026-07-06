@@ -26,6 +26,9 @@
 //! - `bytes N` — the pointer is valid for `N` bytes.
 //! - `elements L E` — valid for `(param L)` elements of `E` bytes each (a
 //!   `(ptr, len)` buffer: `sum(const T* p, int n)` is `p 0 elements 1 sizeof(T)`).
+//! - `cstring N` — valid for `N` bytes AND null-terminated (a zero *byte* before
+//!   the end): bounds a `strlen`-shaped `while (p[n]) n++` scan.
+//! - `sentinel N E` — as `cstring`, but with an `E`-byte zero terminator element.
 //! - `readonly` — grant read but not write (default is read+write).
 
 use csolver_ir::{FuncId, Module, PtrContract, SizeSpec};
@@ -44,6 +47,9 @@ pub struct Precondition {
     pub align: u32,
     /// Whether the pointee may be written (else read-only).
     pub writable: bool,
+    /// `Some(elem_bytes)` if the region is sentinel-terminated (a zero element of
+    /// that width exists before the end) — bounds a `while (p[n] != 0)` scan.
+    pub sentinel: Option<u64>,
 }
 
 /// Parse a precondition file, returning a helpful error (with the 1-based line
@@ -68,10 +74,10 @@ fn parse_line(line: &str) -> Result<Precondition, String> {
     }
     let function = f[0].to_string();
     let param: u32 = f[1].parse().map_err(|_| err())?;
-    let (size, align, rest_at) = match f[2] {
+    let (size, align, sentinel, rest_at) = match f[2] {
         // A byte size carries no element type, so alignment stays 1 (an aligned
         // access through it then remains an obligation).
-        "bytes" => (SizeSpec::Bytes(f[3].parse().map_err(|_| err())?), 1, 4),
+        "bytes" => (SizeSpec::Bytes(f[3].parse().map_err(|_| err())?), 1, None, 4),
         "elements" => {
             if f.len() < 5 {
                 return Err(err());
@@ -80,7 +86,19 @@ fn parse_line(line: &str) -> Result<Precondition, String> {
             let elem_size: u64 = f[4].parse().map_err(|_| err())?;
             // A buffer of `E`-byte elements is naturally `E`-aligned (capped).
             let align = (elem_size.max(1) as u32).min(16).next_power_of_two();
-            (SizeSpec::ParamElements { len_param, elem_size }, align, 5)
+            (SizeSpec::ParamElements { len_param, elem_size }, align, None, 5)
+        }
+        // A null-terminated C string: `N` bytes, with a zero *byte* terminator
+        // within. `sentinel <N> <E>` generalizes to an `E`-byte zero element.
+        "cstring" => (SizeSpec::Bytes(f[3].parse().map_err(|_| err())?), 1, Some(1), 4),
+        "sentinel" => {
+            if f.len() < 5 {
+                return Err(err());
+            }
+            let n: u64 = f[3].parse().map_err(|_| err())?;
+            let elem: u64 = f[4].parse().map_err(|_| err())?;
+            let align = (elem.max(1) as u32).min(16).next_power_of_two();
+            (SizeSpec::Bytes(n), align, Some(elem), 5)
         }
         other => return Err(format!("unknown precondition kind `{other}`")),
     };
@@ -89,7 +107,7 @@ fn parse_line(line: &str) -> Result<Precondition, String> {
         Some(&"readonly") => false,
         Some(other) => return Err(format!("expected `readonly` or end of line, got `{other}`")),
     };
-    Ok(Precondition { function, param, size, align, writable })
+    Ok(Precondition { function, param, size, align, writable, sentinel })
 }
 
 /// Apply preconditions to a module's parameter contracts. A function named in the
@@ -119,6 +137,7 @@ pub fn apply(module: &mut Module, preconds: &[Precondition]) -> Result<usize, St
                 // Caller-established: prove-only, never refuted (a witness against
                 // it may be an argument no valid caller passes).
                 refutable: false,
+                sentinel: p.sentinel,
             },
         );
         applied += 1;
@@ -145,6 +164,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_cstring_and_sentinel() {
+        let p = parse("s 0 cstring 4096\nw 1 sentinel 800 2").expect("parse");
+        assert!(matches!(p[0].size, SizeSpec::Bytes(4096)));
+        assert_eq!(p[0].sentinel, Some(1), "cstring is a 1-byte zero terminator");
+        assert!(matches!(p[1].size, SizeSpec::Bytes(800)));
+        assert_eq!(p[1].sentinel, Some(2), "sentinel element width");
+        assert_eq!(p[1].align, 2);
+    }
+
+    #[test]
     fn rejects_malformed_lines_with_line_number() {
         assert!(parse("sum 0 wat 3").unwrap_err().contains("line 1"));
         assert!(parse("ok 0 bytes 8\nbad line here too few").unwrap_err().contains("line 2"));
@@ -159,6 +188,7 @@ mod tests {
             size: SizeSpec::Bytes(8),
             align: 1,
             writable: true,
+            sentinel: None,
         }];
         assert!(apply(&mut { module }, &pre).unwrap_err().contains("unknown function"));
     }

@@ -247,13 +247,16 @@ fn discharge_inner(
     let mut headers: HashSet<BlockId> = HashSet::new();
     let mut loop_modified: HashMap<BlockId, Vec<RegId>> = HashMap::new();
     let mut loop_frees: HashMap<BlockId, bool> = HashMap::new();
+    let mut loop_bodies: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for l in loops.all() {
         let header = analysis.cfg().block_id(l.header);
         headers.insert(header);
         let mut modified: HashSet<RegId> = HashSet::new();
         let mut frees = false;
+        let mut body: Vec<BlockId> = Vec::new();
         for &node in &l.body {
             let bid = analysis.cfg().block_id(node);
+            body.push(bid);
             if let Some(b) = f.block(bid) {
                 modified.extend(b.params.iter().map(|(r, _)| *r));
                 for inst in &b.insts {
@@ -268,6 +271,7 @@ fn discharge_inner(
         }
         loop_modified.insert(header, modified.into_iter().collect());
         loop_frees.insert(header, frees);
+        loop_bodies.insert(header, body);
     }
 
     let mut ex = Explorer {
@@ -287,6 +291,7 @@ fn discharge_inner(
         headers,
         loop_modified,
         loop_frees,
+        loop_bodies,
         summaries: summaries.clone(),
         field_offsets: HashMap::new(),
         field_frontier: HashMap::new(),
@@ -367,6 +372,7 @@ fn discharge_inner(
             // assumption its `SizeSpec` would imply.
             contract: Some(c.assumption.unwrap_or(assumption)),
             size_nowrap: nowrap,
+            sentinel: c.sentinel,
         });
         env.insert(
             *reg,
@@ -397,6 +403,7 @@ fn discharge_inner(
                 },
                 contract: Some(fc.pointee.assumption.unwrap_or(PARAM_CONTRACTS)),
                 size_nowrap: None,
+                sentinel: None,
             });
             let palign = fc.pointee.align.max(1) as u64;
             let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
@@ -434,6 +441,7 @@ fn discharge_inner(
             perms: Permissions { read: true, write: g.writable, exec: false },
             contract: Some(GLOBAL_MEMORY),
             size_nowrap: Some(truth),
+            sentinel: None,
         });
         ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
     }
@@ -869,6 +877,11 @@ struct SymRegion {
     /// a faithful witness, with `fact` added to the refutation query only (not to
     /// the proving assumptions, to keep proofs cheap). `None` ⇒ not refutable.
     size_nowrap: Option<ExprId>,
+    /// `Some(elem_bytes)` if the region is **sentinel-terminated**: a zero element
+    /// of that width lies before its end. A sequential `while (p[n] != 0)` scan
+    /// over it is then bounded (it must stop at the sentinel), which lets a
+    /// `strlen`-shaped loop be proved. `None` for an ordinary region.
+    sentinel: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1015,6 +1028,8 @@ struct Explorer<'f> {
     loop_modified: HashMap<BlockId, Vec<RegId>>,
     /// Per loop header: whether the loop body may free memory.
     loop_frees: HashMap<BlockId, bool>,
+    /// Per loop header: the blocks forming the loop body (for pattern analyses).
+    loop_bodies: HashMap<BlockId, Vec<BlockId>>,
     /// Interprocedural summaries, by callee id (empty = havoc all calls).
     summaries: HashMap<FuncId, Summary>,
     /// A deterministic synthetic field layout per region: the byte offset assigned
@@ -1614,6 +1629,153 @@ impl Explorer<'_> {
         for cap in ptr_inductions {
             self.assert_ptr_walk_bound(state, cap);
         }
+
+        // Sentinel-scan (`while (p[n] != 0) n++`) bound: if this loop sequentially
+        // scans a sentinel-terminated region for its zero terminator, its index
+        // cannot pass that terminator, which lies before the end.
+        self.install_sentinel_scan_bound(header, state);
+    }
+
+    /// If `header`'s loop is a **sentinel scan** over a sentinel-terminated region
+    /// — an index `n` starting at 0 and stepping by one element, a load of
+    /// `base[n]`, and a loop exit taken exactly when that load is zero — bound the
+    /// index by the region so every `base[n]` access is in bounds. Sound because a
+    /// zero element is guaranteed before the end and the unit stride visits every
+    /// element, so the scan stops at or before it: `n < element_count`, hence
+    /// `(n+1)·E ≤ size`. Every side-condition below is checked; if any fails,
+    /// nothing is installed.
+    fn install_sentinel_scan_bound(&mut self, header: BlockId, state: &mut PathState) {
+        let Some(body) = self.loop_bodies.get(&header).cloned() else { return };
+        let body_set: HashSet<BlockId> = body.iter().copied().collect();
+        let Some(hdr) = self.f.block(header) else { return };
+
+        // Definition of every register (for the increment / gep / cmp checks).
+        let mut def: HashMap<RegId, &Inst> = HashMap::new();
+        for b in &self.f.blocks {
+            for inst in &b.insts {
+                if let Some(d) = inst.defined_reg() {
+                    def.insert(d, inst);
+                }
+            }
+        }
+
+        // 1. A counting induction `n`: a header parameter whose value is 0 on the
+        //    entry edge and `n + 1` on the back-edge (unit stride, so it visits
+        //    every element and cannot step over the sentinel).
+        let preds: Vec<BlockId> = self
+            .analysis
+            .cfg()
+            .predecessors(self.analysis.cfg().index_of(header).unwrap_or(usize::MAX))
+            .iter()
+            .map(|&p| self.analysis.cfg().block_id(p))
+            .collect();
+        for (pos, &(n, _)) in hdr.params.iter().enumerate() {
+            let mut zero_entry = false;
+            let mut unit_backedge = false;
+            for &pred in &preds {
+                let Some(args) = edge_args(self.f, pred, header) else { continue };
+                let Some(arg) = args.get(pos) else { continue };
+                if self.is_back_edge(pred, header) {
+                    // back-edge arg must be `n + 1`.
+                    if let Operand::Reg(m) = arg {
+                        if let Some(Inst::Assign { value: RValue::Bin { op: BinOp::Add, lhs, rhs }, .. }) =
+                            def.get(&resolve_copy(*m, &def))
+                        {
+                            let one = |o: &Operand| matches!(o, Operand::Const(Const::Int(bv)) if bv.unsigned() == 1);
+                            // The increment operand may be a copy of `n`.
+                            let is_n = |o: &Operand| matches!(o, Operand::Reg(r) if resolve_copy(*r, &def) == n);
+                            unit_backedge = (is_n(lhs) && one(rhs)) || (is_n(rhs) && one(lhs));
+                        }
+                    }
+                } else if matches!(arg, Operand::Const(Const::Int(bv)) if bv.unsigned() == 0) {
+                    zero_entry = true;
+                }
+            }
+            if !(zero_entry && unit_backedge) {
+                continue;
+            }
+
+            // 2. In the body, a load `v = base[n]` of an `E`-byte element, where
+            //    `base` evaluates to a sentinel-terminated region of element `E`.
+            for &bid in &body {
+                let Some(blk) = self.f.block(bid) else { continue };
+                for inst in &blk.insts {
+                    let Inst::Load { dst: v, ty, ptr: Operand::Reg(q), .. } = inst else { continue };
+                    let Some(Inst::PtrOffset { base: Operand::Reg(b), index: Operand::Reg(idx), elem, .. }) =
+                        def.get(q)
+                    else {
+                        continue;
+                    };
+                    // mem2reg leaves the base/index as copies of the parameter and
+                    // the induction (`%b = base`, `%i = n`); follow those chains.
+                    if resolve_copy(*idx, &def) != n {
+                        continue;
+                    }
+                    let base_reg = resolve_copy(*b, &def);
+                    let Some(e) = elem.size_bytes(&LAYOUT) else { continue };
+                    if ty.size_bytes(&LAYOUT) != Some(e) {
+                        continue;
+                    }
+                    // The base must be a live sentinel region of matching element.
+                    let Some(SymValue::Ptr(bp)) = state.env.get(&base_reg) else { continue };
+                    let Prov::Region(rid) = bp.prov else { continue };
+                    let Some(region) = state.regions.get(rid) else { continue };
+                    if region.sentinel != Some(e) {
+                        continue;
+                    }
+                    // 3. The loaded value must gate the loop exit: a `v == 0` /
+                    //    `v != 0` comparison feeding a branch that leaves the loop.
+                    if !self.loaded_value_gates_exit(*v, &body_set, &def) {
+                        continue;
+                    }
+                    // All side-conditions hold: install `(n + 1)·E ≤ size`, so the
+                    // access `base[n]` (offset `n·E`, span `E`) is in bounds.
+                    let size = region.size;
+                    let Some(&SymValue::Scalar(n_e)) = state.env.get(&n) else { continue };
+                    let one = self.ctx.int(PTR_WIDTH, 1);
+                    let np1 = self.ctx.bin(BvOp::Add, n_e, one);
+                    let e_e = self.ctx.int(PTR_WIDTH, e as u128);
+                    let bytes = self.ctx.bin(BvOp::Mul, np1, e_e);
+                    let fact = self.ctx.cmp(SCmp::Sle, bytes, size);
+                    state.facts.push(fact);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether `v` (a loaded value) feeds a comparison to zero that governs a
+    /// branch leaving the loop body — the sentinel test of a scan.
+    fn loaded_value_gates_exit(
+        &self,
+        v: RegId,
+        body: &HashSet<BlockId>,
+        def: &HashMap<RegId, &Inst>,
+    ) -> bool {
+        // Registers equal to `v`'s zero-test: `icmp eq/ne v, 0`.
+        let mut tests: HashSet<RegId> = HashSet::new();
+        for (d, inst) in def {
+            if let Inst::Assign { value: RValue::Cmp { op: CmpOp::Eq | CmpOp::Ne, lhs, rhs }, .. } = inst {
+                let is_v = |o: &Operand| matches!(o, Operand::Reg(r) if *r == v);
+                let is_zero = |o: &Operand| matches!(o, Operand::Const(Const::Int(bv)) if bv.unsigned() == 0);
+                if (is_v(lhs) && is_zero(rhs)) || (is_v(rhs) && is_zero(lhs)) {
+                    tests.insert(*d);
+                }
+            }
+        }
+        if tests.is_empty() {
+            return false;
+        }
+        // A `CondBr` on such a test with a target outside the loop = the exit.
+        for &bid in body {
+            let Some(blk) = self.f.block(bid) else { continue };
+            if let Terminator::CondBr { cond: Operand::Reg(c), then_blk, else_blk, .. } = &blk.term {
+                if tests.contains(c) && (!body.contains(then_blk) || !body.contains(else_blk)) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Install the sound offset bound for a pointer equality-exit induction. The
@@ -1785,6 +1947,7 @@ impl Explorer<'_> {
                     perms,
                     contract: None,
                     size_nowrap: Some(nowrap),
+                    sentinel: None,
                 });
                 // The byte size is non-negative by construction.
                 let zero = self.ctx.int(PTR_WIDTH, 0);
@@ -2145,6 +2308,7 @@ impl Explorer<'_> {
             perms: Permissions { read: true, write: writable, exec: false },
             contract: Some(VALID_REFERENCE),
             size_nowrap: nowrap,
+            sentinel: None,
         });
         rid
     }
@@ -2789,6 +2953,36 @@ impl Explorer<'_> {
                 self.ctx.not(inner)
             }
         }
+    }
+}
+
+/// Follow register-copy chains (`dst = src`, which mem2reg leaves when a promoted
+/// load feeds a use) to the underlying register.
+fn resolve_copy(mut r: RegId, def: &HashMap<RegId, &Inst>) -> RegId {
+    for _ in 0..64 {
+        match def.get(&r) {
+            Some(Inst::Assign { value: RValue::Use(Operand::Reg(src)), .. }) if *src != r => r = *src,
+            _ => break,
+        }
+    }
+    r
+}
+
+/// The argument list `pred`'s terminator passes along the edge to `target`
+/// (the block-parameter bindings), or `None` if `pred` does not branch there.
+fn edge_args(f: &Function, pred: BlockId, target: BlockId) -> Option<&Vec<Operand>> {
+    match &f.block(pred)?.term {
+        Terminator::Br { target: t, args } if *t == target => Some(args),
+        Terminator::CondBr { then_blk, then_args, else_blk, else_args, .. } => {
+            if *then_blk == target {
+                Some(then_args)
+            } else if *else_blk == target {
+                Some(else_args)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

@@ -187,6 +187,13 @@ pub struct PtrContract {
     /// real program — refuting there is a false FAIL). Prove-only contracts
     /// still prove; they never refute.
     pub refutable: bool,
+    /// If `Some(elem_bytes)`, the region is **sentinel-terminated**: it contains a
+    /// zero element of `elem_bytes` bytes at some index before its end (a C string
+    /// is `Some(1)`). A sequential scan `while (p[n] != 0) n++` over it is then
+    /// bounded — it must stop at that sentinel — which is what makes a `strlen`-
+    /// shaped loop provable. Language-agnostic: any "scan until a zero terminator"
+    /// buffer. `None` for an ordinary region.
+    pub sentinel: Option<u64>,
 }
 
 /// A contract on a *field* of a contracted pointer parameter: the pointer

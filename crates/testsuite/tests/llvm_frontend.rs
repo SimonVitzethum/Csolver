@@ -1775,3 +1775,94 @@ fn precondition_sidecar_verifies_annotated_buffer_api() {
         "the declared buffer precondition proves the indexed loop"
     );
 }
+
+/// The sentinel-scan engine bound: a `strlen`-shaped loop `while (s[n]) n++` over
+/// a region declared null-terminated (`cstring`) verifies — the scan cannot pass
+/// the terminator, which lies before the end. Language-agnostic: any "scan until a
+/// zero element" loop.
+const SENTINEL_SCAN: &str = r#"
+define i64 @scan(ptr %s) {
+entry:
+  br label %head
+head:
+  %n = phi i64 [ 0, %entry ], [ %nn, %body ]
+  %q = getelementptr i8, ptr %s, i64 %n
+  %c = load i8, ptr %q, align 1
+  %z = icmp eq i8 %c, 0
+  br i1 %z, label %exit, label %body
+body:
+  %nn = add i64 %n, 1
+  br label %head
+exit:
+  ret i64 %n
+}
+"#;
+
+#[allow(clippy::expect_used)] // a test helper, like the `#[test]` bodies it serves
+fn verify_with_pre(src: &str, name: &str, pre: &str) -> Verdict {
+    let mut module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: name.into() })
+        .expect("lower");
+    let p = csolver_verifier::precond::parse(pre).expect("parse pre");
+    csolver_verifier::precond::apply(&mut module, &p).expect("apply pre");
+    verify_module(&module, &Config::default()).verdict
+}
+
+#[test]
+fn sentinel_scan_over_cstring_verifies() {
+    // Without the precondition the unbounded scan is UNKNOWN; with it, PASS.
+    let bare = LlvmFrontend
+        .lower(LlvmInput { source: SENTINEL_SCAN.into(), name: "s".into() })
+        .expect("lower");
+    assert_ne!(verify_module(&bare, &Config::default()).verdict, Verdict::Pass);
+    assert_eq!(verify_with_pre(SENTINEL_SCAN, "s", "scan 0 cstring 4096"), Verdict::Pass);
+}
+
+/// Soundness control: a loop that loads `s[n]` but whose exit is *not* the
+/// sentinel test (`n < m`, not `s[n] == 0`) may run past the terminator, so the
+/// scan bound must not apply — UNKNOWN even with the `cstring` precondition.
+#[test]
+fn sentinel_scan_requires_exit_on_the_loaded_value() {
+    let src = r#"
+define i64 @f(ptr %s, i64 %m) {
+entry:
+  br label %head
+head:
+  %n = phi i64 [ 0, %entry ], [ %nn, %body ]
+  %q = getelementptr i8, ptr %s, i64 %n
+  %c = load i8, ptr %q, align 1
+  %lt = icmp slt i64 %n, %m
+  br i1 %lt, label %body, label %exit
+body:
+  %nn = add i64 %n, 1
+  br label %head
+exit:
+  ret i64 %n
+}
+"#;
+    assert_ne!(verify_with_pre(src, "f", "f 0 cstring 4096"), Verdict::Pass);
+}
+
+/// Soundness control: a stride-2 scan can step over the terminator, so the bound
+/// must not apply — UNKNOWN even with the `cstring` precondition.
+#[test]
+fn sentinel_scan_requires_unit_stride() {
+    let src = r#"
+define i64 @f(ptr %s) {
+entry:
+  br label %head
+head:
+  %n = phi i64 [ 0, %entry ], [ %nn, %body ]
+  %q = getelementptr i8, ptr %s, i64 %n
+  %c = load i8, ptr %q, align 1
+  %z = icmp eq i8 %c, 0
+  br i1 %z, label %exit, label %body
+body:
+  %nn = add i64 %n, 2
+  br label %head
+exit:
+  ret i64 %n
+}
+"#;
+    assert_ne!(verify_with_pre(src, "f", "f 0 cstring 4096"), Verdict::Pass);
+}

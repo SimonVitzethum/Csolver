@@ -202,6 +202,7 @@ fn synthesize_round(
                     // guarantee; a witness against it may combine argument
                     // values no single caller produces — prove-only.
                     refutable: false,
+                    sentinel: None,
                 },
             ))
         })
@@ -415,6 +416,7 @@ pub(crate) fn synthesize_fields(
                             CLOSED_WORLD_CONTRACT
                         }),
                         refutable: false,
+                        sentinel: None,
                     },
                 })
                 .collect();

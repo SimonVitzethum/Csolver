@@ -141,6 +141,7 @@ fn lower_function(
                             align: pointee_align(inner),
                             readable: true,
                             writable: *mutable,
+                            sentinel: None,
                         },
                     ));
                 } else if matches!(inner.as_ref(), MType::Other) {
@@ -156,6 +157,7 @@ fn lower_function(
                             align: 1,
                             readable: true,
                             writable: *mutable,
+                            sentinel: None,
                         },
                     ));
                 }
@@ -177,6 +179,7 @@ fn lower_function(
                 align: stride as u32,
                 readable: true,
                 writable: mutable,
+                sentinel: None,
             },
         ));
     }

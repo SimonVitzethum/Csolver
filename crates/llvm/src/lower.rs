@@ -192,6 +192,7 @@ fn lower_function(
                     align: p.align.unwrap_or(1),
                     readable: !p.writeonly,
                     writable: !p.readonly,
+                    sentinel: None,
                 },
             )
         };
@@ -225,6 +226,7 @@ fn lower_function(
                         align: p.align.unwrap_or(1),
                         readable: !p.writeonly,
                         writable: c.writable && !p.readonly,
+                        sentinel: None,
                     },
                 ));
             }
