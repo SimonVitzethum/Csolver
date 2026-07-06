@@ -837,6 +837,38 @@ declare void @free(ptr)
         "a free with no later use must not be a false positive");
 }
 
+/// A **multi-level** nested gep (`gep %Outer, ptr, 0, 1, 2` — field 1 of Outer, then
+/// field/index 2 within it) must lower to the exact padded byte offset, not drop the
+/// whole function. Pervasive in real C/kernel IR. The offset must be correct, not just
+/// non-dropped: a safe nested access proves in bounds (a wrong offset would not), and
+/// the function is analysed (no `unanalyzed` entry).
+#[test]
+fn nested_multi_level_gep_resolves_the_offset() {
+    // Outer = { i32 x, {i32,i64} in, [4 x i64] arr }; read in.b then arr[3], both in
+    // bounds → PASS proves the nested offsets are right. A whole-program local.
+    let src = r#"
+%struct.inner = type { i32, i64 }
+%struct.outer = type { i32, %struct.inner, [4 x i64] }
+define i64 @f() {
+entry:
+  %o = alloca %struct.outer, align 8
+  %pb = getelementptr inbounds %struct.outer, ptr %o, i64 0, i32 1, i32 1
+  store i64 5, ptr %pb, align 8
+  %b = load i64, ptr %pb, align 8
+  %pa = getelementptr inbounds %struct.outer, ptr %o, i64 0, i32 2, i64 3
+  store i64 7, ptr %pa, align 8
+  %a = load i64, ptr %pa, align 8
+  %s = add i64 %b, %a
+  ret i64 %s
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "n".into() }).expect("lower");
+    assert!(m.unanalyzed.is_empty(), "a nested gep must not drop the function: {:?}", m.unanalyzed);
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "in-bounds nested field + array accesses prove — the padded offsets are correct");
+}
+
 /// A Linux user-copy with an unchecked, caller-controlled length overruns the kernel
 /// buffer — `copy_from_user(buf64, ubuf, n)` with free `n`. It lowers to a refutable
 /// bulk write, so the overflow is a FAIL with a witness; the length-checked sibling

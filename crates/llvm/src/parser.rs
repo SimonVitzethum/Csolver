@@ -219,6 +219,12 @@ pub enum LInst {
     /// Lowered as a two-step pointer-offset chain with the exact padded field
     /// offset (a dropped field offset would misplace every subsequent access).
     GepField { dst: String, struct_ty: LType, base: LValue, index: LValue, field: u32 },
+    /// A **multi-level** gep into a nested aggregate with an all-constant navigation
+    /// path: `base + index * sizeof(agg) + offsetof(agg, path)` where `path` walks
+    /// struct fields and constant array indices (`gep %S, ptr, i, K1, K2, …`). The
+    /// exact nested byte offset is resolved at lowering from the type layout. This
+    /// is pervasive in real C/kernel IR; without it the whole function was dropped.
+    GepChain { dst: String, agg_ty: LType, base: LValue, index: LValue, path: Vec<i128> },
     /// A value the frontend models opaquely — e.g. `landingpad`'s exception
     /// object, which carries no memory-safety content. Lowered to `undef` (sound;
     /// unconstrained), so a function that merely has an unwind-cleanup path is
@@ -1419,24 +1425,34 @@ impl Parser {
             let _ity = self.ltype()?;
             indices.push(self.value()?);
         }
+        // A multi-level navigation whose steps after the leading index are all
+        // constants (nested struct fields / constant array indices) — the common
+        // shape in real C/kernel IR. Resolved to an exact byte offset at lowering.
+        let const_of = |v: &LValue| match v {
+            LValue::Int(k) if *k >= 0 => Some(*k),
+            _ => None,
+        };
+        if indices.len() >= 2 {
+            if let Some(rest) = indices[1..].iter().map(const_of).collect::<Option<Vec<_>>>() {
+                if matches!(base_ty, LType::Struct(_) | LType::PackedStruct(_) | LType::Array(..)) {
+                    return Ok(LInst::GepChain {
+                        dst,
+                        agg_ty: base_ty.clone(),
+                        base,
+                        index: indices[0].clone(),
+                        path: rest,
+                    });
+                }
+            }
+        }
         let (elem, index) = match (&base_ty, indices.as_slice()) {
             // `gep T, ptr, idx` — pointer arithmetic over T.
             (_, [idx]) => (base_ty.clone(), idx.clone()),
-            // `gep [N x T], ptr, 0, idx` — array element.
+            // `gep [N x T], ptr, 0, idx` — array element (variable index).
             (LType::Array(elem, _), [_, idx]) => ((**elem).clone(), idx.clone()),
-            // `gep {S}, ptr, idx, K` — field K of the idx-th struct (packed too).
-            (LType::Struct(_) | LType::PackedStruct(_), [idx, LValue::Int(k)]) if *k >= 0 => {
-                return Ok(LInst::GepField {
-                    dst,
-                    struct_ty: base_ty.clone(),
-                    base,
-                    index: idx.clone(),
-                    field: *k as u32,
-                });
-            }
             _ => {
                 return Err(Error::unsupported(
-                    "getelementptr with a shape outside {single index, [N x T] array, struct field}",
+                    "getelementptr with a variable index below the first level",
                 ))
             }
         };

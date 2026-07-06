@@ -516,6 +516,27 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
             });
             continue;
         }
+        // A multi-level nested gep: leading element stride, then the exact byte
+        // offset of the all-constant navigation path through the aggregate.
+        if let LInst::GepChain { dst, agg_ty, base, index, path } = inst {
+            let ty = lower_type(agg_ty);
+            let off = nested_offset(&ty, path)
+                .ok_or_else(|| Error::unsupported("nested gep with an unresolvable offset"))?;
+            let tmp = ctx.fresh();
+            insts.push(Inst::PtrOffset {
+                dst: tmp,
+                base: ctx.operand(base, 64)?,
+                index: ctx.operand(index, 64)?,
+                elem: ty,
+            });
+            insts.push(Inst::PtrOffset {
+                dst: ctx.reg(dst)?,
+                base: Operand::Reg(tmp),
+                index: Operand::int(64, off as u128),
+                elem: Type::int(8),
+            });
+            continue;
+        }
                 // A `load ptr` that reads a *reference field* of a DWARF-typed struct
         // (see `dwarf_field_loads`): keep the load (it checks the field access),
         // then materialise its result as a valid reference — the loaded pointer
@@ -714,7 +735,7 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
             },
         },
         // Expanded to instruction chains in `lower_block`; unreachable here.
-        LInst::GepField { .. } | LInst::AtomicRmw { .. } => {
+        LInst::GepField { .. } | LInst::GepChain { .. } | LInst::AtomicRmw { .. } => {
             return Err(Error::unsupported("multi-instruction lowering outside lower_block"))
         }
         LInst::Opaque { dst } => Inst::Assign {
@@ -864,6 +885,31 @@ fn branch_args(ctx: &Ctx, from: &str, to: &str) -> Result<Vec<Operand>> {
     Ok(args)
 }
 
+/// The cumulative byte offset of a **nested** navigation `path` into aggregate
+/// `agg` — each step descends a struct field (its padded offset) or a constant
+/// array index (`k · sizeof(elem)`). `None` if a step does not fit the current
+/// type (e.g. a field index into a scalar), so an ill-formed chain is refused, not
+/// silently mis-offset.
+fn nested_offset(agg: &Type, path: &[i128]) -> Option<u64> {
+    let mut ty = agg;
+    let mut offset: u64 = 0;
+    for &k in path {
+        let k = u64::try_from(k).ok()?;
+        match ty {
+            Type::Struct { fields, .. } => {
+                offset = offset.checked_add(struct_field_offset(ty, k as u32)?)?;
+                ty = fields.get(k as usize)?;
+            }
+            Type::Array { elem, .. } => {
+                offset = offset.checked_add(k.checked_mul(elem.size_bytes(&LAYOUT)?)?)?;
+                ty = elem;
+            }
+            _ => return None,
+        }
+    }
+    Some(offset)
+}
+
 /// The padded byte offset of `field` inside struct type `s` (LP64 layout) —
 /// the same alignment rule the IR's own `Type::Struct` sizing uses.
 fn struct_field_offset(s: &Type, field: u32) -> Option<u64> {
@@ -890,6 +936,7 @@ fn inst_dst(inst: &LInst) -> Option<&str> {
         | LInst::ExtractValue { dst, .. }
         | LInst::Opaque { dst, .. }
         | LInst::GepField { dst, .. }
+        | LInst::GepChain { dst, .. }
         | LInst::AtomicRmw { dst, .. }
         | LInst::Cast { dst, .. } => Some(dst),
         LInst::Call { dst, .. } => dst.as_deref(),
