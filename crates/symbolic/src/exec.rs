@@ -2860,13 +2860,20 @@ impl Explorer<'_> {
         bitprecise::find_counterexample(&self.ctx, &assumptions, goal)
     }
 
-    /// On an exact, **feasible** path, a model of the path condition — a witness
-    /// that this program point is genuinely reached. `None` if the path is
-    /// over-approximated or infeasible. Used to witness a *definite* temporal
-    /// violation (use-after-free / double-free): the violation holds for every
-    /// reaching input, so the reachability witness *is* the counterexample.
+    /// A model of the path condition — a witness that this program point is
+    /// genuinely reached. `None` if the path is infeasible (or over-approximated,
+    /// outside bug-finding). Used to witness a *definite* temporal violation
+    /// (use-after-free / double-free): the region reached `Freed` through an explicit
+    /// `Dealloc` on this path and is now accessed, so the violation holds for every
+    /// reaching input and the reachability witness *is* the counterexample.
+    ///
+    /// In **bug-finding mode** the exactness gate is dropped: the free and the access
+    /// are structural facts of this path, so an over-approximation elsewhere (an init
+    /// loop before the free, an opaque call) does not make the use-after-free any less
+    /// real — reporting it accepts the same small path-feasibility risk the mode
+    /// trades for recall. Strict verification keeps the exact gate.
     fn feasibility_witness(&mut self, state: &PathState) -> Option<Model> {
-        if !state.exact {
+        if !state.exact && !self.bug_finding {
             return None;
         }
         let mut assumptions = state.pathcond.clone();

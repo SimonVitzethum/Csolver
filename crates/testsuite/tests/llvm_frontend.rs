@@ -712,6 +712,68 @@ declare void @kfree(ptr)
         "a kmalloc'd buffer freed twice must FAIL (double free)");
 }
 
+/// Bug-finding mode also refutes a *temporal* violation (use-after-free) reached past
+/// an over-approximated path — a free after an init loop, then a read of the freed
+/// pointer. Strict verification stays UNKNOWN (the free/loop made the path inexact);
+/// a free with no later use must not be a false positive in either mode.
+#[test]
+fn bug_finding_refutes_use_after_free_past_a_loop() {
+    let uaf = r#"
+define i64 @f(i64 %i) {
+entry:
+  %p = call ptr @malloc(i64 64)
+  br label %head
+head:
+  %k = phi i64 [ 0, %entry ], [ %kn, %body ]
+  %done = icmp uge i64 %k, 8
+  br i1 %done, label %after, label %body
+body:
+  %pk = getelementptr i64, ptr %p, i64 %k
+  store i64 %k, ptr %pk, align 8
+  %kn = add i64 %k, 1
+  br label %head
+after:
+  call void @free(ptr %p)
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+declare ptr @malloc(i64)
+declare void @free(ptr)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: uaf.into(), name: "u".into() }).expect("lower");
+    let bugs = Config { bug_finding: true, ..Config::default() };
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "strict mode does not refute a temporal violation past an inexact path");
+    assert_eq!(verify_module(&m, &bugs).verdict, Verdict::Fail,
+        "bug-finding refutes a use-after-free reached past an init loop");
+
+    // Control: the same loop + free, but no use after — must not be a false positive.
+    let safe = r#"
+define void @f() {
+entry:
+  %p = call ptr @malloc(i64 64)
+  br label %head
+head:
+  %k = phi i64 [ 0, %entry ], [ %kn, %body ]
+  %done = icmp uge i64 %k, 8
+  br i1 %done, label %after, label %body
+body:
+  %pk = getelementptr i64, ptr %p, i64 %k
+  store i64 %k, ptr %pk, align 8
+  %kn = add i64 %k, 1
+  br label %head
+after:
+  call void @free(ptr %p)
+  ret void
+}
+declare ptr @malloc(i64)
+declare void @free(ptr)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: safe.into(), name: "s".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &bugs).verdict, Verdict::Fail,
+        "a free with no later use must not be a false positive");
+}
+
 /// A Linux user-copy with an unchecked, caller-controlled length overruns the kernel
 /// buffer — `copy_from_user(buf64, ubuf, n)` with free `n`. It lowers to a refutable
 /// bulk write, so the overflow is a FAIL with a witness; the length-checked sibling
