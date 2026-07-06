@@ -1867,6 +1867,38 @@ exit:
     assert_ne!(verify_with_pre(src, "f", "f 0 cstring 4096"), Verdict::Pass);
 }
 
+/// The `-O0` scan shape: an `i32` counter sign-extended to `i64` before indexing
+/// (`gep i8, s, sext(n)`), so the GEP index is a *cast* of the induction, not a
+/// copy of it. The scan bound must still recognize the induction through the
+/// widening — else clang's default `-O0`/`-g` C output stays spuriously UNKNOWN.
+#[test]
+fn sentinel_scan_through_sext_index_verifies() {
+    let src = r#"
+define i32 @scan(ptr %s) {
+entry:
+  br label %head
+head:
+  %n = phi i32 [ 0, %entry ], [ %nn, %body ]
+  %w = sext i32 %n to i64
+  %q = getelementptr i8, ptr %s, i64 %w
+  %c = load i8, ptr %q, align 1
+  %z = icmp eq i8 %c, 0
+  br i1 %z, label %exit, label %body
+body:
+  %nn = add i32 %n, 1
+  br label %head
+exit:
+  ret i32 %n
+}
+"#;
+    // Without the precondition UNKNOWN; with `cstring`, the sext-index scan verifies.
+    let bare = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "s".into() })
+        .expect("lower");
+    assert_ne!(verify_module(&bare, &Config::default()).verdict, Verdict::Pass);
+    assert_eq!(verify_with_pre(src, "s", "scan 0 cstring 4096"), Verdict::Pass);
+}
+
 /// Memory written before a branch and read after the reconvergence must survive
 /// the merge — a store identical on every incoming edge definitely holds. Here a
 /// pointer stored into a (non-promotable, aggregate) slot before an `if` is loaded

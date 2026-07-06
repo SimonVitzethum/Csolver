@@ -1809,8 +1809,9 @@ impl Explorer<'_> {
                         continue;
                     };
                     // mem2reg leaves the base/index as copies of the parameter and
-                    // the induction (`%b = base`, `%i = n`); follow those chains.
-                    if resolve_copy(*idx, &def) != n {
+                    // the induction (`%b = base`, `%i = n`); follow those chains,
+                    // and at -O0 the index is a `sext`/`zext` of the counter.
+                    if resolve_index(*idx, &def) != n {
                         continue;
                     }
                     let base_reg = resolve_copy(*b, &def);
@@ -1830,15 +1831,25 @@ impl Explorer<'_> {
                     if !self.loaded_value_gates_exit(*v, &body_set, &def) {
                         continue;
                     }
-                    // All side-conditions hold: install `(n + 1)·E ≤ size`, so the
-                    // access `base[n]` (offset `n·E`, span `E`) is in bounds.
+                    // All side-conditions hold. The induction value `n` is what the
+                    // access offset uses — directly at -O1, and at -O0 through a
+                    // `sext`/`zext` the executor models as a width-preserving no-op
+                    // on the same expression (so `base[sext(n)]` reuses `n`'s value).
+                    // Install `0 <= n` and `(n + 1)·E ≤ size`, so the access
+                    // `base[n]` (offset `n·E`, span `E`) is in bounds.
                     let size = region.size;
                     let Some(&SymValue::Scalar(n_e)) = state.env.get(&n) else { continue };
+                    if self.ctx.width(n_e) != PTR_WIDTH {
+                        continue;
+                    }
+                    let zero = self.ctx.int(PTR_WIDTH, 0);
+                    let nonneg = self.ctx.cmp(SCmp::Sle, zero, n_e);
                     let one = self.ctx.int(PTR_WIDTH, 1);
                     let np1 = self.ctx.bin(BvOp::Add, n_e, one);
                     let e_e = self.ctx.int(PTR_WIDTH, e as u128);
                     let bytes = self.ctx.bin(BvOp::Mul, np1, e_e);
                     let fact = self.ctx.cmp(SCmp::Sle, bytes, size);
+                    state.facts.push(nonneg);
                     state.facts.push(fact);
                     return;
                 }
@@ -3120,6 +3131,27 @@ fn resolve_copy(mut r: RegId, def: &HashMap<RegId, &Inst>) -> RegId {
     for _ in 0..64 {
         match def.get(&r) {
             Some(Inst::Assign { value: RValue::Use(Operand::Reg(src)), .. }) if *src != r => r = *src,
+            _ => break,
+        }
+    }
+    r
+}
+
+/// Like [`resolve_copy`], but also strips value-preserving integer widenings
+/// (`sext`/`zext`). At `-O0` an `i32` loop counter is sign-extended to `i64` before
+/// indexing (`gep i8, p, sext(n)`), so the GEP index is a *cast* of the induction,
+/// not a copy. A widening of a non-negative counter preserves its value, so the
+/// widened index denotes the same induction for the scan-bound pattern — soundness
+/// is retained because the installed bound is stated over the widened value itself
+/// (with `0 <= i`), not over the narrow one.
+fn resolve_index(mut r: RegId, def: &HashMap<RegId, &Inst>) -> RegId {
+    for _ in 0..64 {
+        r = resolve_copy(r, def);
+        match def.get(&r) {
+            Some(Inst::Assign {
+                value: RValue::Cast { op: CastOp::SExt | CastOp::ZExt, operand: Operand::Reg(src), .. },
+                ..
+            }) if *src != r => r = *src,
             _ => break,
         }
     }
