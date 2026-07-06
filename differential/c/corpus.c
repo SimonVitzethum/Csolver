@@ -152,6 +152,24 @@ int64_t f_asm_then_oob(int64_t i) {
     return a[i];
 }
 
+// A Linux user-copy with an unchecked, caller-controlled length into a 64-byte
+// kernel buffer — the classic overflow class. The driver shims `copy_from_user` to
+// a memcpy so the sanitizer sees the overrun.
+extern unsigned long copy_from_user(void *to, const void *from, unsigned long n);
+int64_t f_user_copy_oob(const void *ubuf, int64_t n) {
+    char buf[64];
+    copy_from_user(buf, ubuf, (unsigned long) n);
+    return buf[0];
+}
+
+// The same, with the length checked against the buffer — safe for every input.
+int64_t f_user_copy_safe(const void *ubuf, int64_t n) {
+    char buf[64];
+    if ((unsigned long) n > sizeof(buf)) return -22;
+    copy_from_user(buf, ubuf, (unsigned long) n);
+    return buf[0];
+}
+
 // A negative offset off a buffer interior — OOB below the allocation.
 int64_t f_negative_index(int64_t i) {
     int64_t a[8] = {0, 1, 2, 3, 4, 5, 6, 7};

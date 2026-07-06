@@ -2285,13 +2285,28 @@ impl Explorer<'_> {
         let src_live = !need_src || src_facts.is_some_and(|f| f.live);
         self.record(block, idx, NoUseAfterFree, dst_live && src_live, "memcpy regions are live", "a memcpy region may be freed");
 
-        let dst_inb = dst_facts.is_some_and(|f| self.prove_in_bounds_len(dst.offset, len_e, f.size, state));
+        // In-bounds for the bulk length. Refutable (like `check_access`): on a region
+        // whose size cannot wrap, a satisfying `off + len > size` is a genuine OOB, so
+        // a user-controlled length overrunning a `copy_from_user`/`memcpy` buffer is a
+        // FAIL with a witness. The source (if any) is checked prove-only — a `Refuted`
+        // on it would need its own region's no-wrap premise; the destination write is
+        // the dominant overflow class and carries the refutation.
         let src_inb = match (need_src, &src, src_facts) {
             (false, _, _) => true,
             (true, Some(p), Some(f)) => self.prove_in_bounds_len(p.offset, len_e, f.size, state),
             _ => false,
         };
-        self.record(block, idx, InBounds, dst_inb && src_inb, "memcpy stays within both regions", "could not prove the copy stays in bounds");
+        let dst_decision = match dst_region_nowrap(&dst, state) {
+            Some((size, nowrap)) if src_inb => {
+                let conj = self.in_bounds_len_conjuncts(dst.offset, len_e, size);
+                self.decide(&conj, state, RefuteMode::Possible, &[nowrap])
+            }
+            _ => {
+                let ok = dst_facts.is_some_and(|f| self.prove_in_bounds_len(dst.offset, len_e, f.size, state));
+                if ok && src_inb { Decision::Proven } else { Decision::Unknown }
+            }
+        };
+        self.record_mem(block, idx, InBounds, dst_decision, "the copy stays within both regions", "could not prove the copy stays in bounds");
 
         let dst_w = dst_facts.is_some_and(|f| f.perms.write);
         self.record(block, idx, ValidWrite, dst_w, "destination is writable", "destination is not writable");
@@ -2661,6 +2676,16 @@ impl Explorer<'_> {
         let zero = self.ctx.int(PTR_WIDTH, 0);
         let asize_e = self.ctx.int(PTR_WIDTH, asize as u128);
         let end = self.ctx.bin(BvOp::Add, offset, asize_e);
+        let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
+        let upper = self.ctx.cmp(SCmp::Sle, end, size);
+        [lower, upper]
+    }
+
+    /// `0 <= offset && offset + len <= size` for a **symbolic** byte length `len`
+    /// (a bulk copy). The refutable form of [`prove_in_bounds_len`].
+    fn in_bounds_len_conjuncts(&mut self, offset: ExprId, len: ExprId, size: ExprId) -> [ExprId; 2] {
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let end = self.ctx.bin(BvOp::Add, offset, len);
         let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
         let upper = self.ctx.cmp(SCmp::Sle, end, size);
         [lower, upper]
@@ -3248,6 +3273,16 @@ struct RegionFacts {
     size: ExprId,
     perms: Permissions,
     contract: Option<&'static str>,
+}
+
+/// If `p` points into a known region whose byte size cannot wrap, return that
+/// `(size, no-wrap fact)` — the premise that makes a bulk-copy OOB *refutable* (a
+/// satisfying `off + len > size` is then a genuine reachable overrun, not an artifact
+/// of a wrapped too-small size). `None` for opaque provenance or an unbounded size.
+fn dst_region_nowrap(p: &SymPointer, state: &PathState) -> Option<(ExprId, ExprId)> {
+    let Prov::Region(rid) = p.prov else { return None };
+    let r = state.regions.get(rid)?;
+    r.size_nowrap.map(|nowrap| (r.size, nowrap))
 }
 
 fn region_facts(p: &SymPointer, state: &PathState) -> Option<RegionFacts> {

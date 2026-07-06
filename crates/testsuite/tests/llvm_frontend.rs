@@ -712,6 +712,48 @@ declare void @kfree(ptr)
         "a kmalloc'd buffer freed twice must FAIL (double free)");
 }
 
+/// A Linux user-copy with an unchecked, caller-controlled length overruns the kernel
+/// buffer — `copy_from_user(buf64, ubuf, n)` with free `n`. It lowers to a refutable
+/// bulk write, so the overflow is a FAIL with a witness; the length-checked sibling
+/// (`n <= 64`) PASSes. `copy_to_user` reads its kernel buffer (arg 1) analogously.
+#[test]
+fn user_copy_unchecked_length_overflows_the_kernel_buffer() {
+    let oob = r#"
+define i64 @f(ptr %ubuf, i64 %n) {
+entry:
+  %buf = alloca [64 x i8], align 16
+  %r = call i64 @copy_from_user(ptr %buf, ptr %ubuf, i64 %n)
+  %v = load i8, ptr %buf, align 1
+  %w = sext i8 %v to i64
+  ret i64 %w
+}
+declare i64 @copy_from_user(ptr, ptr, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: oob.into(), name: "u".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "an unchecked user-controlled copy_from_user length overruns the kernel buffer");
+
+    let safe = r#"
+define i64 @f(ptr %ubuf, i64 %n) {
+entry:
+  %buf = alloca [64 x i8], align 16
+  %ok = icmp ule i64 %n, 64
+  br i1 %ok, label %do, label %skip
+do:
+  %r = call i64 @copy_from_user(ptr %buf, ptr %ubuf, i64 %n)
+  %v = load i8, ptr %buf, align 1
+  %w = sext i8 %v to i64
+  ret i64 %w
+skip:
+  ret i64 -22
+}
+declare i64 @copy_from_user(ptr, ptr, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: safe.into(), name: "s".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Fail,
+        "a length-checked user-copy must not be a false positive");
+}
+
 /// Inline assembly must not drop the whole function (kernel C is saturated with it).
 /// It lowers to an opaque, memory-clobbering call: the function stays analyzed, an
 /// OOB past the asm is still found (bug-finding), and a pointer reloaded across an

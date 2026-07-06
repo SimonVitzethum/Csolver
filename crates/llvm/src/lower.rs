@@ -541,7 +541,7 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         // and — crucially — the path stays *exact* (an `Inst::Call` would taint it,
         // disabling refutation). Only when the result is used (`dst` present) for
         // an allocator; a `free` needs no result.
-        if let LInst::Call { dst, callee, args, .. } = inst {
+        if let LInst::Call { dst, callee, args, ret } = inst {
             if let (Some(dst), Some(size)) = (dst, alloc_size(callee)) {
                 let count = match size {
                     AllocSize::Bytes(i) => ctx.operand(&args[i], 64)?,
@@ -577,6 +577,31 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                     ptr: ctx.operand(&args[i], 64)?,
                 });
                 continue;
+            }
+            // A Linux user-copy (`copy_from_user(to,from,n)` / `copy_to_user(to,from,
+            // n)`) transfers `n` bytes through a kernel buffer — a classic overflow
+            // site when `n` is user-controlled. Model it as a bulk WRITE of `n` bytes
+            // to the kernel buffer (`to` for from_user, `from` for to_user): a
+            // `MemIntrinsic::Set`, which carries the in-bounds obligation and is now
+            // refutable (see `check_mem_intrinsic`). The user side is not ours to
+            // model. The result (bytes-not-copied) is an opaque scalar.
+            if let Some(kbuf) = user_copy_kernel_arg(callee) {
+                if let Some(bufop) = args.get(kbuf) {
+                    insts.push(Inst::MemIntrinsic {
+                        kind: MemKind::Set,
+                        dst: ctx.operand(bufop, 64)?,
+                        src: None,
+                        len: ctx.operand(&args[2.min(args.len().saturating_sub(1))], 64)?,
+                    });
+                    if let Some(d) = dst {
+                        insts.push(Inst::Assign {
+                            dst: ctx.reg(d)?,
+                            ty: lower_type(ret),
+                            value: RValue::Use(Operand::Const(Const::Undef)),
+                        });
+                    }
+                    continue;
+                }
             }
         }
         insts.push(lower_inst(ctx, inst)?);
@@ -989,6 +1014,21 @@ fn alloc_size(callee: &str) -> Option<AllocSize> {
 /// pointer. `free(p)`, `kfree(p)` free argument 0; `kmem_cache_free(cache, p)` frees
 /// argument 1. `free(NULL)` is legal C, but a null free is a sound UNKNOWN, not a
 /// false FAIL, so it costs nothing here.
+/// A Linux user-copy → the argument index of the **kernel** buffer (bounds-checked
+/// for the `n = args[2]` byte length). `copy_from_user(to, from, n)` writes the kernel
+/// buffer `to` (arg 0); `copy_to_user(to, from, n)` reads the kernel buffer `from`
+/// (arg 1). Both are modelled as a bulk write of the kernel side — sound for the
+/// in-bounds obligation (the dominant overflow class); the user side is not ours.
+fn user_copy_kernel_arg(callee: &str) -> Option<usize> {
+    match callee {
+        "copy_from_user" | "_copy_from_user" | "__copy_from_user" | "__copy_from_user_inatomic"
+        | "copy_from_user_nofault" => Some(0),
+        "copy_to_user" | "_copy_to_user" | "__copy_to_user" | "__copy_to_user_inatomic"
+        | "copy_to_user_nofault" => Some(1),
+        _ => None,
+    }
+}
+
 fn dealloc_ptr_arg(callee: &str, argc: usize) -> Option<usize> {
     let idx = match callee {
         "free" | "kfree" | "vfree" | "kvfree" | "kfree_sensitive" | "kzfree" | "__kfree"

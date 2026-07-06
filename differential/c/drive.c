@@ -29,6 +29,17 @@ static int64_t next_range(int64_t lo, int64_t hi) {
     return lo + (int64_t) (next_u64() % span);
 }
 
+// A userspace shim for the kernel `copy_from_user`, so the sanitizer sees the real
+// transfer (a plain memcpy) and catches an overrun of the kernel-side buffer. The
+// corpus's `.ll` keeps the `copy_from_user` symbol, which the engine models directly.
+unsigned long copy_from_user(void *to, const void *from, unsigned long n) {
+    memcpy(to, from, n);
+    return 0;
+}
+// A generous "user" source buffer, so the (in-bounds) source read never itself
+// overruns — the destination overflow is what we are isolating.
+static char USERBUF[8192];
+
 // The corpus under test.
 int64_t f_checked_get(int64_t);
 int64_t f_const_index(void);
@@ -42,6 +53,8 @@ int64_t f_off_by_one(void);
 int64_t f_heap_oob(int64_t);
 int64_t f_use_after_free(int64_t);
 int64_t f_double_free(int64_t);
+int64_t f_user_copy_oob(const void *, int64_t);
+int64_t f_user_copy_safe(const void *, int64_t);
 int64_t f_asm_then_oob(int64_t);
 int64_t f_negative_index(int64_t);
 
@@ -71,6 +84,9 @@ DRIVE(f_off_by_one, f_off_by_one())
 DRIVE(f_heap_oob, f_heap_oob(next_range(-8, 24)))
 DRIVE(f_use_after_free, f_use_after_free(next_range(0, 8)))
 DRIVE(f_double_free, f_double_free(next_range(0, 8)))
+// User-copy: the length spans the in-bounds/overflow boundary of the 64-byte buffer.
+DRIVE(f_user_copy_oob, f_user_copy_oob(USERBUF, next_range(0, 256)))
+DRIVE(f_user_copy_safe, f_user_copy_safe(USERBUF, next_range(0, 256)))
 DRIVE(f_asm_then_oob, f_asm_then_oob(next_range(-8, 24)))
 DRIVE(f_negative_index, f_negative_index(next_range(-8, 8)))
 
@@ -91,6 +107,8 @@ static const struct entry table[] = {
     {"f_heap_oob", drive_f_heap_oob},
     {"f_use_after_free", drive_f_use_after_free},
     {"f_double_free", drive_f_double_free},
+    {"f_user_copy_oob", drive_f_user_copy_oob},
+    {"f_user_copy_safe", drive_f_user_copy_safe},
     {"f_asm_then_oob", drive_f_asm_then_oob},
     {"f_negative_index", drive_f_negative_index},
 };
