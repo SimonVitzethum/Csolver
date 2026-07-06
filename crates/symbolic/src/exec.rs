@@ -854,7 +854,7 @@ impl PartialEq for Prov {
 }
 impl Eq for Prov {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SymPointer {
     prov: Prov,
     offset: ExprId,
@@ -884,7 +884,7 @@ struct SymRegion {
     sentinel: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SymValue {
     Scalar(ExprId),
     Ptr(SymPointer),
@@ -928,7 +928,7 @@ enum LoadOrigin {
 
 /// A recorded store: "`size` bytes equal to `value` were written through
 /// `target`". Most-recent-last.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct StoreRecord {
     target: SymPointer,
     value: SymValue,
@@ -1299,7 +1299,10 @@ impl Explorer<'_> {
     /// the registers live past a join are defined before the split, hence equal),
     /// sanitizing any pointer into a dropped region; the path condition is the
     /// longest common prefix and the facts their intersection (both sound,
-    /// weaker); the heap is forgotten and the path is no longer `exact`.
+    /// weaker); the heap is **intersected** — a store identical on every incoming
+    /// edge definitely holds after the merge, so it is kept (a value written before
+    /// the branch and read after it, e.g. a `va_list`'s fields); anything the paths
+    /// disagree on is dropped. The path is no longer `exact`.
     fn merge_core(&self, edges: &[EdgeState]) -> PathState {
         let first = &edges[0].pred_state;
 
@@ -1349,7 +1352,38 @@ impl Explorer<'_> {
             .filter(|f| edges.iter().all(|e| e.pred_state.facts.contains(f)))
             .collect();
 
-        PathState { env, regions, pathcond, facts, heap: Vec::new(), exact: false }
+        // Heap intersection. A load reads the *last* store to a matching address,
+        // so a store survives only if it is the last store to its address — keyed
+        // by exact `(prov, offset)` — on **every** edge, with the identical value.
+        // Then that address definitely holds it after the merge; a later store the
+        // paths disagree on, or differing values, drops the address. Records into a
+        // region the merge dropped are sanitized out.
+        let region_kept = |p: &Prov| !matches!(p, Prov::Region(rid) if *rid >= rcount);
+        let record_kept = |rec: &StoreRecord| {
+            region_kept(&rec.target.prov)
+                && match &rec.value {
+                    SymValue::Ptr(vp) => region_kept(&vp.prov),
+                    SymValue::Scalar(_) => true,
+                }
+        };
+        let same_addr = |a: &SymPointer, b: &SymPointer| a.prov == b.prov && a.offset == b.offset;
+        let last_for = |heap: &[StoreRecord], t: &SymPointer| {
+            heap.iter().rev().find(|r| same_addr(&r.target, t)).cloned()
+        };
+        let heap: Vec<StoreRecord> = first
+            .heap
+            .iter()
+            .filter(|rec| {
+                record_kept(rec)
+                    && last_for(&first.heap, &rec.target).as_ref() == Some(*rec)
+                    && edges
+                        .iter()
+                        .all(|e| last_for(&e.pred_state.heap, &rec.target).as_ref() == Some(*rec))
+            })
+            .cloned()
+            .collect();
+
+        PathState { env, regions, pathcond, facts, heap, exact: false }
     }
 
     /// Merge per-edge values into one, as a right-folded `ITE` over the edge

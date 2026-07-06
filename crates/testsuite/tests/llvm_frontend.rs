@@ -1866,3 +1866,83 @@ exit:
 "#;
     assert_ne!(verify_with_pre(src, "f", "f 0 cstring 4096"), Verdict::Pass);
 }
+
+/// Memory written before a branch and read after the reconvergence must survive
+/// the merge — a store identical on every incoming edge definitely holds. Here a
+/// pointer stored into a (non-promotable, aggregate) slot before an `if` is loaded
+/// and dereferenced after it; the deref proves only because the store's provenance
+/// is kept across the merge.
+const MERGE_MEMORY: &str = r#"
+define i64 @merged(ptr %p, i1 %c) {
+entry:
+  %slot = alloca [1 x ptr], align 8
+  %s0 = getelementptr [1 x ptr], ptr %slot, i64 0, i64 0
+  store ptr %p, ptr %s0, align 8
+  br i1 %c, label %a, label %b
+a:
+  br label %m
+b:
+  br label %m
+m:
+  %q = load ptr, ptr %s0, align 8
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+define i64 @main() {
+entry:
+  %x = alloca i64, align 8
+  %r = call i64 @merged(ptr %x, i1 1)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn heap_survives_a_control_flow_merge() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: MERGE_MEMORY.into(), name: "mm".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "a store identical on all merge edges must be readable after the merge"
+    );
+}
+
+/// Soundness control: when the two branches store *different* pointers into the
+/// slot, the address is ambiguous after the merge, so the later deref must stay
+/// UNKNOWN — no false PASS.
+#[test]
+fn heap_merge_drops_addresses_the_paths_disagree_on() {
+    let src = r#"
+define i64 @merged(ptr %p, i1 %c) {
+entry:
+  %slot = alloca [1 x ptr], align 8
+  %s0 = getelementptr [1 x ptr], ptr %slot, i64 0, i64 0
+  br i1 %c, label %a, label %b
+a:
+  store ptr %p, ptr %s0, align 8
+  br label %m
+b:
+  store ptr null, ptr %s0, align 8
+  br label %m
+m:
+  %q = load ptr, ptr %s0, align 8
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+define i64 @main() {
+entry:
+  %x = alloca i64, align 8
+  %r = call i64 @merged(ptr %x, i1 1)
+  ret i64 %r
+}
+"#;
+    let module = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "mmd".into() }).expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "an address the paths disagree on must not be provable after the merge"
+    );
+}
