@@ -1394,6 +1394,53 @@ fn closed_world_member_provenance_declines_unwritten_field() {
     );
 }
 
+/// Member-provenance through a **struct-typed** field gep (`gep %S, ptr, 0, 0`),
+/// the shape clang emits at -O0 for `s->q`. It lowers to a two-step PtrOffset
+/// chain whose intermediate `local_defs` also treats as a region root; the field
+/// slot must still be attributed to the aggregate the caller passes, not to that
+/// intermediate. Here field 0 is the pointer, filled with `&x` before the call.
+const MEMBER_PROV_STRUCT_GEP: &str = r#"
+%struct.P = type { ptr }
+define i64 @deref_field(ptr %s) {
+entry:
+  %f = getelementptr inbounds %struct.P, ptr %s, i32 0, i32 0
+  %q = load ptr, ptr %f, align 8
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+define i64 @use() {
+entry:
+  %x = alloca i64, align 8
+  %p = alloca %struct.P, align 8
+  store i64 7, ptr %x, align 8
+  %f = getelementptr inbounds %struct.P, ptr %p, i32 0, i32 0
+  store ptr %x, ptr %f, align 8
+  %r = call i64 @deref_field(ptr %p)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn closed_world_member_provenance_through_struct_gep() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: MEMBER_PROV_STRUCT_GEP.into(), name: "mpsg".into() })
+        .expect("lower");
+    // Open world: the loaded field pointer has no provenance → UNKNOWN.
+    assert_ne!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "a struct-field pointer deref must not be recovered without whole-program info"
+    );
+    // Closed-world: the field slot roots to the passed aggregate, so the caller's
+    // `&x` store is credited and the deref proves.
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "the field guarantee must attach to the aggregate, not the struct-gep intermediate"
+    );
+}
+
 /// Soundness control for member-provenance escape tracking: after the caller
 /// fills the field, it passes the aggregate to an **external** function that
 /// could rewrite the field, then calls the member reader with no re-store. The

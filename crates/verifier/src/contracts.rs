@@ -281,16 +281,21 @@ pub(crate) fn synthesize_fields(
                                 .and_then(|n| n.checked_mul(elem.size_bytes(&module.layout)?)),
                             _ => None,
                         };
-                        match (delta, defs.contains_key(base), field_of.get(base).copied()) {
-                            // `root + delta`.
-                            (Some(d), true, _) => {
-                                field_of.insert(*dst, (*base, d));
-                            }
-                            // `(root + d0) + delta`.
-                            (Some(d), false, Some((root, d0))) => {
+                        match (delta, field_of.get(base).copied(), defs.contains_key(base)) {
+                            // `(root + d0) + delta`. A tracked field pointer chains
+                            // to its root *first* — a struct-field gep's intermediate
+                            // (`tmp = base + 0`) is itself promoted to a region root
+                            // by `local_defs` (for the `&a[k]` case), so without this
+                            // precedence the field would re-root onto that
+                            // intermediate instead of the aggregate actually passed.
+                            (Some(d), Some((root, d0)), _) => {
                                 if let Some(total) = d0.checked_add(d) {
                                     field_of.insert(*dst, (root, total));
                                 }
+                            }
+                            // `root + delta`: `base` is a true region root.
+                            (Some(d), None, true) => {
+                                field_of.insert(*dst, (*base, d));
                             }
                             _ => {}
                         }
