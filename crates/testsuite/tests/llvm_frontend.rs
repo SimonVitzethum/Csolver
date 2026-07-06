@@ -1947,6 +1947,51 @@ entry:
     );
 }
 
+/// The two branches store *different but both-valid* pointers (`p` vs `p+1`) into
+/// the slot; the merge JOINs them into a guarded select rather than dropping the
+/// slot, so the later deref proves in bounds for both — a real UNKNOWN→PASS flip
+/// that heap *intersection* (drop-on-disagree) could not make. Cross-language: any
+/// `slot = c ? p : p+k; *slot` with both offsets in bounds.
+const MERGE_JOIN: &str = r#"
+define i64 @joined(ptr %p, i1 %c) {
+entry:
+  %slot = alloca [1 x ptr], align 8
+  %s0 = getelementptr [1 x ptr], ptr %slot, i64 0, i64 0
+  br i1 %c, label %a, label %b
+a:
+  store ptr %p, ptr %s0, align 8
+  br label %m
+b:
+  %p1 = getelementptr i64, ptr %p, i64 1
+  store ptr %p1, ptr %s0, align 8
+  br label %m
+m:
+  %q = load ptr, ptr %s0, align 8
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+define i64 @main() {
+entry:
+  %x = alloca [2 x i64], align 8
+  %x0 = getelementptr [2 x i64], ptr %x, i64 0, i64 0
+  %r = call i64 @joined(ptr %x0, i1 1)
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn heap_merge_joins_differing_but_valid_pointer_stores() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: MERGE_JOIN.into(), name: "mj".into() })
+        .expect("lower");
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "a slot holding p on one edge and p+1 on the other joins to a select both in bounds"
+    );
+}
+
 /// A pointer that is a `select`/PHI of two *different* valid regions (`c ? &a : &b`)
 /// is no longer opaque: an access through it is proved in bounds for each
 /// alternative under its guard. Language-agnostic (any `cond ? p : q`).

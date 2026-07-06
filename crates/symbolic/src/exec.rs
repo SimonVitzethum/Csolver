@@ -1283,6 +1283,7 @@ impl Explorer<'_> {
             .collect();
 
         let mut merged = self.merge_core(&edges);
+        merged.heap = self.merge_heap(&edges, &discs, merged.regions.len());
 
         let params = self.f.block(block).map(|b| b.params.clone()).unwrap_or_default();
         for (j, (preg, pty)) in params.iter().enumerate() {
@@ -1301,6 +1302,73 @@ impl Explorer<'_> {
             merged.env.insert(*preg, mv);
         }
         merged
+    }
+
+    /// The merged heap. A store to an address survives only if that address has a
+    /// *last* store on **every** incoming edge (else it is ambiguous — dropped).
+    /// Identical values are kept as-is; differing values are **joined** into a
+    /// `select` guarded by the edge discriminators (the same construction as a
+    /// PHI), so e.g. a `va_list` cursor advanced differently per branch stays a
+    /// known — if multi-region — pointer instead of being forgotten. Records whose
+    /// address or joined value points into a dropped region are sanitized out.
+    fn merge_heap(&mut self, edges: &[EdgeState], discs: &[ExprId], rcount: usize) -> Vec<StoreRecord> {
+        let region_kept = |p: &Prov| !matches!(p, Prov::Region(rid) if *rid >= rcount);
+        let same_addr = |a: &SymPointer, b: &SymPointer| a.prov == b.prov && a.offset == b.offset;
+        let last_for = |heap: &[StoreRecord], t: &SymPointer| -> Option<StoreRecord> {
+            heap.iter().rev().find(|r| same_addr(&r.target, t)).cloned()
+        };
+        let ptr_ty = Type::Ptr { pointee: Box::new(Type::int(8)) };
+
+        // Candidate addresses: the last store to each distinct target on edge 0.
+        let mut done: Vec<SymPointer> = Vec::new();
+        let mut out: Vec<StoreRecord> = Vec::new();
+        for rec in edges[0].pred_state.heap.iter().rev() {
+            let t = rec.target.clone();
+            if done.iter().any(|d| same_addr(d, &t)) {
+                continue;
+            }
+            done.push(t.clone());
+            if !region_kept(&t.prov) {
+                continue;
+            }
+            // The last store to `t` on every edge, with a consistent size.
+            let mut per_edge: Vec<(ExprId, SymValue)> = Vec::with_capacity(edges.len());
+            let mut ok = true;
+            for (e, &d) in edges.iter().zip(discs) {
+                match last_for(&e.pred_state.heap, &t) {
+                    Some(r) if r.size == rec.size => per_edge.push((d, r.value)),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let value = self.merge_values(&per_edge, &ptr_ty);
+            // Drop if the joined value points into a region the merge dropped.
+            if let SymValue::Ptr(vp) = &value {
+                if !self.pointer_regions_kept(&vp.prov, rcount) {
+                    continue;
+                }
+            }
+            out.push(StoreRecord { target: t, value, size: rec.size });
+        }
+        out
+    }
+
+    /// Whether every region a (possibly `Select`) provenance can denote survives a
+    /// merge that kept `rcount` regions.
+    fn pointer_regions_kept(&self, prov: &Prov, rcount: usize) -> bool {
+        match prov {
+            Prov::Region(rid) => *rid < rcount,
+            Prov::Select { then_ptr, else_ptr, .. } => {
+                self.pointer_regions_kept(&then_ptr.prov, rcount)
+                    && self.pointer_regions_kept(&else_ptr.prov, rcount)
+            }
+            _ => true,
+        }
     }
 
     /// The non-parameter part of a multi-predecessor merge: a sound
@@ -1363,38 +1431,9 @@ impl Explorer<'_> {
             .filter(|f| edges.iter().all(|e| e.pred_state.facts.contains(f)))
             .collect();
 
-        // Heap intersection. A load reads the *last* store to a matching address,
-        // so a store survives only if it is the last store to its address — keyed
-        // by exact `(prov, offset)` — on **every** edge, with the identical value.
-        // Then that address definitely holds it after the merge; a later store the
-        // paths disagree on, or differing values, drops the address. Records into a
-        // region the merge dropped are sanitized out.
-        let region_kept = |p: &Prov| !matches!(p, Prov::Region(rid) if *rid >= rcount);
-        let record_kept = |rec: &StoreRecord| {
-            region_kept(&rec.target.prov)
-                && match &rec.value {
-                    SymValue::Ptr(vp) => region_kept(&vp.prov),
-                    SymValue::Scalar(_) => true,
-                }
-        };
-        let same_addr = |a: &SymPointer, b: &SymPointer| a.prov == b.prov && a.offset == b.offset;
-        let last_for = |heap: &[StoreRecord], t: &SymPointer| {
-            heap.iter().rev().find(|r| same_addr(&r.target, t)).cloned()
-        };
-        let heap: Vec<StoreRecord> = first
-            .heap
-            .iter()
-            .filter(|rec| {
-                record_kept(rec)
-                    && last_for(&first.heap, &rec.target).as_ref() == Some(*rec)
-                    && edges
-                        .iter()
-                        .all(|e| last_for(&e.pred_state.heap, &rec.target).as_ref() == Some(*rec))
-            })
-            .cloned()
-            .collect();
-
-        PathState { env, regions, pathcond, facts, heap, exact: false }
+        // The heap is computed by `merge_multi` (it needs the edge discriminators
+        // to *join* differing stores); leave it empty here.
+        PathState { env, regions, pathcond, facts, heap: Vec::new(), exact: false }
     }
 
     /// Merge per-edge values into one, as a right-folded `ITE` over the edge
@@ -2275,6 +2314,7 @@ impl Explorer<'_> {
         // never refute through a call. Proofs are unaffected (this only gates
         // refutation, not PASS).
         state.exact = false;
+
         let argvals: Vec<SymValue> = args.iter().map(|a| self.eval_value(a, state)).collect();
         let summary = match callee {
             Callee::Direct(fid) => self.summaries.get(fid).cloned(),
