@@ -843,26 +843,44 @@ declare void @free(ptr)
 /// mixes widths and no bound holds. Refuted in bug-finding mode (witness `idx = UINT_MAX`).
 #[test]
 fn bug_finding_refutes_unsigned_index_oob() {
-    let src = r#"
+    // `buf` is stored to (so the read is initialized — the OOB, not an uninit read,
+    // is what is tested), then indexed by the zero-extended unsigned parameter.
+    let oob = r#"
 define i64 @f(i32 %idx) {
 entry:
   %buf = alloca [16 x i8], align 16
+  call void @llvm.memset.p0.i64(ptr %buf, i8 0, i64 16, i1 false)
   %z = zext i32 %idx to i64
   %p = getelementptr inbounds i8, ptr %buf, i64 %z
   %v = load i8, ptr %p, align 1
   %w = sext i8 %v to i64
   ret i64 %w
 }
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 "#;
-    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "u".into() }).expect("lower");
+    let m = LlvmFrontend.lower(LlvmInput { source: oob.into(), name: "u".into() }).expect("lower");
     let bugs = Config { bug_finding: true, ..Config::default() };
     assert_eq!(verify_module(&m, &bugs).verdict, Verdict::Fail,
         "an OOB indexed by a zero-extended unsigned parameter is refuted");
     // The guarded sibling (`idx < 16`) is safe — no false positive.
-    let safe = src.replace(
-        "%z = zext i32 %idx to i64",
-        "%ok = icmp ult i32 %idx, 16\n  br i1 %ok, label %in, label %out\nout:\n  ret i64 -1\nin:\n  %z = zext i32 %idx to i64",
-    );
+    let safe = r#"
+define i64 @f(i32 %idx) {
+entry:
+  %buf = alloca [16 x i8], align 16
+  call void @llvm.memset.p0.i64(ptr %buf, i8 0, i64 16, i1 false)
+  %ok = icmp ult i32 %idx, 16
+  br i1 %ok, label %in, label %out
+out:
+  ret i64 -1
+in:
+  %z = zext i32 %idx to i64
+  %p = getelementptr inbounds i8, ptr %buf, i64 %z
+  %v = load i8, ptr %p, align 1
+  %w = sext i8 %v to i64
+  ret i64 %w
+}
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+"#;
     let m = LlvmFrontend.lower(LlvmInput { source: safe.into(), name: "s".into() }).expect("lower");
     assert_ne!(verify_module(&m, &bugs).verdict, Verdict::Fail, "a guarded unsigned index is safe");
 }
