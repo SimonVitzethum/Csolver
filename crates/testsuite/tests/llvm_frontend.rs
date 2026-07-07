@@ -2993,3 +2993,35 @@ entry:
         "with no foreign label, an unlabelled destination grants write — no false FAIL"
     );
 }
+
+/// **Member-provenance for labels**: a `foreign` region's provenance survives a round-trip
+/// through a struct-field store/load (the alias-aware heap returns the same region, which
+/// keeps its labels), even across an intervening opaque call that havocs the heap. This is
+/// the building block that lets provenance reach a `require` through pointer fields
+/// (e.g. `req->dst`), rather than only through direct call arguments.
+#[test]
+fn provenance_survives_a_field_store_load() {
+    let src = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare i32 @crypto_aead_encrypt(ptr)
+define void @f(ptr %sk) {
+entry:
+  %page = alloca [16 x i8], align 16
+  %slot = alloca ptr, align 8
+  call void @af_alg_sendpage(ptr %sk, ptr %page)
+  store ptr %page, ptr %slot, align 8
+  %p2 = load ptr, ptr %slot, align 8
+  %e = call i32 @crypto_aead_encrypt(ptr %p2)
+  ret void
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "memprov".into() })
+        .expect("lower");
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Fail,
+        "the foreign label must survive the store/load and reach the write-capability check"
+    );
+}
