@@ -3025,3 +3025,47 @@ entry:
         "the foreign label must survive the store/load and reach the write-capability check"
     );
 }
+
+/// **General effect-summary inference**: an *internal wrapper* `@wrap` around a provenance
+/// primitive (`sg_set_page`) carries **no hand-written contract**, yet the analysis derives
+/// its provenance-transfer summary (dst absorbs src) from its body and applies it at the call
+/// site — so a `foreign` page flows through the wrapper into the scatterlist and the AEAD
+/// write is refused. This is what lets provenance coverage scale without a contract per wrapper.
+#[test]
+fn derived_provenance_transfer_through_an_internal_wrapper() {
+    let base = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare void @sg_set_page(ptr, ptr)
+declare i32 @crypto_aead_encrypt(ptr)
+define internal void @wrap(ptr %sgl, ptr %page) {
+  PRIMITIVE
+  ret void
+}
+define void @f(ptr %sk) {
+entry:
+  %page = alloca [16 x i8], align 16
+  %sgl = alloca [16 x i8], align 16
+  call void @af_alg_sendpage(ptr %sk, ptr %page)
+  call void @wrap(ptr %sgl, ptr %page)
+  %e = call i32 @crypto_aead_encrypt(ptr %sgl)
+  ret void
+}
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // The wrapper propagates provenance (it calls the primitive) → derived → FAIL.
+    let src = base.replace("  PRIMITIVE\n", "  call void @sg_set_page(ptr %sgl, ptr %page)\n");
+    let module = LlvmFrontend.lower(LlvmInput { source: src, name: "w".into() }).expect("lower");
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Fail,
+        "the wrapper's provenance transfer is derived (no contract on @wrap) and applied"
+    );
+    // Control: a wrapper that does NOT propagate leaves the scatterlist unlabelled → no FAIL.
+    let src = base.replace("  PRIMITIVE\n", "");
+    let module = LlvmFrontend.lower(LlvmInput { source: src, name: "w2".into() }).expect("lower");
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Fail,
+        "a wrapper with no provenance effect must not taint the scatterlist — no false FAIL"
+    );
+}

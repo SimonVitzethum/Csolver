@@ -102,6 +102,21 @@ pub enum RetSummary {
     },
 }
 
+/// A function's **provenance-transfer** summary: how a call moves provenance labels
+/// between its pointer arguments. Derived from the body (the lowered `ProvLabel`/
+/// `ProvPropagate` a contract emits, plus callees' own transfers) to a fixpoint — so an
+/// *internal wrapper* around a provenance primitive propagates provenance without a
+/// hand-written contract (the general-inference goal). Only **definite** parameter
+/// aliasing is recorded, so a transfer is never spurious (a false FAIL); a missed one is a
+/// sound under-approximation (a false negative).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProvTransfer {
+    /// `(dst_arg, src_arg)`: a call unions `src_arg`'s labels into `dst_arg`'s.
+    pub transfers: Vec<(usize, usize)>,
+    /// `(arg, label)`: a call adds provenance label `label` to `arg`'s region.
+    pub labels: Vec<(usize, u32)>,
+}
+
 /// A function's interprocedural summary.
 #[derive(Debug, Clone)]
 pub struct Summary {
@@ -111,6 +126,8 @@ pub struct Summary {
     pub writes: bool,
     /// Whether the function may free memory.
     pub frees: bool,
+    /// How a call moves provenance labels between its pointer arguments.
+    pub prov: ProvTransfer,
 }
 
 impl Summary {
@@ -201,6 +218,50 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
         }
     }
 
+    // Propagate provenance transfers through direct calls to a fixpoint: if `f` calls `g`
+    // and `g` transfers/labels one of its parameters, `f` does so on whichever of *its*
+    // parameters the corresponding argument aliases. Only definite parameter aliasing
+    // (`ptr_param_of`) is used, so a composed transfer is never spurious.
+    let param_of: HashMap<FuncId, HashMap<RegId, usize>> =
+        module.functions.iter().map(|f| (f.id, ptr_param_of(f))).collect();
+    loop {
+        let mut changed = false;
+        for f in &module.functions {
+            let pof = &param_of[&f.id];
+            let arg = |op: &Operand| match op {
+                Operand::Reg(r) => pof.get(r).copied(),
+                _ => None,
+            };
+            let mut add: ProvTransfer = ProvTransfer::default();
+            for inst in f.blocks.iter().filter(|b| observable(b)).flat_map(|b| &b.insts) {
+                let Inst::Call { callee: Callee::Direct(g), args, .. } = inst else { continue };
+                let Some(sg) = map.get(g) else { continue };
+                for &(d, s) in &sg.prov.transfers {
+                    if let (Some(pd), Some(ps)) = (args.get(d).and_then(&arg), args.get(s).and_then(&arg)) {
+                        add.transfers.push((pd, ps));
+                    }
+                }
+                for &(a, label) in &sg.prov.labels {
+                    if let Some(pa) = args.get(a).and_then(&arg) {
+                        add.labels.push((pa, label));
+                    }
+                }
+            }
+            if let Some(s) = map.get_mut(&f.id) {
+                let before = (s.prov.transfers.len(), s.prov.labels.len());
+                s.prov.transfers.extend(add.transfers);
+                s.prov.labels.extend(add.labels);
+                dedup(&mut s.prov);
+                if (s.prov.transfers.len(), s.prov.labels.len()) != before {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     map
 }
 
@@ -230,7 +291,81 @@ fn summarize_fn(f: &Function) -> Summary {
         }
     }
 
-    Summary { ret: ret_of_fn(f), writes, frees }
+    Summary { ret: ret_of_fn(f), writes, frees, prov: prov_transfer_of_fn(f) }
+}
+
+/// Which pointer parameter (by index) a register **definitely** aliases: the parameter
+/// pointers themselves, closed under `PtrOffset` / `Assign(Use|Cast)` (an offset/copy of a
+/// parameter pointer stays that parameter's provenance). A register not in the map (a
+/// loaded value, a call result, a block parameter) is *not* claimed — sound: we only ever
+/// record a provenance transfer between two definite parameter pointers.
+fn ptr_param_of(f: &Function) -> HashMap<RegId, usize> {
+    let mut map: HashMap<RegId, usize> = HashMap::new();
+    for (k, (reg, ty)) in f.params.iter().enumerate() {
+        if ty.is_ptr() {
+            map.insert(*reg, k);
+        }
+    }
+    loop {
+        let mut changed = false;
+        let mut relate = |dst: RegId, base: &Operand, map: &mut HashMap<RegId, usize>| {
+            if let Operand::Reg(b) = base {
+                if let Some(&arg) = map.get(b) {
+                    changed |= map.insert(dst, arg).is_none();
+                }
+            }
+        };
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            match inst {
+                Inst::PtrOffset { dst, base, .. } => relate(*dst, base, &mut map),
+                Inst::Assign { dst, value: RValue::Use(op), .. }
+                | Inst::Assign { dst, value: RValue::Cast { operand: op, .. }, .. } => {
+                    relate(*dst, op, &mut map)
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            return map;
+        }
+    }
+}
+
+/// Derive a function's provenance-transfer summary from the `ProvLabel`/`ProvPropagate`
+/// instructions its body contains (the ones a contract lowered for the recognized calls it
+/// makes). Interprocedural composition through direct callees is added by the module
+/// fixpoint in [`summarize_module`].
+fn prov_transfer_of_fn(f: &Function) -> ProvTransfer {
+    let param_of = ptr_param_of(f);
+    let arg = |op: &Operand| match op {
+        Operand::Reg(r) => param_of.get(r).copied(),
+        _ => None,
+    };
+    let mut prov = ProvTransfer::default();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst {
+            Inst::ProvLabel { ptr, label } => {
+                if let Some(a) = arg(ptr) {
+                    prov.labels.push((a, *label));
+                }
+            }
+            Inst::ProvPropagate { dst, src } => {
+                if let (Some(d), Some(s)) = (arg(dst), arg(src)) {
+                    prov.transfers.push((d, s));
+                }
+            }
+            _ => {}
+        }
+    }
+    dedup(&mut prov);
+    prov
+}
+
+fn dedup(prov: &mut ProvTransfer) {
+    prov.transfers.sort_unstable();
+    prov.transfers.dedup();
+    prov.labels.sort_unstable();
+    prov.labels.dedup();
 }
 
 /// The registers that provably hold pointers into the function's *own*

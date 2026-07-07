@@ -17,7 +17,7 @@ use csolver_absint::{
 };
 use csolver_cfg::{Dominators, Loops};
 use csolver_core::{Model, RegionKind, SafetyProperty};
-use crate::summary::{Affine, RetSummary, Summary};
+use crate::summary::{Affine, ProvTransfer, RetSummary, Summary};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FieldContract,
     FuncId, Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RefResult, RegId,
@@ -2583,6 +2583,39 @@ impl Explorer<'_> {
 
     /// Handle a call using the callee's summary: effect-aware heap handling and
     /// a provenance-preserving return binding.
+    /// Apply a callee's derived provenance-transfer summary to the actual argument
+    /// regions: add each `(arg, label)` to that argument's region, then union each
+    /// `(dst, src)` source's labels into the destination's. Mirrors the direct
+    /// `ProvLabel`/`ProvPropagate` semantics, one interprocedural step removed.
+    fn apply_prov_transfer(&self, prov: &ProvTransfer, argvals: &[SymValue], state: &mut PathState) {
+        let region = |i: usize| match argvals.get(i) {
+            Some(SymValue::Ptr(p)) => match p.prov {
+                Prov::Region(rid) => Some(rid),
+                _ => None,
+            },
+            _ => None,
+        };
+        for &(a, label) in &prov.labels {
+            if let Some(rid) = region(a) {
+                if let Some(r) = state.regions.get_mut(rid) {
+                    r.prov_labels.insert(label);
+                }
+            }
+        }
+        for &(d, s) in &prov.transfers {
+            let Some(src) = region(s) else { continue };
+            let src_labels = state.regions[src].prov_labels.clone();
+            if src_labels.is_empty() {
+                continue;
+            }
+            if let Some(rid) = region(d) {
+                if let Some(r) = state.regions.get_mut(rid) {
+                    r.prov_labels.extend(src_labels);
+                }
+            }
+        }
+    }
+
     fn step_call(
         &mut self,
         dst: Option<&RegId>,
@@ -2633,6 +2666,14 @@ impl Explorer<'_> {
                     r.state = LifetimeState::Freed;
                 }
             }
+        }
+
+        // Provenance transfer: the callee's summary records how a call moves provenance
+        // labels between its pointer arguments (a wrapper around a `sg_set_page`-style
+        // primitive, derived without a hand-written contract). Apply it to the actual
+        // argument regions, so a foreign element propagates through the wrapper.
+        if let Some(prov) = summary.as_ref().map(|s| s.prov.clone()) {
+            self.apply_prov_transfer(&prov, &argvals, state);
         }
 
         if let Some(d) = dst {
@@ -4922,6 +4963,7 @@ mod tests {
                 ret: crate::summary::RetSummary::Unknown,
                 writes: false,
                 frees: true,
+                prov: crate::summary::ProvTransfer::default(),
             },
         );
         let r = discharge_with_summaries(&f, &summaries);
