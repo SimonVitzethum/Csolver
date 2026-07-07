@@ -8,11 +8,13 @@
 use crate::parser::{
     LBin, LBlock, LCast, LFunc, LInst, LModule, LPred, LTerm, LType, LValue,
 };
+use csolver_contracts::{ApiContract, Contracts, Effect, Fill, SizeExpr};
 use csolver_core::{BitVector, Error, RegionKind, Result};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Const, DataLayout, FuncId, Function, Inst,
     MemKind, Module, Operand, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
 };
+use std::sync::OnceLock;
 use std::collections::HashMap;
 
 const LAYOUT: DataLayout = DataLayout::LP64;
@@ -604,74 +606,14 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 continue;
             }
         }
-        // A C/kernel allocator call becomes a heap `Alloc`/`Dealloc` (like `alloca`
-        // for the stack), so heap OOB / use-after-free / double-free are modelled
-        // and — crucially — the path stays *exact* (an `Inst::Call` would taint it,
-        // disabling refutation). Only when the result is used (`dst` present) for
-        // an allocator; a `free` needs no result.
+        // A recognized library/kernel API (allocator, deallocator, user-copy, …) is
+        // lowered from its **external effect contract** (crates/contracts/data/*.contract)
+        // instead of a hardcoded table: an `Alloc`/`Dealloc`/`MemIntrinsic` that models the
+        // API's memory effect. This keeps the path *exact* (an `Inst::Call` would taint it,
+        // disabling refutation) and lets a new API be covered by writing one contract block.
         if let LInst::Call { dst, callee, args, ret } = inst {
-            if let (Some(dst), Some(size)) = (dst, alloc_size(callee)) {
-                let count = match size {
-                    AllocSize::Bytes(i) => ctx.operand(&args[i], 64)?,
-                    AllocSize::Product(a, b) => {
-                        let tmp = ctx.fresh();
-                        insts.push(Inst::Assign {
-                            dst: tmp,
-                            ty: Type::int(64),
-                            value: RValue::Bin {
-                                op: BinOp::Mul,
-                                lhs: ctx.operand(&args[a], 64)?,
-                                rhs: ctx.operand(&args[b], 64)?,
-                            },
-                        });
-                        Operand::Reg(tmp)
-                    }
-                };
-                insts.push(Inst::Alloc {
-                    dst: ctx.reg(dst)?,
-                    region: RegionKind::Heap,
-                    elem: Type::int(8),
-                    count,
-                    // The malloc/kmalloc family guarantees alignment for any scalar;
-                    // 16 covers x86-64 `max_align_t`. Over-stating alignment can only
-                    // miss a misalignment bug, never fabricate a false FAIL.
-                    align: 16,
-                });
-                continue;
-            }
-            if let Some(i) = dealloc_ptr_arg(callee, args.len()) {
-                insts.push(Inst::Dealloc {
-                    region: RegionKind::Heap,
-                    ptr: ctx.operand(&args[i], 64)?,
-                });
-                continue;
-            }
-            // A Linux user-copy (`copy_from_user(to,from,n)` / `copy_to_user(to,from,
-            // n)`) transfers `n` bytes through a kernel buffer — a classic overflow
-            // site when `n` is user-controlled. Model it as a bulk WRITE of `n` bytes
-            // to the kernel buffer (`to` for from_user, `from` for to_user): a
-            // `MemIntrinsic::Set`, which carries the in-bounds obligation and is now
-            // refutable (see `check_mem_intrinsic`). The user side is not ours to
-            // model. The result (bytes-not-copied) is an opaque scalar.
-            if let Some(kbuf) = user_copy_kernel_arg(callee) {
-                if let Some(bufop) = args.get(kbuf) {
-                    // `from_user` fills the kernel buffer with untrusted data
-                    // (`UserFill`, so reads back are genuine adversarial inputs);
-                    // `to_user` only reads it, so a plain bounded `Set` (no taint).
-                    let kind = if kbuf == 0 { MemKind::UserFill } else { MemKind::Set };
-                    insts.push(Inst::MemIntrinsic {
-                        kind,
-                        dst: ctx.operand(bufop, 64)?,
-                        src: None,
-                        len: ctx.operand(&args[2.min(args.len().saturating_sub(1))], 64)?,
-                    });
-                    if let Some(d) = dst {
-                        insts.push(Inst::Assign {
-                            dst: ctx.reg(d)?,
-                            ty: lower_type(ret),
-                            value: RValue::Use(Operand::Const(Const::Undef)),
-                        });
-                    }
+            if let Some(contract) = contracts().lookup(callee) {
+                if emit_contract(ctx, &mut insts, contract, dst.as_deref(), args, ret)? {
                     continue;
                 }
             }
@@ -1196,64 +1138,122 @@ fn is_noop_intrinsic(name: &str) -> bool {
         || name == "llvm.assume"
 }
 
-/// How a recognized allocator computes its byte size from the call arguments.
-#[derive(Clone, Copy)]
-enum AllocSize {
-    /// A single byte-size argument (`malloc(n)`, `kmalloc(n, gfp)`).
-    Bytes(usize),
-    /// A count × element-size product (`kmalloc_array(n, size, gfp)`).
-    Product(usize, usize),
+/// The API effect contracts, parsed once from the embedded default files (allocators,
+/// deallocators, user-copies). Recognized calls are lowered from these instead of a
+/// hardcoded table; see [`csolver_contracts`] and `crates/contracts/data/*.contract`.
+fn contracts() -> &'static Contracts {
+    static CONTRACTS: OnceLock<Contracts> = OnceLock::new();
+    CONTRACTS.get_or_init(Contracts::defaults)
 }
 
-/// A C/kernel allocator recognized by name → the argument(s) giving its byte size.
-///
-/// **Only non-zeroing allocators are listed.** A zeroing allocator (`kzalloc`,
-/// `calloc`, …) returns *initialized* memory, but a plain `Alloc` region is modelled
-/// as uninitialized — so reading it would be a false "uninitialized read" FAIL. Those
-/// are deliberately left as opaque calls (sound UNKNOWN) until zero-init is modelled.
-/// The pointer size is byte-granular (`elem = i8`), so any later access is checked
-/// against the exact requested size.
-fn alloc_size(callee: &str) -> Option<AllocSize> {
-    Some(match callee {
-        "malloc" | "kmalloc" | "kmalloc_node" | "__kmalloc" | "vmalloc" | "vmalloc_node"
-        | "kvmalloc" | "kvmalloc_node" | "__vmalloc" | "aligned_alloc" | "kmalloc_noprof"
-        | "valloc" => AllocSize::Bytes(0),
-        // `aligned_alloc(align, size)` — the size is the second argument.
-        "memalign" => AllocSize::Bytes(1),
-        "kmalloc_array" | "kvmalloc_array" | "kmalloc_array_node" => AllocSize::Product(0, 1),
-        // `reallocarray(ptr, n, size)` — the fresh size is n × size.
-        "reallocarray" => AllocSize::Product(1, 2),
-        _ => return None,
-    })
-}
-
-/// A C/kernel deallocator recognized by name → the argument index of the freed
-/// pointer. `free(p)`, `kfree(p)` free argument 0; `kmem_cache_free(cache, p)` frees
-/// argument 1. `free(NULL)` is legal C, but a null free is a sound UNKNOWN, not a
-/// false FAIL, so it costs nothing here.
-/// A Linux user-copy → the argument index of the **kernel** buffer (bounds-checked
-/// for the `n = args[2]` byte length). `copy_from_user(to, from, n)` writes the kernel
-/// buffer `to` (arg 0); `copy_to_user(to, from, n)` reads the kernel buffer `from`
-/// (arg 1). Both are modelled as a bulk write of the kernel side — sound for the
-/// in-bounds obligation (the dominant overflow class); the user side is not ours.
-fn user_copy_kernel_arg(callee: &str) -> Option<usize> {
-    match callee {
-        "copy_from_user" | "_copy_from_user" | "__copy_from_user" | "__copy_from_user_inatomic"
-        | "copy_from_user_nofault" => Some(0),
-        "copy_to_user" | "_copy_to_user" | "__copy_to_user" | "__copy_to_user_inatomic"
-        | "copy_to_user_nofault" => Some(1),
-        _ => None,
+/// Lower a recognized API call from its `contract` into the modelling MSIR instructions.
+/// Returns `true` if the call was handled (and should not fall through to a generic call).
+fn emit_contract(
+    ctx: &mut Ctx,
+    insts: &mut Vec<Inst>,
+    contract: &ApiContract,
+    dst: Option<&str>,
+    args: &[LValue],
+    ret: &LType,
+) -> Result<bool> {
+    let mut handled = false;
+    let mut result_bound = false;
+    for effect in &contract.effects {
+        match effect {
+            // A fresh heap region (byte-granular, `elem = i8`) whose result pointer is
+            // the call value — only meaningful when that result is actually used.
+            Effect::Alloc { size, align } => {
+                let Some(dst) = dst else { continue };
+                let Some(count) = size_operand(ctx, insts, size, args)? else { continue };
+                insts.push(Inst::Alloc {
+                    dst: ctx.reg(dst)?,
+                    region: RegionKind::Heap,
+                    elem: Type::int(8),
+                    count,
+                    align: *align,
+                });
+                handled = true;
+                result_bound = true;
+            }
+            Effect::Free { ptr } => {
+                if let Some(a) = args.get(*ptr) {
+                    insts.push(Inst::Dealloc { region: RegionKind::Heap, ptr: ctx.operand(a, 64)? });
+                    handled = true;
+                }
+            }
+            // A bulk write of `len` bytes to the argument buffer — carries the in-bounds
+            // obligation (refutable via `check_mem_intrinsic`). `fill=user` taints the
+            // region so a value read back is a genuine adversarial input.
+            Effect::Write { ptr, len, fill } => {
+                if let Some(a) = args.get(*ptr) {
+                    let Some(len) = size_operand(ctx, insts, len, args)? else { continue };
+                    let kind = match fill {
+                        Fill::User => MemKind::UserFill,
+                        Fill::Undef => MemKind::Set,
+                    };
+                    insts.push(Inst::MemIntrinsic { kind, dst: ctx.operand(a, 64)?, src: None, len });
+                    handled = true;
+                }
+            }
+            // A bulk read is modelled as a bounded `Set` of the buffer: it carries the
+            // same in-bounds obligation (the read must stay within the region), no taint.
+            Effect::Read { ptr, len } => {
+                if let Some(a) = args.get(*ptr) {
+                    let Some(len) = size_operand(ctx, insts, len, args)? else { continue };
+                    insts.push(Inst::MemIntrinsic {
+                        kind: MemKind::Set,
+                        dst: ctx.operand(a, 64)?,
+                        src: None,
+                        len,
+                    });
+                    handled = true;
+                }
+            }
+        }
     }
+    // A recognized non-allocating call still yields a result the caller may use
+    // (e.g. `copy_from_user`'s bytes-not-copied) — bind it to an opaque value.
+    if handled && !result_bound {
+        if let Some(dst) = dst {
+            insts.push(Inst::Assign {
+                dst: ctx.reg(dst)?,
+                ty: lower_type(ret),
+                value: RValue::Use(Operand::Const(Const::Undef)),
+            });
+        }
+    }
+    Ok(handled)
 }
 
-fn dealloc_ptr_arg(callee: &str, argc: usize) -> Option<usize> {
-    let idx = match callee {
-        "free" | "kfree" | "vfree" | "kvfree" | "kfree_sensitive" | "kzfree" | "__kfree"
-        | "free_pages" | "__free_pages" | "kfree_const" => 0,
-        "kmem_cache_free" => 1,
-        _ => return None,
-    };
-    (idx < argc).then_some(idx)
+/// Evaluate a contract [`SizeExpr`] to a byte-length operand, or `None` if it references
+/// an argument the call does not have (then the effect is skipped — a sound fallthrough).
+fn size_operand(
+    ctx: &mut Ctx,
+    insts: &mut Vec<Inst>,
+    size: &SizeExpr,
+    args: &[LValue],
+) -> Result<Option<Operand>> {
+    Ok(match size {
+        SizeExpr::Arg(i) => match args.get(*i) {
+            Some(a) => Some(ctx.operand(a, 64)?),
+            None => None,
+        },
+        SizeExpr::Const(n) => Some(Operand::int(64, *n as u128)),
+        SizeExpr::Product(a, b) => match (args.get(*a), args.get(*b)) {
+            (Some(x), Some(y)) => {
+                let lhs = ctx.operand(x, 64)?;
+                let rhs = ctx.operand(y, 64)?;
+                let tmp = ctx.fresh();
+                insts.push(Inst::Assign {
+                    dst: tmp,
+                    ty: Type::int(64),
+                    value: RValue::Bin { op: BinOp::Mul, lhs, rhs },
+                });
+                Some(Operand::Reg(tmp))
+            }
+            _ => None,
+        },
+    })
 }
 
 fn type_width(ty: &LType) -> u32 {

@@ -1,0 +1,12 @@
+[package]
+name = "csolver-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "External, per-API memory-effect contracts (one file per API family)."
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+# Non-zeroing allocators: a call becomes a fresh heap region whose result pointer is
+# checked for OOB / use-after-free / double-free. The size is byte-granular (elem = i8).
+#
+# ZEROING allocators (kzalloc/calloc/vzalloc) are deliberately absent: a plain fresh
+# region reads as uninitialized, so a read of zeroed memory would be a false
+# "uninitialized read" FAIL. Add them only once zero-init is modelled.
+#
+# Alignment is stated at 16 (covers x86-64 max_align_t); over-stating alignment can only
+# miss a misalignment bug, never fabricate a false FAIL.
+
+[malloc kmalloc kmalloc_node __kmalloc vmalloc vmalloc_node kvmalloc kvmalloc_node __vmalloc aligned_alloc kmalloc_noprof valloc]
+alloc size=arg0 align=16
+
+# aligned_alloc-style: memalign(align, size) — the size is the second argument.
+[memalign]
+alloc size=arg1 align=16
+
+# element-count × element-size allocators.
+[kmalloc_array kvmalloc_array kmalloc_array_node]
+alloc size=arg0*arg1 align=16
+
+# reallocarray(ptr, n, size) — the fresh size is n × size.
+[reallocarray]
+alloc size=arg1*arg2 align=16

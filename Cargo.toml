@@ -7,6 +7,7 @@ members = [
     "crates/parser",
     "crates/mir",
     "crates/llvm",
+    "crates/contracts",
     "crates/asm",
     "crates/elf",
     "crates/memory",
@@ -40,6 +41,7 @@ csolver-cfg = { path = "crates/cfg", version = "0.0.1" }
 csolver-parser = { path = "crates/parser", version = "0.0.1" }
 csolver-mir = { path = "crates/mir", version = "0.0.1" }
 csolver-llvm = { path = "crates/llvm", version = "0.0.1" }
+csolver-contracts = { path = "crates/contracts", version = "0.0.1" }
 csolver-asm = { path = "crates/asm", version = "0.0.1" }
 csolver-elf = { path = "crates/elf", version = "0.0.1" }
 csolver-memory = { path = "crates/memory", version = "0.0.1" }

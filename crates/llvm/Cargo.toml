@@ -12,6 +12,7 @@ description = "LLVM-IR frontend: lowers textual LLVM IR (SSA, PHIs, intrinsics) 
 csolver-core.workspace = true
 csolver-ir.workspace = true
 csolver-parser.workspace = true
+csolver-contracts.workspace = true
 
 [lints]
 workspace = true

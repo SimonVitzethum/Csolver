@@ -1,0 +1,10 @@
+# Deallocators: a call frees the region pointed to by the named argument, so a later
+# access is a use-after-free and a second free is a double-free. free(NULL) is legal C,
+# but a null free is a sound UNKNOWN, not a false FAIL, so it costs nothing here.
+
+[free kfree vfree kvfree kfree_sensitive kzfree __kfree free_pages __free_pages kfree_const]
+free arg0
+
+# kmem_cache_free(cache, ptr) — the freed pointer is the second argument.
+[kmem_cache_free]
+free arg1
