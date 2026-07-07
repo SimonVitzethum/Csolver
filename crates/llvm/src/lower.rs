@@ -52,9 +52,12 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);
         match lower_function(f, fid, &func_ids, &m.debuginfo) {
-            Ok((func, contracts)) => {
+            Ok((func, contracts, raw_ptr_hints)) => {
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
+                }
+                for (idx, hint) in raw_ptr_hints {
+                    module.raw_ptr_hints.insert((fid, idx), hint);
                 }
                 if f.internal {
                     module.internal.insert(fid);
@@ -152,7 +155,7 @@ fn lower_function(
     id: FuncId,
     func_ids: &HashMap<String, FuncId>,
     debuginfo: &crate::debuginfo::DebugInfo,
-) -> Result<(Function, Vec<(u32, PtrContract)>)> {
+) -> Result<(Function, Vec<(u32, PtrContract)>, Vec<(u32, (u64, u32))>)> {
     let mut ctx = Ctx {
         regs: HashMap::new(),
         next_reg: 0,
@@ -178,6 +181,7 @@ fn lower_function(
     // Pointer parameters with a `dereferenceable(N)` contract — or the `(ptr,
     // usize len)` slice ABI — become known live regions during analysis.
     let mut contracts = Vec::new();
+    let mut raw_ptr_hints: Vec<(u32, (u64, u32))> = Vec::new();
     for (idx, p) in f.params.iter().enumerate() {
         if !matches!(p.ty, LType::Ptr) {
             continue;
@@ -229,6 +233,14 @@ fn lower_function(
                         sentinel: None,
                     },
                 ));
+            } else if let Some((size, align)) =
+                f.dbg.and_then(|sp| debuginfo.param_raw_ptr(sp, idx as u32 + 1))
+            {
+                // A raw pointer (`T*`) of known pointee size gets no contract by
+                // itself (it may dangle) — but record the size as a *hint*, applied
+                // only under the opt-in `assume_valid_params` (the framework-passes-
+                // a-valid-pointer assumption).
+                raw_ptr_hints.push((idx as u32, (size, align)));
             }
         }
     }
@@ -263,7 +275,7 @@ fn lower_function(
         blocks,
         entry: BlockId(0),
     };
-    Ok((function, contracts))
+    Ok((function, contracts, raw_ptr_hints))
 }
 
 /// A per-function pre-pass over debug info: the *result* locals of `load ptr`

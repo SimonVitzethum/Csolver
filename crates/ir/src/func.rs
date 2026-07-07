@@ -237,6 +237,12 @@ pub struct Module {
     /// program (never freed). Frontends without global information leave it
     /// empty — such symbols stay opaque scalars, the sound default.
     pub globals: HashMap<String, GlobalDef>,
+    /// Optional `(pointee byte size, align)` for a **raw** pointer parameter, keyed
+    /// by `(function, parameter index)`, recovered from debug info. NOT a contract on
+    /// its own (a raw pointer may dangle) — only applied when the caller opts into the
+    /// "the framework passes a valid pointer" assumption (`Config::assume_valid_params`),
+    /// where it becomes a prove-only contract under the `param-valid` assumption.
+    pub raw_ptr_hints: HashMap<(FuncId, u32), (u64, u32)>,
 }
 
 /// A global/static definition: what the analysis may assume about the memory
@@ -263,6 +269,7 @@ impl Module {
             unanalyzed: Vec::new(),
             internal: std::collections::HashSet::new(),
             globals: HashMap::new(),
+            raw_ptr_hints: HashMap::new(),
         }
     }
 

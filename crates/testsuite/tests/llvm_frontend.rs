@@ -837,6 +837,47 @@ declare void @free(ptr)
         "a free with no later use must not be a false positive");
 }
 
+/// The opt-in `assume_valid_params`: a field access through a raw pointer parameter
+/// of known (debug-info) pointee size proves — the framework/kernel entry ABI passes
+/// a valid pointer. UNKNOWN by default (a raw pointer may dangle); PASS under the
+/// assumption, which the report surfaces as `param-valid`. This is the dominant
+/// `UNKNOWN` cause in per-TU kernel/driver code.
+#[test]
+fn assume_valid_params_contracts_raw_pointer_params() {
+    // `struct dev { i32 id; [8 x i64] buf }`; read `d->buf[3]`, in bounds of the
+    // 72-byte instance. Needs `-g` debug info for the pointee size, so hand-write it.
+    let src = r#"
+%struct.dev = type { i32, [8 x i64] }
+define i64 @read_field(ptr %d) !dbg !4 {
+entry:
+  %p = getelementptr %struct.dev, ptr %d, i64 0, i32 1, i64 3
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)
+!1 = !DIFile(filename: "d.c", directory: "/")
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = distinct !DISubprogram(name: "read_field", scope: !1, file: !1, line: 1, type: !5, unit: !0, retainedNodes: !9)
+!5 = !DISubroutineType(types: !6)
+!6 = !{!7, !8}
+!7 = !DIBasicType(name: "long", size: 64, encoding: DW_ATE_signed)
+!8 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !10, size: 64)
+!10 = !DICompositeType(tag: DW_TAG_structure_type, name: "dev", size: 576)
+!9 = !{!11}
+!11 = !DILocalVariable(name: "d", arg: 1, scope: !4, file: !1, type: !8)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "d".into() }).expect("lower");
+    // Default: a raw pointer parameter is uncontracted → UNKNOWN.
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Pass,
+        "a raw pointer parameter is not assumed valid by default");
+    // Opt-in: the framework-valid-pointer assumption makes the field access prove.
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "assume_valid_params contracts the raw pointer param to its pointee size");
+}
+
 /// `callbr` (inline-asm goto, pervasive in the kernel for static keys) must not drop
 /// the function: it lowers to an asm havoc plus a branch to every target. An OOB in
 /// the fallthrough block (reached after the callbr) is still found.

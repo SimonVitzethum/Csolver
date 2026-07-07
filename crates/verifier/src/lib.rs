@@ -36,7 +36,7 @@ use csolver_core::{
     ResidualObligation, SafetyProperty, SourceLevel, SuggestedAssumption, Verdict,
 };
 use csolver_ir::{
-    Condition, Const, FieldContract, FuncId, Function, Inst, Module, Operand, PtrContract,
+    Condition, Const, FieldContract, FuncId, Function, Inst, Module, Operand, PtrContract, SizeSpec,
 };
 use csolver_symbolic::{
     discharge_function, discharge_with_fields, summarize_module, Summary, SymOutcome, SymbolicReport,
@@ -69,6 +69,13 @@ pub struct Config {
     /// small false-positive risk for far higher recall. Off by default —
     /// verification stays strict (a false FAIL is as bad as a false PASS there).
     pub bug_finding: bool,
+    /// **Assume framework-passed pointers are valid.** For each raw pointer parameter
+    /// of a statically-known pointee size (from debug info), install a prove-only
+    /// contract of that size resting on the `param-valid` assumption. Off by default
+    /// (unsound in general — a raw pointer may dangle); opt-in for context-free
+    /// analysis whose dominant `UNKNOWN` cause is an uncontracted pointer parameter
+    /// (per-TU kernel/driver code).
+    pub assume_valid_params: bool,
 }
 
 impl Default for Config {
@@ -79,6 +86,7 @@ impl Default for Config {
             use_symbolic: true,
             closed_world: false,
             bug_finding: false,
+            assume_valid_params: false,
         }
     }
 }
@@ -192,6 +200,27 @@ fn verify_one_function(
         if slot.is_none() {
             *slot = synthesized.get(&(f.id, i as u32)).copied();
         }
+        // Opt-in `assume_valid_params`: a still-uncontracted raw pointer parameter of
+        // known pointee size becomes a prove-only, valid, correctly-sized region under
+        // the `param-valid` assumption (the framework passes a valid pointer at entry).
+        if slot.is_none() && config.assume_valid_params {
+            if let Some(&(size, align)) = module.raw_ptr_hints.get(&(f.id, i as u32)) {
+                // A valid instance is naturally aligned; when debug info omits the
+                // alignment, derive it from the size (a type's size is a multiple of
+                // its alignment) — the largest power of two dividing it, capped at 16
+                // (`max_align_t`) — so an aligned field access proves.
+                let derived = 1u32 << size.trailing_zeros().min(4);
+                *slot = Some(PtrContract {
+                    assumption: Some("param-valid"),
+                    refutable: false,
+                    size: SizeSpec::Bytes(size),
+                    align: align.max(derived).max(1),
+                    readable: true,
+                    writable: true,
+                    sentinel: None,
+                });
+            }
+        }
         // An internal function's (or closure's) contract is a caller-established
         // precondition: the guard lives at the call sites, so a witness picked
         // freely from the parameter space may never occur in the real program.
@@ -299,6 +328,17 @@ fn assumption_record(id: String) -> Assumption {
                             (`&[T]`, `&mut [T; N]`, …), which the compiler guarantees and \
                             emits as LLVM parameter attributes; the proof is relative to \
                             the caller upholding the reference's validity"
+                .into(),
+        },
+        "param-valid" => Assumption {
+            id,
+            statement: "a raw pointer parameter points to a valid, live, correctly-sized \
+                        instance of its (debug-info) pointee type"
+                .into(),
+            justification: "the opt-in `--assume-valid-params`: a framework/kernel entry \
+                            point is passed a valid pointer by its caller (the framework), \
+                            which C's type system cannot state; unsound for an arbitrary raw \
+                            pointer, so the proof is explicitly relative to this assumption"
                 .into(),
         },
         contracts::INTERNAL_CALL_CONTRACT => Assumption {

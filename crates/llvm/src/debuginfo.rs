@@ -146,6 +146,19 @@ impl DebugInfo {
         1
     }
 
+    /// The pointee byte size and alignment of a **raw** pointer parameter (`T*`) of
+    /// statically-known pointee size — for the opt-in "the framework passes a valid
+    /// pointer" assumption (`param-valid`). Unlike [`param_ref`], this deliberately
+    /// accepts a raw pointer: it is the *assumption's* job (not the type's) to
+    /// guarantee validity, so it is only ever applied under the caller's opt-in.
+    pub(crate) fn param_raw_ptr(&self, subprogram: u32, arg: u32) -> Option<(u64, u32)> {
+        let ty = *self.params.get(&(subprogram, arg))?;
+        match self.nodes.get(&ty)? {
+            DiNode::Pointer { base, .. } => Some((self.sized_bytes(*base)?, self.sized_align(*base))),
+            _ => None,
+        }
+    }
+
     /// The **pointee** type node of a reference parameter — the struct a `&mut
     /// StructT` param points at — so field loads through it can resolve members.
     pub(crate) fn param_pointee(&self, subprogram: u32, arg: u32) -> Option<u32> {
