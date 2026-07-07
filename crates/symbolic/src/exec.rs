@@ -142,6 +142,7 @@ pub fn discharge_full(
 /// store of a fresh valid region into that field's slot, so the callee's load of
 /// the field yields a pointer with provenance (proved under the field pointee's
 /// own trust basis).
+#[allow(clippy::too_many_arguments)]
 pub fn discharge_with_fields(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
@@ -150,8 +151,9 @@ pub fn discharge_with_fields(
     globals: &HashMap<String, GlobalDef>,
     bug_finding: bool,
     exported: bool,
+    assume_valid_params: bool,
 ) -> SymbolicReport {
-    let limits = ExecLimits { bug_finding, exported, ..ExecLimits::default() };
+    let limits = ExecLimits { bug_finding, exported, assume_valid_params, ..ExecLimits::default() };
     discharge_inner(f, limits, summaries, contracts, field_contracts, globals)
 }
 
@@ -287,6 +289,7 @@ fn discharge_inner(
         fresh: 0,
         bug_finding: limits.bug_finding,
         exported: limits.exported,
+        assume_valid_params: limits.assume_valid_params,
         visits: 0,
         truncated: false,
         limits,
@@ -1042,6 +1045,8 @@ struct Explorer<'f> {
     /// only an exported function's `arg…` parameters count as genuine adversarial
     /// inputs (see `goal_is_genuine`); an internal function's are caller-constrained.
     exported: bool,
+    /// Honour `RefWitness { assumed }` (a raw pointer field valid under the opt-in).
+    assume_valid_params: bool,
     visits: usize,
     truncated: bool,
     limits: ExecLimits,
@@ -2317,7 +2322,16 @@ impl Explorer<'_> {
                 let decision = self.decide(&[goal], state, RefuteMode::Definite, &[]);
                 self.record_scalar(block, idx, decision);
             }
-            Inst::RefWitness { dst, size, align, writable } => {
+            Inst::RefWitness { dst, size, align, writable, assumed } => {
+                // A raw-pointer field (`assumed`) is a valid reference only under the
+                // `assume_valid_params` opt-in; otherwise leave the loaded pointer with
+                // its opaque provenance (sound — accesses through it stay UNKNOWN).
+                if *assumed && !self.assume_valid_params {
+                    return;
+                }
+                if *assumed {
+                    self.assumptions.insert("param-valid");
+                }
                 // A valid reference to a fresh live region (see
                 // `materialize_ref_region`): a known size is refutable, an
                 // unknown size (slice/`str`) prove-only.

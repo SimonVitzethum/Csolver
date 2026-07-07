@@ -344,6 +344,11 @@ pub enum Inst {
         align: u32,
         /// Whether the reference is mutable (`&mut T`).
         writable: bool,
+        /// `true` if the reference's validity rests on the `assume_valid_params`
+        /// opt-in (a raw pointer field recovered from debug info) rather than the
+        /// type system (a Rust `&T`/C++ `T&`, always valid). The executor
+        /// materialises an `assumed` witness only when that mode is on.
+        assumed: bool,
     },
     /// A bulk memory operation (`memcpy`/`memmove`/`memset`): touches `len`
     /// bytes at `dst` (write) and, for copy/move, `len` bytes at `src` (read).

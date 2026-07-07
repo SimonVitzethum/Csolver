@@ -63,6 +63,9 @@ pub struct ExecLimits {
     /// false positive (e.g. an internal helper indexed by a bounded enum). Default
     /// `true`: an isolated function is treated as an entry point.
     pub exported: bool,
+    /// Honour `RefWitness { assumed: true }` — a raw pointer field recovered from
+    /// debug info, valid only under the `assume_valid_params` opt-in.
+    pub assume_valid_params: bool,
 }
 
 impl Default for ExecLimits {
@@ -72,6 +75,7 @@ impl Default for ExecLimits {
             time_budget: Some(std::time::Duration::from_secs(30)),
             bug_finding: false,
             exported: true,
+            assume_valid_params: false,
         }
     }
 }

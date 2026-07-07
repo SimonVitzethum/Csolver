@@ -894,6 +894,54 @@ entry:
         "the pointee size is inferred from the gep-base type when debug info is absent");
 }
 
+/// `assume_valid_params` also recovers a **loaded** raw pointer field: `d->child->
+/// data[2]` where `child` is a `struct child *` member. Under the opt-in, the loaded
+/// `child` is materialised as a valid `struct child` (from debug info), so the access
+/// through it proves — the dominant `UNKNOWN` cause on real kernel code. UNKNOWN by
+/// default (a raw pointer field may hold null / a dangling value).
+#[test]
+fn assume_valid_params_recovers_loaded_pointer_fields() {
+    // struct child { i32; [4 x i64] }; struct dev { i32; child* }. Access d->child->
+    // data[2] (offset 8 in child) — in bounds of the 40-byte child. With DWARF: `dev`
+    // has a raw-pointer member `child` at offset 8 pointing at `struct child`.
+    let src = r#"
+%struct.child = type { i32, [4 x i64] }
+%struct.dev = type { i32, ptr }
+define i64 @read_child(ptr %d) !dbg !4 {
+entry:
+  %c = getelementptr inbounds i8, ptr %d, i64 8
+  %child = load ptr, ptr %c, align 8
+  %p = getelementptr inbounds i8, ptr %child, i64 24
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)
+!1 = !DIFile(filename: "d.c", directory: "/")
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = distinct !DISubprogram(name: "read_child", scope: !1, file: !1, type: !5, unit: !0, retainedNodes: !20)
+!5 = !DISubroutineType(types: !6)
+!6 = !{!7, !8}
+!7 = !DIBasicType(name: "long", size: 64)
+!8 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "dev", size: 128, elements: !10)
+!10 = !{!11, !12}
+!11 = !DIDerivedType(tag: DW_TAG_member, name: "id", baseType: !7, size: 32, offset: 0)
+!12 = !DIDerivedType(tag: DW_TAG_member, name: "child", baseType: !13, size: 64, offset: 64)
+!13 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !14, size: 64)
+!14 = !DICompositeType(tag: DW_TAG_structure_type, name: "child", size: 320)
+!20 = !{!21}
+!21 = !DILocalVariable(name: "d", arg: 1, scope: !4, file: !1, type: !8)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "c".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Pass,
+        "a loaded raw pointer field is not assumed valid by default");
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "assume_valid_params materialises the loaded child pointer as a valid struct");
+}
+
 /// `callbr` (inline-asm goto, pervasive in the kernel for static keys) must not drop
 /// the function: it lowers to an asm havoc plus a branch to every target. An OOB in
 /// the fallthrough block (reached after the callbr) is still found.

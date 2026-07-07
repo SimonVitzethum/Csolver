@@ -86,7 +86,7 @@ struct Ctx<'a> {
     /// *field* of a DWARF-typed struct (`load ptr, gep(&mut StructT, offset)`
     /// where the member at `offset` is a `&T`). Such a loaded pointer is a valid
     /// reference — `lower_block` materialises it with a `RefWitness`.
-    field_ref_loads: HashMap<String, (u64, u32, bool)>,
+    field_ref_loads: HashMap<String, (u64, u32, bool, bool)>,
 }
 
 impl Ctx<'_> {
@@ -300,16 +300,19 @@ fn lower_function(
 fn dwarf_field_loads(
     f: &LFunc,
     di: &crate::debuginfo::DebugInfo,
-) -> HashMap<String, (u64, u32, bool)> {
+) -> HashMap<String, (u64, u32, bool, bool)> {
     let mut out = HashMap::new();
     let Some(sp) = f.dbg else { return out };
 
     // `local -> DWARF struct type id it points to (at offset 0)`. Seed the
     // reference parameters whose pointee is a struct.
     let mut struct_of: HashMap<String, u32> = HashMap::new();
+   
     for (i, p) in f.params.iter().enumerate() {
         if !p.name.is_empty() {
-            if let Some(s) = di.param_pointee(sp, i as u32 + 1) {
+            // Seed from any pointer param (raw included) — a raw pointer's fields are
+            // recovered only as `assumed`, honoured under `assume_valid_params`.
+            if let Some(s) = di.param_pointee_any(sp, i as u32 + 1) {
                 struct_of.insert(p.name.clone(), s);
             }
         }
@@ -333,10 +336,14 @@ fn dwarf_field_loads(
                 if let Some(s) = spill_src.get(slot).and_then(|src| struct_of.get(src)).copied() {
                     struct_of.insert(dst.clone(), s);
                 }
-                // A load of a recorded reference field: record its result.
+                // A load of a recorded reference field: record its result. A valid
+                // reference (`&T`/`T&`) is unconditional; a raw pointer field is
+                // recovered only under the `assume_valid_params` opt-in (`assumed`).
                 if let Some(&(struct_id, off)) = field_at.get(slot) {
                     if let Some(c) = di.member_ref(struct_id, off) {
-                        out.insert(dst.clone(), (c.size, c.align, c.writable));
+                        out.insert(dst.clone(), (c.size, c.align, c.writable, false));
+                    } else if let Some((size, align)) = di.member_raw_ptr(struct_id, off) {
+                        out.insert(dst.clone(), (size, align, true, true));
                     }
                 }
             }
@@ -351,10 +358,44 @@ fn dwarf_field_loads(
                     field_at.insert(dst.clone(), (s, *off as u64));
                 }
             }
+            // `gep %struct.T, ptr %base, 0, K` — the typed struct-field form modern
+            // opaque-pointer IR (`-O2`) emits. Record the field's byte offset.
+            LInst::GepChain { dst, agg_ty, base: LValue::Local(base), indices } => {
+                if let Some(&s) = struct_of.get(base) {
+                    if matches!(indices.first(), Some(LValue::Int(0))) {
+                        if let Some(off) = gepchain_const_offset(&lower_type(agg_ty), &indices[1..]) {
+                            field_at.insert(dst.clone(), (s, off));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
     out
+}
+
+/// The constant byte offset of an all-constant `GepChain` navigation path into
+/// `agg` (struct field / constant array index). `None` on a variable step.
+fn gepchain_const_offset(agg: &Type, path: &[LValue]) -> Option<u64> {
+    let mut ty = agg;
+    let mut offset = 0u64;
+    for step in path {
+        let LValue::Int(k) = step else { return None };
+        let k = u64::try_from(*k).ok()?;
+        match ty {
+            Type::Struct { fields, .. } => {
+                offset = offset.checked_add(struct_field_offset(ty, k as u32)?)?;
+                ty = fields.get(k as usize)?;
+            }
+            Type::Array { elem, .. } => {
+                offset = offset.checked_add(k.checked_mul(elem.size_bytes(&LAYOUT)?)?)?;
+                ty = elem;
+            }
+            _ => return None,
+        }
+    }
+    Some(offset)
 }
 
 /// Detect a Rust slice parameter: a `ptr` (with an `align` attribute, as `rustc`
@@ -547,7 +588,7 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         // is a `&T`/`&mut T` by the field's declared type, so accesses through it
         // prove. Without this the loaded field pointer has lost provenance.
         if let LInst::Load { dst, align_meta, .. } = inst {
-            if let Some(&(size, align, writable)) = ctx.field_ref_loads.get(dst) {
+            if let Some(&(size, align, writable, assumed)) = ctx.field_ref_loads.get(dst) {
                 insts.push(lower_inst(ctx, inst)?);
                 insts.push(Inst::RefWitness {
                     dst: ctx.reg(dst)?,
@@ -557,6 +598,8 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                     // the larger so an aligned access through the field proves.
                     align: align.max(align_meta.unwrap_or(0)),
                     writable,
+                    // A raw-pointer field is only valid under `assume_valid_params`.
+                    assumed,
                 });
                 continue;
             }

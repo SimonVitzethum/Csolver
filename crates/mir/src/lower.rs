@@ -590,7 +590,7 @@ impl Ctx {
             None => (None, 1),
         };
         let dst = self.fresh();
-        out.push(Inst::RefWitness { dst, size, align, writable: *mutable });
+        out.push(Inst::RefWitness { dst, size, align, writable: *mutable, assumed: false });
         Some(IrOp::Reg(dst))
     }
 

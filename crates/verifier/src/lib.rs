@@ -443,6 +443,7 @@ fn verify_function_with(
     let symbolic = config.use_symbolic.then(|| match summaries {
         Some(s) => discharge_with_fields(
             f, s, contracts, field_contracts, globals, config.bug_finding, exported,
+            config.assume_valid_params,
         ),
         None => discharge_function(f),
     });

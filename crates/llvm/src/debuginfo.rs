@@ -159,11 +159,16 @@ impl DebugInfo {
         }
     }
 
-    /// The **pointee** type node of a reference parameter — the struct a `&mut
-    /// StructT` param points at — so field loads through it can resolve members.
-    pub(crate) fn param_pointee(&self, subprogram: u32, arg: u32) -> Option<u32> {
+    /// The pointee type node of **any** pointer parameter, including a raw pointer
+    /// (`struct T *`) — so field loads through it can resolve members. Used to seed
+    /// member-provenance recovery; a raw pointer's *fields* are only trusted under
+    /// `assume_valid_params` (they are recorded as `assumed`).
+    pub(crate) fn param_pointee_any(&self, subprogram: u32, arg: u32) -> Option<u32> {
         let ty = *self.params.get(&(subprogram, arg))?;
-        self.valid_ref(ty).map(|(base, _)| base)
+        match self.nodes.get(&ty)? {
+            DiNode::Pointer { base, .. } | DiNode::Reference { base, .. } => Some(*base),
+            _ => None,
+        }
     }
 
     /// The recovered contract for the member of struct type `struct_id` at byte
@@ -182,6 +187,31 @@ impl DebugInfo {
                         align: self.sized_align(pointee),
                         writable,
                     });
+                }
+            }
+        }
+        None
+    }
+
+    /// Like [`member_ref`], but for a **raw** pointer member (`T*`) of known pointee
+    /// size — the pointee `(size, align)`. Recovered only under the opt-in
+    /// `assume_valid_params` (a raw pointer field may hold null or a dangling value):
+    /// a `dev->child` where `child` is a `struct child *`, so a load of it yields a
+    /// valid pointer to a `struct child`.
+    pub(crate) fn member_raw_ptr(&self, struct_id: u32, offset: u64) -> Option<(u64, u32)> {
+        let elements = self.composite_elements(struct_id)?;
+        let DiNode::Tuple(members) = self.nodes.get(&elements)? else { return None };
+        for &m in members {
+            if let Some(DiNode::Member { offset_bytes, base }) = self.nodes.get(&m) {
+                if *offset_bytes == offset {
+                    if let DiNode::Pointer { base: pointee, .. } = self.nodes.get(base)? {
+                        let size = self.sized_bytes(*pointee)?;
+                        // A valid instance is naturally aligned; when debug info omits
+                        // the alignment, derive it from the size (a type's size is a
+                        // multiple of its alignment), capped at 16 (`max_align_t`).
+                        let derived = 1u32 << size.trailing_zeros().min(4);
+                        return Some((size, self.sized_align(*pointee).max(derived)));
+                    }
                 }
             }
         }
@@ -434,7 +464,7 @@ start:
     #[test]
     fn resolves_reference_struct_member_at_offset() {
         let di = parse(STRUCT_SRC);
-        let s = di.param_pointee(7, 1).expect("&mut Wrap pointee");
+        let s = di.param_pointee_any(7, 1).expect("&mut Wrap pointee");
         // Member `inner: &u8` is at byte offset 8 (bit offset 64).
         let c = di.member_ref(s, 8).expect("reference member at offset 8");
         assert_eq!(c.size, 1, "&u8 pointee is 1 byte");
