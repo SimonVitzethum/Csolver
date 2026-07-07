@@ -1209,6 +1209,13 @@ fn emit_contract(
                     handled = true;
                 }
             }
+            // Provenance labelling / capability requirements (the Copy-Fail write-to-a-
+            // read-only-page class) are enforced in the symbolic executor, which needs a
+            // region-level provenance model. Until that lands they are recognized but not
+            // yet emitted — sound (an unenforced `require` can only miss a bug, never
+            // fabricate a false FAIL). They do not by themselves mark the call handled, so
+            // an otherwise-unmodelled call still falls through to a generic (opaque) call.
+            Effect::Label { .. } | Effect::Require { .. } => {}
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

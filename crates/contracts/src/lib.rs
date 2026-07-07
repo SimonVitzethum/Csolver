@@ -36,7 +36,7 @@
 //! value semantics beyond "this call was recognized"; the frontend decides how to bind the
 //! result (an allocation's result is the fresh pointer, everything else is opaque).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// A byte-length expression referring to a call's arguments (0-based) or a constant.
@@ -92,6 +92,25 @@ pub enum Effect {
         /// How many bytes are read.
         len: SizeExpr,
     },
+    /// Attaches a **provenance label** to the region pointed to by argument `ptr`. The
+    /// label's granted capabilities are declared by a `prov` line (see [`Contracts`]).
+    /// The archetype: a splice-inserted page enters a scatterlist labelled `foreign`.
+    Label {
+        /// The 0-based index of the argument whose region is labelled.
+        ptr: usize,
+        /// The provenance label name.
+        label: String,
+    },
+    /// Requires that the region pointed to by argument `ptr` **grants** the named
+    /// capability. Refuted (a capability violation) when the region's provenance label
+    /// provably does not grant it — e.g. a `foreign` page used where `write` is required
+    /// (the Copy-Fail write-to-a-read-only-page shape).
+    Require {
+        /// The 0-based index of the argument whose region must grant the capability.
+        ptr: usize,
+        /// The required capability name (matched against the label's `grants` set).
+        cap: String,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -114,11 +133,16 @@ impl ApiContract {
     }
 }
 
-/// A registry of API contracts, indexed by function name.
+/// A registry of API contracts, indexed by function name, plus the **provenance
+/// lattice**: which capabilities each provenance label grants. An *unlabelled* region
+/// grants **every** capability (the sound default — a `Require` only fails when a label
+/// explicitly withholds the capability), so the whole mechanism is opt-in and cannot
+/// introduce a false FAIL on code that names no labels.
 #[derive(Debug, Default, Clone)]
 pub struct Contracts {
     by_name: HashMap<String, usize>,
     contracts: Vec<ApiContract>,
+    grants: HashMap<String, HashSet<String>>,
 }
 
 impl Contracts {
@@ -155,6 +179,21 @@ impl Contracts {
         self.by_name.get(name).map(|&i| &self.contracts[i])
     }
 
+    /// Whether a region labelled `label` grants capability `cap`. An unknown/unlabelled
+    /// label grants everything (the sound default).
+    pub fn grants(&self, label: &str, cap: &str) -> bool {
+        match self.grants.get(label) {
+            Some(set) => set.contains(cap),
+            None => true,
+        }
+    }
+
+    /// The provenance lattice (label → granted capabilities), for consumers that intern
+    /// it (e.g. the frontend attaching it to the module).
+    pub fn lattice(&self) -> &HashMap<String, HashSet<String>> {
+        &self.grants
+    }
+
     /// Number of registered contract blocks (one per API family).
     pub fn len(&self) -> usize {
         self.contracts.len()
@@ -174,6 +213,24 @@ impl Contracts {
                 continue;
             }
             let at = || format!("{src}:{}", lineno + 1);
+            // A top-level provenance declaration: `prov <label> grants=<c1,c2,...>`.
+            if let Some(decl) = line.strip_prefix("prov ") {
+                self.flush(pending.take());
+                let words: Vec<&str> = decl.split_whitespace().collect();
+                let label = words
+                    .first()
+                    .filter(|w| !w.contains('='))
+                    .ok_or_else(|| format!("{}: `prov` needs a label name", at()))?;
+                let caps = kv(&words, "grants")
+                    .ok_or_else(|| format!("{}: `prov` needs `grants=...`", at()))?;
+                let set = caps
+                    .split(',')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                self.grants.insert(label.to_string(), set);
+                continue;
+            }
             if let Some(inner) = line.strip_prefix('[') {
                 // A new block header flushes the previous block.
                 self.flush(pending.take());
@@ -240,6 +297,17 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let ptr = parse_arg(rest.first().copied().unwrap_or(""))?;
             let len = parse_kv_size(&rest, "len")?;
             Ok(Effect::Read { ptr, len })
+        }
+        // `label arg<k> <labelname>` and `require arg<k> <capname>` (positional).
+        "label" => {
+            let ptr = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let label = rest.get(1).copied().ok_or("`label` needs a label name")?.to_string();
+            Ok(Effect::Label { ptr, label })
+        }
+        "require" => {
+            let ptr = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let cap = rest.get(1).copied().ok_or("`require` needs a capability name")?.to_string();
+            Ok(Effect::Require { ptr, cap })
         }
         other => Err(format!("unknown effect `{other}`")),
     }
@@ -333,6 +401,33 @@ mod tests {
         assert!(Contracts::default().parse_str("free arg0\n", "t").is_err());
         // An unknown effect is an error.
         assert!(Contracts::default().parse_str("[x]\nteleport arg0\n", "t").is_err());
+    }
+
+    #[test]
+    fn provenance_lattice_labels_and_requirements() {
+        let mut c = Contracts::default();
+        c.parse_str(
+            "prov foreign grants=read\nprov kernel grants=read,write\n\
+             [mark_foreign]\nlabel arg0 foreign\n\
+             [needs_writable]\nrequire arg0 write\n",
+            "t",
+        )
+        .unwrap();
+        // The lattice: `foreign` grants read but not write; `kernel` grants both.
+        assert!(c.grants("foreign", "read"));
+        assert!(!c.grants("foreign", "write"));
+        assert!(c.grants("kernel", "write"));
+        // An unlabelled region grants everything (sound default).
+        assert!(c.grants("anything-unknown", "write"));
+        // The effects.
+        assert_eq!(
+            c.lookup("mark_foreign").unwrap().effects,
+            vec![Effect::Label { ptr: 0, label: "foreign".into() }]
+        );
+        assert_eq!(
+            c.lookup("needs_writable").unwrap().effects,
+            vec![Effect::Require { ptr: 0, cap: "write".into() }]
+        );
     }
 
     #[test]
