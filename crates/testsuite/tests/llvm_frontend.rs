@@ -876,6 +876,22 @@ entry:
     let cfg = Config { assume_valid_params: true, ..Config::default() };
     assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
         "assume_valid_params contracts the raw pointer param to its pointee size");
+
+    // Kernel IR is built without debug info, so the pointee size must also be
+    // inferable from the parameter's *use* (`gep %struct.dev, ptr %d, 0, …`).
+    let no_dwarf = r#"
+%struct.dev = type { i32, [8 x i64] }
+define i64 @read_field(ptr %d) {
+entry:
+  %p = getelementptr %struct.dev, ptr %d, i64 0, i32 1, i64 3
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: no_dwarf.into(), name: "n".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Pass);
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "the pointee size is inferred from the gep-base type when debug info is absent");
 }
 
 /// `callbr` (inline-asm goto, pervasive in the kernel for static keys) must not drop

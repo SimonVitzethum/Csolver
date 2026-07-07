@@ -233,13 +233,17 @@ fn lower_function(
                         sentinel: None,
                     },
                 ));
-            } else if let Some((size, align)) =
-                f.dbg.and_then(|sp| debuginfo.param_raw_ptr(sp, idx as u32 + 1))
+            } else if let Some((size, align)) = f
+                .dbg
+                .and_then(|sp| debuginfo.param_raw_ptr(sp, idx as u32 + 1))
+                .or_else(|| infer_raw_ptr_pointee(f, &p.name))
             {
                 // A raw pointer (`T*`) of known pointee size gets no contract by
                 // itself (it may dangle) — but record the size as a *hint*, applied
-                // only under the opt-in `assume_valid_params` (the framework-passes-
-                // a-valid-pointer assumption).
+                // only under the opt-in `assume_valid_params`. The size comes from
+                // debug info, or (kernel IR is built without it) is inferred from how
+                // the parameter is used: `gep %struct.T, ptr %p, 0, …` reveals that
+                // `%p` points at a `%struct.T`.
                 raw_ptr_hints.push((idx as u32, (size, align)));
             }
         }
@@ -905,6 +909,36 @@ fn branch_args(ctx: &Ctx, from: &str, to: &str) -> Result<Vec<Operand>> {
         args.push(ctx.operand(val, type_width(&phi.ty))?);
     }
     Ok(args)
+}
+
+/// Infer the pointee `(size, align)` of a raw pointer parameter from its **use**,
+/// when debug info is absent (kernel IR is built without it). A single-element gep
+/// `gep %struct.T, ptr %param, 0, …` reveals that `%param` points at a `%struct.T`;
+/// take the largest such aggregate (a union is accessed through its biggest member).
+/// Only sees a use directly on the parameter (sound at `-O1`+, where the parameter is
+/// not spilled to an alloca — kernel IR is `-O2`). Returns `None` if never so used.
+fn infer_raw_ptr_pointee(f: &LFunc, param_name: &str) -> Option<(u64, u32)> {
+    let mut best: Option<(u64, u32)> = None;
+    for b in &f.blocks {
+        for inst in &b.insts {
+            // A struct/array field navigation whose leading index is 0 (one element)
+            // and whose base is exactly this parameter.
+            let LInst::GepChain { agg_ty, base, indices, .. } = inst else { continue };
+            if !matches!(base, LValue::Local(n) if n == param_name) {
+                continue;
+            }
+            if !matches!(indices.first(), Some(LValue::Int(0))) {
+                continue;
+            }
+            let ty = lower_type(agg_ty);
+            if let (Some(size), Some(align)) = (ty.size_bytes(&LAYOUT), ty.align_bytes(&LAYOUT)) {
+                if size > 0 && best.is_none_or(|(bs, _)| size > bs) {
+                    best = Some((size, align as u32));
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Lower a multi-level `getelementptr` into a `PtrOffset` chain by walking the
