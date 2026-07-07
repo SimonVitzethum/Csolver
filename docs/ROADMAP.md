@@ -242,11 +242,13 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
    propagate, `crypto_aead_encrypt` requires `write`). The full label→propagate→require
    chain now **closes end to end** through the file-driven contracts on a faithful
    synthetic reproduction (testsuite `copy_fail_provenance_chain_is_refused`).
-   **Remaining to fire on the real unmodified kernel .ll:** recover *region identity*
-   for the scatterlist/request regions built by opaque helpers (`af_alg_get_rsgl`) and
-   reached through struct-field loads (`areq->first_rsgl.sgl.sg`) — member-provenance for
-   the crypto-API structs — so the labelled page's provenance reaches the requirement.
-   (VPS-verified: today the real algif_aead.ll stays 0 FAIL — sound, no false alarm.)
+   **Member-provenance already works** (a label survives a struct-field store/load, even
+   across a heap-havocing opaque call — tested). So the barrier to firing on the real
+   unmodified kernel .ll is *not* member-provenance but cross-syscall / whole-object: the
+   label source (`af_alg_sendpage`) lives in a different syscall than the sink
+   (`_aead_recvmsg`), and the sink's scatterlist/request regions are opaque. That is step 4
+   below. A naive over-approximation would false-FAIL the patched out-of-place path, so it is
+   deferred rather than hacked. (VPS-verified: real algif_aead.ll stays 0 FAIL — sound.)
 4. **Multi-entry typestate** over the socket object (reachable operation sequences)
    — the precise-but-research-scale finale that yields a syscall-sequence witness.
 
