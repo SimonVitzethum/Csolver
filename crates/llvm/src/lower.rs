@@ -1287,6 +1287,17 @@ fn emit_contract(
                     });
                 }
             }
+            Effect::RequireIfAlias { a, b, cap } => {
+                if let (Some(pa), Some(pb), Some(id)) =
+                    (args.get(*a), args.get(*b), prov_interner().id(cap))
+                {
+                    insts.push(Inst::CapRequireIfAlias {
+                        a: ctx.operand(pa, 64)?,
+                        b: ctx.operand(pb, 64)?,
+                        cap: id,
+                    });
+                }
+            }
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

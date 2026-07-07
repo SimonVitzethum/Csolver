@@ -3069,3 +3069,44 @@ entry:
         "a wrapper with no provenance effect must not taint the scatterlist — no false FAIL"
     );
 }
+
+/// **In-place-aliasing precision gate** (`require-if-alias`): the precise Copy-Fail signature is
+/// an in-place crypto op (`aead_request_set_crypt` with `src == dst`) writing a `foreign` page.
+/// The VULNERABLE in-place form (src and dst the same foreign region) is refused; the PATCHED
+/// out-of-place form (a distinct fresh destination) is not — so the gate never false-FAILs the
+/// safe copy, which is what makes reaching for cross-syscall provenance sound.
+#[test]
+fn inplace_write_to_foreign_is_refused_out_of_place_is_not() {
+    let template = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare void @aead_request_set_crypt(ptr, ptr, ptr, i64, ptr)
+define void @recvmsg(ptr %sk, ptr %iv) {
+entry:
+  %page = alloca [16 x i8], align 16
+  %dst = alloca [16 x i8], align 16
+  %req = alloca [16 x i8], align 16
+  call void @af_alg_sendpage(ptr %sk, ptr %page)
+  call void @aead_request_set_crypt(ptr %req, ptr %page, ptr DEST, i64 16, ptr %iv)
+  ret void
+}
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // Vulnerable: in-place — src == dst == the foreign page.
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: template.replace("DEST", "%page"), name: "vuln".into() })
+        .expect("lower");
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Fail,
+        "in-place crypto (src==dst) over a foreign page must be refused"
+    );
+    // Patched: out-of-place — a distinct, fresh destination.
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: template.replace("DEST", "%dst"), name: "safe".into() })
+        .expect("lower");
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Fail,
+        "out-of-place crypto (src != dst) must NOT fire — no false FAIL on the patched path"
+    );
+}

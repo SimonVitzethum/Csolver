@@ -376,6 +376,10 @@ fn visit_operands(inst: &Inst, op: &mut impl FnMut(&Operand)) {
             op(dst);
             op(src);
         }
+        Inst::CapRequireIfAlias { a, b, .. } => {
+            op(a);
+            op(b);
+        }
         Inst::SafetyCheck { condition, .. } => condition_operands(condition, op),
         Inst::Asm { .. } => {}
     }

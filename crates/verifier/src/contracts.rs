@@ -600,6 +600,7 @@ fn address_taken_names(module: &Module) -> HashSet<String> {
                     Inst::Dealloc { ptr, .. } => op(ptr),
                     Inst::ProvLabel { ptr, .. } | Inst::CapRequire { ptr, .. } => op(ptr),
                     Inst::ProvPropagate { dst, src } => { op(dst); op(src); }
+                    Inst::CapRequireIfAlias { a, b, .. } => { op(a); op(b); }
                     Inst::SafetyCheck { condition, .. } => condition_operands(condition, &mut op),
                     Inst::Asm { .. } => {}
                 }

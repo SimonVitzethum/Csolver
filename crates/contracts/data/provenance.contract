@@ -37,6 +37,9 @@ propagate arg2 from arg1
 
 [aead_request_set_crypt]
 propagate arg0 from arg2
+# In-place reuse (src == dst) writing a foreign page is the precise Copy-Fail signature; a
+# distinct out-of-place dst (the patched path) does not fire.
+require-if-alias arg1 arg2 write
 
 [crypto_aead_encrypt crypto_aead_decrypt]
 require arg0 write

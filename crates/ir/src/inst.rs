@@ -401,6 +401,19 @@ pub enum Inst {
         /// The pointer whose labels are absorbed.
         src: Operand,
     },
+    /// **Conditional capability** (a contract's `require-if-alias`): *iff* `a` and `b`
+    /// point into the same region (an in-place `src == dst` operation), that region must
+    /// grant `cap`. Implies [`SafetyProperty::WriteCapability`]. The precise Copy-Fail
+    /// signature — an in-place crypto op writing a `foreign` page — that does **not** fire
+    /// when `a` and `b` are distinct regions (the safe out-of-place path).
+    CapRequireIfAlias {
+        /// The first pointer (e.g. the crypto source).
+        a: Operand,
+        /// The second pointer (e.g. the crypto destination).
+        b: Operand,
+        /// The interned capability the aliased region must grant.
+        cap: u32,
+    },
 }
 
 /// The reference-validity facts a call's `&T`/`&mut T` result carries.
@@ -434,6 +447,7 @@ impl Inst {
                 }
             },
             Inst::CapRequire { .. } => &[WriteCapability],
+            Inst::CapRequireIfAlias { .. } => &[WriteCapability],
             _ => &[],
         }
     }
@@ -455,6 +469,7 @@ impl Inst {
             | Inst::ProvLabel { .. }
             | Inst::CapRequire { .. }
             | Inst::ProvPropagate { .. }
+            | Inst::CapRequireIfAlias { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }

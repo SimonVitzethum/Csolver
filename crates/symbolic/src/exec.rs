@@ -215,6 +215,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                 Inst::Dealloc { ptr, .. } => op(ptr),
                 Inst::ProvLabel { ptr, .. } | Inst::CapRequire { ptr, .. } => op(ptr),
                 Inst::ProvPropagate { dst, src } => { op(dst); op(src); }
+                Inst::CapRequireIfAlias { a, b, .. } => { op(a); op(b); }
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -2403,6 +2404,29 @@ impl Explorer<'_> {
                     state,
                     "the access target's provenance grants the required capability",
                     "the access target's provenance may not grant the required capability",
+                );
+            }
+            // Conditional capability: fire ONLY when `a` and `b` are the SAME region (an
+            // in-place `src == dst` op) and that region's provenance lacks `cap`. When they
+            // are distinct regions (the safe out-of-place path) it never fires — the precise
+            // gate that catches in-place-write-to-foreign without false-FAILing the copy.
+            Inst::CapRequireIfAlias { a, b, cap } => {
+                let (pa, pb) = (self.eval_pointer(a, state).prov, self.eval_pointer(b, state).prov);
+                let lacks = match (pa, pb) {
+                    (Prov::Region(ra), Prov::Region(rb)) if ra == rb => {
+                        state.regions[ra].prov_labels.iter().any(|label| {
+                            self.prov_grants.get(label).is_some_and(|caps| !caps.contains(cap))
+                        })
+                    }
+                    _ => false,
+                };
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::WriteCapability,
+                    lacks,
+                    state,
+                    "an in-place operation's aliased region grants the required capability",
+                    "an in-place operation writes a region whose provenance may not grant it",
                 );
             }
             Inst::RefWitness { dst, size, align, writable, assumed } => {

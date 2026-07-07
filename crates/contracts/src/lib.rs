@@ -122,6 +122,21 @@ pub enum Effect {
         /// The 0-based index of the argument whose labels are absorbed.
         src: usize,
     },
+    /// **Conditional capability**: *iff* arguments `a` and `b` point into the **same**
+    /// region (an in-place operation, `src == dst`), that region must grant `cap`. The
+    /// precise signature of the Copy-Fail write-to-a-read-only-page: an in-place crypto op
+    /// (`aead_request_set_crypt(req, src, dst)` with `src == dst`) writing a `foreign` page.
+    /// When `a` and `b` are *distinct* regions (the out-of-place / patched path) it does not
+    /// fire — so the gate distinguishes the vulnerable in-place reuse from the safe copy,
+    /// and never false-FAILs the patched code.
+    RequireIfAlias {
+        /// The 0-based index of the first argument (e.g. the crypto source).
+        a: usize,
+        /// The 0-based index of the second argument (e.g. the crypto destination).
+        b: usize,
+        /// The capability the aliased region must grant.
+        cap: String,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -335,6 +350,13 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let src = parse_arg(rest.get(2).copied().unwrap_or(""))?;
             Ok(Effect::Propagate { dst, src })
         }
+        // `require-if-alias arg<a> arg<b> <cap>`.
+        "require-if-alias" => {
+            let a = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let b = parse_arg(rest.get(1).copied().unwrap_or(""))?;
+            let cap = rest.get(2).copied().ok_or("`require-if-alias` needs a capability")?.to_string();
+            Ok(Effect::RequireIfAlias { a, b, cap })
+        }
         other => Err(format!("unknown effect `{other}`")),
     }
 }
@@ -467,6 +489,16 @@ mod tests {
         );
         // Bad syntax (missing `from`) is an error.
         assert!(Contracts::default().parse_str("[x]\npropagate arg0 arg1\n", "t").is_err());
+    }
+
+    #[test]
+    fn require_if_alias_parses() {
+        let mut c = Contracts::default();
+        c.parse_str("[aead_request_set_crypt]\nrequire-if-alias arg1 arg2 write\n", "t").unwrap();
+        assert_eq!(
+            c.lookup("aead_request_set_crypt").unwrap().effects,
+            vec![Effect::RequireIfAlias { a: 1, b: 2, cap: "write".into() }]
+        );
     }
 
     #[test]
