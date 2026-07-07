@@ -254,9 +254,25 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
    **Groundwork DONE — the in-place-aliasing precision gate** (`require-if-alias`):
    the vulnerable in-place `src==dst` write to a foreign page is refused while the safe
    out-of-place copy is not, so a future cross-syscall provenance flow can fire *only* on
-   the vulnerable path and never false-FAIL the patched kernel. Remaining: the actual
-   cross-syscall socket-state persistence (the label from `af_alg_sendpage` reaching
-   `_aead_recvmsg`).
+   the vulnerable path and never false-FAIL the patched kernel.
+
+   Firing on the **unmodified** algif_aead.ll then needs three further pieces, each
+   soundness-critical (a wrong move here is a false PASS or a false FAIL on the patched
+   path), so they are deferred to a focused effort rather than rushed:
+   - **(i) cross-syscall socket state.** The `foreign` label is set by `af_alg_sendpage`
+     (a *different* syscall) and must persist on the shared `ctx`/socket so `_aead_recvmsg`
+     sees it. Needs a whole-object provenance summary threaded across the object's
+     operations (not per-function).
+   - **(ii) materialized-field region identity.** `areq->first_rsgl.sgl.sg` is loaded from
+     an opaque struct built by `af_alg_get_rsgl`; two loads must resolve to the *same*
+     tracked region for `require-if-alias` to see `src == dst`. Extends the existing
+     `assume_valid_params`/member-provenance materialisation with per-field read-consistency
+     (repeated loads of one field alias). Materialising a region for an unknown pointer is
+     only sound under the opt-in — doing it unconditionally would be a false-PASS hole.
+   - **(iii) read-consistency for unwritten locations.** Two reads of the same unwritten
+     field currently yield distinct fresh values (sound but imprecise); making them agree
+     (the correct memory semantics) is a prerequisite for (ii). Must invalidate on every
+     heap havoc to stay sound.
 
 **General inference (parallel track) — provenance-transfer DONE.** Each function gets a
 derived `ProvTransfer` summary (which arg's labels flow to which, which arg is labelled),

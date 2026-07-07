@@ -31,6 +31,13 @@ write-to-a-read-only-page class (e.g. CVE-2026-31431 "Copy Fail"); enforcement i
 sound-by-default (an unlabelled region grants every capability, so it never
 false-FAILs).
 
+> **Note.** Today, each recognized leaf API (an allocator, a user-copy, a crypto
+> primitive) still needs a hand-written contract entry. This is expected to shrink as
+> the project matures: a general effect-summary inference already derives the behaviour
+> of *internal wrappers* automatically (no contract per wrapper), and that inference will
+> grow to cover more, leaving only a small, auditable set of irreducible interface axioms
+> at the true trust boundaries.
+
 Every verdict is checked against a **dynamic oracle**: Rust against **Miri**, C
 against **AddressSanitizer + UBSan** (see [differential/](differential/)). The
 `--bugs` mode finds all 8 memory-bug classes in the C differential corpus with
