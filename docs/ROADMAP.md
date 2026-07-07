@@ -238,10 +238,15 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
    it. **Remaining:** connect `crypto_aead_encrypt(req)`'s write to the destination
    *segment* — the request→scatterlist→page field-tracking step (needs interprocedural
    member-provenance through the `aead_request`/`af_alg` structs).
-3. **Crypto-API effect contracts** (`crypto_aead_encrypt` writes `req->dst`) — a
-   handful of interface axioms at the trust boundary, or derived by a general
-   effect-summary inference (mod/ref + provenance-transfer fixpoint) that also
-   auto-derives most ordinary contracts.
+3. **Crypto-API effect contracts — DONE** (`crypto_aead_copy_sgl`/`aead_request_set_crypt`
+   propagate, `crypto_aead_encrypt` requires `write`). The full label→propagate→require
+   chain now **closes end to end** through the file-driven contracts on a faithful
+   synthetic reproduction (testsuite `copy_fail_provenance_chain_is_refused`).
+   **Remaining to fire on the real unmodified kernel .ll:** recover *region identity*
+   for the scatterlist/request regions built by opaque helpers (`af_alg_get_rsgl`) and
+   reached through struct-field loads (`areq->first_rsgl.sgl.sg`) — member-provenance for
+   the crypto-API structs — so the labelled page's provenance reaches the requirement.
+   (VPS-verified: today the real algif_aead.ll stays 0 FAIL — sound, no false alarm.)
 4. **Multi-entry typestate** over the socket object (reachable operation sequences)
    — the precise-but-research-scale finale that yields a syscall-sequence witness.
 
