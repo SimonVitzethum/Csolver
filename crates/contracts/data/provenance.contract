@@ -1,0 +1,19 @@
+# Provenance capability lattice (general — extend per subsystem in your own files).
+#
+# A provenance label records WHERE a region's backing pages came from; `grants` lists the
+# capabilities that origin legitimately confers. An unlabelled region grants EVERYTHING
+# (the sound default), so this is purely opt-in — naming no labels changes nothing.
+#
+#   foreign  — a page inserted from an untrusted/foreign source (e.g. a page-cache page
+#              spliced into a socket). Readable, but NOT a legitimate kernel WRITE target.
+#   kernel   — an ordinary kernel-owned buffer: read + write.
+prov foreign grants=read
+prov kernel  grants=read,write
+
+# CVE-2026-31431 "Copy Fail" source: splice()/sendpage inserts a caller-supplied page
+# (arg1) into the socket's scatterlist with no write-permission check. Label it `foreign`.
+# The enforcing sink — the in-place AEAD op writing that page through req->dst — needs the
+# scatterlist/request model (a later increment) to connect the `require write` to this
+# label; until then this records the real provenance source without effect.
+[af_alg_sendpage]
+label arg1 foreign

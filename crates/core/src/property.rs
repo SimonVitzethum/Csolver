@@ -38,6 +38,11 @@ pub enum SafetyProperty {
     ValidStackFrame,
     /// An indirect branch/call target is within the analyzable set.
     ValidIndirectTarget,
+    /// A write (or other operation) targets a region whose **provenance** grants the
+    /// required capability — e.g. not a write through a pointer to a foreign/read-only
+    /// page (the Copy-Fail class). Driven by external contract labels; see
+    /// `csolver_contracts`.
+    WriteCapability,
 }
 
 impl SafetyProperty {
@@ -58,6 +63,7 @@ impl SafetyProperty {
             SafetyProperty::Alignment => "alignment",
             SafetyProperty::ValidStackFrame => "valid_stack_frame",
             SafetyProperty::ValidIndirectTarget => "valid_indirect_target",
+            SafetyProperty::WriteCapability => "write_capability",
         }
     }
 
@@ -78,6 +84,7 @@ impl SafetyProperty {
             SafetyProperty::Alignment => "access satisfies alignment requirement",
             SafetyProperty::ValidStackFrame => "stack frame is well-formed",
             SafetyProperty::ValidIndirectTarget => "indirect branch target is valid",
+            SafetyProperty::WriteCapability => "access target's provenance grants the capability",
         }
     }
 
@@ -99,6 +106,7 @@ impl SafetyProperty {
             Alignment,
             ValidStackFrame,
             ValidIndirectTarget,
+            WriteCapability,
         ]
     }
 }

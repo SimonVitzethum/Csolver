@@ -70,6 +70,9 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
             Err(e) => module.unanalyzed.push((f.name.clone(), e.to_string())),
         }
     }
+    // The provenance lattice (label id → granted capability ids) that the emitted
+    // `ProvLabel`/`CapRequire` instructions reference; same for every module.
+    module.prov_grants = prov_interner().grants.clone();
     Ok(module)
 }
 
@@ -1146,6 +1149,58 @@ fn contracts() -> &'static Contracts {
     CONTRACTS.get_or_init(Contracts::defaults)
 }
 
+/// Interns provenance label and capability names (a shared namespace) to stable `u32`
+/// ids, and precomputes the id-keyed grant relation, so the emitted `ProvLabel`/
+/// `CapRequire` instructions and `Module::prov_grants` speak in ids. Built once from the
+/// global contracts (deterministic: names sorted before assigning ids).
+struct ProvInterner {
+    ids: HashMap<String, u32>,
+    grants: HashMap<u32, std::collections::HashSet<u32>>,
+}
+
+impl ProvInterner {
+    fn id(&self, name: &str) -> Option<u32> {
+        self.ids.get(name).copied()
+    }
+}
+
+fn prov_interner() -> &'static ProvInterner {
+    static INTERNER: OnceLock<ProvInterner> = OnceLock::new();
+    INTERNER.get_or_init(|| {
+        let c = contracts();
+        // Collect every label/capability name: the lattice keys (labels) and values
+        // (capabilities), plus any name mentioned by a `label`/`require` effect.
+        let mut names: Vec<&str> = Vec::new();
+        for (label, caps) in c.lattice() {
+            names.push(label);
+            names.extend(caps.iter().map(String::as_str));
+        }
+        for contract in c.iter() {
+            for effect in &contract.effects {
+                match effect {
+                    Effect::Label { label, .. } => names.push(label),
+                    Effect::Require { cap, .. } => names.push(cap),
+                    _ => {}
+                }
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        let ids: HashMap<String, u32> =
+            names.iter().enumerate().map(|(i, n)| (n.to_string(), i as u32)).collect();
+        let grants = c
+            .lattice()
+            .iter()
+            .filter_map(|(label, caps)| {
+                let lid = *ids.get(label)?;
+                let cset = caps.iter().filter_map(|c| ids.get(c).copied()).collect();
+                Some((lid, cset))
+            })
+            .collect();
+        ProvInterner { ids, grants }
+    })
+}
+
 /// Lower a recognized API call from its `contract` into the modelling MSIR instructions.
 /// Returns `true` if the call was handled (and should not fall through to a generic call).
 fn emit_contract(
@@ -1210,12 +1265,20 @@ fn emit_contract(
                 }
             }
             // Provenance labelling / capability requirements (the Copy-Fail write-to-a-
-            // read-only-page class) are enforced in the symbolic executor, which needs a
-            // region-level provenance model. Until that lands they are recognized but not
-            // yet emitted — sound (an unenforced `require` can only miss a bug, never
-            // fabricate a false FAIL). They do not by themselves mark the call handled, so
-            // an otherwise-unmodelled call still falls through to a generic (opaque) call.
-            Effect::Label { .. } | Effect::Require { .. } => {}
+            // read-only-page class): the label/cap names are interned to ids the executor
+            // resolves against `Module::prov_grants`. These do NOT mark the call handled —
+            // an otherwise-unmodelled call still falls through to a generic (opaque) call,
+            // it just also carries the provenance effect.
+            Effect::Label { ptr, label } => {
+                if let (Some(a), Some(id)) = (args.get(*ptr), prov_interner().id(label)) {
+                    insts.push(Inst::ProvLabel { ptr: ctx.operand(a, 64)?, label: id });
+                }
+            }
+            Effect::Require { ptr, cap } => {
+                if let (Some(a), Some(id)) = (args.get(*ptr), prov_interner().id(cap)) {
+                    insts.push(Inst::CapRequire { ptr: ctx.operand(a, 64)?, cap: id });
+                }
+            }
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

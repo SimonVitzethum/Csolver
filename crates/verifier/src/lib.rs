@@ -243,6 +243,7 @@ fn verify_one_function(
         &contracts,
         &field_contracts,
         &module.globals,
+        &module.prov_grants,
         config,
         exported,
         &mut local_id,
@@ -423,7 +424,7 @@ fn assumption_record(id: String) -> Assumption {
 /// Verify a single function in isolation (no interprocedural summaries or
 /// parameter contracts), drawing obligation ids from `next_id`.
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
-    verify_function_with(f, None, &[], &[], &HashMap::new(), config, true, next_id)
+    verify_function_with(f, None, &[], &[], &HashMap::new(), &HashMap::new(), config, true, next_id)
 }
 
 /// Verify a single function, optionally using module-wide summaries for calls
@@ -435,6 +436,7 @@ fn verify_function_with(
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, csolver_ir::GlobalDef>,
+    prov_grants: &HashMap<u32, std::collections::HashSet<u32>>,
     config: &Config,
     exported: bool,
     next_id: &mut u32,
@@ -442,7 +444,7 @@ fn verify_function_with(
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
         Some(s) => discharge_with_fields(
-            f, s, contracts, field_contracts, globals, config.bug_finding, exported,
+            f, s, contracts, field_contracts, globals, prov_grants, config.bug_finding, exported,
             config.assume_valid_params,
         ),
         None => discharge_function(f),

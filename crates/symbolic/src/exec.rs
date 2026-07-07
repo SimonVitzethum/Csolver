@@ -111,7 +111,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &HashMap::new(), &HashMap::new())
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -120,7 +120,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &HashMap::new(), &HashMap::new())
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -133,7 +133,7 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], globals)
+    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], globals, &HashMap::new())
 }
 
 /// As [`discharge_full`], plus interprocedural **member-provenance**:
@@ -149,12 +149,13 @@ pub fn discharge_with_fields(
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, GlobalDef>,
+    prov_grants: &HashMap<u32, HashSet<u32>>,
     bug_finding: bool,
     exported: bool,
     assume_valid_params: bool,
 ) -> SymbolicReport {
     let limits = ExecLimits { bug_finding, exported, assume_valid_params, ..ExecLimits::default() };
-    discharge_inner(f, limits, summaries, contracts, field_contracts, globals)
+    discharge_inner(f, limits, summaries, contracts, field_contracts, globals, prov_grants)
 }
 
 /// As [`discharge_function`], with explicit limits and no summaries.
@@ -165,7 +166,7 @@ pub fn discharge_with_fields(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &[], &[], &HashMap::new())
+    discharge_inner(f, limits, &HashMap::new(), &[], &[], &HashMap::new(), &HashMap::new())
 }
 
 /// Every symbol name referenced by an operand of `f` (`Const::Symbol` /
@@ -212,6 +213,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                     op(len);
                 }
                 Inst::Dealloc { ptr, .. } => op(ptr),
+                Inst::ProvLabel { ptr, .. } | Inst::CapRequire { ptr, .. } => op(ptr),
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -230,6 +232,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discharge_inner(
     f: &Function,
     limits: ExecLimits,
@@ -237,6 +240,7 @@ fn discharge_inner(
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
     globals: &HashMap<String, GlobalDef>,
+    prov_grants: &HashMap<u32, HashSet<u32>>,
 ) -> SymbolicReport {
     let analysis = analyze_intervals(f);
     let zones = analyze_zones(f);
@@ -306,6 +310,7 @@ fn discharge_inner(
         loop_frees,
         loop_bodies,
         summaries: summaries.clone(),
+        prov_grants: prov_grants.clone(),
         field_offsets: HashMap::new(),
         field_frontier: HashMap::new(),
         scalar_ptr_cause: classify_scalar_ptr_defs(f),
@@ -388,6 +393,7 @@ fn discharge_inner(
             sentinel: c.sentinel,
             user_controlled: false,
             assumed: false,
+            prov_label: None,
         });
         env.insert(
             *reg,
@@ -421,6 +427,7 @@ fn discharge_inner(
                 sentinel: None,
                 user_controlled: false,
                 assumed: false,
+                prov_label: None,
             });
             let palign = fc.pointee.align.max(1) as u64;
             let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
@@ -461,6 +468,7 @@ fn discharge_inner(
             sentinel: None,
             user_controlled: false,
             assumed: false,
+            prov_label: None,
         });
         ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
     }
@@ -925,6 +933,10 @@ struct SymRegion {
     /// guess, not a real bug: refuting it would be a false FAIL. Only an OOB the code
     /// drives with a *genuine input* offset is reported (see `check_access`).
     assumed: bool,
+    /// The region's **provenance label** id, set by an [`Inst::ProvLabel`] (from an
+    /// external contract). `None` = unlabelled, which grants every capability (the sound
+    /// default). An [`Inst::CapRequire`] refutes iff this label provably lacks the cap.
+    prov_label: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1086,6 +1098,10 @@ struct Explorer<'f> {
     loop_bodies: HashMap<BlockId, Vec<BlockId>>,
     /// Interprocedural summaries, by callee id (empty = havoc all calls).
     summaries: HashMap<FuncId, Summary>,
+    /// The provenance lattice (label id → granted capability ids), from the module's
+    /// contracts. An [`Inst::CapRequire`] checks it; a label absent here grants all
+    /// capabilities (sound default). Empty ⇒ the capability mechanism is inert.
+    prov_grants: HashMap<u32, HashSet<u32>>,
     /// A deterministic synthetic field layout per region: the byte offset assigned
     /// to each `(region, field index)` the first time it is accessed, and the
     /// running frontier per region. Fields are packed sequentially so distinct
@@ -2217,6 +2233,7 @@ impl Explorer<'_> {
                     sentinel: None,
                     user_controlled: false,
                     assumed: false,
+                    prov_label: None,
                 });
                 // The byte size is non-negative by construction.
                 let zero = self.ctx.int(PTR_WIDTH, 0);
@@ -2337,6 +2354,39 @@ impl Explorer<'_> {
                 let goal = self.eval_condition(condition, state);
                 let decision = self.decide(&[goal], state, RefuteMode::Definite, &[]);
                 self.record_scalar(block, idx, decision);
+            }
+            // Attach a provenance label to the pointed-to region (a contract `label`).
+            Inst::ProvLabel { ptr, label } => {
+                if let Prov::Region(rid) = self.eval_pointer(ptr, state).prov {
+                    if let Some(r) = state.regions.get_mut(rid) {
+                        r.prov_label = Some(*label);
+                    }
+                }
+            }
+            // Require the pointed-to region to grant `cap` (a contract `require`). A
+            // region labelled with a provenance that provably lacks the capability is a
+            // definite violation — refuted with the path-feasibility witness (a FAIL on an
+            // exact / bug-finding path, else UNKNOWN). An unlabelled region, or an opaque
+            // pointer, grants everything (sound: no false FAIL). Mirrors `record_temporal`.
+            Inst::CapRequire { ptr, cap } => {
+                let lacks = match self.eval_pointer(ptr, state).prov {
+                    Prov::Region(rid) => match state.regions[rid].prov_label {
+                        Some(label) => !self
+                            .prov_grants
+                            .get(&label)
+                            .is_none_or(|caps| caps.contains(cap)),
+                        None => false,
+                    },
+                    _ => false,
+                };
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::WriteCapability,
+                    lacks,
+                    state,
+                    "the access target's provenance grants the required capability",
+                    "the access target's provenance may not grant the required capability",
+                );
             }
             Inst::RefWitness { dst, size, align, writable, assumed } => {
                 // A raw-pointer field (`assumed`) is a valid reference only under the
@@ -2631,6 +2681,7 @@ impl Explorer<'_> {
             sentinel: None,
             user_controlled: false,
             assumed,
+            prov_label: None,
         });
         rid
     }
@@ -3825,6 +3876,88 @@ mod tests {
             d.refutation.is_none(),
             "a load of memcpy-initialized bytes must not be refuted: {d:?}"
         );
+    }
+
+    /// A straight-line function: allocate a 16-byte region, optionally label it with
+    /// provenance id 0, then `CapRequire` capability id 1 on it. The `CapRequire` is the
+    /// last instruction (index 1 unlabelled, 2 labelled).
+    fn cap_func(with_label: bool) -> (Function, usize) {
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 16),
+            align: 16,
+        });
+        if with_label {
+            bb0.insts.push(Inst::ProvLabel { ptr: Operand::Reg(buf), label: 0 });
+        }
+        bb0.insts.push(Inst::CapRequire { ptr: Operand::Reg(buf), cap: 1 });
+        let idx = bb0.insts.len() - 1;
+        let f = Function {
+            id: FuncId(0),
+            name: "cap".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        (f, idx)
+    }
+
+    fn discharge_with_grants(f: &Function, grants: HashMap<u32, HashSet<u32>>) -> SymbolicReport {
+        discharge_with_fields(
+            f,
+            &HashMap::new(),
+            &[],
+            &[],
+            &HashMap::new(),
+            &grants,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn capability_violation_on_labelled_region_is_refuted() {
+        // Region labelled `foreign` (id 0), which grants nothing; a `CapRequire` for
+        // capability `write` (id 1) is therefore a definite violation → FAIL with witness.
+        let (f, idx) = cap_func(true);
+        let grants = HashMap::from([(0u32, HashSet::new())]);
+        let d = discharge_with_grants(&f, grants)
+            .mem_decision(BlockId(0), idx, SafetyProperty::WriteCapability)
+            .expect("a WriteCapability obligation for the CapRequire")
+            .clone();
+        assert!(!d.proven, "a label lacking the capability must not be proven");
+        assert!(d.refutation.is_some(), "it is refuted with a witness: {d:?}");
+    }
+
+    #[test]
+    fn capability_granted_by_label_proves() {
+        // The same label now grants `write` (id 1) → the requirement holds.
+        let (f, idx) = cap_func(true);
+        let grants = HashMap::from([(0u32, HashSet::from([1u32]))]);
+        let d = discharge_with_grants(&f, grants)
+            .mem_decision(BlockId(0), idx, SafetyProperty::WriteCapability)
+            .expect("a WriteCapability obligation")
+            .clone();
+        assert!(d.proven, "a granting label proves the requirement: {d:?}");
+    }
+
+    #[test]
+    fn capability_on_unlabelled_region_proves() {
+        // No label ⇒ the region grants EVERYTHING (the sound default): no false FAIL,
+        // even though the grant map withholds the capability from label 0.
+        let (f, idx) = cap_func(false);
+        let grants = HashMap::from([(0u32, HashSet::new())]);
+        let d = discharge_with_grants(&f, grants)
+            .mem_decision(BlockId(0), idx, SafetyProperty::WriteCapability)
+            .expect("a WriteCapability obligation")
+            .clone();
+        assert!(d.proven, "an unlabelled region grants all capabilities: {d:?}");
     }
 
     /// `init()`: `buf = alloc i32*4; store 7 -> buf; v = load buf` — read after

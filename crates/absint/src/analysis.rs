@@ -473,6 +473,8 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::Dealloc { .. }
         | Inst::Asm { .. }
         | Inst::MemIntrinsic { .. }
+        | Inst::ProvLabel { .. }
+        | Inst::CapRequire { .. }
         | Inst::SafetyCheck { .. } => {}
     }
 }

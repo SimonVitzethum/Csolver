@@ -194,6 +194,12 @@ impl Contracts {
         &self.grants
     }
 
+    /// Iterate every registered contract block (to collect the label/capability names its
+    /// `label`/`require` effects mention, e.g. for interning).
+    pub fn iter(&self) -> std::slice::Iter<'_, ApiContract> {
+        self.contracts.iter()
+    }
+
     /// Number of registered contract blocks (one per API family).
     pub fn len(&self) -> usize {
         self.contracts.len()
@@ -354,6 +360,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("alloc.contract", include_str!("../data/alloc.contract")),
     ("free.contract", include_str!("../data/free.contract")),
     ("user_copy.contract", include_str!("../data/user_copy.contract")),
+    ("provenance.contract", include_str!("../data/provenance.contract")),
 ];
 
 #[cfg(test)]

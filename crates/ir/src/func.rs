@@ -243,6 +243,12 @@ pub struct Module {
     /// "the framework passes a valid pointer" assumption (`Config::assume_valid_params`),
     /// where it becomes a prove-only contract under the `param-valid` assumption.
     pub raw_ptr_hints: HashMap<(FuncId, u32), (u64, u32)>,
+    /// The **provenance lattice**: which capability ids each provenance-label id grants
+    /// (from external contracts, `prov <label> grants=…`). An [`Inst::ProvLabel`] tags a
+    /// region with a label id; an [`Inst::CapRequire`] checks this map. A label absent
+    /// here (or an unlabelled region) grants **everything** — the sound default, so the
+    /// capability mechanism never introduces a false FAIL on code that names no labels.
+    pub prov_grants: HashMap<u32, std::collections::HashSet<u32>>,
 }
 
 /// A global/static definition: what the analysis may assume about the memory
@@ -270,6 +276,7 @@ impl Module {
             internal: std::collections::HashSet::new(),
             globals: HashMap::new(),
             raw_ptr_hints: HashMap::new(),
+            prov_grants: HashMap::new(),
         }
     }
 

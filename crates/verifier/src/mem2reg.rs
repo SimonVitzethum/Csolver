@@ -371,6 +371,7 @@ fn visit_operands(inst: &Inst, op: &mut impl FnMut(&Operand)) {
             op(len);
         }
         Inst::Dealloc { ptr, .. } => op(ptr),
+        Inst::ProvLabel { ptr, .. } | Inst::CapRequire { ptr, .. } => op(ptr),
         Inst::SafetyCheck { condition, .. } => condition_operands(condition, op),
         Inst::Asm { .. } => {}
     }

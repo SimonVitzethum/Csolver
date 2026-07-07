@@ -371,6 +371,25 @@ pub enum Inst {
         /// A human note describing the origin (e.g. "slice index `a[i]`").
         note: String,
     },
+    /// Attach a **provenance label** to the region `ptr` points to (from an external
+    /// API contract's `label` effect). The label's granted capabilities live in
+    /// [`crate::Module::prov_grants`]; a later [`Inst::CapRequire`] checks them.
+    ProvLabel {
+        /// The pointer whose region is labelled.
+        ptr: Operand,
+        /// The interned provenance-label id.
+        label: u32,
+    },
+    /// Require that the region `ptr` points to **grants** capability `cap` (from a
+    /// contract's `require` effect). Implies [`SafetyProperty::WriteCapability`]:
+    /// refuted when the region's provenance label provably does not grant `cap`
+    /// (an unlabelled region grants everything — the sound default).
+    CapRequire {
+        /// The pointer whose region must grant the capability.
+        ptr: Operand,
+        /// The interned capability id.
+        cap: u32,
+    },
 }
 
 /// The reference-validity facts a call's `&T`/`&mut T` result carries.
@@ -403,6 +422,7 @@ impl Inst {
                     &[NoNullDeref, NoUseAfterFree, InBounds, ValidRead, ValidWrite]
                 }
             },
+            Inst::CapRequire { .. } => &[WriteCapability],
             _ => &[],
         }
     }
@@ -421,6 +441,8 @@ impl Inst {
             | Inst::Dealloc { .. }
             | Inst::Asm { .. }
             | Inst::SafetyCheck { .. }
+            | Inst::ProvLabel { .. }
+            | Inst::CapRequire { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }
