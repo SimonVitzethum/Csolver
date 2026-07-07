@@ -111,6 +111,17 @@ pub enum Effect {
         /// The required capability name (matched against the label's `grants` set).
         cap: String,
     },
+    /// **Propagates provenance**: the region at argument `dst` absorbs the provenance
+    /// labels of the region at argument `src` (their union). Models a container taking in
+    /// an element — `sg_set_page(sgl, page)`, a DMA buffer, an io_uring fixed buffer — so a
+    /// `foreign` element makes the whole container only as writable as its least-writable
+    /// member. General (not scatterlist-specific): any add-element / taint-transfer API.
+    Propagate {
+        /// The 0-based index of the argument whose region absorbs the labels.
+        dst: usize,
+        /// The 0-based index of the argument whose labels are absorbed.
+        src: usize,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -315,6 +326,15 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let cap = rest.get(1).copied().ok_or("`require` needs a capability name")?.to_string();
             Ok(Effect::Require { ptr, cap })
         }
+        // `propagate arg<dst> from arg<src>`.
+        "propagate" => {
+            let dst = parse_arg(rest.first().copied().unwrap_or(""))?;
+            if rest.get(1) != Some(&"from") {
+                return Err("`propagate` syntax is `propagate arg<dst> from arg<src>`".into());
+            }
+            let src = parse_arg(rest.get(2).copied().unwrap_or(""))?;
+            Ok(Effect::Propagate { dst, src })
+        }
         other => Err(format!("unknown effect `{other}`")),
     }
 }
@@ -435,6 +455,18 @@ mod tests {
             c.lookup("needs_writable").unwrap().effects,
             vec![Effect::Require { ptr: 0, cap: "write".into() }]
         );
+    }
+
+    #[test]
+    fn propagate_effect_parses() {
+        let mut c = Contracts::default();
+        c.parse_str("[sg_set_page]\npropagate arg0 from arg1\n", "t").unwrap();
+        assert_eq!(
+            c.lookup("sg_set_page").unwrap().effects,
+            vec![Effect::Propagate { dst: 0, src: 1 }]
+        );
+        // Bad syntax (missing `from`) is an error.
+        assert!(Contracts::default().parse_str("[x]\npropagate arg0 arg1\n", "t").is_err());
     }
 
     #[test]

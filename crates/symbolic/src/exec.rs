@@ -214,6 +214,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                 }
                 Inst::Dealloc { ptr, .. } => op(ptr),
                 Inst::ProvLabel { ptr, .. } | Inst::CapRequire { ptr, .. } => op(ptr),
+                Inst::ProvPropagate { dst, src } => { op(dst); op(src); }
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -393,7 +394,7 @@ fn discharge_inner(
             sentinel: c.sentinel,
             user_controlled: false,
             assumed: false,
-            prov_label: None,
+            prov_labels: HashSet::new(),
         });
         env.insert(
             *reg,
@@ -427,7 +428,7 @@ fn discharge_inner(
                 sentinel: None,
                 user_controlled: false,
                 assumed: false,
-                prov_label: None,
+                prov_labels: HashSet::new(),
             });
             let palign = fc.pointee.align.max(1) as u64;
             let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
@@ -468,7 +469,7 @@ fn discharge_inner(
             sentinel: None,
             user_controlled: false,
             assumed: false,
-            prov_label: None,
+            prov_labels: HashSet::new(),
         });
         ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
     }
@@ -933,10 +934,12 @@ struct SymRegion {
     /// guess, not a real bug: refuting it would be a false FAIL. Only an OOB the code
     /// drives with a *genuine input* offset is reported (see `check_access`).
     assumed: bool,
-    /// The region's **provenance label** id, set by an [`Inst::ProvLabel`] (from an
-    /// external contract). `None` = unlabelled, which grants every capability (the sound
-    /// default). An [`Inst::CapRequire`] refutes iff this label provably lacks the cap.
-    prov_label: Option<u32>,
+    /// The region's **provenance labels** (interned ids), set by [`Inst::ProvLabel`] and
+    /// accumulated by [`Inst::ProvPropagate`] (a container unions in each element's labels).
+    /// Empty = unlabelled, which grants every capability (the sound default). An
+    /// [`Inst::CapRequire`] refutes iff **some** label in the set provably lacks the cap —
+    /// a container is only as capable as its least-capable member.
+    prov_labels: HashSet<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2233,7 +2236,7 @@ impl Explorer<'_> {
                     sentinel: None,
                     user_controlled: false,
                     assumed: false,
-                    prov_label: None,
+                    prov_labels: HashSet::new(),
                 });
                 // The byte size is non-negative by construction.
                 let zero = self.ctx.int(PTR_WIDTH, 0);
@@ -2359,24 +2362,38 @@ impl Explorer<'_> {
             Inst::ProvLabel { ptr, label } => {
                 if let Prov::Region(rid) = self.eval_pointer(ptr, state).prov {
                     if let Some(r) = state.regions.get_mut(rid) {
-                        r.prov_label = Some(*label);
+                        r.prov_labels.insert(*label);
                     }
                 }
             }
-            // Require the pointed-to region to grant `cap` (a contract `require`). A
-            // region labelled with a provenance that provably lacks the capability is a
+            // Propagate provenance: the dst region absorbs src's labels (a contract
+            // `propagate` — a container taking in an element). A foreign element thus makes
+            // the container only as capable as its least-capable member.
+            Inst::ProvPropagate { dst, src } => {
+                let src_labels = match self.eval_pointer(src, state).prov {
+                    Prov::Region(rid) => state.regions[rid].prov_labels.clone(),
+                    _ => HashSet::new(),
+                };
+                if !src_labels.is_empty() {
+                    if let Prov::Region(rid) = self.eval_pointer(dst, state).prov {
+                        if let Some(r) = state.regions.get_mut(rid) {
+                            r.prov_labels.extend(src_labels);
+                        }
+                    }
+                }
+            }
+            // Require the pointed-to region to grant `cap` (a contract `require`). A region
+            // whose provenance set contains a label that provably lacks the capability is a
             // definite violation — refuted with the path-feasibility witness (a FAIL on an
             // exact / bug-finding path, else UNKNOWN). An unlabelled region, or an opaque
             // pointer, grants everything (sound: no false FAIL). Mirrors `record_temporal`.
             Inst::CapRequire { ptr, cap } => {
                 let lacks = match self.eval_pointer(ptr, state).prov {
-                    Prov::Region(rid) => match state.regions[rid].prov_label {
-                        Some(label) => !self
-                            .prov_grants
-                            .get(&label)
-                            .is_none_or(|caps| caps.contains(cap)),
-                        None => false,
-                    },
+                    Prov::Region(rid) => state.regions[rid].prov_labels.iter().any(|label| {
+                        // A label present in the lattice but not granting `cap` withholds it;
+                        // a label absent from the lattice grants everything (sound default).
+                        self.prov_grants.get(label).is_some_and(|caps| !caps.contains(cap))
+                    }),
                     _ => false,
                 };
                 self.record_temporal(
@@ -2681,7 +2698,7 @@ impl Explorer<'_> {
             sentinel: None,
             user_controlled: false,
             assumed,
-            prov_label: None,
+            prov_labels: HashSet::new(),
         });
         rid
     }
@@ -3958,6 +3975,46 @@ mod tests {
             .expect("a WriteCapability obligation")
             .clone();
         assert!(d.proven, "an unlabelled region grants all capabilities: {d:?}");
+    }
+
+    /// The Copy-Fail flow in miniature: a `foreign` element propagates its provenance into
+    /// a container, and a later `require write` on the container is refuted — the container
+    /// is only as capable as its least-capable member.
+    #[test]
+    fn capability_propagates_from_element_into_container() {
+        let page = RegId(0);
+        let container = RegId(1);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        for dst in [page, container] {
+            bb0.insts.push(Inst::Alloc {
+                dst,
+                region: RegionKind::Heap,
+                elem: Type::int(8),
+                count: Operand::int(64, 16),
+                align: 16,
+            });
+        }
+        // page is `foreign` (label 0); container absorbs page's labels; then require `write`.
+        bb0.insts.push(Inst::ProvLabel { ptr: Operand::Reg(page), label: 0 });
+        bb0.insts.push(Inst::ProvPropagate { dst: Operand::Reg(container), src: Operand::Reg(page) });
+        bb0.insts.push(Inst::CapRequire { ptr: Operand::Reg(container), cap: 1 });
+        let idx = bb0.insts.len() - 1;
+        let f = Function {
+            id: FuncId(0),
+            name: "prop".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        // `foreign` (0) grants read only, not write (1).
+        let grants = HashMap::from([(0u32, HashSet::from([2u32]))]);
+        let d = discharge_with_grants(&f, grants)
+            .mem_decision(BlockId(0), idx, SafetyProperty::WriteCapability)
+            .expect("a WriteCapability obligation")
+            .clone();
+        assert!(!d.proven, "the container inherits the element's foreign provenance");
+        assert!(d.refutation.is_some(), "a write to the foreign-tainted container is refuted: {d:?}");
     }
 
     /// `init()`: `buf = alloc i32*4; store 7 -> buf; v = load buf` — read after

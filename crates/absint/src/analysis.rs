@@ -475,6 +475,7 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::MemIntrinsic { .. }
         | Inst::ProvLabel { .. }
         | Inst::CapRequire { .. }
+        | Inst::ProvPropagate { .. }
         | Inst::SafetyCheck { .. } => {}
     }
 }

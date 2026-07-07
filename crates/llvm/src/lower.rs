@@ -1279,6 +1279,14 @@ fn emit_contract(
                     insts.push(Inst::CapRequire { ptr: ctx.operand(a, 64)?, cap: id });
                 }
             }
+            Effect::Propagate { dst, src } => {
+                if let (Some(d), Some(s)) = (args.get(*dst), args.get(*src)) {
+                    insts.push(Inst::ProvPropagate {
+                        dst: ctx.operand(d, 64)?,
+                        src: ctx.operand(s, 64)?,
+                    });
+                }
+            }
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

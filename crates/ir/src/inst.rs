@@ -390,6 +390,17 @@ pub enum Inst {
         /// The interned capability id.
         cap: u32,
     },
+    /// **Propagate provenance**: the region `dst` points to absorbs the provenance
+    /// labels of the region `src` points to (their union), from a contract's `propagate`
+    /// effect. Models a container taking in an element (`sg_set_page`, DMA/io-uring
+    /// buffers): a foreign element makes the whole container as restricted as its
+    /// least-capable member.
+    ProvPropagate {
+        /// The pointer whose region absorbs the labels.
+        dst: Operand,
+        /// The pointer whose labels are absorbed.
+        src: Operand,
+    },
 }
 
 /// The reference-validity facts a call's `&T`/`&mut T` result carries.
@@ -443,6 +454,7 @@ impl Inst {
             | Inst::SafetyCheck { .. }
             | Inst::ProvLabel { .. }
             | Inst::CapRequire { .. }
+            | Inst::ProvPropagate { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }

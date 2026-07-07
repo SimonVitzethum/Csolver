@@ -12,8 +12,21 @@ prov kernel  grants=read,write
 
 # CVE-2026-31431 "Copy Fail" source: splice()/sendpage inserts a caller-supplied page
 # (arg1) into the socket's scatterlist with no write-permission check. Label it `foreign`.
-# The enforcing sink — the in-place AEAD op writing that page through req->dst — needs the
-# scatterlist/request model (a later increment) to connect the `require write` to this
-# label; until then this records the real provenance source without effect.
 [af_alg_sendpage]
 label arg1 foreign
+
+# Provenance PROPAGATION through scatterlists (general — a container absorbs an element's
+# provenance, so a foreign page taints the whole list). `sg_set_page(sg, page, ...)` puts a
+# page into a scatterlist entry; `sg_chain(prv, ..., sgl)` links one list into another.
+[sg_set_page]
+propagate arg0 from arg1
+
+[sg_chain]
+propagate arg0 from arg2
+
+# The enforcing SINK — the in-place AEAD op writing the destination scatterlist through
+# req->dst — needs the request/scatterlist field model (a later increment) to reach the
+# labelled destination segment from `crypto_aead_encrypt(req)`. Once that lands, a line like
+#   [crypto_aead_encrypt]  require arg0 write
+# closes the loop: a foreign-tainted destination is refused. The label/propagate machinery
+# above already flows the provenance; only the request→dst-segment step is missing.
