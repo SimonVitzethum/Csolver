@@ -237,6 +237,14 @@ impl DebugInfo {
 /// advisory, never required.
 pub(crate) fn parse(src: &str) -> DebugInfo {
     let mut di = DebugInfo::default();
+    // For the `-O2`/no-`DILocalVariable` case, recover parameter types from the
+    // function signature: `DISubprogram(type: !ST)`, `DISubroutineType(types: !TL)`,
+    // `!TL = !{!ret, !arg1, …}`. Collected here, resolved in a post-pass.
+    let mut subprogram_ty: HashMap<u32, u32> = HashMap::new(); // subprogram -> subroutine type
+    let mut subroutine_types: HashMap<u32, u32> = HashMap::new(); // subroutine type -> types tuple
+    // Position-preserving tuples (a `void` return is `null` at index 0 — dropping it
+    // would misalign parameter indices), for resolving signatures.
+    let mut positional_tuples: HashMap<u32, Vec<Option<u32>>> = HashMap::new();
     for line in src.lines() {
         let line = line.trim_start();
         // A metadata definition: `!123 = [distinct] !DI…(…)`.
@@ -247,6 +255,15 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
         // prefixes the node body and must be stripped before the tag match.
         let body = body.strip_prefix("distinct ").unwrap_or(body);
 
+        if let Some(args) = tag_body(body, "!DISubprogram(") {
+            if let Some(ty) = field_ref(args, "type:") {
+                subprogram_ty.insert(id, ty);
+            }
+        } else if let Some(args) = tag_body(body, "!DISubroutineType(") {
+            if let Some(types) = field_ref(args, "types:") {
+                subroutine_types.insert(id, types);
+            }
+        }
         if let Some(args) = tag_body(body, "!DICompileUnit(") {
             // The source language fixes pointer-validity semantics (see `Lang`).
             if let Some(l) = field_word(args, "language:") {
@@ -283,6 +300,24 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
         } else if let Some(members) = tuple_refs(body) {
             // A `!{!a, !b, …}` metadata tuple — a struct's element list.
             di.nodes.insert(id, DiNode::Tuple(members));
+            if let Some(inner) = body.strip_prefix("!{").and_then(|b| b.strip_suffix('}')) {
+                positional_tuples.insert(
+                    id,
+                    inner.split(',').map(|e| e.trim().strip_prefix('!').and_then(|s| s.parse().ok())).collect(),
+                );
+            }
+        }
+    }
+    // Post-pass: fill parameter types from each function's signature where a
+    // `DILocalVariable` did not already provide one (the `-O2` case). `types` is
+    // `!{return, arg1, arg2, …}`, so parameter `k` (1-based) is tuple index `k`.
+    for (&sp, &st) in &subprogram_ty {
+        let Some(tl) = subroutine_types.get(&st) else { continue };
+        let Some(types) = positional_tuples.get(tl) else { continue };
+        for (k, ty) in types.iter().enumerate().skip(1) {
+            if let Some(ty) = ty {
+                di.params.entry((sp, k as u32)).or_insert(*ty);
+            }
         }
     }
     di
