@@ -387,6 +387,7 @@ fn discharge_inner(
             size_nowrap: nowrap,
             sentinel: c.sentinel,
             user_controlled: false,
+            assumed: false,
         });
         env.insert(
             *reg,
@@ -419,6 +420,7 @@ fn discharge_inner(
                 size_nowrap: None,
                 sentinel: None,
                 user_controlled: false,
+                assumed: false,
             });
             let palign = fc.pointee.align.max(1) as u64;
             let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
@@ -458,6 +460,7 @@ fn discharge_inner(
             size_nowrap: Some(truth),
             sentinel: None,
             user_controlled: false,
+            assumed: false,
         });
         ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
     }
@@ -914,6 +917,14 @@ struct SymRegion {
     /// it is a *genuine adversarial input* — refutable like a parameter — so a
     /// length read back from a user-copied struct can drive an out-of-bounds FAIL.
     user_controlled: bool,
+    /// `true` if this region models a raw pointer only **assumed** valid under the
+    /// `--assume-valid-params` opt-in (a `RefWitness { assumed }`), so its byte size
+    /// is a caller-supplied *guess* (e.g. from DWARF), not a proven allocation bound.
+    /// A constant-offset "OOB" against such a region — the pervasive `container_of`
+    /// backward step, or a fixed field past the guessed size — is an artifact of the
+    /// guess, not a real bug: refuting it would be a false FAIL. Only an OOB the code
+    /// drives with a *genuine input* offset is reported (see `check_access`).
+    assumed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2205,6 +2216,7 @@ impl Explorer<'_> {
                     size_nowrap: Some(nowrap),
                     sentinel: None,
                     user_controlled: false,
+                    assumed: false,
                 });
                 // The byte size is non-negative by construction.
                 let zero = self.ctx.int(PTR_WIDTH, 0);
@@ -2339,7 +2351,7 @@ impl Explorer<'_> {
                 // A valid reference to a fresh live region (see
                 // `materialize_ref_region`): a known size is refutable, an
                 // unknown size (slice/`str`) prove-only.
-                let rid = self.materialize_ref_region(*size, *writable, state);
+                let rid = self.materialize_ref_region(*size, *writable, *assumed, state);
                 let zero = self.ctx.int(PTR_WIDTH, 0);
                 state.env.insert(
                     *dst,
@@ -2574,7 +2586,7 @@ impl Explorer<'_> {
                         size: None,
                         writable: false,
                     });
-                    let rid = self.materialize_ref_region(size, writable, state);
+                    let rid = self.materialize_ref_region(size, writable, false, state);
                     SymValue::Ptr(SymPointer {
                         prov: Prov::Region(rid),
                         offset: self.ctx.int(PTR_WIDTH, 0),
@@ -2595,6 +2607,7 @@ impl Explorer<'_> {
         &mut self,
         size: Option<u64>,
         writable: bool,
+        assumed: bool,
         state: &mut PathState,
     ) -> usize {
         let (size_e, nowrap) = match size {
@@ -2617,6 +2630,7 @@ impl Explorer<'_> {
             size_nowrap: nowrap,
             sentinel: None,
             user_controlled: false,
+            assumed,
         });
         rid
     }
@@ -2725,6 +2739,7 @@ impl Explorer<'_> {
         let rsize = region.size;
         let contract = region.contract;
         let size_nowrap = region.size_nowrap;
+        let region_assumed = region.assumed;
 
         // Use-after-free: on an exact path a `Freed` region was definitely
         // deallocated, so the access is a certain UAF — refuted with a witness.
@@ -2738,10 +2753,18 @@ impl Explorer<'_> {
         // genuine reachable OOB, since the only remaining free variable is the
         // access offset and the size cannot be a wrapped too-small value.
         let conjuncts = self.in_bounds_conjuncts(p.offset, asize, rsize);
-        let (mode, extra) = match size_nowrap {
+        let (mut mode, extra) = match size_nowrap {
             Some(fact) => (RefuteMode::Possible, vec![fact]),
             None => (RefuteMode::Off, vec![]),
         };
+        // An *assumed* region's size is a caller-supplied guess, not a proven bound
+        // (see `SymRegion::assumed`). Refute an OOB against it only when the access
+        // offset is actually driven by a genuine adversarial input; a constant offset
+        // (`container_of`'s backward step, a fixed field past the guessed size) is an
+        // artifact of the guess — reporting it would be a false FAIL.
+        if region_assumed && !self.expr_has_genuine_leaf(p.offset) {
+            mode = RefuteMode::Off;
+        }
         let decision = self.decide(&conjuncts, state, mode, &extra);
         self.record_mem(block, idx, InBounds, decision, "access stays within the allocation", "could not prove the access stays in bounds");
 
@@ -2996,6 +3019,44 @@ impl Explorer<'_> {
             }
         }
         true
+    }
+
+    /// `true` if `expr` contains **at least one** genuine-input leaf (`user…`, `ind…`,
+    /// or — when the function is exported — `arg…`). Unlike [`Explorer::goal_is_genuine`]
+    /// (which is vacuously true for a pure constant), this requires the value to
+    /// *actually vary* with an adversarial input. Used to keep an assumed region from
+    /// refuting a constant-offset access (see `check_access`).
+    fn expr_has_genuine_leaf(&self, expr: ExprId) -> bool {
+        let mut stack = vec![expr];
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        while let Some(e) = stack.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            match self.ctx.node(e) {
+                Node::Sym { name, .. } => {
+                    if name.starts_with("user")
+                        || name.starts_with("ind")
+                        || (self.exported && name.starts_with("arg"))
+                    {
+                        return true;
+                    }
+                }
+                Node::Const(_) | Node::Bool(_) => {}
+                Node::Not(a) | Node::Zext(a) => stack.push(*a),
+                Node::Bin { a, b, .. } | Node::Cmp { a, b, .. } => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Node::And(xs) | Node::Or(xs) => stack.extend(xs.iter().copied()),
+                Node::Ite { c, t, e } => {
+                    stack.push(*c);
+                    stack.push(*t);
+                    stack.push(*e);
+                }
+            }
+        }
+        false
     }
 
     /// On an exact path, return a concrete witness of a violation, or `None`.

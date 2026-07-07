@@ -990,6 +990,94 @@ entry:
         "assume_valid_params materialises the loaded child pointer as a valid struct");
 }
 
+/// Soundness of `--assume-valid-params` under bug-finding: an assumed-valid pointer's
+/// pointee size is a *guess* (from debug info / use), not a proven allocation bound. The
+/// pervasive kernel `container_of` idiom steps **backward** off the member pointer to the
+/// enclosing struct — a negative *constant* offset. That must never be reported as an OOB
+/// (it would be a false FAIL); only an access whose offset is driven by a *genuine input*
+/// may refute against an assumed region.
+#[test]
+fn assume_valid_params_does_not_false_fail_on_container_of() {
+    // The refutable assumed-region path: `d->child` is a loaded raw-pointer field
+    // materialised (RefWitness) as a valid 40-byte `struct child`. `container_of` steps
+    // 16 bytes **back** off that member pointer to reach the enclosing struct — a constant
+    // negative offset, before the region base. Its size is only a guess, so this must NOT
+    // FAIL (before the fix it did, with an empty witness — the kernel false positive).
+    let src = r#"
+%struct.child = type { i32, [4 x i64] }
+%struct.dev = type { i32, ptr }
+define i64 @up(ptr %d) !dbg !4 {
+entry:
+  %c = getelementptr inbounds i8, ptr %d, i64 8
+  %child = load ptr, ptr %c, align 8
+  %b = getelementptr inbounds i8, ptr %child, i64 -16
+  %v = load i64, ptr %b, align 8
+  ret i64 %v
+}
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)
+!1 = !DIFile(filename: "d.c", directory: "/")
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = distinct !DISubprogram(name: "up", scope: !1, file: !1, type: !5, unit: !0, retainedNodes: !20)
+!5 = !DISubroutineType(types: !6)
+!6 = !{!7, !8}
+!7 = !DIBasicType(name: "long", size: 64)
+!8 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "dev", size: 128, elements: !10)
+!10 = !{!11, !12}
+!11 = !DIDerivedType(tag: DW_TAG_member, name: "id", baseType: !7, size: 32, offset: 0)
+!12 = !DIDerivedType(tag: DW_TAG_member, name: "child", baseType: !13, size: 64, offset: 64)
+!13 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !14, size: 64)
+!14 = !DICompositeType(tag: DW_TAG_structure_type, name: "child", size: 320)
+!20 = !{!21}
+!21 = !DILocalVariable(name: "d", arg: 1, scope: !4, file: !1, type: !8)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "u".into() }).expect("lower");
+    let cfg = Config { assume_valid_params: true, bug_finding: true, ..Config::default() };
+    assert_ne!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "a constant backward (container_of) offset off an assumed region is not a bug");
+
+    // A *genuine* input-driven OOB against a RefWitness-materialised assumed region (the
+    // refutable path: a loaded raw-pointer field, `d->child`) is still caught. `child`
+    // points at a 40-byte `struct child`; indexing `child->data[idx]` with an unbounded
+    // parameter `idx` reaches out of it — that is a real, input-driven OOB, not an artifact
+    // of the assumed size, so it must FAIL even after the container_of suppression.
+    let genuine = r#"
+%struct.child = type { i32, [4 x i64] }
+%struct.dev = type { i32, ptr }
+define i64 @oob(ptr %d, i64 %idx) !dbg !4 {
+entry:
+  %c = getelementptr inbounds i8, ptr %d, i64 8
+  %child = load ptr, ptr %c, align 8
+  %p = getelementptr %struct.child, ptr %child, i64 0, i32 1, i64 %idx
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)
+!1 = !DIFile(filename: "d.c", directory: "/")
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = distinct !DISubprogram(name: "oob", scope: !1, file: !1, type: !5, unit: !0, retainedNodes: !20)
+!5 = !DISubroutineType(types: !6)
+!6 = !{!7, !8, !7}
+!7 = !DIBasicType(name: "long", size: 64)
+!8 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "dev", size: 128, elements: !10)
+!10 = !{!11, !12}
+!11 = !DIDerivedType(tag: DW_TAG_member, name: "id", baseType: !7, size: 32, offset: 0)
+!12 = !DIDerivedType(tag: DW_TAG_member, name: "child", baseType: !13, size: 64, offset: 64)
+!13 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !14, size: 64)
+!14 = !DICompositeType(tag: DW_TAG_structure_type, name: "child", size: 320)
+!20 = !{!21}
+!21 = !DILocalVariable(name: "d", arg: 1, scope: !4, file: !1, type: !8)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: genuine.into(), name: "g".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "an input-driven OOB off a RefWitness-materialised assumed region is still a genuine bug");
+}
+
 /// `callbr` (inline-asm goto, pervasive in the kernel for static keys) must not drop
 /// the function: it lowers to an asm havoc plus a branch to every target. An OOB in
 /// the fallthrough block (reached after the callbr) is still found.
