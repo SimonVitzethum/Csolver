@@ -1536,13 +1536,33 @@ impl Parser {
         } else {
             self.callee_name()?
         };
+        // A debug intrinsic (`llvm.dbg.value/declare/label`) carries only `metadata`
+        // operands (`metadata !5, metadata !DIExpression()`) the value parser cannot
+        // read and no memory-safety content — skip its argument list wholesale.
+        if callee.starts_with("llvm.dbg.") {
+            self.skip_balanced('(', ')')?;
+            return Ok(LInst::Call { dst, ret, callee, args: Vec::new() });
+        }
         self.expect_punct('(')?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Tok::Punct(')')) {
             loop {
-                let _ty = self.ltype()?;
-                self.skip_arg_attrs()?;
-                args.push(self.value()?);
+                // A `metadata` argument (`metadata !5`, `metadata !DIExpression()`)
+                // carries no value — skip to the next `,` or the closing `)`.
+                if matches!(self.peek(), Tok::Word(w) if w == "metadata") {
+                    while !matches!(self.peek(), Tok::Punct(',' | ')') | Tok::Eof) {
+                        if matches!(self.peek(), Tok::Punct('(')) {
+                            self.skip_balanced('(', ')')?;
+                        } else {
+                            self.pos += 1;
+                        }
+                    }
+                    args.push(LValue::Undef);
+                } else {
+                    let _ty = self.ltype()?;
+                    self.skip_arg_attrs()?;
+                    args.push(self.value()?);
+                }
                 if matches!(self.peek(), Tok::Punct(',')) {
                     self.pos += 1;
                 } else {
