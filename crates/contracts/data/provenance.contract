@@ -24,9 +24,26 @@ propagate arg0 from arg1
 [sg_chain]
 propagate arg0 from arg2
 
-# The enforcing SINK — the in-place AEAD op writing the destination scatterlist through
-# req->dst — needs the request/scatterlist field model (a later increment) to reach the
-# labelled destination segment from `crypto_aead_encrypt(req)`. Once that lands, a line like
-#   [crypto_aead_encrypt]  require arg0 write
-# closes the loop: a foreign-tainted destination is refused. The label/propagate machinery
-# above already flows the provenance; only the request→dst-segment step is missing.
+# The AEAD in-place chain that weaponizes the foreign page:
+#   crypto_aead_copy_sgl(tfm, src, dst, len)   copies src's scatterlist into dst → dst
+#                                              absorbs src's provenance.
+#   aead_request_set_crypt(req, src, dst, len, iv)   the request's crypto WRITES dst, so the
+#                                              request's write-target provenance is dst's.
+#   crypto_aead_{encrypt,decrypt}(req)         performs the write → the request's destination
+#                                              must grant `write`. A foreign page that reached
+#                                              it (via the propagations above) is refused.
+[crypto_aead_copy_sgl]
+propagate arg2 from arg1
+
+[aead_request_set_crypt]
+propagate arg0 from arg2
+
+[crypto_aead_encrypt crypto_aead_decrypt]
+require arg0 write
+
+# NOTE: on REAL algif_aead the scatterlist regions are built by opaque helpers
+# (`af_alg_get_rsgl`) and reached through struct-field loads (`areq->first_rsgl.sgl.sg`), whose
+# region identity the per-TU analysis does not yet recover — so the provenance does not yet
+# connect end-to-end on the unmodified kernel .ll. The contract chain and the enforcement are
+# complete (proven on a faithful synthetic reproduction); closing it on real IR needs the
+# opaque-region / member-provenance recovery for these crypto-API structs.

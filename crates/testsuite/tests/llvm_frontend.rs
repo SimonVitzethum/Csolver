@@ -2942,3 +2942,54 @@ entry:
         "p[2] via the 1-element alternative is out of bounds — no false PASS"
     );
 }
+
+/// End-to-end provenance/capability enforcement through the **file-driven contracts**, on a
+/// faithful reproduction of the CVE-2026-31431 "Copy Fail" AEAD in-place chain: a page is
+/// labelled `foreign` by `af_alg_sendpage`, its provenance flows through `crypto_aead_copy_sgl`
+/// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the
+/// request's destination to grant `write` — which `foreign` does not → FAIL. This exercises
+/// `label`/`propagate`/`require` (data/provenance.contract) end to end through real API names.
+#[test]
+fn copy_fail_provenance_chain_is_refused() {
+    // The same page pointer is threaded through the chain (mirroring the in-place src=dst
+    // reuse); the opaque calls havoc the heap but the region provenance survives, so the
+    // final capability requirement sees the foreign label. Needs bug-finding (the calls make
+    // the path inexact, exactly as on real kernel code).
+    let src = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare void @crypto_aead_copy_sgl(ptr, ptr, ptr, i64)
+declare void @aead_request_set_crypt(ptr, ptr, ptr, i64, ptr)
+declare i32 @crypto_aead_encrypt(ptr)
+define void @recvmsg(ptr %sk, ptr %tfm, ptr %iv) {
+entry:
+  %page = alloca [16 x i8], align 16
+  %rsgl = alloca [16 x i8], align 16
+  %req = alloca [16 x i8], align 16
+  call void @af_alg_sendpage(ptr %sk, ptr %page)
+  call void @crypto_aead_copy_sgl(ptr %tfm, ptr %page, ptr %rsgl, i64 16)
+  call void @aead_request_set_crypt(ptr %req, ptr %rsgl, ptr %rsgl, i64 16, ptr %iv)
+  %e = call i32 @crypto_aead_encrypt(ptr %req)
+  ret void
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "aead".into() })
+        .expect("lower");
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Fail,
+        "a foreign page reaching an AEAD write destination must be refused (write-capability)"
+    );
+
+    // Control: without the labelling source, the same chain is not a violation.
+    let safe = src.replace("  call void @af_alg_sendpage(ptr %sk, ptr %page)\n", "");
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: safe, name: "aead_safe".into() })
+        .expect("lower");
+    assert_ne!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Fail,
+        "with no foreign label, an unlabelled destination grants write — no false FAIL"
+    );
+}
