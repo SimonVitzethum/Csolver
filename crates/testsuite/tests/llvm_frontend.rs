@@ -837,6 +837,36 @@ declare void @free(ptr)
         "a free with no later use must not be a false positive");
 }
 
+/// An OOB indexed by an **unsigned** parameter — `buf[idx]` where `idx` is `unsigned`
+/// zero-extended to pointer width (`gep i8, buf, zext(idx)`), the pervasive C form.
+/// The index must be widened to pointer width before the offset arithmetic, else it
+/// mixes widths and no bound holds. Refuted in bug-finding mode (witness `idx = UINT_MAX`).
+#[test]
+fn bug_finding_refutes_unsigned_index_oob() {
+    let src = r#"
+define i64 @f(i32 %idx) {
+entry:
+  %buf = alloca [16 x i8], align 16
+  %z = zext i32 %idx to i64
+  %p = getelementptr inbounds i8, ptr %buf, i64 %z
+  %v = load i8, ptr %p, align 1
+  %w = sext i8 %v to i64
+  ret i64 %w
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "u".into() }).expect("lower");
+    let bugs = Config { bug_finding: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &bugs).verdict, Verdict::Fail,
+        "an OOB indexed by a zero-extended unsigned parameter is refuted");
+    // The guarded sibling (`idx < 16`) is safe — no false positive.
+    let safe = src.replace(
+        "%z = zext i32 %idx to i64",
+        "%ok = icmp ult i32 %idx, 16\n  br i1 %ok, label %in, label %out\nout:\n  ret i64 -1\nin:\n  %z = zext i32 %idx to i64",
+    );
+    let m = LlvmFrontend.lower(LlvmInput { source: safe.into(), name: "s".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &bugs).verdict, Verdict::Fail, "a guarded unsigned index is safe");
+}
+
 /// The opt-in `assume_valid_params`: a field access through a raw pointer parameter
 /// of known (debug-info) pointee size proves — the framework/kernel entry ABI passes
 /// a valid pointer. UNKNOWN by default (a raw pointer may dangle); PASS under the

@@ -2222,7 +2222,11 @@ impl Explorer<'_> {
             Inst::PtrOffset { dst, base, index, elem } => {
                 let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1).max(1);
                 let base_ptr = self.eval_pointer(base, state);
+                // Widen a narrower index to pointer width — a `zext i32 %i to i64`
+                // the executor kept at its source width (the common `arr[unsigned]`
+                // form), else the offset arithmetic mixes widths and no bound holds.
                 let index_e = self.eval_scalar(index, state);
+                let index_e = self.widen_to_ptr(index_e);
                 let stride_e = self.ctx.int(PTR_WIDTH, stride as u128);
                 let delta = self.ctx.bin(BvOp::Mul, index_e, stride_e);
                 let new_off = self.ctx.bin(BvOp::Add, base_ptr.offset, delta);
