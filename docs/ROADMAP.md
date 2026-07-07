@@ -231,9 +231,13 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
    (`prov`/`label`/`require`, `SafetyProperty::WriteCapability`,
    `Inst::ProvLabel`/`CapRequire`, `Module::prov_grants`). Sound-by-default: an
    unlabelled region grants everything, so it never false-FAILs.
-2. **Scatterlist as a structured region** (a list of `(page, offset, len)` segments
-   + `sg_chain`) and **src=dst segment aliasing**, so a `require write` on a crypto
-   request reaches the labelled destination segment.
+2. **Provenance propagation — DONE** (general, not scatterlist-specific): a
+   `propagate dst from src` contract effect flows a label from an element into a
+   container (a region carries a *set* of labels), so a `foreign` page taints the
+   whole collection and a `require` over it refuses. `sg_set_page`/`sg_chain` map to
+   it. **Remaining:** connect `crypto_aead_encrypt(req)`'s write to the destination
+   *segment* — the request→scatterlist→page field-tracking step (needs interprocedural
+   member-provenance through the `aead_request`/`af_alg` structs).
 3. **Crypto-API effect contracts** (`crypto_aead_encrypt` writes `req->dst`) — a
    handful of interface axioms at the trust boundary, or derived by a general
    effect-summary inference (mod/ref + provenance-transfer fixpoint) that also
