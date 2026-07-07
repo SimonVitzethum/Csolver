@@ -243,7 +243,7 @@ fn lower_function(
         }
         // `invoke` is a terminator that also *defines* a value (`%r = invoke …`);
         // register it here too, else the normal successor's use is undefined.
-        if let LTerm::Invoke { dst: Some(dst), .. } = &b.term {
+        if let LTerm::Invoke { dst: Some(dst), .. } | LTerm::CallBr { dst: Some(dst), .. } = &b.term {
             ctx.define(dst);
         }
     }
@@ -516,25 +516,13 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
             });
             continue;
         }
-        // A multi-level nested gep: leading element stride, then the exact byte
-        // offset of the all-constant navigation path through the aggregate.
-        if let LInst::GepChain { dst, agg_ty, base, index, path } = inst {
-            let ty = lower_type(agg_ty);
-            let off = nested_offset(&ty, path)
-                .ok_or_else(|| Error::unsupported("nested gep with an unresolvable offset"))?;
-            let tmp = ctx.fresh();
-            insts.push(Inst::PtrOffset {
-                dst: tmp,
-                base: ctx.operand(base, 64)?,
-                index: ctx.operand(index, 64)?,
-                elem: ty,
-            });
-            insts.push(Inst::PtrOffset {
-                dst: ctx.reg(dst)?,
-                base: Operand::Reg(tmp),
-                index: Operand::int(64, off as u128),
-                elem: Type::int(8),
-            });
+        // A multi-level gep: walk the aggregate type through the index list,
+        // emitting a PtrOffset chain — the leading index strides by `sizeof(agg)`,
+        // a struct field or a constant array index folds into a byte offset, and a
+        // *variable* array index emits its own scaled PtrOffset.
+        if let LInst::GepChain { dst, agg_ty, base, indices } = inst {
+            let out = lower_gep_chain(ctx, dst, lower_type(agg_ty), base, indices)?;
+            insts.extend(out);
             continue;
         }
                 // A `load ptr` that reads a *reference field* of a DWARF-typed struct
@@ -667,6 +655,28 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 else_blk,
                 else_args,
             }
+        }
+        // `callbr` (inline-asm goto): the asm may clobber memory and control may
+        // continue at the fallthrough or any listed label. Emit the asm as an opaque
+        // (memory-havoc) call, then a Switch to *every* target on a fresh scrutinee,
+        // so all successors are analysed (dropping any would be a false-PASS hole).
+        LTerm::CallBr { dst, targets } => {
+            let call_dst = dst.as_deref().map(|d| ctx.reg(d)).transpose()?;
+            insts.push(Inst::Call {
+                dst: call_dst,
+                callee: Callee::Symbol("<inline asm>".into()),
+                args: Vec::new(),
+                ret_ty: Type::int(64),
+                ret_ref: None,
+            });
+            let blk = |name: &str| ctx.block(name);
+            let default = blk(&targets[0])?;
+            let cases = targets[1..]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| Ok((BitVector::new(64, i as u128), blk(t)?)))
+                .collect::<Result<Vec<_>>>()?;
+            Terminator::Switch { value: Operand::Reg(ctx.fresh()), cases, default }
         }
         _ => lower_term(ctx, &b.label, &b.term)?,
     };
@@ -853,9 +863,9 @@ fn lower_term(ctx: &Ctx, from: &str, term: &LTerm) -> Result<Terminator> {
             }
         }
         LTerm::Unreachable => Terminator::Unreachable,
-        // Handled in `lower_block` (it needs to append the call instruction);
+        // Handled in `lower_block` (they need to append the call instruction);
         // defensive and sound if ever reached directly.
-        LTerm::Invoke { .. } => Terminator::Unreachable,
+        LTerm::Invoke { .. } | LTerm::CallBr { .. } => Terminator::Unreachable,
     })
 }
 
@@ -885,29 +895,96 @@ fn branch_args(ctx: &Ctx, from: &str, to: &str) -> Result<Vec<Operand>> {
     Ok(args)
 }
 
-/// The cumulative byte offset of a **nested** navigation `path` into aggregate
-/// `agg` — each step descends a struct field (its padded offset) or a constant
-/// array index (`k · sizeof(elem)`). `None` if a step does not fit the current
-/// type (e.g. a field index into a scalar), so an ill-formed chain is refused, not
-/// silently mis-offset.
-fn nested_offset(agg: &Type, path: &[i128]) -> Option<u64> {
+/// Lower a multi-level `getelementptr` into a `PtrOffset` chain by walking the
+/// aggregate type through the index list. The leading index strides by
+/// `sizeof(agg)`; a struct field or a *constant* array index folds into a running
+/// byte offset; a *variable* array index emits its own scaled `PtrOffset`. The
+/// running offset (possibly zero) is folded into `dst` at the end. A step that does
+/// not fit the current type (a field index into a scalar, a variable struct field)
+/// is refused, never mis-offset.
+fn lower_gep_chain(
+    ctx: &mut Ctx,
+    dst: &str,
+    agg: Type,
+    base: &LValue,
+    indices: &[LValue],
+) -> Result<Vec<Inst>> {
+    let const_idx = |v: &LValue| match v {
+        LValue::Int(k) if *k >= 0 => u64::try_from(*k).ok(),
+        _ => None,
+    };
+    let mut insts = Vec::new();
+    // Leading index: pointer arithmetic over the whole aggregate.
+    let mut cur = ctx.fresh();
+    insts.push(Inst::PtrOffset {
+        dst: cur,
+        base: ctx.operand(base, 64)?,
+        index: ctx.operand(&indices[0], 64)?,
+        elem: agg.clone(),
+    });
     let mut ty = agg;
-    let mut offset: u64 = 0;
-    for &k in path {
-        let k = u64::try_from(k).ok()?;
+    let mut acc: u64 = 0; // accumulated constant byte offset not yet emitted
+    for idx in &indices[1..] {
         match ty {
-            Type::Struct { fields, .. } => {
-                offset = offset.checked_add(struct_field_offset(ty, k as u32)?)?;
-                ty = fields.get(k as usize)?;
+            Type::Struct { ref fields, .. } => {
+                let k = const_idx(idx)
+                    .ok_or_else(|| Error::unsupported("variable struct-field gep index"))?;
+                acc = acc
+                    .checked_add(struct_field_offset(&ty, k as u32).ok_or_else(|| {
+                        Error::unsupported("struct-field gep with an unsizable offset")
+                    })?)
+                    .ok_or_else(|| Error::unsupported("gep offset overflow"))?;
+                ty = fields
+                    .get(k as usize)
+                    .cloned()
+                    .ok_or_else(|| Error::unsupported("struct-field gep index out of range"))?;
             }
             Type::Array { elem, .. } => {
-                offset = offset.checked_add(k.checked_mul(elem.size_bytes(&LAYOUT)?)?)?;
-                ty = elem;
+                match const_idx(idx) {
+                    Some(k) => {
+                        let sz = elem
+                            .size_bytes(&LAYOUT)
+                            .ok_or_else(|| Error::unsupported("array gep with an unsizable elem"))?;
+                        acc = acc
+                            .checked_add(k.saturating_mul(sz))
+                            .ok_or_else(|| Error::unsupported("gep offset overflow"))?;
+                    }
+                    None => {
+                        // Flush the pending constant offset, then a scaled step.
+                        if acc > 0 {
+                            let n = ctx.fresh();
+                            insts.push(Inst::PtrOffset {
+                                dst: n,
+                                base: Operand::Reg(cur),
+                                index: Operand::int(64, acc as u128),
+                                elem: Type::int(8),
+                            });
+                            cur = n;
+                            acc = 0;
+                        }
+                        let n = ctx.fresh();
+                        insts.push(Inst::PtrOffset {
+                            dst: n,
+                            base: Operand::Reg(cur),
+                            index: ctx.operand(idx, 64)?,
+                            elem: (*elem).clone(),
+                        });
+                        cur = n;
+                    }
+                }
+                ty = *elem;
             }
-            _ => return None,
+            _ => return Err(Error::unsupported("gep navigation into a non-aggregate")),
         }
     }
-    Some(offset)
+    // Fold the remaining constant offset (possibly zero) into the destination.
+    insts.push(Inst::PtrOffset {
+        dst: ctx.reg(dst)?,
+        base: Operand::Reg(cur),
+        index: Operand::int(64, acc as u128),
+        elem: Type::int(8),
+    });
+    Ok(insts)
 }
 
 /// The padded byte offset of `field` inside struct type `s` (LP64 layout) —

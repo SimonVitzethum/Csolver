@@ -271,9 +271,9 @@ done:
   ret void
 }
 
-define i32 @uses_callbr(ptr %p, i32 %v) {
+define i32 @uses_indirectbr(ptr %p, i32 %v) {
 entry:
-  callbr void asm "", ""() to label %done []
+  indirectbr ptr %p, [label %done]
 done:
   %old = add i32 %v, 1
   ret i32 %old
@@ -292,14 +292,14 @@ fn llvm_per_function_recovery() {
     // The supported function lowered; the other is recorded as unanalyzed.
     assert_eq!(module.functions.len(), 1);
     assert_eq!(module.functions[0].name, "good");
-    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_callbr"));
+    assert!(module.unanalyzed.iter().any(|(n, _)| n == "uses_indirectbr"));
 
     let report = verify_module(&module, &Config::default());
     // Module is UNKNOWN (one function not analyzed), but `good` is PASS.
     assert_eq!(report.verdict, Verdict::Unknown);
     let good = report.functions.iter().find(|f| f.function == "good").unwrap();
     assert_eq!(good.verdict, Verdict::Pass);
-    let bad = report.functions.iter().find(|f| f.function == "uses_callbr").unwrap();
+    let bad = report.functions.iter().find(|f| f.function == "uses_indirectbr").unwrap();
     assert_eq!(bad.verdict, Verdict::Unknown);
 }
 
@@ -835,6 +835,60 @@ declare void @free(ptr)
     let m = LlvmFrontend.lower(LlvmInput { source: safe.into(), name: "s".into() }).expect("lower");
     assert_ne!(verify_module(&m, &bugs).verdict, Verdict::Fail,
         "a free with no later use must not be a false positive");
+}
+
+/// `callbr` (inline-asm goto, pervasive in the kernel for static keys) must not drop
+/// the function: it lowers to an asm havoc plus a branch to every target. An OOB in
+/// the fallthrough block (reached after the callbr) is still found.
+#[test]
+fn callbr_is_analyzed_not_dropped() {
+    let src = r#"
+define i64 @f(i64 %i) {
+entry:
+  %a = alloca [8 x i64], align 8
+  callbr void asm sideeffect "", "!i,~{memory}"() to label %cont [label %err]
+cont:
+  %p = getelementptr [8 x i64], ptr %a, i64 0, i64 %i
+  store i64 1, ptr %p, align 8
+  ret i64 0
+err:
+  ret i64 -1
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "cb".into() }).expect("lower");
+    assert!(m.unanalyzed.is_empty(), "callbr must not drop the function: {:?}", m.unanalyzed);
+    let bugs = Config { bug_finding: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &bugs).verdict, Verdict::Fail,
+        "an OOB in the callbr fallthrough is found");
+}
+
+/// A gep with a **variable index below the first level** (`p->arr[j]` →
+/// `gep %S, ptr, 0, 1, %j`) must lower to a PtrOffset chain (field offset folded,
+/// then a scaled variable step), not drop the function. A safe in-bounds nested
+/// access with a guarded variable index proves under closed-world.
+#[test]
+fn variable_mid_index_gep_lowers_to_a_chain() {
+    let src = r#"
+%struct.s = type { i32, [4 x i64] }
+define i64 @f(i64 %j) {
+entry:
+  %s = alloca %struct.s, align 8
+  %ok = icmp ult i64 %j, 4
+  br i1 %ok, label %in, label %out
+in:
+  %p = getelementptr %struct.s, ptr %s, i64 0, i32 1, i64 %j
+  store i64 7, ptr %p, align 8
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+out:
+  ret i64 -1
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "vm".into() }).expect("lower");
+    assert!(m.unanalyzed.is_empty(), "variable-mid-index gep must not drop the function: {:?}", m.unanalyzed);
+    let cfg = Config { closed_world: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "a guarded in-bounds variable nested access proves (the chain offsets are correct)");
 }
 
 /// In bug-finding mode a scalar parameter is a genuine adversarial input only for an

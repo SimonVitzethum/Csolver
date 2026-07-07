@@ -224,7 +224,7 @@ pub enum LInst {
     /// struct fields and constant array indices (`gep %S, ptr, i, K1, K2, …`). The
     /// exact nested byte offset is resolved at lowering from the type layout. This
     /// is pervasive in real C/kernel IR; without it the whole function was dropped.
-    GepChain { dst: String, agg_ty: LType, base: LValue, index: LValue, path: Vec<i128> },
+    GepChain { dst: String, agg_ty: LType, base: LValue, indices: Vec<LValue> },
     /// A value the frontend models opaquely — e.g. `landingpad`'s exception
     /// object, which carries no memory-safety content. Lowered to `undef` (sound;
     /// unconstrained), so a function that merely has an unwind-cleanup path is
@@ -266,6 +266,11 @@ pub enum LTerm {
         ok: String,
         cleanup: String,
     },
+    /// `[dst =] callbr … asm …(args) to label %ft [label %t1, …]` — an inline-asm
+    /// **goto**: an opaque asm effect whose control may continue at the fallthrough
+    /// or any listed label. Pervasive in the kernel (static keys, exception tables).
+    /// Lowered to an asm havoc + a branch to *every* target (sound over-approximation).
+    CallBr { dst: Option<String>, targets: Vec<String> },
 }
 
 /// Parse a `.ll` source into an [`LModule`].
@@ -1077,7 +1082,7 @@ impl Parser {
         // Detect that form (3-token lookahead) and consume the `%dst =` prefix.
         let invoke_dst = if matches!(self.peek(), Tok::Local(_))
             && matches!(self.peek2(), Tok::Punct('='))
-            && matches!(self.toks.get(self.pos + 2), Some(Tok::Word(w)) if w == "invoke")
+            && matches!(self.toks.get(self.pos + 2), Some(Tok::Word(w)) if w == "invoke" || w == "callbr")
         {
             let d = self.local()?;
             self.expect_punct('=')?;
@@ -1125,6 +1130,39 @@ impl Parser {
                 let cleanup = self.local()?;
                 return Ok(Some(LTerm::Invoke { dst: invoke_dst, ret, callee, args, ok, cleanup }));
             }
+        }
+        if kw == "callbr" {
+            self.pos += 1;
+            self.skip_to_type()?;
+            let _ret = self.ltype()?;
+            // Callee is inline asm (`asm "…", "…"`) or, rarely, a value — skip up to
+            // the argument list either way.
+            while !matches!(self.peek(), Tok::Punct('(') | Tok::Eof | Tok::Punct('}')) {
+                self.pos += 1;
+            }
+            self.skip_balanced('(', ')')?;
+            // Attributes, then `to label %ft [label %t1, …]`.
+            while !matches!(self.peek(), Tok::Word(w) if w == "to")
+                && !matches!(self.peek(), Tok::Eof | Tok::Punct('}'))
+            {
+                self.pos += 1;
+            }
+            self.expect_word("to")?;
+            self.expect_word("label")?;
+            let mut targets = vec![self.local()?];
+            // The indirect label list `[label %t1, label %t2, …]`.
+            if matches!(self.peek(), Tok::Punct('[')) {
+                self.pos += 1;
+                while !matches!(self.peek(), Tok::Punct(']') | Tok::Eof) {
+                    if self.eat_word("label") {
+                        targets.push(self.local()?);
+                    } else {
+                        self.pos += 1; // a comma or other separator
+                    }
+                }
+                self.expect_punct(']')?;
+            }
+            return Ok(Some(LTerm::CallBr { dst: invoke_dst, targets }));
         }
         match kw.as_str() {
             "ret" => {
@@ -1425,38 +1463,17 @@ impl Parser {
             let _ity = self.ltype()?;
             indices.push(self.value()?);
         }
-        // A multi-level navigation whose steps after the leading index are all
-        // constants (nested struct fields / constant array indices) — the common
-        // shape in real C/kernel IR. Resolved to an exact byte offset at lowering.
-        let const_of = |v: &LValue| match v {
-            LValue::Int(k) if *k >= 0 => Some(*k),
-            _ => None,
-        };
-        if indices.len() >= 2 {
-            if let Some(rest) = indices[1..].iter().map(const_of).collect::<Option<Vec<_>>>() {
-                if matches!(base_ty, LType::Struct(_) | LType::PackedStruct(_) | LType::Array(..)) {
-                    return Ok(LInst::GepChain {
-                        dst,
-                        agg_ty: base_ty.clone(),
-                        base,
-                        index: indices[0].clone(),
-                        path: rest,
-                    });
-                }
+        // A single index is plain pointer arithmetic over the base type. Anything
+        // with a navigation below the first level (nested struct fields / array
+        // indices, constant *or* variable) becomes a `GepChain`, resolved to a
+        // PtrOffset chain at lowering by walking the aggregate type.
+        match indices.as_slice() {
+            [idx] => Ok(LInst::Gep { dst, elem: base_ty.clone(), base, index: idx.clone() }),
+            _ if matches!(base_ty, LType::Struct(_) | LType::PackedStruct(_) | LType::Array(..)) => {
+                Ok(LInst::GepChain { dst, agg_ty: base_ty.clone(), base, indices })
             }
+            _ => Err(Error::unsupported("getelementptr with a navigation into a non-aggregate")),
         }
-        let (elem, index) = match (&base_ty, indices.as_slice()) {
-            // `gep T, ptr, idx` — pointer arithmetic over T.
-            (_, [idx]) => (base_ty.clone(), idx.clone()),
-            // `gep [N x T], ptr, 0, idx` — array element (variable index).
-            (LType::Array(elem, _), [_, idx]) => ((**elem).clone(), idx.clone()),
-            _ => {
-                return Err(Error::unsupported(
-                    "getelementptr with a variable index below the first level",
-                ))
-            }
-        };
-        Ok(LInst::Gep { dst, elem, base, index })
     }
 
     /// The callee of a `call`/`invoke`: a direct `@name`, or — for an *indirect*
