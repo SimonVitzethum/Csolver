@@ -4,9 +4,11 @@
 MSIR is a typed, block-argument SSA CFG with **explicit** memory operations
 (`Load`/`Store`/`Alloc`/`Dealloc`/`PtrOffset`) and first-class
 `SafetyCheck` instructions. All frontends lower into it; all analyses read it.
-Provenance is carried by `ProvLabel` (tag a region's origin) and `CapRequire`
-(demand a capability), whose interned lattice rides on `Module::prov_grants` —
-the basis for `WriteCapability` (the Copy-Fail write-to-a-read-only-page class).
+Provenance is carried by `ProvLabel` (tag a region's origin), `ProvPropagate`
+(a container absorbs an element's labels), `CapRequire` (demand a capability), and
+`CapRequireIfAlias` (demand it only for an in-place `src==dst` op), whose interned
+lattice rides on `Module::prov_grants` — the basis for `WriteCapability` (the
+Copy-Fail write-to-a-read-only-page class).
 
 ## Specification
 - Block-argument SSA: a value's single definition dominates its uses; PHIs are

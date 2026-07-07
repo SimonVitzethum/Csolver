@@ -31,11 +31,15 @@ Highlights beyond the historical log below:
 - **File-driven API contracts** (`csolver-contracts`). Recognized allocators,
   deallocators, and user-copies are described in external `data/*.contract` files
   (one block per API family), not hardcoded — a new API is a contract, not a code
-  change. The language also carries **provenance labels + a capability lattice**
-  (`SafetyProperty::WriteCapability`), the general, sound-by-default basis for the
-  write-to-a-read-only-page class (CVE-2026-31431 "Copy Fail"). Enforcement is live
-  (an unlabelled region grants everything ⇒ no false FAIL); the full Copy-Fail sink
-  additionally needs a scatterlist/request model (roadmap).
+  change. The language also carries **provenance labels, a capability lattice, label
+  propagation, and an in-place-aliasing gate** (`SafetyProperty::WriteCapability`):
+  the general, sound-by-default basis for the write-to-a-read-only-page class
+  (CVE-2026-31431 "Copy Fail"). Enforcement is live (an unlabelled region grants
+  everything ⇒ no false FAIL); `require-if-alias` distinguishes the vulnerable in-place
+  `src==dst` write from the safe out-of-place copy. **Internal wrappers** need no
+  contract — `csolver-symbolic` derives a `ProvTransfer` summary and applies it at call
+  sites. Firing on the *unmodified* kernel additionally needs cross-syscall / whole-object
+  provenance (the label source and sink are in different syscalls) — roadmap Bucket D.
 - **`solver scan <dir>`.** Sweeps every `.ll` under a tree without stopping,
   lists every violation with a witness, and reports coverage (PASS/FAIL/UNKNOWN %,
   decided, dropped). On the debug-info kernel: ~31 % of driver functions and ~40 %

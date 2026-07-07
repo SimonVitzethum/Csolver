@@ -289,15 +289,29 @@ language can only describe what the executor already models faithfully.
 
 **Provenance & capabilities (the Copy-Fail / write-to-a-read-only-page class).**
 A `prov <label> grants=<caps>` line declares a provenance lattice; `label arg_k
-<label>` tags a region's origin (e.g. a spliced page is `foreign`); `require
-arg_k <cap>` demands a capability. These lower to `Inst::ProvLabel` /
-`Inst::CapRequire`; the interned lattice rides on `Module::prov_grants`. The
-executor refutes a `require` exactly when the region's label **provably** lacks
-the capability (`SafetyProperty::WriteCapability`, via `record_temporal` — a FAIL
-only on an exact/bug-finding path). **An unlabelled region grants everything: the
-sound default, so the mechanism cannot fabricate a false FAIL on code that names
-no labels.** (Full CVE-2026-31431 coverage additionally needs a scatterlist/
-request model, tracked in the roadmap.)
+<label>` tags a region's origin (e.g. a spliced page is `foreign`); `propagate
+arg_d from arg_s` flows labels from an element into a container (a region carries a
+*set* of labels); `require arg_k <cap>` demands a capability; `require-if-alias
+arg_a arg_b <cap>` demands it only when the two arguments are the **same** region
+(the precise in-place `src==dst` Copy-Fail signature, which does not fire on the
+safe out-of-place copy). These lower to `Inst::ProvLabel` / `ProvPropagate` /
+`CapRequire` / `CapRequireIfAlias`; the interned lattice rides on
+`Module::prov_grants`. The executor refutes exactly when a region's label
+**provably** lacks the capability (`SafetyProperty::WriteCapability`, via
+`record_temporal` — a FAIL only on an exact/bug-finding path). **An unlabelled
+region grants everything: the sound default, so the mechanism cannot fabricate a
+false FAIL on code that names no labels.**
+
+**General inference.** Internal wrappers around these primitives need no contract:
+`csolver-symbolic` derives a per-function `ProvTransfer` summary (which arg's labels
+flow where, which arg is labelled) from the body, composes it through direct callees
+to a fixpoint, and applies it at call sites — so provenance coverage scales without a
+contract per wrapper. Only *definite* parameter aliasing is recorded, so a derived
+transfer is never spurious. Leaf primitives (body-less externals) still need file
+contracts, which is irreducible. (Full CVE-2026-31431 firing on the *unmodified*
+kernel additionally needs cross-syscall / whole-object provenance — the label source
+`af_alg_sendpage` lives in a different syscall than the sink `_aead_recvmsg` — tracked
+in the roadmap.)
 
 ---
 

@@ -25,7 +25,9 @@ read arg1 len=arg2                # bulk-reads arg2 bytes from arg1
 # provenance / capabilities (write-to-a-read-only-page class)
 prov foreign grants=read          # top-level lattice: what a label grants
 label arg1 foreign                # tag a region's provenance
+propagate arg0 from arg1          # a container absorbs an element's labels
 require arg0 write                # a region must grant a capability
+require-if-alias arg1 arg2 write  # ...only if arg1 and arg2 are the SAME region (in-place)
 ```
 A `<size>` is `arg<k>`, `arg<a>*arg<b>`, or a decimal integer (a byte count).
 
@@ -36,10 +38,14 @@ A `<size>` is `arg<k>`, `arg<a>*arg<b>`, or a decimal integer (a byte count).
 | `free` | `Inst::Dealloc` |
 | `write` / `read` | `Inst::MemIntrinsic` (a bounded write carrying the in-bounds obligation; `fill=user` taints the region so a value read back is a genuine adversarial input) |
 | `label` | `Inst::ProvLabel { ptr, label_id }` |
+| `propagate` | `Inst::ProvPropagate { dst, src }` (dst's region unions in src's labels — a container inherits its elements' provenance) |
 | `require` | `Inst::CapRequire { ptr, cap_id }` (implies `SafetyProperty::WriteCapability`) |
+| `require-if-alias` | `Inst::CapRequireIfAlias { a, b, cap_id }` — fires only when `a`,`b` are the same region (an in-place `src==dst` op); the precise Copy-Fail signature that never false-FAILs the out-of-place copy |
 
 Label/capability names are interned to stable ids; the lattice (`label id →
-granted cap ids`) rides on `Module::prov_grants` for the executor.
+granted cap ids`) rides on `Module::prov_grants` for the executor. **Internal wrappers**
+around these primitives need no contract of their own — `csolver-symbolic` derives a
+`ProvTransfer` summary from the wrapper's body and applies it at call sites.
 
 ## Soundness (specification)
 The language is **sound-preserving**: it can only describe effects the executor

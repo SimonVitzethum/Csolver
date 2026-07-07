@@ -251,6 +251,12 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
    deferred rather than hacked. (VPS-verified: real algif_aead.ll stays 0 FAIL — sound.)
 4. **Multi-entry typestate** over the socket object (reachable operation sequences)
    — the precise-but-research-scale finale that yields a syscall-sequence witness.
+   **Groundwork DONE — the in-place-aliasing precision gate** (`require-if-alias`):
+   the vulnerable in-place `src==dst` write to a foreign page is refused while the safe
+   out-of-place copy is not, so a future cross-syscall provenance flow can fire *only* on
+   the vulnerable path and never false-FAIL the patched kernel. Remaining: the actual
+   cross-syscall socket-state persistence (the label from `af_alg_sendpage` reaching
+   `_aead_recvmsg`).
 
 **General inference (parallel track) — provenance-transfer DONE.** Each function gets a
 derived `ProvTransfer` summary (which arg's labels flow to which, which arg is labelled),

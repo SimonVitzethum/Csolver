@@ -13,11 +13,20 @@ the canonical obligations (non-null, no-use-after-free, in-bounds, alignment,
 read/write permission, valid pointer arithmetic, no-double-free) from the region
 table + path condition + solver.
 
-Each region also carries a **provenance label** (`SymRegion.prov_label`): a
-`ProvLabel` sets it, and a `CapRequire` refutes exactly when the label *provably*
-lacks the demanded capability (per `Module::prov_grants`) — a `WriteCapability`
-FAIL only on an exact / bug-finding path (via `record_temporal`), else UNKNOWN. An
-unlabelled region grants everything, so this never fabricates a false FAIL.
+Each region also carries a **set of provenance labels** (`SymRegion.prov_labels`):
+`ProvLabel` inserts one, `ProvPropagate` unions a source region's labels into a
+destination (a container inherits its elements' provenance), and `CapRequire` /
+`CapRequireIfAlias` refute exactly when *some* label *provably* lacks the demanded
+capability (per `Module::prov_grants`) — a `WriteCapability` FAIL only on an exact /
+bug-finding path (via `record_temporal`), else UNKNOWN. `CapRequireIfAlias` fires only
+when its two pointers are the same region (an in-place `src==dst` op). An unlabelled
+region grants everything, so this never fabricates a false FAIL.
+
+**General inference.** A per-function `ProvTransfer` summary (which arg's labels flow to
+which, which arg is labelled) is derived from the body and composed through direct callees
+to a fixpoint (`summarize_module`); `apply_prov_transfer` applies a callee's transfer at the
+call site — so an internal wrapper around a provenance primitive propagates provenance with
+no hand-written contract. Only definite parameter aliasing is recorded (never spurious).
 
 ## State merging (scaling — process each block once)
 The old executor enumerated paths recursively, so a CFG with *N* independent
