@@ -252,6 +252,13 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
 4. **Multi-entry typestate** over the socket object (reachable operation sequences)
    — the precise-but-research-scale finale that yields a syscall-sequence witness.
 
+**General inference (parallel track) — provenance-transfer DONE.** Each function gets a
+derived `ProvTransfer` summary (which arg's labels flow to which, which arg is labelled),
+composed through direct callees to a fixpoint, so an *internal wrapper* around a provenance
+primitive propagates without a hand-written contract — coverage scales without a contract per
+wrapper. Leaf primitives (body-less externals: `kmalloc`/`sg_set_page`/…) still need file
+contracts, which is irreducible (no body to derive from) and small.
+
 ## Sequencing
 
 The fastest route to "verify real compiled Rust" is **Bucket A.1 (LLVM-IR
