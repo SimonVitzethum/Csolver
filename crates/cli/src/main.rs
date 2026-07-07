@@ -39,6 +39,10 @@ USAGE:
                                     ABI — opt-in, unsound in general, surfaced as an assumption);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
+    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world]
+                                    verify EVERY .ll under <dir> without stopping, then
+                                    report coverage (% of functions decided) and list
+                                    every memory-safety violation found, with a witness
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
     solver report <result.json>     re-render a saved JSON report
     solver --help                   show this help
@@ -100,6 +104,15 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .find(|a| !a.starts_with("--") && Some(a.as_str()) != pre_value)
                 .ok_or("`verify` needs a path argument")?;
             verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, pre_file.as_deref())
+        }
+        "scan" => {
+            let dir = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .ok_or("`scan` needs a directory argument")?;
+            let config = Config { closed_world, bug_finding, assume_valid_params, ..Config::default() };
+            scan_dir(Path::new(dir), &config)
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
@@ -188,6 +201,117 @@ fn verify_path(
                  hint: try `solver demo` to exercise the verifier on built-in MSIR",
                 path.display()
             ))
+        }
+    }
+}
+
+/// One found memory-safety violation, for the scan summary.
+struct Finding {
+    file: String,
+    function: String,
+    property: String,
+    witness: String,
+}
+
+/// Scan **every** `.ll` file under `dir` (recursively), verify all of them without
+/// stopping at any UNKNOWN or FAIL, and report the coverage (how much of the code is
+/// actually decided) plus every memory-safety violation found, with its witness.
+fn scan_dir(dir: &Path, config: &Config) -> Result<ExitCode, String> {
+    use csolver_core::ObligationResult;
+    use csolver_ir::Frontend;
+
+    let mut files = Vec::new();
+    collect_ll(dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no .ll files found under {}", dir.display()));
+    }
+    eprintln!("scanning {} .ll files under {} …", files.len(), dir.display());
+
+    let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut findings: Vec<Finding> = Vec::new();
+
+    for (n, path) in files.iter().enumerate() {
+        let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+        let Ok(source) = std::fs::read_to_string(path) else { errored += 1; continue };
+        let module = match (csolver_llvm::LlvmFrontend)
+            .lower(csolver_llvm::LlvmInput { source, name: rel.clone() })
+        {
+            Ok(m) => m,
+            Err(_) => {
+                errored += 1;
+                continue;
+            }
+        };
+        dropped += module.unanalyzed.len() as u64;
+        let report = verify_module(&module, config);
+        for f in &report.functions {
+            match f.verdict {
+                Verdict::Pass => pass += 1,
+                Verdict::Unknown => unknown += 1,
+                Verdict::Fail => {
+                    fail += 1;
+                    // Record each refuted obligation (the concrete bug + its witness).
+                    for o in &f.outcomes {
+                        if let ObligationResult::Refuted(cx) = &o.result {
+                            // Show the genuine triggering inputs (parameters `arg…`,
+                            // user data `user…`, loop counters `ind…`); an internal
+                            // havoc symbol (`?…`) is noise, not a reproducible input.
+                            let witness = cx
+                                .model
+                                .assignments
+                                .iter()
+                                .filter(|a| !a.name.starts_with('?'))
+                                .map(|a| format!("{}={}", a.name, a.value))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            findings.push(Finding {
+                                file: rel.clone(),
+                                function: f.function.clone(),
+                                property: format!("{:?}", o.obligation.property),
+                                witness,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if (n + 1) % 50 == 0 {
+            eprintln!("  … {}/{} files", n + 1, files.len());
+        }
+    }
+
+    let total = pass + fail + unknown;
+    let pct = |x: u64| if total == 0 { 0.0 } else { 100.0 * x as f64 / total as f64 };
+    println!("\n== memory-safety violations found ({}) ==", findings.len());
+    if findings.is_empty() {
+        println!("  (none)");
+    } else {
+        for b in &findings {
+            println!("  {}::{}  [{}]  witness: {}", b.file, b.function, b.property, b.witness);
+        }
+    }
+    println!("\n== coverage ==");
+    println!("functions analyzed : {total}");
+    println!("  PASS  (proven safe)  : {pass}  ({:.1}%)", pct(pass));
+    println!("  FAIL  (bug found)    : {fail}  ({:.1}%)", pct(fail));
+    println!("  UNKNOWN (undecided)  : {unknown}  ({:.1}%)", pct(unknown));
+    println!("decided (PASS+FAIL)  : {}  ({:.1}%)", pass + fail, pct(pass + fail));
+    println!("dropped (unanalyzed) : {dropped}   (functions the frontend could not lower)");
+    println!("files with tool error: {errored}");
+    // A scan is an inventory, not a single verdict — exit non-zero iff any bug was found.
+    Ok(if fail > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// Recursively collect every `*.ll` file under `dir`.
+fn collect_ll(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_ll(&p, out);
+        } else if p.extension().and_then(|x| x.to_str()) == Some("ll") {
+            out.push(p);
         }
     }
 }
