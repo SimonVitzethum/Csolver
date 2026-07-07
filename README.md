@@ -23,6 +23,14 @@ solver — are implemented and audited for soundness. The **Rust (MIR)** and
 recovery, C/kernel allocators, `copy_from_user`, and inline assembly, and runs on
 real Linux-kernel IR. **C++** goes through the same LLVM path.
 
+Recognized library/kernel APIs are described by **external, file-driven contracts**
+(`crates/contracts/data/*.contract`) — one block per API family, so a new API is
+covered by writing a contract, not editing the frontend. The contract language also
+carries **provenance labels and a capability lattice**, the general basis for the
+write-to-a-read-only-page class (e.g. CVE-2026-31431 "Copy Fail"); enforcement is
+sound-by-default (an unlabelled region grants every capability, so it never
+false-FAILs).
+
 Every verdict is checked against a **dynamic oracle**: Rust against **Miri**, C
 against **AddressSanitizer + UBSan** (see [differential/](differential/)). The
 `--bugs` mode finds all 8 memory-bug classes in the C differential corpus with
@@ -35,7 +43,8 @@ and [ARCHITECTURE.md](ARCHITECTURE.md).
 No out-of-bounds access · no use-after-free · no double-free · no dangling
 deref · no null deref · stack integrity · valid pointer arithmetic · valid
 references · valid reads/writes · no forbidden region overlap · alignment ·
-valid stack frames · valid indirect branch targets.
+valid stack frames · valid indirect branch targets · write-capability
+(provenance: no write through a pointer to a read-only/foreign region).
 
 ## Soundness contract
 
@@ -64,9 +73,13 @@ solver verify <module.ll> --closed-world   # whole-program: synthesize contracts
 solver verify <module.ll> --bugs           # bug-finding mode (find, don't prove)
 solver verify <module.ll> --pre <file>     # caller preconditions (bytes/elements/cstring)
 solver verify <path> --json                # machine-readable report
+solver scan <dir> [--bugs] [--assume-valid-params]   # sweep EVERY .ll under a tree:
+                                            # list every violation + report coverage
+                                            # (PASS/FAIL/UNKNOWN %, decided, dropped)
 ```
 
-Exit codes: `0` PASS · `1` FAIL · `2` UNKNOWN · `3` tool error.
+Exit codes: `verify` — `0` PASS · `1` FAIL · `2` UNKNOWN · `3` tool error.
+`scan` exits `1` iff any bug was found (it is an inventory, not one verdict).
 
 ## Differential validation
 

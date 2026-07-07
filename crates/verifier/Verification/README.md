@@ -3,7 +3,9 @@
 ## Design
 The orchestrator. For each function it runs the interval analysis, turns every
 `SafetyCheck` into a `ProofObligation`, discharges it (interval first, SMT
-later), and rolls up `Verdict`s into a `ModuleReport`.
+later), and rolls up `Verdict`s into a `ModuleReport`. It threads module-wide
+context to the symbolic executor: parameter/field contracts, globals, and the
+provenance lattice (`Module::prov_grants`, for `WriteCapability`).
 
 ## Specification
 - `Trivalent::True → Proven(ProofTree)`, `False → Refuted(CounterExample)`,

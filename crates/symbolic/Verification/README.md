@@ -13,6 +13,12 @@ the canonical obligations (non-null, no-use-after-free, in-bounds, alignment,
 read/write permission, valid pointer arithmetic, no-double-free) from the region
 table + path condition + solver.
 
+Each region also carries a **provenance label** (`SymRegion.prov_label`): a
+`ProvLabel` sets it, and a `CapRequire` refutes exactly when the label *provably*
+lacks the demanded capability (per `Module::prov_grants`) — a `WriteCapability`
+FAIL only on an exact / bug-finding path (via `record_temporal`), else UNKNOWN. An
+unlabelled region grants everything, so this never fabricates a false FAIL.
+
 ## State merging (scaling — process each block once)
 The old executor enumerated paths recursively, so a CFG with *N* independent
 branches forked into *2^N* paths and could trip the visit budget into a

@@ -209,13 +209,37 @@ whole tool, argued in each crate's `Verification/`.
 These are where "full safety" becomes "safety relative to a named contract":
 
 - **FFI / external calls**: a summarized pre/post-contract, else `UNKNOWN` +
-  suggested contract.
+  suggested contract. Recognized APIs are described by **external, file-driven
+  contracts** (`csolver-contracts`, `data/*.contract`) — one block per API family,
+  covering allocators, deallocators, user-copies, and provenance/capability rules;
+  a new API is a contract, not a code change.
 - **`int → ptr` casts / inline asm**: provable only with an assumption that
   re-establishes provenance / supplies a semantics.
 - **Indirect calls/branches**: provable when the target set is recoverable
   (vtables, jump tables), else a `ValidIndirectTarget` assumption.
 - **Concurrency / weak memory**: out of the current model; a data-race-aware
   extension would be required for concurrent safety.
+
+## Bucket D — provenance across syscalls (the Copy-Fail class)
+
+CVE-2026-31431 "Copy Fail" is not a spatial OOB: a page-cache page, inserted into
+a socket's scatterlist by `splice()` in one syscall, is later written through an
+in-place AEAD op set up in another — a **provenance + write-capability + aliasing**
+bug assembled across syscall boundaries. Covering this class needs, in order:
+
+1. **Provenance labels + a capability lattice — DONE**, file-driven
+   (`prov`/`label`/`require`, `SafetyProperty::WriteCapability`,
+   `Inst::ProvLabel`/`CapRequire`, `Module::prov_grants`). Sound-by-default: an
+   unlabelled region grants everything, so it never false-FAILs.
+2. **Scatterlist as a structured region** (a list of `(page, offset, len)` segments
+   + `sg_chain`) and **src=dst segment aliasing**, so a `require write` on a crypto
+   request reaches the labelled destination segment.
+3. **Crypto-API effect contracts** (`crypto_aead_encrypt` writes `req->dst`) — a
+   handful of interface axioms at the trust boundary, or derived by a general
+   effect-summary inference (mod/ref + provenance-transfer fixpoint) that also
+   auto-derives most ordinary contracts.
+4. **Multi-entry typestate** over the socket object (reachable operation sequences)
+   — the precise-but-research-scale finale that yields a syscall-sequence witness.
 
 ## Sequencing
 

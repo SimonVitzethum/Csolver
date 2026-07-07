@@ -28,6 +28,19 @@ Highlights beyond the historical log below:
 - **Oracles.** Rust vs **Miri** (`differential/`), C vs **ASan+UBSan**
   (`differential/c/`), and a **kernel sweep** over real `make LLVM=1` IR
   (`scaling/kernel/`).
+- **File-driven API contracts** (`csolver-contracts`). Recognized allocators,
+  deallocators, and user-copies are described in external `data/*.contract` files
+  (one block per API family), not hardcoded — a new API is a contract, not a code
+  change. The language also carries **provenance labels + a capability lattice**
+  (`SafetyProperty::WriteCapability`), the general, sound-by-default basis for the
+  write-to-a-read-only-page class (CVE-2026-31431 "Copy Fail"). Enforcement is live
+  (an unlabelled region grants everything ⇒ no false FAIL); the full Copy-Fail sink
+  additionally needs a scatterlist/request model (roadmap).
+- **`solver scan <dir>`.** Sweeps every `.ll` under a tree without stopping,
+  lists every violation with a witness, and reports coverage (PASS/FAIL/UNKNOWN %,
+  decided, dropped). On the debug-info kernel: ~31 % of driver functions and ~40 %
+  of core functions are *decided* (proven-safe or refuted); the rest are UNKNOWN,
+  dominated by pointers from interprocedural calls/globals.
 
 Known open frontend gap on real kernel IR: complex `getelementptr` shapes
 (multi-index / vector) still drop the enclosing function to `unanalyzed`.

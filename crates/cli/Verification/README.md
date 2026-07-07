@@ -6,7 +6,13 @@ text/JSON reporting. Exit codes encode the verdict (0/1/2) or tool error (3).
 
 ## Specification
 - `verify <path>` selects the frontend by extension/ELF magic; a frontend that
-  cannot lower is a **tool error** (exit 3), not a verdict.
+  cannot lower is a **tool error** (exit 3), not a verdict. Flags: `--closed-world`,
+  `--bugs`, `--assume-valid-params`, `--pre <file>`, `--json`.
+- `scan <dir>` verifies **every** `.ll` under a tree without stopping at any
+  UNKNOWN/FAIL, then prints every memory-safety violation (file::function,
+  property, genuine-input witness) and a **coverage** breakdown (PASS/FAIL/UNKNOWN
+  %, decided = PASS+FAIL, dropped). Exits `1` iff any bug was found (an inventory,
+  not one verdict). Respects `--bugs` / `--assume-valid-params` / `--closed-world`.
 - `demo` verifies a built-in MSIR module to exercise the whole pipeline offline.
 - Exit codes: `PASS=0`, `FAIL=1`, `UNKNOWN=2`, tool error `=3`.
 

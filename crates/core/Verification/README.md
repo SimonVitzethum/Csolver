@@ -5,7 +5,10 @@
 `ProofObligation`, `ObligationResult` (`Proven`/`Refuted`/`Open`), `ProofTree`,
 `CounterExample`, `Assumption`, `Verdict`, and the concrete `BitVector` value.
 It has **no internal dependencies**, so these types are a stable shared
-language and the soundness policy lives in exactly one place.
+language and the soundness policy lives in exactly one place. The property
+catalogue includes `WriteCapability` — a write/access must target a region whose
+**provenance** grants the capability (the write-to-a-read-only-page class, driven
+by external contract labels; see `csolver-contracts`).
 
 ## Specification
 - `Verdict::combine` is a commutative, associative monoid with identity `Pass`;

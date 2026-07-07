@@ -153,7 +153,8 @@ Strictly acyclic layering (arrows = "depends on"):
 | `csolver-cfg` | CFG construction, dominator/post-dominator tree, natural loops, SCCs | core, ir |
 | `csolver-parser` | shared lexer/parser infrastructure (tokens, spans, error recovery) | core |
 | `csolver-mir` | Rust-MIR frontend → MSIR (uses borrow/panic info) | core, ir, parser |
-| `csolver-llvm` | LLVM-IR frontend → MSIR (SSA, PHI, intrinsics, allocator/user-copy/asm modelling, DWARF field recovery) | core, ir, parser |
+| `csolver-llvm` | LLVM-IR frontend → MSIR (SSA, PHI, intrinsics, contract-driven allocator/user-copy/provenance modelling, asm, DWARF field recovery) | core, ir, parser, contracts |
+| `csolver-contracts` | external, file-driven **API effect contracts** (alloc/free/user-copy/read-write, provenance labels + capability lattice); one block per API family in `data/*.contract` | — |
 | `csolver-asm` | x86-64 (Intel/AT&T) + AArch64 → MSIR | core, ir, parser |
 | `csolver-elf` | ELF loader, sections, reloc, symbols, DWARF, PLT/GOT/TLS | core, ir |
 | `csolver-memory` | symbolic memory model: region, pointer, provenance, permissions, alignment, lifetime | core |
@@ -163,7 +164,7 @@ Strictly acyclic layering (arrows = "depends on"):
 | `csolver-solver` | constraint IR (bit-vectors, zext, …), simplification, the bit-precise (bit-blasting) and linear procedures | core, memory, smt |
 | `csolver-verifier` | orchestration: builds proof obligations from MSIR+analyses, discharges them, forms verdicts; contract synthesis; precondition sidecar | core, ir, cfg, memory, absint, symbolic, solver, smt |
 | `csolver-report` | human- and machine-readable (JSON) output, proof tree, counterexample | core |
-| `csolver-cli` | the `solver` binary: `verify` (`--closed-world`, `--bugs`, `--pre`) | all of the above |
+| `csolver-cli` | the `solver` binary: `verify` (`--closed-world`, `--bugs`, `--pre`), `scan` (whole-tree sweep + coverage) | all of the above |
 | `csolver-testsuite` | real Rust/C programs with `unsafe`/raw pointers as end-to-end fixtures | verifier, cli (dev) |
 
 The current scaffold is deliberately `std`-only and therefore reproducibly
@@ -266,6 +267,37 @@ Per-obligation strategy (escalating, cheapest first):
 `Config` selects `closed_world` (whole-program contract synthesis) and
 `bug_finding` (see §1a). A **precondition sidecar** (`--pre`) supplies caller
 contracts C's types cannot express (`bytes`/`elements`/`cstring`/`sentinel`).
+
+### 4.7 External API effect contracts (`csolver-contracts`)
+
+Library/kernel APIs whose body a single translation unit cannot see (allocators,
+deallocators, user-copies, crypto/scatterlist primitives) are described by a
+**declarative, file-driven contract language** — one block per API family in a
+separate `data/*.contract` file (embedded via `include_str!`; `--contracts <dir>`
+layers user files on top). This replaces the frontend's former hardcoded name
+tables: a new API is covered by *writing a contract*, not editing code.
+
+```text
+[kmalloc __kmalloc vmalloc]      alloc size=arg0 align=16
+[kfree vfree kvfree]             free arg0
+[copy_from_user _copy_from_user] write arg0 len=arg2 fill=user
+```
+
+The LLVM frontend lowers a recognized call from its contract into the modelling
+MSIR (`Alloc`/`Dealloc`/`MemIntrinsic`). Effects are **sound-preserving** — the
+language can only describe what the executor already models faithfully.
+
+**Provenance & capabilities (the Copy-Fail / write-to-a-read-only-page class).**
+A `prov <label> grants=<caps>` line declares a provenance lattice; `label arg_k
+<label>` tags a region's origin (e.g. a spliced page is `foreign`); `require
+arg_k <cap>` demands a capability. These lower to `Inst::ProvLabel` /
+`Inst::CapRequire`; the interned lattice rides on `Module::prov_grants`. The
+executor refutes a `require` exactly when the region's label **provably** lacks
+the capability (`SafetyProperty::WriteCapability`, via `record_temporal` — a FAIL
+only on an exact/bug-finding path). **An unlabelled region grants everything: the
+sound default, so the mechanism cannot fabricate a false FAIL on code that names
+no labels.** (Full CVE-2026-31431 coverage additionally needs a scatterlist/
+request model, tracked in the roadmap.)
 
 ---
 

@@ -8,6 +8,13 @@ MSIR). The one structural transformation is **PHI elimination**: each block's
 leading `phi` nodes become MSIR block parameters and every in-edge supplies the
 matching incoming values as branch arguments.
 
+Recognized library/kernel calls (allocators, deallocators, `copy_from_user`,
+provenance-labelling primitives) are lowered from **external, file-driven
+contracts** (`csolver-contracts`, `data/*.contract`) rather than hardcoded name
+tables: `emit_contract` turns a contract's effects into the modelling MSIR
+(`Alloc`/`Dealloc`/`MemIntrinsic`/`ProvLabel`/`CapRequire`). A new API is a
+contract block, not a match arm.
+
 ## Supported subset
 `define`d functions; `void`/`iN`/`ptr`/`[N x T]` types (and legacy `T*`);
 `alloca`, `load`, `store`, `getelementptr` (pointer-arith and `[N x T]` array
