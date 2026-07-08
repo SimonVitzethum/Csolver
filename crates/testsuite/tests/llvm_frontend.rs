@@ -3070,6 +3070,39 @@ entry:
     );
 }
 
+/// **Opaque-pointer provenance (Track-A groundwork)**: a raw-pointer *parameter* is opaque
+/// provenance, not a region, yet it can now be labelled (on its holding SSA register) and the
+/// in-place gate works on it — without modelling it as a region (which would false-PASS its
+/// null/liveness/bounds). Here `%sk` is labelled `foreign` and used in-place (`src == dst`)
+/// → refused; the out-of-place form (distinct pointers) is not. This is what lets a future
+/// whole-object cross-syscall seed label the socket object at all.
+#[test]
+fn an_opaque_parameter_is_labelable_and_gated_in_place() {
+    let base = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare void @aead_request_set_crypt(ptr, ptr, ptr, i64, ptr)
+define void @f(ptr %sk, ptr %other, ptr %iv) {
+entry:
+  call void @af_alg_sendpage(ptr %iv, ptr %sk)
+  call void @aead_request_set_crypt(ptr %iv, ptr %sk, ptr DST, i64 16, ptr %iv)
+  ret void
+}
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // In-place: src == dst == the labelled opaque parameter → refused.
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: base.replace("DST", "%sk"), name: "ip".into() })
+        .expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "an in-place op on a foreign-labelled opaque parameter is refused");
+    // Out-of-place: a distinct pointer → not aliased → no fire (no false FAIL).
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: base.replace("DST", "%other"), name: "oop".into() })
+        .expect("lower");
+    assert_ne!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "distinct pointers are not aliased — no false FAIL");
+}
+
 /// **Read-consistency for unwritten memory**: two reads of the same never-written location
 /// must agree (unwritten memory holds one fixed unknown value). Here `%a` and `%b` load the
 /// same field of a `dereferenceable` parameter, so `%c = %a - %b` is provably `0`, hence

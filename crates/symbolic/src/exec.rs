@@ -487,6 +487,7 @@ fn discharge_inner(
         heap: initial_heap,
         unwritten_reads: HashMap::new(),
         ref_regions: HashMap::new(),
+            reg_labels: HashMap::new(),
         exact: true,
     };
     ex.run_merged(state);
@@ -1021,6 +1022,13 @@ struct PathState {
     /// yield the *same* tracked region (an in-place `src == dst` through field loads is then
     /// recognised). Cleared on every heap havoc (a call may have reassigned the field) — sound.
     ref_regions: HashMap<(usize, u128), usize>,
+    /// Provenance labels attached to an **opaque pointer** by the SSA register that holds it
+    /// (a raw-pointer parameter is opaque provenance, not a region, so it has no `prov_labels`
+    /// of its own). Decoupled from the region/safety model entirely — a `reg_label` affects
+    /// **only** the provenance checks (`CapRequire`/`CapRequireIfAlias`), never null-deref,
+    /// bounds, liveness, or permissions — so it cannot introduce a false PASS. Persistent (a
+    /// register's provenance is a fact about the SSA value, not memory), so not cleared on havoc.
+    reg_labels: HashMap<RegId, HashSet<u32>>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -1523,6 +1531,7 @@ impl Explorer<'_> {
             heap: Vec::new(),
             unwritten_reads: HashMap::new(),
             ref_regions: HashMap::new(),
+            reg_labels: HashMap::new(),
             exact: false,
         }
     }
@@ -2389,44 +2398,28 @@ impl Explorer<'_> {
                 let decision = self.decide(&[goal], state, RefuteMode::Definite, &[]);
                 self.record_scalar(block, idx, decision);
             }
-            // Attach a provenance label to the pointed-to region (a contract `label`).
+            // Attach a provenance label (a contract `label`) — to the pointed-to region, or,
+            // for an opaque pointer (a raw-pointer parameter), to its holding SSA register.
             Inst::ProvLabel { ptr, label } => {
-                if let Prov::Region(rid) = self.eval_pointer(ptr, state).prov {
-                    if let Some(r) = state.regions.get_mut(rid) {
-                        r.prov_labels.insert(*label);
-                    }
-                }
+                self.add_ptr_label(ptr, *label, state);
             }
-            // Propagate provenance: the dst region absorbs src's labels (a contract
-            // `propagate` — a container taking in an element). A foreign element thus makes
-            // the container only as capable as its least-capable member.
+            // Propagate provenance: `dst` absorbs `src`'s labels (a contract `propagate` — a
+            // container taking in an element). A foreign element thus makes the container only
+            // as capable as its least-capable member.
             Inst::ProvPropagate { dst, src } => {
-                let src_labels = match self.eval_pointer(src, state).prov {
-                    Prov::Region(rid) => state.regions[rid].prov_labels.clone(),
-                    _ => HashSet::new(),
-                };
-                if !src_labels.is_empty() {
-                    if let Prov::Region(rid) = self.eval_pointer(dst, state).prov {
-                        if let Some(r) = state.regions.get_mut(rid) {
-                            r.prov_labels.extend(src_labels);
-                        }
-                    }
+                let src_labels = self.ptr_labels(src, state);
+                for l in src_labels {
+                    self.add_ptr_label(dst, l, state);
                 }
             }
-            // Require the pointed-to region to grant `cap` (a contract `require`). A region
-            // whose provenance set contains a label that provably lacks the capability is a
+            // Require the pointed-to region/pointer to grant `cap` (a contract `require`). A
+            // provenance set containing a label that provably lacks the capability is a
             // definite violation — refuted with the path-feasibility witness (a FAIL on an
-            // exact / bug-finding path, else UNKNOWN). An unlabelled region, or an opaque
-            // pointer, grants everything (sound: no false FAIL). Mirrors `record_temporal`.
+            // exact / bug-finding path, else UNKNOWN). An unlabelled pointer grants everything
+            // (sound: no false FAIL). Mirrors `record_temporal`.
             Inst::CapRequire { ptr, cap } => {
-                let lacks = match self.eval_pointer(ptr, state).prov {
-                    Prov::Region(rid) => state.regions[rid].prov_labels.iter().any(|label| {
-                        // A label present in the lattice but not granting `cap` withholds it;
-                        // a label absent from the lattice grants everything (sound default).
-                        self.prov_grants.get(label).is_some_and(|caps| !caps.contains(cap))
-                    }),
-                    _ => false,
-                };
+                let labels = self.ptr_labels(ptr, state);
+                let lacks = self.labels_lack_cap(&labels, *cap);
                 self.record_temporal(
                     (block, idx),
                     SafetyProperty::WriteCapability,
@@ -2436,19 +2429,15 @@ impl Explorer<'_> {
                     "the access target's provenance may not grant the required capability",
                 );
             }
-            // Conditional capability: fire ONLY when `a` and `b` are the SAME region (an
-            // in-place `src == dst` op) and that region's provenance lacks `cap`. When they
-            // are distinct regions (the safe out-of-place path) it never fires — the precise
-            // gate that catches in-place-write-to-foreign without false-FAILing the copy.
+            // Conditional capability: fire ONLY when `a` and `b` have the SAME provenance
+            // identity (an in-place `src == dst` op — same region or same opaque register) and
+            // that provenance lacks `cap`. When they are distinct (the safe out-of-place path)
+            // it never fires — the precise gate that catches in-place-write-to-foreign without
+            // false-FAILing the copy.
             Inst::CapRequireIfAlias { a, b, cap } => {
-                let (pa, pb) = (self.eval_pointer(a, state).prov, self.eval_pointer(b, state).prov);
-                let lacks = match (pa, pb) {
-                    (Prov::Region(ra), Prov::Region(rb)) if ra == rb => {
-                        state.regions[ra].prov_labels.iter().any(|label| {
-                            self.prov_grants.get(label).is_some_and(|caps| !caps.contains(cap))
-                        })
-                    }
-                    _ => false,
+                let lacks = self.same_ptr_identity(a, b, state) && {
+                    let labels = self.ptr_labels(a, state);
+                    self.labels_lack_cap(&labels, *cap)
                 };
                 self.record_temporal(
                     (block, idx),
@@ -2692,6 +2681,55 @@ impl Explorer<'_> {
                 }
             }
         }
+    }
+
+    /// The provenance labels attached to a pointer operand: a materialised region's own
+    /// labels, or — for an **opaque pointer** (a raw-pointer parameter) — the labels on its
+    /// holding SSA register (`PathState::reg_labels`). Unifies both provenance channels.
+    fn ptr_labels(&mut self, ptr: &Operand, state: &PathState) -> HashSet<u32> {
+        match self.eval_pointer(ptr, state).prov {
+            Prov::Region(rid) => state.regions[rid].prov_labels.clone(),
+            _ => match ptr {
+                Operand::Reg(r) => state.reg_labels.get(r).cloned().unwrap_or_default(),
+                _ => HashSet::new(),
+            },
+        }
+    }
+
+    /// Attach a provenance label to a pointer operand: its region if it has one, else its
+    /// holding SSA register (so an opaque parameter becomes labelable without being modelled
+    /// as a region — sound: `reg_labels` touch no safety check but the provenance ones).
+    fn add_ptr_label(&mut self, ptr: &Operand, label: u32, state: &mut PathState) {
+        match self.eval_pointer(ptr, state).prov {
+            Prov::Region(rid) => {
+                if let Some(r) = state.regions.get_mut(rid) {
+                    r.prov_labels.insert(label);
+                }
+            }
+            _ => {
+                if let Operand::Reg(r) = ptr {
+                    state.reg_labels.entry(*r).or_default().insert(label);
+                }
+            }
+        }
+    }
+
+    /// Whether two pointer operands have the **same provenance identity**: the same
+    /// materialised region, or the same opaque SSA register. Conservative — distinct
+    /// registers holding the same opaque value are not unified (a sound under-approximation).
+    fn same_ptr_identity(&mut self, a: &Operand, b: &Operand, state: &PathState) -> bool {
+        match (self.eval_pointer(a, state).prov, self.eval_pointer(b, state).prov) {
+            (Prov::Region(ra), Prov::Region(rb)) => ra == rb,
+            _ => matches!((a, b), (Operand::Reg(x), Operand::Reg(y)) if x == y),
+        }
+    }
+
+    /// Whether `labels` contains one that the provenance lattice proves does **not** grant
+    /// `cap` (a label absent from the lattice grants everything — the sound default).
+    fn labels_lack_cap(&self, labels: &HashSet<u32>, cap: u32) -> bool {
+        labels
+            .iter()
+            .any(|l| self.prov_grants.get(l).is_some_and(|caps| !caps.contains(&cap)))
     }
 
     fn step_call(
