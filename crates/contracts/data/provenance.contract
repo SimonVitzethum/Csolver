@@ -44,6 +44,13 @@ require-if-alias arg1 arg2 write
 [crypto_aead_encrypt crypto_aead_decrypt]
 require arg0 write
 
+# CVE-2026-31431 whole-object seed: the AEAD recvmsg worker's socket (arg0) may hold a page
+# spliced in by af_alg_sendpage in a PRIOR syscall, so seed it `foreign` at entry. Only the
+# in-place sink (require-if-alias, above) then fires, so this never false-FAILs the safe
+# out-of-place (patched) path. This is the cross-syscall step that closes the chain on real IR.
+[_aead_recvmsg aead_recvmsg]
+seed arg0 foreign
+
 # NOTE: on REAL algif_aead the scatterlist regions are built by opaque helpers
 # (`af_alg_get_rsgl`) and reached through struct-field loads (`areq->first_rsgl.sgl.sg`), whose
 # region identity the per-TU analysis does not yet recover — so the provenance does not yet

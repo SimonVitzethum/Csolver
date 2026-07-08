@@ -276,6 +276,20 @@ fn lower_function(
         blocks.push(lower_block(&mut ctx, b, BlockId(i as u32))?);
     }
 
+    // Entry seeds (whole-object cross-syscall provenance): a `seed arg_k <label>` contract
+    // on THIS function labels the parameter's object at entry (an `Inst::ProvLabel` prepended
+    // to the entry block), so a sink can be told its object may carry the provenance a sibling
+    // syscall operation left on it. The in-place gate keeps this from false-FAILing the safe
+    // path. Applied at the *definition* (not at call sites — see `emit_contract`).
+    let seeds = entry_seed_insts(&f.name, &params);
+    if !seeds.is_empty() {
+        if let Some(entry) = blocks.first_mut() {
+            let mut s = seeds;
+            s.append(&mut entry.insts);
+            entry.insts = s;
+        }
+    }
+
     let function = Function {
         id,
         name: f.name.clone(),
@@ -1168,6 +1182,22 @@ impl ProvInterner {
     }
 }
 
+/// The entry-seed `ProvLabel`s for a function definition: from any `seed arg_k <label>`
+/// effects in this function's own contract (`Effect::Seed`), a `ProvLabel` on the named
+/// parameter. Empty for a function with no seed contract (the sound default).
+fn entry_seed_insts(name: &str, params: &[(RegId, Type)]) -> Vec<Inst> {
+    let Some(contract) = contracts().lookup(name) else { return Vec::new() };
+    let mut seeds = Vec::new();
+    for effect in &contract.effects {
+        if let Effect::Seed { arg, label } = effect {
+            if let (Some((reg, _)), Some(id)) = (params.get(*arg), prov_interner().id(label)) {
+                seeds.push(Inst::ProvLabel { ptr: Operand::Reg(*reg), label: id });
+            }
+        }
+    }
+    seeds
+}
+
 fn prov_interner() -> &'static ProvInterner {
     static INTERNER: OnceLock<ProvInterner> = OnceLock::new();
     INTERNER.get_or_init(|| {
@@ -1302,6 +1332,9 @@ fn emit_contract(
                     });
                 }
             }
+            // A `seed` is applied at the seeded function's OWN entry (see `entry_seeds`), not
+            // at call sites — a no-op here.
+            Effect::Seed { .. } => {}
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

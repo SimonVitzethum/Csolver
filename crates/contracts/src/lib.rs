@@ -137,6 +137,19 @@ pub enum Effect {
         /// The capability the aliased region must grant.
         cap: String,
     },
+    /// **Entry seed** (whole-object cross-syscall provenance): applied not at a *call* to
+    /// this API but at the **entry of the named function itself** — parameter `arg`'s object
+    /// is labelled `label`. Models the fact that an object shared across syscalls (a socket)
+    /// may carry provenance a *sibling* operation left on it: e.g. `_aead_recvmsg`'s socket
+    /// may hold a `foreign` page spliced in by `af_alg_sendpage` in another syscall. Only the
+    /// **in-place** sink (`require-if-alias`) then fires, so seeding never false-FAILs the
+    /// out-of-place (patched) path.
+    Seed {
+        /// The 0-based parameter index to label at the function's entry.
+        arg: usize,
+        /// The provenance label name.
+        label: String,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -356,6 +369,12 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let b = parse_arg(rest.get(1).copied().unwrap_or(""))?;
             let cap = rest.get(2).copied().ok_or("`require-if-alias` needs a capability")?.to_string();
             Ok(Effect::RequireIfAlias { a, b, cap })
+        }
+        // `seed arg<k> <label>`.
+        "seed" => {
+            let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let label = rest.get(1).copied().ok_or("`seed` needs a label name")?.to_string();
+            Ok(Effect::Seed { arg, label })
         }
         other => Err(format!("unknown effect `{other}`")),
     }
