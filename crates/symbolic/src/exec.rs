@@ -2550,10 +2550,8 @@ impl Explorer<'_> {
             // it never fires — the precise gate that catches in-place-write-to-foreign without
             // false-FAILing the copy.
             Inst::CapRequireIfAlias { a, b, cap } => {
-                let lacks = self.same_ptr_identity(a, b, state) && {
-                    let labels = self.ptr_labels(a, state);
-                    self.labels_lack_cap(&labels, *cap)
-                };
+                let (pa, pb) = (self.eval_pointer(a, state), self.eval_pointer(b, state));
+                let lacks = self.alias_lacks_cap(&pa, &pb, *cap, state);
                 self.record_temporal(
                     (block, idx),
                     SafetyProperty::WriteCapability,
@@ -2581,25 +2579,7 @@ impl Explorer<'_> {
                 let (sv, dv) = (field(self, *off_a, state), field(self, *off_b, state));
                 let lacks = match (&sv, &dv) {
                     (SymValue::Ptr(sp), SymValue::Ptr(dp)) => {
-                        let same = match (&sp.prov, &dp.prov) {
-                            (Prov::Region(ra), Prov::Region(rb)) => ra == rb,
-                            (Prov::Unknown(_, Some(ia)), Prov::Unknown(_, Some(ib))) => {
-                                ia == ib && sp.offset == dp.offset
-                            }
-                            _ => false,
-                        };
-                        same && {
-                            let labels = match sp.prov {
-                                Prov::Region(rid) => {
-                                    state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default()
-                                }
-                                Prov::Unknown(_, Some(id)) => {
-                                    state.opaque_labels.get(&id).cloned().unwrap_or_default()
-                                }
-                                _ => HashSet::new(),
-                            };
-                            self.labels_lack_cap(&labels, *cap)
-                        }
+                        self.alias_lacks_cap(sp, dp, *cap, state)
                     }
                     _ => false,
                 };
@@ -2884,20 +2864,41 @@ impl Explorer<'_> {
         }
     }
 
-    /// Whether two pointer operands have the **same provenance identity**: the same
-    /// materialised region (at any offset — the in-place gate is region-granular), or the
-    /// same opaque provenance id **at the same offset** (so `obj->f` and `obj->g` off one
-    /// object are *not* aliased, but two loads of `obj->f` are). Conservative — an opaque
-    /// pointer with no id is never unified (a sound under-approximation).
-    fn same_ptr_identity(&mut self, a: &Operand, b: &Operand, state: &PathState) -> bool {
-        let (pa, pb) = (self.eval_pointer(a, state), self.eval_pointer(b, state));
-        match (pa.prov, pb.prov) {
+
+    /// Whether two symbolic pointers **alias the same region/identity** and that region's
+    /// provenance lacks `cap` — decomposing a `Prov::Select` (a PHI/`select` join) on either
+    /// side into its alternatives. Firing on one alternative is sound: that alternative is a
+    /// feasible reaching path (the refutation's feasibility witness confirms it) on which the
+    /// in-place-foreign write genuinely holds. This is what lets an in-place op whose src is a
+    /// PHI of the (in-place) dst and an out-of-place value still be caught on the in-place arm.
+    fn alias_lacks_cap(&self, sp: &SymPointer, dp: &SymPointer, cap: u32, state: &PathState) -> bool {
+        // Decompose a Select on either side (bounded by the finite pointer structure).
+        if let Prov::Select { then_ptr, else_ptr, .. } = &sp.prov {
+            return self.alias_lacks_cap(then_ptr, dp, cap, state)
+                || self.alias_lacks_cap(else_ptr, dp, cap, state);
+        }
+        if let Prov::Select { then_ptr, else_ptr, .. } = &dp.prov {
+            return self.alias_lacks_cap(sp, then_ptr, cap, state)
+                || self.alias_lacks_cap(sp, else_ptr, cap, state);
+        }
+        let same = match (&sp.prov, &dp.prov) {
             (Prov::Region(ra), Prov::Region(rb)) => ra == rb,
             (Prov::Unknown(_, Some(ia)), Prov::Unknown(_, Some(ib))) => {
-                ia == ib && pa.offset == pb.offset
+                ia == ib && sp.offset == dp.offset
             }
             _ => false,
+        };
+        if !same {
+            return false;
         }
+        let labels = match sp.prov {
+            Prov::Region(rid) => {
+                state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default()
+            }
+            Prov::Unknown(_, Some(id)) => state.opaque_labels.get(&id).cloned().unwrap_or_default(),
+            _ => HashSet::new(),
+        };
+        self.labels_lack_cap(&labels, cap)
     }
 
     /// Whether `labels` contains one that the provenance lattice proves does **not** grant
