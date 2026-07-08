@@ -3683,28 +3683,51 @@ impl Explorer<'_> {
         state: &PathState,
     ) -> AliasResult {
         match (&a.prov, &b.prov) {
+            // Same allocation: decide by offsets.
             (Prov::Region(r1), Prov::Region(r2)) if r1 == r2 => {
-                // Same allocation: decide by offsets.
-                let eq = self.ctx.cmp(SCmp::Eq, a.offset, b.offset);
-                if sizea >= sizeb && self.prove(eq, state) {
-                    return AliasResult::Must;
-                }
-                let asz = self.ctx.int(PTR_WIDTH, sizea as u128);
-                let bsz = self.ctx.int(PTR_WIDTH, sizeb as u128);
-                let a_end = self.ctx.bin(BvOp::Add, a.offset, asz);
-                let b_end = self.ctx.bin(BvOp::Add, b.offset, bsz);
-                let a_before_b = self.ctx.cmp(SCmp::Sle, a_end, b.offset);
-                let b_before_a = self.ctx.cmp(SCmp::Sle, b_end, a.offset);
-                if self.prove(a_before_b, state) || self.prove(b_before_a, state) {
-                    return AliasResult::No;
-                }
-                AliasResult::May
+                self.offsets_alias(a, b, sizea, sizeb, state)
             }
             // Distinct allocations never alias.
             (Prov::Region(_), Prov::Region(_)) => AliasResult::No,
-            // Opaque or null provenance: be conservative.
+            // Same opaque object identity (the unique `Prov::Unknown` id minted per opaque
+            // pointer, which flows through `gep`/copy — the same identity `opaque_labels` and
+            // `RefBase::Opaque` key on): two accesses to the same opaque object decide by
+            // offset exactly like a region, so a field store into an opaque base
+            // (`store p, areq->dst`) is read back (`load areq->dst`) — read-your-writes over
+            // an opaque object. Sound: an intervening writing call clears the store list
+            // (`heap.clear()`), so a stale store is never forwarded across a havoc.
+            (Prov::Unknown(_, Some(i1)), Prov::Unknown(_, Some(i2))) if i1 == i2 => {
+                self.offsets_alias(a, b, sizea, sizeb, state)
+            }
+            // Distinct or unidentified opaque / null provenance: be conservative.
             _ => AliasResult::May,
         }
+    }
+
+    /// Decide aliasing of two pointers already known to address the **same** object
+    /// (same region or same opaque identity) purely by their offsets and access sizes.
+    fn offsets_alias(
+        &mut self,
+        a: &SymPointer,
+        b: &SymPointer,
+        sizea: u64,
+        sizeb: u64,
+        state: &PathState,
+    ) -> AliasResult {
+        let eq = self.ctx.cmp(SCmp::Eq, a.offset, b.offset);
+        if sizea >= sizeb && self.prove(eq, state) {
+            return AliasResult::Must;
+        }
+        let asz = self.ctx.int(PTR_WIDTH, sizea as u128);
+        let bsz = self.ctx.int(PTR_WIDTH, sizeb as u128);
+        let a_end = self.ctx.bin(BvOp::Add, a.offset, asz);
+        let b_end = self.ctx.bin(BvOp::Add, b.offset, bsz);
+        let a_before_b = self.ctx.cmp(SCmp::Sle, a_end, b.offset);
+        let b_before_a = self.ctx.cmp(SCmp::Sle, b_end, a.offset);
+        if self.prove(a_before_b, state) || self.prove(b_before_a, state) {
+            return AliasResult::No;
+        }
+        AliasResult::May
     }
 
     fn record(
@@ -4367,6 +4390,73 @@ mod tests {
             .clone();
         assert!(!d.proven, "the container inherits the element's foreign provenance");
         assert!(d.refutation.is_some(), "a write to the foreign-tainted container is refuted: {d:?}");
+    }
+
+    /// The real algif_aead shape in miniature: the request object is an **opaque** pointer
+    /// (an allocator's result, not a tracked region), it is labelled `foreign`, and the same
+    /// foreign pointer is stored into two of its fields (`req->src` at +64 and `req->dst` at
+    /// +72 — an in-place op). The `require-if-alias-fields` sink reads those fields back and
+    /// must refute the write. This exercises read-your-writes over an *opaque base* (the
+    /// `alias_check` same-opaque-identity case): without it the field loads return fresh
+    /// values, the alias is lost, and the bug is missed.
+    #[test]
+    fn in_place_write_of_a_foreign_opaque_object_is_refused() {
+        let obj = RegId(0); // an opaque pointer parameter (Prov::Unknown)
+        let fsrc = RegId(1);
+        let fdst = RegId(2);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        // Label the opaque object `foreign` (id 0).
+        bb0.insts.push(Inst::ProvLabel { ptr: Operand::Reg(obj), label: 0 });
+        // req->src = obj  (field at +64)
+        bb0.insts.push(Inst::PtrOffset {
+            dst: fsrc,
+            base: Operand::Reg(obj),
+            index: Operand::int(64, 64),
+            elem: Type::int(8),
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::ptr(Type::int(8)),
+            ptr: Operand::Reg(fsrc),
+            value: Operand::Reg(obj),
+            align: 8,
+        });
+        // req->dst = obj  (field at +72) — same pointer ⇒ in-place
+        bb0.insts.push(Inst::PtrOffset {
+            dst: fdst,
+            base: Operand::Reg(obj),
+            index: Operand::int(64, 72),
+            elem: Type::int(8),
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::ptr(Type::int(8)),
+            ptr: Operand::Reg(fdst),
+            value: Operand::Reg(obj),
+            align: 8,
+        });
+        // Sink: read req->src (+64) and req->dst (+72) back; iff they alias, require `write` (1).
+        bb0.insts.push(Inst::CapRequireIfAliasFields {
+            obj: Operand::Reg(obj),
+            off_a: 64,
+            off_b: 72,
+            cap: 1,
+        });
+        let idx = bb0.insts.len() - 1;
+        let f = Function {
+            id: FuncId(0),
+            name: "inplace_opaque".into(),
+            params: vec![(obj, Type::ptr(Type::int(8)))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        // `foreign` (0) grants read (2) only, not write (1).
+        let grants = HashMap::from([(0u32, HashSet::from([2u32]))]);
+        let d = discharge_with_grants(&f, grants)
+            .mem_decision(BlockId(0), idx, SafetyProperty::WriteCapability)
+            .expect("a WriteCapability obligation")
+            .clone();
+        assert!(!d.proven, "the in-place write of a foreign opaque object is refuted: {d:?}");
+        assert!(d.refutation.is_some(), "read-your-writes over the opaque base found the alias: {d:?}");
     }
 
     /// `init()`: `buf = alloc i32*4; store 7 -> buf; v = load buf` — read after
