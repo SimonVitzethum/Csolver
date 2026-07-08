@@ -299,12 +299,17 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
      Kernel-wide audited SOUND: seeded scan byte-identical (2468/32/3740, 653/0), vulnerable algif_aead.ll
      stays 0 (applies, does not false-FAIL).
 
-     **Remaining is precision, not soundness/mechanism: the taint does not yet FLOW through the real
-     worker.** On the unmodified algif_aead the seeded socket's provenance must reach the in-place
-     `set_crypt` through a `list_for_each_entry` walk over `ctx->tsgl_list` and the opaque helpers
-     `af_alg_get_rsgl` / `crypto_aead_copy_sgl` — a taint-flow precision gap (linked-list traversal and
-     opaque-helper provenance), plus the WriteCapability recall gaps B2–B5 (merge/Select/transfer). The
-     (a)+(b)+(c) machinery is complete and sound; closing the real-IR firing is now a taint-precision task.
+     **Remaining is precision, not soundness/mechanism.** Taint-flow precision now added and validated
+     (all SOUND, kernel byte-identical, algif_aead stays 0): (1) general **taint-on-read at Load** — a
+     pointer loaded from a labelled object inherits its provenance (flows `sk → ctx → tsgl_src` through
+     plain field loads); (2) provenance labels survive **loop havoc** (an iterator over a foreign list
+     stays foreign); (3) labels survive **CFG merges by intersection** (the meet — sound, entry-seeds on
+     all paths survive; fixes the DeepSeek recall gap on `opaque_labels`/region labels). The taint now
+     survives control flow. Firing on the *unmodified* algif_aead is still blocked by that worker's
+     specifics, each a precision task: `ctx = alg_sk(sk)->private` is a `container_of` negative-offset
+     cast (sk→ctx taint not modelled); the deeply nested `areq->first_rsgl.sgl.sg`; and the opaque
+     `af_alg_get_rsgl` building the rsgl into a fresh `areq` (the foreign must reach it via
+     `crypto_aead_copy_sgl`'s propagate). The (a)+(b)+(c) machinery is complete and sound.
    - **(ii) materialized-field region identity — DONE.** A `RefWitness` now carries the field
      address it was loaded from and caches the materialised region by `(region, offset)`
      (`PathState.ref_regions`, cleared on heap havoc), so two loads of the same raw-pointer
