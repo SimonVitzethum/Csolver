@@ -2402,6 +2402,37 @@ impl Explorer<'_> {
                         state.exact = false;
                     }
                 }
+                // Taint-on-read: a pointer loaded from a labelled object inherits its
+                // provenance — a pointer stored in a `foreign` scatterlist/socket is itself
+                // foreign. Only ADDS labels, and a label causes a FAIL only through a (gated)
+                // capability requirement (`require-if-alias` never fires off the safe
+                // out-of-place path), so this can introduce neither a false PASS nor a false
+                // FAIL. Flows provenance through the plain pointer-field loads the real crypto
+                // worker uses (`sk → ctx → tsgl_src`), complementing the RefWitness path.
+                if ty.is_ptr() {
+                    let src_labels = match p.prov {
+                        Prov::Region(rid) => {
+                            state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default()
+                        }
+                        Prov::Unknown(_, Some(id)) => {
+                            state.opaque_labels.get(&id).cloned().unwrap_or_default()
+                        }
+                        _ => HashSet::new(),
+                    };
+                    if !src_labels.is_empty() {
+                        match &value {
+                            SymValue::Ptr(SymPointer { prov: Prov::Region(rid), .. }) => {
+                                if let Some(r) = state.regions.get_mut(*rid) {
+                                    r.prov_labels.extend(src_labels);
+                                }
+                            }
+                            SymValue::Ptr(SymPointer { prov: Prov::Unknown(_, Some(vid)), .. }) => {
+                                state.opaque_labels.entry(*vid).or_default().extend(src_labels);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 state.env.insert(*dst, value);
             }
             Inst::Store { ty, ptr, value, align } => {

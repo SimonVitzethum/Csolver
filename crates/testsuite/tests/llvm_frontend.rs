@@ -3070,6 +3070,52 @@ entry:
     );
 }
 
+/// **Taint-on-read chains through plain field loads**: the seeded socket's `foreign` provenance
+/// flows `sk → ctx → child` across two levels of ordinary pointer-field loads (not just DWARF
+/// raw-pointer/RefWitness fields), and the in-place write of the twice-loaded `child` is refused.
+/// This is the `sk → ctx → tsgl_src` shape the real crypto worker uses (minus its list walk).
+#[test]
+fn taint_on_read_chains_through_plain_loads() {
+    let src = r#"
+%struct.child = type { i32, [4 x i64] }
+%struct.dev = type { i32, ptr }
+declare void @aead_request_set_crypt(ptr, ptr, ptr, i64, ptr)
+define void @_aead_recvmsg(ptr %sk, ptr %iv) !dbg !4 {
+entry:
+  %pctx = getelementptr inbounds i8, ptr %sk, i64 8
+  %ctx = load ptr, ptr %pctx, align 8
+  %c1 = getelementptr inbounds i8, ptr %ctx, i64 8
+  %child1 = load ptr, ptr %c1, align 8
+  %c2 = getelementptr inbounds i8, ptr %ctx, i64 8
+  %child2 = load ptr, ptr %c2, align 8
+  call void @aead_request_set_crypt(ptr %sk, ptr %child1, ptr %child2, i64 16, ptr %iv)
+  ret void
+}
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)
+!1 = !DIFile(filename: "d.c", directory: "/")
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = distinct !DISubprogram(name: "_aead_recvmsg", scope: !1, file: !1, type: !5, unit: !0, retainedNodes: !20)
+!5 = !DISubroutineType(types: !6)
+!6 = !{null, !8, !8}
+!8 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "dev", size: 128, elements: !10)
+!10 = !{!11, !12}
+!7 = !DIBasicType(name: "int", size: 32)
+!11 = !DIDerivedType(tag: DW_TAG_member, name: "id", baseType: !7, size: 32, offset: 0)
+!12 = !DIDerivedType(tag: DW_TAG_member, name: "child", baseType: !13, size: 64, offset: 64)
+!13 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !14, size: 64)
+!14 = !DICompositeType(tag: DW_TAG_structure_type, name: "child", size: 320)
+!20 = !{!21}
+!21 = !DILocalVariable(name: "sk", arg: 1, scope: !4, file: !1, type: !8)
+"#;
+    let module = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "chain".into() }).expect("lower");
+    let cfg = Config { bug_finding: true, assume_valid_params: true, ..Config::default() };
+    assert_eq!(verify_module(&module, &cfg).verdict, Verdict::Fail,
+        "the seeded socket's foreign provenance flows sk->ctx->child through plain loads");
+}
+
 /// **Whole-object cross-syscall seed (Track-A (c))**: a `seed arg0 foreign` contract on
 /// `_aead_recvmsg` labels its socket at ENTRY (the object may hold a page a sibling syscall
 /// spliced in). With no explicit label in the body, the socket is foreign, its raw-pointer
