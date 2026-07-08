@@ -43,6 +43,11 @@ require-if-alias arg1 arg2 write
 
 [crypto_aead_encrypt crypto_aead_decrypt]
 require arg0 write
+# Inlined form (real optimized kernel): aead_request_set_crypt is `static inline`, so there is
+# no call — `req->src`/`req->dst` are set by field stores. Read them back from the request (arg0)
+# at offsets 64 (src) and 72 (dst) in `struct aead_request` and apply the in-place-alias check:
+# an in-place op (src==dst) writing a foreign page is refused; distinct dst (patched) is not.
+require-if-alias-fields arg0 64 72 write
 
 # CVE-2026-31431 whole-object seed: the AEAD recvmsg worker's socket (arg0) may hold a page
 # spliced in by af_alg_sendpage in a PRIOR syscall, so seed it `foreign` at entry. Only the

@@ -3070,6 +3070,44 @@ entry:
     );
 }
 
+/// **Inlined-request in-place check (`require-if-alias-fields`)**: on a real optimized kernel the
+/// crypto API is `static inline`, so there is no `aead_request_set_crypt` call — `req->src`/`req->dst`
+/// are set by field STORES. The contract reads those two fields back from the request (at their byte
+/// offsets) at the `crypto_aead_encrypt(req)` sink and applies the in-place-alias capability check:
+/// a foreign page stored to BOTH src and dst (in-place) is refused; a distinct dst (patched) is not.
+/// General — any operation on a descriptor with in-place src/dst pointer fields.
+#[test]
+fn inlined_request_in_place_write_of_a_foreign_page_is_refused() {
+    let base = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare i32 @crypto_aead_encrypt(ptr)
+define void @f(ptr %sk, ptr %page) {
+entry:
+  %req = alloca [96 x i8], align 8
+  call void @af_alg_sendpage(ptr %sk, ptr %page)
+  %src = getelementptr inbounds i8, ptr %req, i64 64
+  store ptr %page, ptr %src, align 8
+  %dst = getelementptr inbounds i8, ptr %req, i64 72
+  store ptr DSTVAL, ptr %dst, align 8
+  %e = call i32 @crypto_aead_encrypt(ptr %req)
+  ret void
+}
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // In-place: the foreign page is stored to BOTH src (64) and dst (72) → refused.
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: base.replace("DSTVAL", "%page"), name: "ip".into() })
+        .expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "an inlined in-place crypto op (req->src == req->dst == foreign) is refused");
+    // Out-of-place: a distinct dst → no fire (no false FAIL).
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: base.replace("DSTVAL", "%sk"), name: "oop".into() })
+        .expect("lower");
+    assert_ne!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "a distinct dst (patched out-of-place) does not fire — no false FAIL");
+}
+
 /// **Taint-on-read chains through plain field loads**: the seeded socket's `foreign` provenance
 /// flows `sk → ctx → child` across two levels of ordinary pointer-field loads (not just DWARF
 /// raw-pointer/RefWitness fields), and the in-place write of the twice-loaded `child` is refused.

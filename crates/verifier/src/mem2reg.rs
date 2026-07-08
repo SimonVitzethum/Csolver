@@ -380,6 +380,7 @@ fn visit_operands(inst: &Inst, op: &mut impl FnMut(&Operand)) {
             op(a);
             op(b);
         }
+        Inst::CapRequireIfAliasFields { obj, .. } => op(obj),
         Inst::SafetyCheck { condition, .. } => condition_operands(condition, op),
         Inst::Asm { .. } => {}
     }

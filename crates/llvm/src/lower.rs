@@ -1335,6 +1335,21 @@ fn emit_contract(
             // A `seed` is applied at the seeded function's OWN entry (see `entry_seeds`), not
             // at call sites — a no-op here.
             Effect::Seed { .. } => {}
+            // Read the two field pointers back from the object (via read-your-writes of the
+            // prior field stores — the inlined `req->src = …; req->dst = …`) and apply the
+            // in-place-alias capability check to them. A dedicated inst so the executor reads
+            // the fields *internally* (no `ValidRead`/`InBounds` obligation on the analyzer's
+            // own field reads — those would spuriously FAIL on a small/opaque object).
+            Effect::RequireIfAliasFields { arg, off_a, off_b, cap } => {
+                if let (Some(a), Some(id)) = (args.get(*arg), prov_interner().id(cap)) {
+                    insts.push(Inst::CapRequireIfAliasFields {
+                        obj: ctx.operand(a, 64)?,
+                        off_a: *off_a,
+                        off_b: *off_b,
+                        cap: id,
+                    });
+                }
+            }
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

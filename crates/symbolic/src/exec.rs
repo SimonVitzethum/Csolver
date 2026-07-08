@@ -220,6 +220,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                 Inst::ProvLabel { ptr, .. } | Inst::CapRequire { ptr, .. } => op(ptr),
                 Inst::ProvPropagate { dst, src } => { op(dst); op(src); }
                 Inst::CapRequireIfAlias { a, b, .. } => { op(a); op(b); }
+                Inst::CapRequireIfAliasFields { obj, .. } => op(obj),
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -2560,6 +2561,55 @@ impl Explorer<'_> {
                     state,
                     "an in-place operation's aliased region grants the required capability",
                     "an in-place operation writes a region whose provenance may not grant it",
+                );
+            }
+            // The inlined-request form: read the two field pointers back from the object
+            // INTERNALLY (via read-your-writes, no safety obligation on these analyzer reads),
+            // then apply the same in-place-alias check. Fires iff both fields hold the same
+            // region and it lacks the capability.
+            Inst::CapRequireIfAliasFields { obj, off_a, off_b, cap } => {
+                let base = self.eval_pointer(obj, state);
+                let field = |ex: &mut Self, off: u64, st: &mut PathState| -> SymValue {
+                    let off_e = ex.ctx.int(PTR_WIDTH, off as u128);
+                    let field_ptr = SymPointer {
+                        prov: base.prov.clone(),
+                        offset: ex.ctx.bin(BvOp::Add, base.offset, off_e),
+                        align: 1,
+                    };
+                    ex.load_value(&field_ptr, PTR_WIDTH as u64 / 8, &Type::ptr(Type::int(8)), st).0
+                };
+                let (sv, dv) = (field(self, *off_a, state), field(self, *off_b, state));
+                let lacks = match (&sv, &dv) {
+                    (SymValue::Ptr(sp), SymValue::Ptr(dp)) => {
+                        let same = match (&sp.prov, &dp.prov) {
+                            (Prov::Region(ra), Prov::Region(rb)) => ra == rb,
+                            (Prov::Unknown(_, Some(ia)), Prov::Unknown(_, Some(ib))) => {
+                                ia == ib && sp.offset == dp.offset
+                            }
+                            _ => false,
+                        };
+                        same && {
+                            let labels = match sp.prov {
+                                Prov::Region(rid) => {
+                                    state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default()
+                                }
+                                Prov::Unknown(_, Some(id)) => {
+                                    state.opaque_labels.get(&id).cloned().unwrap_or_default()
+                                }
+                                _ => HashSet::new(),
+                            };
+                            self.labels_lack_cap(&labels, *cap)
+                        }
+                    }
+                    _ => false,
+                };
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::WriteCapability,
+                    lacks,
+                    state,
+                    "an in-place operation's aliased field region grants the required capability",
+                    "an in-place operation writes a field region whose provenance may not grant it",
                 );
             }
             Inst::RefWitness { dst, size, align, writable, assumed, src } => {

@@ -407,6 +407,22 @@ pub enum Inst {
         /// The pointer whose labels are absorbed.
         src: Operand,
     },
+    /// Like [`Inst::CapRequireIfAlias`], but the two pointers are read from **fields of an
+    /// object** (`obj + off_a`, `obj + off_b`) rather than being operands — the inlined-
+    /// request form (`req->src`/`req->dst` set by stores, no `set_crypt` call). The executor
+    /// reads the fields *internally* (read-your-writes, no `ValidRead`/`InBounds` obligation
+    /// on these analyzer reads), then fires iff both fields hold the same region and it lacks
+    /// `cap`. Implies [`SafetyProperty::WriteCapability`].
+    CapRequireIfAliasFields {
+        /// The object holding the two pointer fields (e.g. the crypto request).
+        obj: Operand,
+        /// Byte offset of the first pointer field.
+        off_a: u64,
+        /// Byte offset of the second pointer field.
+        off_b: u64,
+        /// The interned capability the aliased field region must grant.
+        cap: u32,
+    },
     /// **Conditional capability** (a contract's `require-if-alias`): *iff* `a` and `b`
     /// point into the same region (an in-place `src == dst` operation), that region must
     /// grant `cap`. Implies [`SafetyProperty::WriteCapability`]. The precise Copy-Fail
@@ -454,6 +470,7 @@ impl Inst {
             },
             Inst::CapRequire { .. } => &[WriteCapability],
             Inst::CapRequireIfAlias { .. } => &[WriteCapability],
+            Inst::CapRequireIfAliasFields { .. } => &[WriteCapability],
             _ => &[],
         }
     }
@@ -476,6 +493,7 @@ impl Inst {
             | Inst::CapRequire { .. }
             | Inst::ProvPropagate { .. }
             | Inst::CapRequireIfAlias { .. }
+            | Inst::CapRequireIfAliasFields { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }

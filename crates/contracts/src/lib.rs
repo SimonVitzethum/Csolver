@@ -137,6 +137,25 @@ pub enum Effect {
         /// The capability the aliased region must grant.
         cap: String,
     },
+    /// **Conditional capability on two FIELDS of an object** — the inlined-request form of
+    /// [`Effect::RequireIfAlias`]. At a call `op(req, …)`, the pointers stored at byte offsets
+    /// `off_a` and `off_b` of the object `arg` are read back (via read-your-writes over the
+    /// prior field stores) and, *iff* they alias the same region, that region must grant `cap`.
+    /// This catches the Copy-Fail in-place write when the crypto API is `static inline`: the
+    /// real optimized kernel has no `aead_request_set_crypt` call — `req->src` and `req->dst`
+    /// are set by field stores, so the check must read them back from the request at the
+    /// `crypto_aead_encrypt(req)` sink. General: any operation on a descriptor with in-place
+    /// src/dst pointer fields.
+    RequireIfAliasFields {
+        /// The 0-based argument holding the object (e.g. the crypto request).
+        arg: usize,
+        /// Byte offset of the first pointer field (e.g. the request's `src`).
+        off_a: u64,
+        /// Byte offset of the second pointer field (e.g. the request's `dst`).
+        off_b: u64,
+        /// The capability the aliased field region must grant.
+        cap: String,
+    },
     /// **Entry seed** (whole-object cross-syscall provenance): applied not at a *call* to
     /// this API but at the **entry of the named function itself** — parameter `arg`'s object
     /// is labelled `label`. Models the fact that an object shared across syscalls (a socket)
@@ -375,6 +394,14 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
             let label = rest.get(1).copied().ok_or("`seed` needs a label name")?.to_string();
             Ok(Effect::Seed { arg, label })
+        }
+        // `require-if-alias-fields arg<k> <off_a> <off_b> <cap>` (offsets are byte offsets).
+        "require-if-alias-fields" => {
+            let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let off_a = rest.get(1).and_then(|s| s.parse().ok()).ok_or("needs off_a")?;
+            let off_b = rest.get(2).and_then(|s| s.parse().ok()).ok_or("needs off_b")?;
+            let cap = rest.get(3).copied().ok_or("needs a capability")?.to_string();
+            Ok(Effect::RequireIfAliasFields { arg, off_a, off_b, cap })
         }
         other => Err(format!("unknown effect `{other}`")),
     }
