@@ -90,12 +90,23 @@ pub struct Config {
     pub entry_patterns: Option<Vec<String>>,
 }
 
-/// Whether `name` matches an entry pattern: exact, or a trailing-`*` prefix
-/// (e.g. `__x64_sys_*` matches `__x64_sys_read`).
+/// Whether `name` matches an entry pattern. A single `*` is a wildcard at the
+/// start and/or end of the pattern (no interior wildcards):
+/// - `foo`     — exact match
+/// - `foo*`    — prefix  (`__x64_sys_*` matches `__x64_sys_read`)
+/// - `*foo`    — suffix  (`*_ioctl` matches `tun_chr_ioctl`)
+/// - `*foo*`   — contains
 pub fn matches_entry(name: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|p| match p.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => name == p,
+    patterns.iter().any(|p| {
+        let starred_start = p.starts_with('*');
+        let starred_end = p.ends_with('*');
+        let core = p.trim_matches('*');
+        match (starred_start, starred_end) {
+            (false, false) => name == core,
+            (false, true) => name.starts_with(core),
+            (true, false) => name.ends_with(core),
+            (true, true) => name.contains(core),
+        }
     })
 }
 
@@ -746,16 +757,25 @@ mod entry_tests {
     use super::matches_entry;
 
     #[test]
-    fn exact_and_prefix_patterns_match() {
-        let pats = vec!["aead_recvmsg".to_string(), "__x64_sys_*".to_string()];
-        // Exact name.
+    fn exact_prefix_suffix_and_contains_patterns_match() {
+        let pats = vec![
+            "aead_recvmsg".to_string(),
+            "__x64_sys_*".to_string(),
+            "*_ioctl".to_string(),
+            "*netlink*".to_string(),
+        ];
+        // Exact.
         assert!(matches_entry("aead_recvmsg", &pats));
-        // Trailing-`*` prefix.
+        assert!(!matches_entry("aead_recvmsg_nokey", &pats));
+        // Prefix.
         assert!(matches_entry("__x64_sys_read", &pats));
-        assert!(matches_entry("__x64_sys_", &pats));
-        // Non-entries: an internal helper is not adversarial under the policy.
-        assert!(!matches_entry("notify_cpu_starting", &pats));
-        assert!(!matches_entry("aead_recvmsg_nokey", &pats)); // exact, not a prefix
         assert!(!matches_entry("__x64_sy", &pats));
+        // Suffix.
+        assert!(matches_entry("tun_chr_ioctl", &pats));
+        assert!(!matches_entry("ioctl_helper", &pats));
+        // Contains.
+        assert!(matches_entry("rtnetlink_rcv_msg", &pats));
+        // A pure internal helper matches nothing.
+        assert!(!matches_entry("notify_cpu_starting", &pats));
     }
 }
