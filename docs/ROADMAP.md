@@ -269,10 +269,11 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
      `assume_valid_params`/member-provenance materialisation with per-field read-consistency
      (repeated loads of one field alias). Materialising a region for an unknown pointer is
      only sound under the opt-in — doing it unconditionally would be a false-PASS hole.
-   - **(iii) read-consistency for unwritten locations.** Two reads of the same unwritten
-     field currently yield distinct fresh values (sound but imprecise); making them agree
-     (the correct memory semantics) is a prerequisite for (ii). Must invalidate on every
-     heap havoc to stay sound.
+   - **(iii) read-consistency for unwritten locations — DONE.** Two reads of the same
+     never-written `(region, concrete offset, width)` now agree (cached in
+     `PathState.unwritten_reads`, store-wins-first, cleared on every heap havoc). Correct
+     memory semantics + broad precision gain; the prerequisite for (ii). Validated sound:
+     both differentials SOUND, VPS kernel scan byte-identical.
 
 **General inference (parallel track) — provenance-transfer DONE.** Each function gets a
 derived `ProvTransfer` summary (which arg's labels flow to which, which arg is labelled),
