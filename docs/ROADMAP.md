@@ -262,7 +262,19 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
    - **(i) cross-syscall socket state.** The `foreign` label is set by `af_alg_sendpage`
      (a *different* syscall) and must persist on the shared `ctx`/socket so `_aead_recvmsg`
      sees it. Needs a whole-object provenance summary threaded across the object's
-     operations (not per-function).
+     operations (not per-function). **Investigated — the blocker is concrete: a raw-pointer
+     *parameter* is opaque provenance, not a tracked region, so it cannot even be labelled**
+     (`require-if-alias(%sk,%sk)` after labelling `%sk` stays PASS — verified). So (i) is not
+     one step but three interlocking ones, each with real false-FAIL risk: (a) make the socket
+     parameter a *tracked, labelable* region (like `assume_valid_params` for pointees, but for
+     the object itself); (b) **taint-on-read** — a reference materialised from a `foreign`
+     container inherits its provenance (implemented + reverted: sound but inert until (a)+(c)
+     land, so not committed undemonstrated); (c) a **whole-object seed** — at a sink's entry,
+     join in the labels sibling operations leave on that object type (the actual cross-syscall
+     step, and the one that can false-FAIL the patched path if the seed is too coarse). This is
+     the multi-entry-typestate research finale; it must be built as a dedicated effort with
+     kernel-wide false-FAIL auditing, not a rushed increment. The in-place gate (require-if-alias,
+     done) is what will keep (c) from false-FAILing the out-of-place patched path once it fires.
    - **(ii) materialized-field region identity — DONE.** A `RefWitness` now carries the field
      address it was loaded from and caches the materialised region by `(region, offset)`
      (`PathState.ref_regions`, cleared on heap havoc), so two loads of the same raw-pointer
