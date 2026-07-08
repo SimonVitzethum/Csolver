@@ -1743,14 +1743,33 @@ impl Explorer<'_> {
             .unwrap_or_default();
         let modified_set: HashSet<RegId> = modified.iter().copied().collect();
         for reg in modified {
-            match state.env.get(&reg) {
-                Some(SymValue::Ptr(_)) => {
-                    // A loop-modified pointer loses provenance (conservative).
+            match state.env.get(&reg).cloned() {
+                Some(SymValue::Ptr(pre)) => {
+                    // A loop-modified pointer loses its *region/bounds* provenance
+                    // (conservative — it becomes opaque). But it **keeps its provenance
+                    // labels**: an iterator walking a `foreign` container (a `list_for_each`
+                    // over a foreign scatterlist) stays foreign. Sound — labels only feed the
+                    // gated capability sink, never a memory-safety check — and it is what lets
+                    // the taint reach the sink through the real worker's list traversal.
+                    let labels = match pre.prov {
+                        Prov::Region(rid) => {
+                            state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default()
+                        }
+                        Prov::Unknown(_, Some(id)) => {
+                            state.opaque_labels.get(&id).cloned().unwrap_or_default()
+                        }
+                        _ => HashSet::new(),
+                    };
                     let offset = self.ctx.int(PTR_WIDTH, 0);
+                    let id = self.prov_ids;
+                    self.prov_ids += 1;
+                    if !labels.is_empty() {
+                        state.opaque_labels.insert(id, labels);
+                    }
                     state.env.insert(
                         reg,
                         SymValue::Ptr(SymPointer {
-                            prov: Prov::Unknown(POrigin::Loop, None),
+                            prov: Prov::Unknown(POrigin::Loop, Some(id)),
                             offset,
                             align: 1,
                         }),
