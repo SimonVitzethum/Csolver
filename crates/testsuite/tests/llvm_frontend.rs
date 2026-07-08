@@ -3115,6 +3115,18 @@ entry:
     let cfg = Config { bug_finding: true, assume_valid_params: true, ..Config::default() };
     assert_eq!(verify_module(&module, &cfg).verdict, Verdict::Fail,
         "a field of a foreign object inherits foreign and its in-place write is refused");
+
+    // A **store** between the two field loads reassigns the field, so the two references are
+    // *different* objects — the materialised-field cache must be dropped, else they would be
+    // treated as one region and `require-if-alias` would fire spuriously (a false FAIL). This
+    // guards the fix for that (found by the DeepSeek review).
+    let with_store = src.replace(
+        "  %c2 = getelementptr inbounds i8, ptr %d, i64 8",
+        "  store ptr %iv, ptr %c1, align 8\n  %c2 = getelementptr inbounds i8, ptr %d, i64 8",
+    );
+    let module = LlvmFrontend.lower(LlvmInput { source: with_store, name: "taint_store".into() }).expect("lower");
+    assert_ne!(verify_module(&module, &cfg).verdict, Verdict::Fail,
+        "a store between the loads breaks field identity — no false FAIL");
 }
 
 /// **Opaque-pointer provenance (Track-A groundwork)**: a raw-pointer *parameter* is opaque

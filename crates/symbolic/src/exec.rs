@@ -2410,6 +2410,12 @@ impl Explorer<'_> {
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidWrite, state);
                 let v = self.eval_value(value, state);
                 state.heap.push(StoreRecord { target: p, value: v, size: asize });
+                // A store may reassign a raw-pointer field, so the region a later `RefWitness`
+                // load of that field should materialise is now a *different* object. Drop the
+                // materialised-field cache (which the RefWitness path consults instead of the
+                // store) — else two loads straddling the store would be treated as the *same*
+                // region and `require-if-alias` could fire spuriously (a false FAIL).
+                state.ref_regions.clear();
             }
             Inst::Dealloc { ptr, .. } => {
                 let p = self.eval_pointer(ptr, state);
