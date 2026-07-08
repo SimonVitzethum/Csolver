@@ -291,11 +291,20 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
      across CFG merges / `Prov::Select` / interprocedural transfer — a lost label is a missed
      violation, never a false FAIL, and opaque labels touch no memory-safety check — kept conservative).
 
-     **Remaining: (c) the whole-object seed.** At a sink's entry, label the object parameter with the
-     labels sibling operations leave on that object type (the cross-syscall step). This is the only
-     piece left to fire on the unmodified kernel; the in-place gate keeps it from false-FAILing the
-     out-of-place patched path. It is the one with real false-FAIL risk if the seed is too coarse —
-     build with kernel-wide false-FAIL auditing. (Also improving B2–B5's recall would raise detection.)
+     **(c) the whole-object seed — DONE.** A `seed arg_k <label>` contract labels a parameter's object
+     at the seeded function's OWN entry (`entry_seed_insts` prepends an `Inst::ProvLabel`);
+     `data/provenance.contract` seeds `_aead_recvmsg` arg0 `foreign`. The full (a)+(b)+(c) chain closes
+     end to end on the direct-flow shape (test `a_seeded_sink_treats_its_object_as_foreign`); because only
+     the in-place `require-if-alias` sink fires, the seed never false-FAILs the out-of-place patched path.
+     Kernel-wide audited SOUND: seeded scan byte-identical (2468/32/3740, 653/0), vulnerable algif_aead.ll
+     stays 0 (applies, does not false-FAIL).
+
+     **Remaining is precision, not soundness/mechanism: the taint does not yet FLOW through the real
+     worker.** On the unmodified algif_aead the seeded socket's provenance must reach the in-place
+     `set_crypt` through a `list_for_each_entry` walk over `ctx->tsgl_list` and the opaque helpers
+     `af_alg_get_rsgl` / `crypto_aead_copy_sgl` — a taint-flow precision gap (linked-list traversal and
+     opaque-helper provenance), plus the WriteCapability recall gaps B2–B5 (merge/Select/transfer). The
+     (a)+(b)+(c) machinery is complete and sound; closing the real-IR firing is now a taint-precision task.
    - **(ii) materialized-field region identity — DONE.** A `RefWitness` now carries the field
      address it was loaded from and caches the materialised region by `(region, offset)`
      (`PathState.ref_regions`, cleared on heap havoc), so two loads of the same raw-pointer
