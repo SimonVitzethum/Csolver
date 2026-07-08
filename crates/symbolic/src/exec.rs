@@ -1518,6 +1518,15 @@ impl Explorer<'_> {
                 .all(|e| e.pred_state.regions[i].state == LifetimeState::Live);
             let mut r = first.regions[i].clone();
             r.state = if live_all { LifetimeState::Live } else { LifetimeState::Freed };
+            // Intersect provenance labels across edges: a label survives the join only if it
+            // holds on EVERY incoming path (the meet), so it is never attributed to a path that
+            // did not set it — sound (no false FAIL); an entry-set label (on all paths) survives.
+            r.prov_labels = first.regions[i]
+                .prov_labels
+                .iter()
+                .copied()
+                .filter(|l| edges.iter().all(|e| e.pred_state.regions[i].prov_labels.contains(l)))
+                .collect();
             regions.push(r);
         }
         let rcount = regions.len();
@@ -1550,6 +1559,26 @@ impl Explorer<'_> {
             .filter(|f| edges.iter().all(|e| e.pred_state.facts.contains(f)))
             .collect();
 
+        // Opaque-pointer labels survive the join by the same **meet** as regions/facts: an id
+        // keeps a label only if every incoming edge has it — sound (never attributed to a path
+        // that did not set it), and an entry-seed (set before any branch) survives on all paths.
+        let opaque_labels: HashMap<u32, HashSet<u32>> = first
+            .opaque_labels
+            .iter()
+            .filter_map(|(id, labels)| {
+                let common: HashSet<u32> = labels
+                    .iter()
+                    .copied()
+                    .filter(|l| {
+                        edges
+                            .iter()
+                            .all(|e| e.pred_state.opaque_labels.get(id).is_some_and(|s| s.contains(l)))
+                    })
+                    .collect();
+                (!common.is_empty()).then_some((*id, common))
+            })
+            .collect();
+
         // The heap is computed by `merge_multi` (it needs the edge discriminators
         // to *join* differing stores); leave it empty here.
         PathState {
@@ -1560,7 +1589,7 @@ impl Explorer<'_> {
             heap: Vec::new(),
             unwritten_reads: HashMap::new(),
             ref_regions: HashMap::new(),
-            opaque_labels: HashMap::new(),
+            opaque_labels,
             exact: false,
         }
     }
