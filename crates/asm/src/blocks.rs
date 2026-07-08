@@ -2,6 +2,7 @@
 //! decoded instructions (each with its byte span, MSIR, and control-flow effect)
 //! into MSIR basic blocks. Both the x86-64 and AArch64 decoders share this.
 
+use csolver_core::Error as CoreError;
 use csolver_ir::{BasicBlock, BlockId, Operand, RegId, Terminator};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -32,7 +33,7 @@ pub(crate) struct DecodedInsn {
 /// branch target that is not an instruction boundary makes the function fail to
 /// build (the caller reports it `unanalyzed`) — sound: we never guess at a
 /// mid-instruction or data target.
-pub(crate) fn build_blocks(decoded: Vec<DecodedInsn>) -> Result<(Vec<BasicBlock>, BlockId), String> {
+pub(crate) fn build_blocks(decoded: Vec<DecodedInsn>) -> csolver_core::Result<(Vec<BasicBlock>, BlockId)> {
     if decoded.is_empty() {
         // An empty body is a vacuously-safe single `ret` block.
         return Ok((vec![BasicBlock::new(BlockId(0), Terminator::Return(None))], BlockId(0)));
@@ -45,7 +46,7 @@ pub(crate) fn build_blocks(decoded: Vec<DecodedInsn>) -> Result<(Vec<BasicBlock>
         match d.ctrl {
             Ctrl::Jmp(t) | Ctrl::Jcc(t, _) => {
                 if !offsets.contains(&t) {
-                    return Err("asm: branch target is not an instruction boundary".into());
+                    return Err(CoreError::parse("asm: branch target is not an instruction boundary"));
                 }
                 leaders.insert(t);
                 leaders.insert(d.next);
@@ -81,9 +82,9 @@ pub(crate) fn build_blocks(decoded: Vec<DecodedInsn>) -> Result<(Vec<BasicBlock>
 }
 
 /// The MSIR terminator for a block ending at `d`.
-fn terminator_for(d: &DecodedInsn, block_of: &BTreeMap<usize, BlockId>) -> Result<Terminator, String> {
+fn terminator_for(d: &DecodedInsn, block_of: &BTreeMap<usize, BlockId>) -> csolver_core::Result<Terminator> {
     let target =
-        |off: usize| block_of.get(&off).copied().ok_or("asm: dangling branch target".to_string());
+        |off: usize| block_of.get(&off).copied().ok_or_else(|| CoreError::parse("asm: dangling branch target"));
     Ok(match d.ctrl {
         Ctrl::Ret => Terminator::Return(None),
         Ctrl::Jmp(t) => Terminator::Br { target: target(t)?, args: Vec::new() },

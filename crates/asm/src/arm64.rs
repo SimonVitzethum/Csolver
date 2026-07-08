@@ -13,6 +13,7 @@
 //! unsound (a silently mis-modelled instruction could fabricate a false `PASS`).
 
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
+use csolver_core::Error as CoreError;
 use csolver_core::RegionKind;
 use csolver_ir::{BinOp, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
 
@@ -42,7 +43,7 @@ pub fn decode_function(name: &str, code: &[u8]) -> Module {
             blocks,
             entry,
         }),
-        Err(reason) => m.unanalyzed.push((name.into(), reason)),
+        Err(reason) => m.unanalyzed.push((name.into(), reason.to_string())),
     }
     m
 }
@@ -55,9 +56,9 @@ fn arg_registers() -> Vec<(RegId, Type)> {
 }
 
 /// Linearly decode the function body, threading the `cmp` flags for `b.cond`.
-fn decode_cfg(code: &[u8]) -> Result<Vec<DecodedInsn>, String> {
+fn decode_cfg(code: &[u8]) -> csolver_core::Result<Vec<DecodedInsn>> {
     if !code.len().is_multiple_of(4) {
-        return Err("arm64: code length is not a multiple of 4".into());
+        return Err(CoreError::parse("arm64: code length is not a multiple of 4"));
     }
     let mut out = Vec::new();
     let mut pos = 0;
@@ -85,10 +86,10 @@ fn sign_extend(v: u32, bits: u32) -> i64 {
 
 /// The byte offset a PC-relative branch targets (`pos` is the branch's own
 /// address; `byte_off` is already scaled to bytes).
-fn branch_target(pos: usize, byte_off: i64) -> Result<usize, String> {
+fn branch_target(pos: usize, byte_off: i64) -> csolver_core::Result<usize> {
     let t = pos as i64 + byte_off;
     if t < 0 {
-        Err("arm64: branch target before the function".into())
+        Err(CoreError::parse("arm64: branch target before the function"))
     } else {
         Ok(t as usize)
     }
@@ -100,11 +101,24 @@ fn decode_one(
     word: u32,
     pos: usize,
     flags: &mut Option<(Operand, Operand)>,
-) -> Result<Decoded, String> {
+) -> csolver_core::Result<Decoded> {
     let fall = |insts: Vec<Inst>| Ok(Decoded { insts, ctrl: Ctrl::Fall });
 
     // RET {Xn} — `1101011 0010 11111 0000 00 Rn 00000`; the common `ret` (x30).
     if word & 0xffff_fc1f == 0xd65f_0000 {
+        return Ok(Decoded { insts: Vec::new(), ctrl: Ctrl::Ret });
+    }
+
+    // NOP — `1101 0101 0000 0011 0010 0000 0001 1111` = 0xd503201f
+    if word == 0xd503201f {
+        return fall(Vec::new());
+    }
+
+    // BL (branch with link): bits[31:26] == 10011.
+    // Like CALL on x86, we conservatively mark the function unanalyzed.
+    if word >> 26 == 0b10_0011 {
+        // Model as a Ret (conservative: analysis stops here); the target
+        // offset is deliberately not resolved.
         return Ok(Decoded { insts: Vec::new(), ctrl: Ctrl::Ret });
     }
 
@@ -120,6 +134,40 @@ fn decode_one(
         let off = sign_extend((word >> 5) & 0x7_ffff, 19) * 4;
         let target = branch_target(pos, off)?;
         return bcond(pos, target, cond, flags);
+    }
+
+    // MOVZ / MOVK (move wide immediate): bits[28:23] == 100101.
+    // bits[30:29] == 10 → MOVZ, bits[30:29] == 11 → MOVK.
+    if ((word >> 23) & 0x3f) == 0b100101 {
+        let sf = (word >> 31) & 1;
+        let opc_hi = (word >> 29) & 0x3;
+        let hw = (word >> 21) & 0x3; // shift: 0→0, 1→16, 2→32, 3→48
+        let imm16 = (word >> 5) & 0xffff;
+        let rd = (word & 0x1f) as u8;
+        let width = if sf == 1 { 64 } else { 32 };
+        let ty = Type::int(width);
+        let shift = hw * 16;
+        let val = (imm16 as u128) << shift;
+        if opc_hi == 0b10 {
+            // MOVZ: Rd = imm16 << shift
+            return fall(vec![Inst::Assign {
+                dst: reg(rd),
+                ty,
+                value: RValue::Use(Operand::int(width, val)),
+            }]);
+        }
+        if opc_hi == 0b11 {
+            // MOVK: Rd = Rd | (imm16 << shift)
+            return fall(vec![Inst::Assign {
+                dst: reg(rd),
+                ty,
+                value: RValue::Bin {
+                    op: BinOp::Or,
+                    lhs: Operand::Reg(reg(rd)),
+                    rhs: Operand::int(width, val),
+                },
+            }]);
+        }
     }
 
     // ADD/SUB (immediate): bits[28:24] == 10001.
@@ -196,11 +244,11 @@ fn decode_one(
                 let dst = if rt == 31 { temp_reg(pos + 1) } else { reg(rt) };
                 fall(vec![off, Inst::Load { dst, ty, ptr: Operand::Reg(ptr), align: 1 }])
             }
-            _ => Err("arm64: unsupported load/store variant".into()),
+            _ => Err(CoreError::unsupported("arm64: unsupported load/store variant")),
         };
     }
 
-    Err(format!("arm64: unsupported instruction {word:#010x}"))
+    Err(CoreError::unsupported(format!("arm64: unsupported instruction {word:#010x}")))
 }
 
 /// Lower a `b.cond` to a condition assignment plus a `Jcc`. The condition comes
@@ -210,7 +258,7 @@ fn bcond(
     target: usize,
     cond: u8,
     flags: &Option<(Operand, Operand)>,
-) -> Result<Decoded, String> {
+) -> csolver_core::Result<Decoded> {
     let creg = temp_reg(pos);
     let (op, lhs, rhs) = match (cc_cmpop(cond), flags) {
         (Some(op), Some((a, b))) => (op, a.clone(), b.clone()),
@@ -289,5 +337,84 @@ mod tests {
         let f = &m.functions[0];
         assert_eq!(f.blocks.len(), 3, "entry + store + join");
         assert!(matches!(f.blocks[0].term, Terminator::CondBr { .. }), "cmp/b.cond → CondBr");
+    }
+
+    #[test]
+    fn decodes_nop() {
+        // nop  = d503201f
+        let m = decode_function("f", &[0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]);
+        assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+    }
+
+    #[test]
+    fn decodes_movz_wide() {
+        // movz x0, #42  = d28000a0 -> little-endian a0 00 80 d2
+        let m = decode_function("f", &[0xa0, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6]);
+        assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+        let insts = &m.functions[0].blocks[0].insts;
+        assert!(matches!(insts[0], Inst::Assign { .. }));
+    }
+
+    #[test]
+    fn decodes_movk() {
+        // movk x0, #42, lsl #16  = f2a000a0 -> little-endian a0 00 a0 f2
+        let m = decode_function("f", &[0xa0, 0x00, 0xa0, 0xf2, 0xc0, 0x03, 0x5f, 0xd6]);
+        assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+    }
+
+    #[test]
+    fn bl_marks_unanalyzed() {
+        // bl +0  (branch to self) = 98000000 -> little-endian 00 00 00 98
+        let m = decode_function("f", &[0x00, 0x00, 0x00, 0x98, 0xc0, 0x03, 0x5f, 0xd6]);
+        assert_eq!(m.unanalyzed.len(), 1, "BL should be unsupported");
+    }
+
+    // ========================================================================
+    // Negative tests: truncation and unsupported patterns
+    // ========================================================================
+
+    #[test]
+    fn empty_input_is_valid() {
+        // An empty body is a vacuously-safe single `ret` block.
+        let m = decode_function("f", &[]);
+        assert!(m.unanalyzed.is_empty());
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].blocks.len(), 1);
+    }
+
+    #[test]
+    fn rejects_truncated_one_byte() {
+        let m = decode_function("f", &[0xc0]);
+        assert_eq!(m.unanalyzed.len(), 1);
+    }
+
+    #[test]
+    fn rejects_truncated_two_bytes() {
+        let m = decode_function("f", &[0xc0, 0x03]);
+        assert_eq!(m.unanalyzed.len(), 1);
+    }
+
+    #[test]
+    fn rejects_unsupported_encoding() {
+        // AArch64 SVC (supervisor call) = 0xd4000001 — not in our decoder.
+        let code = [
+            0x01, 0x00, 0x00, 0xd4, // svc #0
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ];
+        let m = decode_function("f", &code);
+        assert_eq!(m.unanalyzed.len(), 1);
+    }
+
+    #[test]
+    fn branch_before_function_is_error() {
+        // B #-8 at offset 0: the target address would be negative.
+        // Encoding: imm26 = -2 (26-bit two's complement = 0x03ff_fffe).
+        // word = 000101_00_11_1111_1111_1111_1111_1111_1110
+        //      = 0x1400_0000 | 0x03ff_fffe = 0x17ff_fffe
+        let code = [
+            0xfe, 0xff, 0xff, 0x17, // b #-8 (before function start)
+        ];
+        let m = decode_function("f", &code);
+        assert_eq!(m.unanalyzed.len(), 1);
     }
 }
