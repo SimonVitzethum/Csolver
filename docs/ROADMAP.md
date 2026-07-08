@@ -276,14 +276,26 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
      operations leave on that object type (the actual cross-syscall step, and the one that can
      false-FAIL the patched path if too coarse).
 
-     **Next concrete blocker for (b): opaque pointers have no identity.** `%c1 = gep %sk, 8` and
-     `%c2 = gep %sk, 8` are both `Prov::Unknown` (deliberately equal), so neither the field-region
-     identity (ii) nor a reg-label flow can trace a field address back to its base object `%sk`.
-     Closing (b)+(c) therefore needs opaque pointers to carry a real **provenance identity** (a
-     unique id on `Prov::Unknown`, threaded through the manual `PartialEq`, the alias logic, and
-     gep/copy propagation) — a substantial, soundness-critical refactor. The in-place gate
-     (require-if-alias, done) is what will keep (c) from false-FAILing the out-of-place patched
-     path once it fires. Build as a dedicated effort with kernel-wide false-FAIL auditing.
+     **(a) and (b) DONE via the opaque-pointer identity refactor.** `Prov::Unknown` now carries an
+     optional provenance identity (a unique id per opaque pointer), which flows through gep/copy via
+     `prov.clone()` and is DELIBERATELY excluded from `PartialEq` — so aliasing/merge/every verdict
+     stay byte-identical (VPS 2468/32/3740, 653/0). (a): opaque pointers are labelled on their id
+     (`PathState.opaque_labels`); (b): `RefWitness` field identity is keyed by `RefBase::{Region|Opaque}`
+     + offset (two loads of `obj->f` off an opaque object → one region) and a field materialised from a
+     `foreign` object inherits its provenance (taint-on-read). Tests
+     `a_field_of_a_foreign_object_is_foreign_and_gated_in_place` (+ its store-in-between control).
+
+     A **DeepSeek-V4-Flash review (via opencode)** during the refactor found the one soundness issue
+     (B1: `ref_regions` not invalidated on a `Store` → a false-FAIL risk if a field is reassigned
+     between two loads — FIXED) and four SAFE-direction recall gaps (B2–B5: labels not preserved
+     across CFG merges / `Prov::Select` / interprocedural transfer — a lost label is a missed
+     violation, never a false FAIL, and opaque labels touch no memory-safety check — kept conservative).
+
+     **Remaining: (c) the whole-object seed.** At a sink's entry, label the object parameter with the
+     labels sibling operations leave on that object type (the cross-syscall step). This is the only
+     piece left to fire on the unmodified kernel; the in-place gate keeps it from false-FAILing the
+     out-of-place patched path. It is the one with real false-FAIL risk if the seed is too coarse —
+     build with kernel-wide false-FAIL auditing. (Also improving B2–B5's recall would raise detection.)
    - **(ii) materialized-field region identity — DONE.** A `RefWitness` now carries the field
      address it was loaded from and caches the materialised region by `(region, offset)`
      (`PathState.ref_regions`, cleared on heap havoc), so two loads of the same raw-pointer
