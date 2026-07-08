@@ -2871,20 +2871,29 @@ impl Explorer<'_> {
     /// feasible reaching path (the refutation's feasibility witness confirms it) on which the
     /// in-place-foreign write genuinely holds. This is what lets an in-place op whose src is a
     /// PHI of the (in-place) dst and an out-of-place value still be caught on the in-place arm.
-    fn alias_lacks_cap(&self, sp: &SymPointer, dp: &SymPointer, cap: u32, state: &PathState) -> bool {
+    fn alias_lacks_cap(&mut self, sp: &SymPointer, dp: &SymPointer, cap: u32, state: &PathState) -> bool {
         // Decompose a Select on either side (bounded by the finite pointer structure).
         if let Prov::Select { then_ptr, else_ptr, .. } = &sp.prov {
-            return self.alias_lacks_cap(then_ptr, dp, cap, state)
-                || self.alias_lacks_cap(else_ptr, dp, cap, state);
+            let (then_ptr, else_ptr) = ((**then_ptr).clone(), (**else_ptr).clone());
+            return self.alias_lacks_cap(&then_ptr, dp, cap, state)
+                || self.alias_lacks_cap(&else_ptr, dp, cap, state);
         }
         if let Prov::Select { then_ptr, else_ptr, .. } = &dp.prov {
-            return self.alias_lacks_cap(sp, then_ptr, cap, state)
-                || self.alias_lacks_cap(sp, else_ptr, cap, state);
+            let (then_ptr, else_ptr) = ((**then_ptr).clone(), (**else_ptr).clone());
+            return self.alias_lacks_cap(sp, &then_ptr, cap, state)
+                || self.alias_lacks_cap(sp, &else_ptr, cap, state);
         }
         let same = match (&sp.prov, &dp.prov) {
             (Prov::Region(ra), Prov::Region(rb)) => ra == rb,
+            // Same opaque object identity, and the two field offsets CAN be equal. The offset
+            // is compared by SATISFIABILITY, not structurally: a `req->src` set from a
+            // `phi [in-place-dst, out-of-place]` carries an ITE offset that equals the dst
+            // offset only on the in-place edge — a structural `==` misses it, but that edge is
+            // a genuine reachable in-place write. `record_temporal` gates the FAIL on
+            // bug-finding/exact, so this raises recall without a false PASS (and, in strict
+            // mode on an inexact merged path, stays UNKNOWN rather than becoming a false FAIL).
             (Prov::Unknown(_, Some(ia)), Prov::Unknown(_, Some(ib))) => {
-                ia == ib && sp.offset == dp.offset
+                ia == ib && self.offsets_can_be_equal(sp.offset, dp.offset, state)
             }
             _ => false,
         };
@@ -2899,6 +2908,33 @@ impl Explorer<'_> {
             _ => HashSet::new(),
         };
         self.labels_lack_cap(&labels, cap)
+    }
+
+    /// The object-identity key of a pointer value: the region or the opaque id it is based
+    /// on. `None` for a non-pointer, a null/derived-from-int pointer, or a `Select` join
+    /// (ambiguous base) — callers treat `None` conservatively (e.g. drop the store record).
+    fn ptr_base_key(v: &SymValue) -> Option<RefBase> {
+        match v {
+            SymValue::Ptr(p) => match &p.prov {
+                Prov::Region(r) => Some(RefBase::Region(*r)),
+                Prov::Unknown(_, Some(id)) => Some(RefBase::Opaque(*id)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether two offset expressions **can** be equal under the current path (not provably
+    /// distinct). A structural match is the fast path; otherwise we ask the solver whether
+    /// `a != b` is *unprovable* — if we cannot prove them distinct, an in-place aliasing is a
+    /// feasible reaching state. Used only for the in-place capability gate, whose FAIL is
+    /// gated on bug-finding/exact by `record_temporal`.
+    fn offsets_can_be_equal(&mut self, a: ExprId, b: ExprId, state: &PathState) -> bool {
+        if a == b {
+            return true;
+        }
+        let ne = self.ctx.cmp(SCmp::Ne, a, b);
+        !self.prove(ne, state)
     }
 
     /// Whether `labels` contains one that the provenance lattice proves does **not** grant
@@ -2942,9 +2978,31 @@ impl Explorer<'_> {
         // to any helper — e.g. `s.is_empty()` — would defeat every later access.)
         let (writes, frees) = summary.as_ref().map_or((true, true), |s| (s.writes, s.frees));
         if writes || frees {
-            state.heap.clear();
-        state.unwritten_reads.clear();
-        state.ref_regions.clear();
+            // In BUG-FINDING mode, assume an opaque call writes only through the objects
+            // reachable from its pointer arguments: preserve store records whose target
+            // object is identity-disjoint from every argument (so field provenance set up
+            // before an unrelated helper — a refcount warn / atomic-op asm on a *different*
+            // object — survives to a later in-place check). This is a recall heuristic
+            // (a callee could in principle reach an object via a global or a nested pointer),
+            // surfaced as an assumption; strict `verify` keeps the fully-sound havoc.
+            if self.bug_finding {
+                let arg_bases: HashSet<RefBase> =
+                    argvals.iter().filter_map(Self::ptr_base_key).collect();
+                let before = state.heap.len();
+                state
+                    .heap
+                    .retain(|rec| Self::ptr_base_key(&SymValue::Ptr(rec.target.clone()))
+                        .is_some_and(|b| !arg_bases.contains(&b)));
+                if state.heap.len() != before {
+                    self.assumptions.insert("opaque-call-writes-through-args-only");
+                }
+            } else {
+                state.heap.clear();
+            }
+            // The precision caches are conservatively dropped regardless (cheap to rebuild;
+            // read-your-writes for the in-place check runs off the store list above).
+            state.unwritten_reads.clear();
+            state.ref_regions.clear();
         }
         if frees {
             for r in &mut state.regions {
@@ -4492,6 +4550,47 @@ mod tests {
             .expect("a WriteCapability obligation")
             .clone();
         assert!(!d.proven && d.refutation.is_some(), "a derived foreign pointer stored in-place is refuted: {d:?}");
+    }
+
+    /// SOUNDNESS GUARD for the satisfiability-based offset alias (Fix 2): the OUT-OF-PLACE
+    /// (patched) shape — req->src and req->dst hold DIFFERENT, provably-distinct field
+    /// offsets of the same foreign object — must NOT fire. If the possible-alias check over-
+    /// fired, this would be a false FAIL on patched code.
+    #[test]
+    fn out_of_place_distinct_fields_do_not_fire() {
+        let obj = RegId(0);
+        let p1 = RegId(1); // gep obj+16
+        let p2 = RegId(2); // gep obj+32  (distinct from p1)
+        let fsrc = RegId(3);
+        let fdst = RegId(4);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::ProvLabel { ptr: Operand::Reg(obj), label: 0 });
+        bb0.insts.push(Inst::PtrOffset { dst: p1, base: Operand::Reg(obj), index: Operand::int(64, 16), elem: Type::int(8) });
+        bb0.insts.push(Inst::PtrOffset { dst: p2, base: Operand::Reg(obj), index: Operand::int(64, 32), elem: Type::int(8) });
+        bb0.insts.push(Inst::PtrOffset { dst: fsrc, base: Operand::Reg(obj), index: Operand::int(64, 64), elem: Type::int(8) });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(p1), align: 8 });
+        bb0.insts.push(Inst::PtrOffset { dst: fdst, base: Operand::Reg(obj), index: Operand::int(64, 72), elem: Type::int(8) });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p2), align: 8 });
+        bb0.insts.push(Inst::CapRequireIfAliasFields { obj: Operand::Reg(obj), off_a: 64, off_b: 72, cap: 1 });
+        let idx = bb0.insts.len() - 1;
+        let f = Function {
+            id: FuncId(0),
+            name: "outofplace".into(),
+            params: vec![(obj, Type::ptr(Type::int(8)))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let grants = HashMap::from([(0u32, HashSet::from([2u32]))]);
+        for bugf in [false, true] {
+            let d = discharge_with_fields(
+                &f, &HashMap::new(), &[], &[], &HashMap::new(), &grants, bugf, false, false,
+            )
+            .mem_decision(BlockId(0), idx, SafetyProperty::WriteCapability)
+            .expect("a WriteCapability obligation")
+            .clone();
+            assert!(d.refutation.is_none(), "distinct (out-of-place) fields must NOT be refuted (bug_finding={bugf}): {d:?}");
+        }
     }
 
     /// COPY-FAIL DIAGNOSIS, suspect 1 — a PHI on the src value. The real IR sets
