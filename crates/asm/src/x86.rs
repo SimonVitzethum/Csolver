@@ -1614,7 +1614,8 @@ pub struct DecodedInstruction {
 /// Parsed VEX prefix information (used for SSE/AVX instructions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct VexInfo {
-    /// VEX.vvvv — 4-bit register complement (the third operand).
+    /// The third-operand register index (0..15), already decoded from the
+    /// complemented VEX.vvvv field.
     vvvv: u8,
     /// VEX.L — 256-bit operation (YMM).
     l: bool,
@@ -1624,8 +1625,12 @@ struct VexInfo {
     mmmmm: u8,
     /// Equivalent REX.W from VEX.W.
     w: bool,
-    /// VEX.reg — extended register specifier (complement of VEX~R).
-    reg: u8,
+    /// Equivalent REX.R (ModRM.reg extension): true → reg is r8/xmm8+.
+    rex_r: bool,
+    /// Equivalent REX.X (SIB.index extension). Always false for 2-byte VEX.
+    rex_x: bool,
+    /// Equivalent REX.B (ModRM.rm / SIB.base extension). Always false for 2-byte VEX.
+    rex_b: bool,
 }
 
 use std::fmt;
@@ -1993,24 +1998,18 @@ pub fn decode_instruction(code: &[u8], offset: usize) -> csolver_core::Result<De
     if let Some(&b) = code.get(p) {
         if b == 0xc5 || b == 0xc4 {
             let vex = parse_vex(code, &mut p, b == 0xc5)?;
-            // Derive effective REX bits from VEX:
-            // VEX.~R → REX.R, VEX.~X → REX.X, VEX.~B → REX.B, VEX.W → REX.W
-            let v_rex_w = vex.w;
-            let v_rex_r = (vex.reg & 8) == 0;       // VEX.~R: 0→extended
-            let v_rex_x = (vex.vvvv & 8) == 0;       // VEX.~X (from vvvv bit 3)
-            let _v_rex_b = false;                      // VEX.~B not directly available in 2-byte; use ModRM.rm later
-            // Note: vvvv holds the complemented register index.
-            // The third-operand register is XmmReg::from_idx(!(vex.vvvv & 0xf) & 0xf)
-            let _third_xmm = XmmReg::from_idx((!(vex.vvvv & 0xf)) & 0xf);
+            // The effective REX bits and the third-operand register are already
+            // decoded in `vex` (see `parse_vex`).
+            let (v_rex_w, v_rex_r, v_rex_x, v_rex_b) = (vex.w, vex.rex_r, vex.rex_x, vex.rex_b);
 
             // Determine the opcode lead bytes based on VEX.mmmmm.
             const MAP_0F: u8 = 1;
             const MAP_0F38: u8 = 2;
             const MAP_0F3A: u8 = 3;
             let (inst, next) = match vex.mmmmm {
-                MAP_0F => decode_vex_0f(code, &mut p, vex, v_rex_w, v_rex_r, v_rex_x, op_size, width)?,
-                MAP_0F38 => decode_vex_0f38(code, &mut p, vex, v_rex_w, v_rex_r, v_rex_x, op_size, width)?,
-                MAP_0F3A => decode_vex_0f3a(code, &mut p, vex, v_rex_w, v_rex_r, v_rex_x, op_size, width)?,
+                MAP_0F => decode_vex_0f(code, &mut p, vex)?,
+                MAP_0F38 => decode_vex_0f38(code, &mut p, vex)?,
+                MAP_0F3A => decode_vex_0f3a(code, &mut p, vex)?,
                 _ => return Err(CoreError::unsupported(format!("x86: unsupported VEX map {}", vex.mmmmm))),
             };
 
@@ -2019,7 +2018,7 @@ pub fn decode_instruction(code: &[u8], offset: usize) -> csolver_core::Result<De
                 length: next - offset,
                 prefixes: Prefixes {
                     rex: false,
-                    rex_w: v_rex_w, rex_r: v_rex_r, rex_x: v_rex_x, rex_b: false,
+                    rex_w: v_rex_w, rex_r: v_rex_r, rex_x: v_rex_x, rex_b: v_rex_b,
                     operand_size: op_size,
                     address_size: addr_size,
                 },
@@ -2050,7 +2049,7 @@ pub fn decode_instruction(code: &[u8], offset: usize) -> csolver_core::Result<De
 
 /// Parse x86-64 legacy and REX prefixes, advancing `p` past them.
 /// Returns (rex_w, rex_r, rex_x, rex_b, op_size, addr_size, sse_pp)
-/// where sse_pp encodes the SSE/VEX prefix: 0=None, 1=0x66, 2=0xF2, 3=0xF3.
+/// where sse_pp encodes the SSE/VEX mandatory prefix: 0=None, 1=0x66, 2=0xF3, 3=0xF2.
 fn parse_prefixes(code: &[u8], p: &mut usize) -> csolver_core::Result<(bool, bool, bool, bool, bool, bool, u8)> {
     let mut rex_w = false;
     let mut rex_r = false;
@@ -2700,7 +2699,7 @@ fn decode_typed_opcode(
                 0x51 | 0x54 | 0x55 | 0x56 | 0x57 | 0x58 | 0x59 |
                 0x5b | 0x5c | 0x5d | 0x5e | 0x5f | 0xc2 | 0xc6 |
                 0xd4 | 0xdb | 0xeb | 0xef | 0xfb => {
-                    decode_sse_0f_op(op2, code, &mut p, sse_pp, rex_r, rex_x)
+                    decode_sse_0f_op(op2, code, &mut p, sse_pp, rex_r, rex_x, rex_b)
                 }
                 _ => Err(CoreError::unsupported(format!("x86: unsupported two-byte opcode 0f {op2:#04x}"))),
             }
@@ -2712,82 +2711,56 @@ fn decode_typed_opcode(
 
 // ============================================================================
 // VEX prefix parsing / SSE decode helpers
-//
-// !!! KNOWN-INCORRECT — DO NOT WIRE INTO ANALYSIS UNTIL REWORKED !!!
-//
-// The VEX decoder below models a FICTIONAL encoding, not real x86-64 VEX. It
-// assumes an extra prefix payload byte and the wrong C4/C5 field layout, so it
-// will never match compiler output. Verified against llvm-mc:
-//
-//   vmovaps %xmm1,%xmm0   real: c5 f8 28 c1   (this decoder expects c5 e1 78 28 c1)
-//   vmovapd %xmm1,%xmm0   real: c5 f9 28 c1   (2-byte VEX; this decoder expects a 3-byte c4 ..)
-//   vpmulld %xmm2,%xmm0   real: c4 e2 79 40 c2
-//
-// Real layout — 2-byte VEX (C5): one payload byte = [R vvvv L pp], mmmmm=0F, W=0.
-//               3-byte VEX (C4): byte1 = [R X B mmmmm(5)], byte2 = [W vvvv L pp].
-//
-// The self-consistent tests (`typed_vex_*`) are `#[ignore]`d because they encode
-// the same fiction. This subsystem is dormant (the asm frontend `lower` still
-// returns Unsupported, so nothing runs it) — it must be re-derived from the real
-// spec, with test vectors taken from a real assembler, before it is ever trusted.
 // ============================================================================
 
-/// Parse a VEX prefix at `*p`, advancing `p` past the VEX bytes.
-/// `is_two_byte` is true for C5, false for C4 (three-byte).
+/// Parse a VEX prefix at `*p`, advancing `p` past it. `is_two_byte` selects the
+/// C5 (2-byte) form; otherwise the C4 (3-byte) form.
 ///
-/// WARNING: the field extraction here is on an INCORRECT encoding model (see the
-/// section banner above). Do not rely on its output; rework before wiring in.
+/// Real x86-64 VEX layout (all "~"-marked fields are stored inverted):
+/// - 2-byte VEX (`C5 b`): one payload byte `b = [~R vvvv L pp]`; the map is
+///   implicitly `0F` (mmmmm=1) and `W`/`X`/`B` are 0 (unextended).
+/// - 3-byte VEX (`C4 b1 b2`): `b1 = [~R ~X ~B mmmmm(5)]`, `b2 = [W ~vvvv L pp]`.
+///
+/// The `~R/~X/~B` bits are complements (0 → the corresponding register field is
+/// extended, i.e. r8/xmm8+), and `~vvvv` is the 1's-complement of the third
+/// operand's register number. Test vectors are taken from a real assembler
+/// (`llvm-mc -triple=x86_64 --show-encoding`).
 fn parse_vex(code: &[u8], p: &mut usize, is_two_byte: bool) -> csolver_core::Result<VexInfo> {
-    // C5: 2-byte VEX: [VEX.~R | VEX.~X | VEX.~B | VEX.mmmmm] [W|~vvvv|L|pp]
-    // C4: 3-byte VEX: [~R|~X|~B|~R|W|~vvvv] [~vvvv|L|pp|mmmmm]
-    // Advance past the C4/C5 byte:
+    // Advance past the C4/C5 lead byte.
     *p += 1;
     if is_two_byte {
-        let b2 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated VEX prefix (C5)"))?;
-        *p += 1;
-        // b2: [~R|~X|~B|mmmmm] — but in 2-byte form, mmmmm must be 00001 (0F map)
-        if (b2 & 0x1f) != 1 {
-            return Err(CoreError::unsupported(format!("x86: unsupported VEX.mmmmm {} in 2-byte VEX", b2 & 0x1f)));
-        }
-        let b3 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated VEX prefix (C5 byte 3)"))?;
+        // C5: single payload byte [~R vvvv L pp]. Map is implicitly 0F; W=0.
+        let b = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated 2-byte VEX prefix (C5)"))?;
         *p += 1;
         Ok(VexInfo {
-            vvvv: (!(b3 >> 3) & 0xf),
-            l: (b3 & 4) != 0,
-            pp: b3 & 3,
+            vvvv: (!(b >> 3)) & 0xf,
+            l: (b & 0x04) != 0,
+            pp: b & 0x03,
             mmmmm: 1,
             w: false,
-            reg: ((b2 >> 7) & 1) << 3, // REX.R complement: ~R=0 → extended → reg=0
+            rex_r: (b & 0x80) == 0, // ~R: 0 → extended
+            rex_x: false,
+            rex_b: false,
         })
     } else {
-        // Three-byte VEX (C4).
-        let b2 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated VEX prefix (C4 byte 2)"))?;
+        // C4: b1 = [~R ~X ~B mmmmm(5)], b2 = [W ~vvvv L pp].
+        let b1 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated 3-byte VEX prefix (C4 byte 1)"))?;
         *p += 1;
-        let b3 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated VEX prefix (C4 byte 3)"))?;
+        let b2 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated 3-byte VEX prefix (C4 byte 2)"))?;
         *p += 1;
-        // b2: [~R|~X|~B|~W|~vvvv]
-        // b3: [~vvvv|L|pp|mmmmm]
-        let rex_r = (b2 >> 7) & 1;  // ~R: 0 means extended
-        let _rex_x = (b2 >> 6) & 1;  // ~X
-        let _rex_b = (b2 >> 5) & 1; // ~B (not used directly)
-        let w = (b2 >> 4) & 1;      // W
-        let vvvv_low = b2 & 0xf;    // low 4 bits of ~vvvv
-        let vvvv_high = (b3 >> 7) & 1; // high bit of ~vvvv
-        let vvvv = !((vvvv_high << 4) | vvvv_low) & 0xf;
-        let l = (b3 & 4) != 0;
-        let pp = b3 & 3;
-        let mmmmm = b3 >> 5;        // bits [7:5] = mmmmm
-        let reg = rex_r << 3; // ~R=0 → rex_r=0 → reg=0 → v_rex_r=true (extended)
+        let mmmmm = b1 & 0x1f;
         if mmmmm == 0 || mmmmm > 3 {
-            return Err(CoreError::unsupported(format!("x86: unsupported VEX.mmmmm {}", mmmmm)));
+            return Err(CoreError::unsupported(format!("x86: unsupported VEX.mmmmm {mmmmm}")));
         }
         Ok(VexInfo {
-            vvvv,
-            l,
-            pp,
+            vvvv: (!(b2 >> 3)) & 0xf,
+            l: (b2 & 0x04) != 0,
+            pp: b2 & 0x03,
             mmmmm,
-            w: w != 0,
-            reg,
+            w: (b2 & 0x80) != 0,
+            rex_r: (b1 & 0x80) == 0, // ~R: 0 → extended
+            rex_x: (b1 & 0x40) == 0, // ~X
+            rex_b: (b1 & 0x20) == 0, // ~B
         })
     }
 }
@@ -2830,9 +2803,10 @@ fn decode_sse_0f_op(
     pp: u8,
     rex_r: bool,
     rex_x: bool,
+    rex_b: bool,
 ) -> csolver_core::Result<(Instruction, usize)> {
     let decode_reg_mem = |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
-        read_xmm_rm_operand(code, p, rex_r, rex_x, false, Width::DQ)
+        read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
     };
     match op {
         // 0F 10: MOVUPS (pp=0), MOVSS (pp=2), MOVSD (pp=3), MOVUPD (pp=1)
@@ -3155,40 +3129,21 @@ fn decode_sse_0f_op(
 }
 
 /// VEX.128 wrapper: reads the opcode byte and dispatches to `decode_sse_0f_op`.
-#[allow(clippy::too_many_arguments)]
-fn decode_vex_0f(
-    code: &[u8],
-    p: &mut usize,
-    vex: VexInfo,
-    _rex_w: bool,
-    rex_r: bool,
-    rex_x: bool,
-    _op_size: bool,
-    _width: Width,
-) -> csolver_core::Result<(Instruction, usize)> {
+fn decode_vex_0f(code: &[u8], p: &mut usize, vex: VexInfo) -> csolver_core::Result<(Instruction, usize)> {
     let op = *code.get(*p).ok_or_else(|| CoreError::parse(format!("x86: truncated VEX opcode at offset {}", *p)))?;
     *p += 1;
-    decode_sse_0f_op(op, code, p, vex.pp, rex_r, rex_x)
+    decode_sse_0f_op(op, code, p, vex.pp, vex.rex_r, vex.rex_x, vex.rex_b)
 }
 
 /// Decode VEX.128-encoded instructions from the 0F38 opcode map (VEX.mmmmm=2).
 /// Most instructions require pp=1 (66 prefix). SSSE3 and SSE4.1 instructions.
-#[allow(clippy::too_many_arguments)]
-fn decode_vex_0f38(
-    code: &[u8],
-    p: &mut usize,
-    vex: VexInfo,
-    _rex_w: bool,
-    rex_r: bool,
-    rex_x: bool,
-    _op_size: bool,
-    _width: Width,
-) -> csolver_core::Result<(Instruction, usize)> {
+fn decode_vex_0f38(code: &[u8], p: &mut usize, vex: VexInfo) -> csolver_core::Result<(Instruction, usize)> {
     let op = *code.get(*p).ok_or_else(|| CoreError::parse(format!("x86: truncated VEX 0F38 opcode at offset {}", *p)))?;
     *p += 1;
     let pp = vex.pp;
+    let (rex_r, rex_x, rex_b) = (vex.rex_r, vex.rex_x, vex.rex_b);
     let decode_reg_mem = |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
-        read_xmm_rm_operand(code, p, rex_r, rex_x, false, Width::DQ)
+        read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
     };
     // Most 0F38 instructions require 66 prefix (pp=1).
     match op {
@@ -3422,22 +3377,14 @@ fn decode_vex_0f38(
 
 /// Decode VEX.128-encoded instructions from the 0F3A opcode map (VEX.mmmmm=3).
 /// All require pp=1 (66 prefix). SSE4.1 and SSSE3 instructions with an imm8.
-#[allow(clippy::too_many_arguments)]
-fn decode_vex_0f3a(
-    code: &[u8],
-    p: &mut usize,
-    vex: VexInfo,
-    rex_w: bool,
-    rex_r: bool,
-    rex_x: bool,
-    _op_size: bool,
-    _width: Width,
-) -> csolver_core::Result<(Instruction, usize)> {
+fn decode_vex_0f3a(code: &[u8], p: &mut usize, vex: VexInfo) -> csolver_core::Result<(Instruction, usize)> {
     let op = *code.get(*p).ok_or_else(|| CoreError::parse(format!("x86: truncated VEX 0F3A opcode at offset {}", *p)))?;
     *p += 1;
     let pp = vex.pp;
+    let rex_w = vex.w;
+    let (rex_r, rex_x, rex_b) = (vex.rex_r, vex.rex_x, vex.rex_b);
     let decode_reg_mem = |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
-        read_xmm_rm_operand(code, p, rex_r, rex_x, false, Width::DQ)
+        read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
     };
     let read_imm8 = |code: &[u8], p: &mut usize| -> csolver_core::Result<u8> {
         let imm = code.get(*p).copied()
@@ -5426,12 +5373,13 @@ mod tests {
 
     // --- VEX-encoded SSE (2-byte VEX prefix C5) ---
 
+    // --- VEX-encoded SSE. All byte vectors below are real assembler output
+    //     (`llvm-mc -triple=x86_64 --show-encoding`). ---
+
     #[test]
-    #[ignore = "VEX encoding model is incorrect (see parse_vex banner); reworked separately"]
     fn typed_vex_movaps_reg_reg() {
-        // vmovaps xmm0, xmm1  = c5 e1 78 28 c1
-        // 2-byte VEX: mmmmm=1 (0F), pp=0 (none), W=0, L=0, ~vvvv=1111
-        let d = decode_instruction(&[0xc5, 0xe1, 0x78, 0x28, 0xc1], 0).unwrap();
+        // vmovaps %xmm1, %xmm0  = c5 f8 28 c1  (2-byte VEX: mmmmm=0F, pp=none, W=0)
+        let d = decode_instruction(&[0xc5, 0xf8, 0x28, 0xc1], 0).unwrap();
         assert_eq!(
             d.instruction,
             Instruction::Movaps(
@@ -5439,14 +5387,14 @@ mod tests {
                 xmm_op(XmmReg::XMM1, Width::DQ),
             )
         );
-        assert_eq!(d.length, 5);
+        assert_eq!(d.length, 4);
     }
 
     #[test]
-    #[ignore = "VEX encoding model is incorrect (see parse_vex banner); reworked separately"]
     fn typed_vex_addps_reg_reg() {
-        // vaddps xmm0, xmm2  = c5 e1 78 58 c2
-        let d = decode_instruction(&[0xc5, 0xe1, 0x78, 0x58, 0xc2], 0).unwrap();
+        // vaddps %xmm2, %xmm0, %xmm0  = c5 f8 58 c2  (the vvvv third operand,
+        // xmm0 here, is not representable in the 2-operand Addps and is dropped)
+        let d = decode_instruction(&[0xc5, 0xf8, 0x58, 0xc2], 0).unwrap();
         assert_eq!(
             d.instruction,
             Instruction::Addps(
@@ -5454,18 +5402,13 @@ mod tests {
                 xmm_op(XmmReg::XMM2, Width::DQ),
             )
         );
+        assert_eq!(d.length, 4);
     }
 
-    // --- VEX-encoded SSE (3-byte VEX prefix C4) ---
-
     #[test]
-    #[ignore = "VEX encoding model is incorrect (see parse_vex banner); reworked separately"]
-    fn typed_vex_movapd_3byte() {
-        // vmovapd xmm0, xmm1  = c4 ef 21 28 c1
-        // 3-byte VEX: pp=1 (66), mmmmm=1 (0F), L=0, W=0, vvvv=0
-        // b2: ~R=1,~X=1,~B=1,W=0, vvvv_low=1111  → 0xef
-        // b3: vvvv_high=0, mmmmm=001, L=0, pp=01 → 0x21
-        let d = decode_instruction(&[0xc4, 0xef, 0x21, 0x28, 0xc1], 0).unwrap();
+    fn typed_vex_movapd_2byte() {
+        // vmovapd %xmm1, %xmm0  = c5 f9 28 c1  (2-byte VEX, pp=66)
+        let d = decode_instruction(&[0xc5, 0xf9, 0x28, 0xc1], 0).unwrap();
         assert_eq!(
             d.instruction,
             Instruction::Movapd(
@@ -5473,16 +5416,13 @@ mod tests {
                 xmm_op(XmmReg::XMM1, Width::DQ),
             )
         );
-        assert_eq!(d.length, 5);
+        assert_eq!(d.length, 4);
     }
 
     #[test]
-    #[ignore = "VEX encoding model is incorrect (see parse_vex banner); reworked separately"]
     fn typed_vex_0f38_pmulld() {
-        // vpmulld xmm0, xmm2  = c4 ef 41 40 c2
-        // 3-byte VEX: pp=1 (66), mmmmm=2 (0F38), L=0, W=0, vvvv=0
-        // b2: 0xef, b3: vvvv_high=0, mmmmm=010, L=0, pp=01 → 0x41
-        let d = decode_instruction(&[0xc4, 0xef, 0x41, 0x40, 0xc2], 0).unwrap();
+        // vpmulld %xmm2, %xmm0, %xmm0  = c4 e2 79 40 c2  (3-byte VEX, map 0F38, pp=66)
+        let d = decode_instruction(&[0xc4, 0xe2, 0x79, 0x40, 0xc2], 0).unwrap();
         assert_eq!(
             d.instruction,
             Instruction::Pmulld(
@@ -5490,15 +5430,13 @@ mod tests {
                 xmm_op(XmmReg::XMM2, Width::DQ),
             )
         );
+        assert_eq!(d.length, 5);
     }
 
     #[test]
-    #[ignore = "VEX encoding model is incorrect (see parse_vex banner); reworked separately"]
     fn typed_vex_0f3a_roundps() {
-        // vroundps xmm0, xmm1, 1  = c4 ef 61 08 c1 01
-        // 3-byte VEX: pp=1 (66), mmmmm=3 (0F3A), L=0, W=0, vvvv=0
-        // b2: 0xef, b3: vvvv_high=0, mmmmm=011, L=0, pp=01 → 0x61
-        let d = decode_instruction(&[0xc4, 0xef, 0x61, 0x08, 0xc1, 0x01], 0).unwrap();
+        // vroundps $1, %xmm1, %xmm0  = c4 e3 79 08 c1 01  (3-byte VEX, map 0F3A, pp=66)
+        let d = decode_instruction(&[0xc4, 0xe3, 0x79, 0x08, 0xc1, 0x01], 0).unwrap();
         assert_eq!(
             d.instruction,
             Instruction::Roundps(
@@ -5507,13 +5445,13 @@ mod tests {
                 1,
             )
         );
+        assert_eq!(d.length, 6);
     }
 
     #[test]
-    #[ignore = "VEX encoding model is incorrect (see parse_vex banner); reworked separately"]
     fn typed_vex_0f3a_palignr() {
-        // vpalignr xmm0, xmm1, 3  = c4 ef 61 0f c1 03
-        let d = decode_instruction(&[0xc4, 0xef, 0x61, 0x0f, 0xc1, 0x03], 0).unwrap();
+        // vpalignr $3, %xmm1, %xmm0, %xmm0  = c4 e3 79 0f c1 03
+        let d = decode_instruction(&[0xc4, 0xe3, 0x79, 0x0f, 0xc1, 0x03], 0).unwrap();
         assert_eq!(
             d.instruction,
             Instruction::Palignr(
@@ -5522,6 +5460,67 @@ mod tests {
                 3,
             )
         );
+        assert_eq!(d.length, 6);
+    }
+
+    // --- Extended registers (xmm8..15). These exercise the VEX.R/VEX.B
+    //     extension bits — the class of bug the previous decoder got wrong. ---
+
+    #[test]
+    fn typed_vex_2byte_rexr_dst() {
+        // vmovaps %xmm1, %xmm8  = c5 78 28 c1  (2-byte VEX.~R=0 → reg extended)
+        let d = decode_instruction(&[0xc5, 0x78, 0x28, 0xc1], 0).unwrap();
+        assert_eq!(
+            d.instruction,
+            Instruction::Movaps(
+                xmm_op(XmmReg::XMM8, Width::DQ),
+                xmm_op(XmmReg::XMM1, Width::DQ),
+            )
+        );
+        assert_eq!(d.length, 4);
+    }
+
+    #[test]
+    fn typed_vex_2byte_rexr_store_src() {
+        // vmovaps %xmm9, %xmm0  = c5 78 29 c8  (store form; reg=xmm9 via VEX.~R=0)
+        let d = decode_instruction(&[0xc5, 0x78, 0x29, 0xc8], 0).unwrap();
+        assert_eq!(
+            d.instruction,
+            Instruction::Movaps(
+                xmm_op(XmmReg::XMM0, Width::DQ),
+                xmm_op(XmmReg::XMM9, Width::DQ),
+            )
+        );
+        assert_eq!(d.length, 4);
+    }
+
+    #[test]
+    fn typed_vex_3byte_rexr_and_rexb() {
+        // vmovaps %xmm9, %xmm8  = c4 41 78 28 c1  (3-byte: VEX.~R=0 → reg=xmm8,
+        // VEX.~B=0 → rm=xmm9). Threading VEX.B is exactly what was broken before.
+        let d = decode_instruction(&[0xc4, 0x41, 0x78, 0x28, 0xc1], 0).unwrap();
+        assert_eq!(
+            d.instruction,
+            Instruction::Movaps(
+                xmm_op(XmmReg::XMM8, Width::DQ),
+                xmm_op(XmmReg::XMM9, Width::DQ),
+            )
+        );
+        assert_eq!(d.length, 5);
+    }
+
+    #[test]
+    fn typed_vex_0f38_rexb_rm() {
+        // vpmulld %xmm9, %xmm0, %xmm0  = c4 c2 79 40 c1  (rm=xmm9 via VEX.~B=0)
+        let d = decode_instruction(&[0xc4, 0xc2, 0x79, 0x40, 0xc1], 0).unwrap();
+        assert_eq!(
+            d.instruction,
+            Instruction::Pmulld(
+                xmm_op(XmmReg::XMM0, Width::DQ),
+                xmm_op(XmmReg::XMM9, Width::DQ),
+            )
+        );
+        assert_eq!(d.length, 5);
     }
 
     // --- SSE error cases ---
