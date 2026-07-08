@@ -3008,10 +3008,15 @@ define void @f(ptr %sk) {
 entry:
   %page = alloca [16 x i8], align 16
   %slot = alloca ptr, align 8
+  %req = alloca [96 x i8], align 8
   call void @af_alg_sendpage(ptr %sk, ptr %page)
   store ptr %page, ptr %slot, align 8
   %p2 = load ptr, ptr %slot, align 8
-  %e = call i32 @crypto_aead_encrypt(ptr %p2)
+  %s = getelementptr inbounds i8, ptr %req, i64 64
+  store ptr %p2, ptr %s, align 8
+  %d = getelementptr inbounds i8, ptr %req, i64 72
+  store ptr %p2, ptr %d, align 8
+  %e = call i32 @crypto_aead_encrypt(ptr %req)
   ret void
 }
 "#;
@@ -3045,9 +3050,14 @@ define void @f(ptr %sk) {
 entry:
   %page = alloca [16 x i8], align 16
   %sgl = alloca [16 x i8], align 16
+  %req = alloca [96 x i8], align 8
   call void @af_alg_sendpage(ptr %sk, ptr %page)
   call void @wrap(ptr %sgl, ptr %page)
-  %e = call i32 @crypto_aead_encrypt(ptr %sgl)
+  %s = getelementptr inbounds i8, ptr %req, i64 64
+  store ptr %sgl, ptr %s, align 8
+  %d = getelementptr inbounds i8, ptr %req, i64 72
+  store ptr %sgl, ptr %d, align 8
+  %e = call i32 @crypto_aead_encrypt(ptr %req)
   ret void
 }
 "#;
