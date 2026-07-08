@@ -3070,6 +3070,36 @@ entry:
     );
 }
 
+/// **Read-consistency for unwritten memory**: two reads of the same never-written location
+/// must agree (unwritten memory holds one fixed unknown value). Here `%a` and `%b` load the
+/// same field of a `dereferenceable` parameter, so `%c = %a - %b` is provably `0`, hence
+/// `arr[%c]` is `arr[0]` — in bounds. Without read-consistency the two loads would be distinct
+/// fresh values, `%c` unknown, and the indexed access unprovable (UNKNOWN). PASS rests on the
+/// `param-contracts` assumption (the dereferenceable region), not on the read-consistency,
+/// which is the correct memory semantics.
+#[test]
+fn two_reads_of_an_unwritten_field_agree() {
+    let src = r#"
+define i32 @f(ptr dereferenceable(8) align 8 %p) {
+entry:
+  %arr = alloca [1 x i32], align 4
+  store i32 0, ptr %arr, align 4
+  %a = load i64, ptr %p, align 8
+  %b = load i64, ptr %p, align 8
+  %c = sub i64 %a, %b
+  %e = getelementptr [1 x i32], ptr %arr, i64 0, i64 %c
+  %v = load i32, ptr %e, align 4
+  ret i32 %v
+}
+"#;
+    let module = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "rc".into() }).expect("lower");
+    assert_eq!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "two loads of the same unwritten field agree, so arr[a-b] = arr[0] is in bounds"
+    );
+}
+
 /// **In-place-aliasing precision gate** (`require-if-alias`): the precise Copy-Fail signature is
 /// an in-place crypto op (`aead_request_set_crypt` with `src == dst`) writing a `foreign` page.
 /// The VULNERABLE in-place form (src and dst the same foreign region) is refused; the PATCHED

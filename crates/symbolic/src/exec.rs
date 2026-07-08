@@ -481,6 +481,7 @@ fn discharge_inner(
         pathcond: Vec::new(),
         facts,
         heap: initial_heap,
+        unwritten_reads: HashMap::new(),
         exact: true,
     };
     ex.run_merged(state);
@@ -1002,6 +1003,14 @@ struct PathState {
     facts: Vec<ExprId>,
     /// The symbolic store, in program order (for read-your-writes).
     heap: Vec<StoreRecord>,
+    /// **Read-consistency** cache for *unwritten* locations: the value first materialized
+    /// for a load from `(region, concrete byte offset, access width)` that no store aliases,
+    /// so two reads of the same never-written field agree (the correct memory semantics —
+    /// unwritten memory holds one fixed unknown value). Populated only for concrete offsets;
+    /// consulted only in `load_value`'s unwritten fallback (a store always wins first).
+    /// Cleared on every heap havoc (an opaque call may have written the location), so it can
+    /// never return a stale post-write value — sound.
+    unwritten_reads: HashMap<(usize, u128, u32), SymValue>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -1496,7 +1505,15 @@ impl Explorer<'_> {
 
         // The heap is computed by `merge_multi` (it needs the edge discriminators
         // to *join* differing stores); leave it empty here.
-        PathState { env, regions, pathcond, facts, heap: Vec::new(), exact: false }
+        PathState {
+            env,
+            regions,
+            pathcond,
+            facts,
+            heap: Vec::new(),
+            unwritten_reads: HashMap::new(),
+            exact: false,
+        }
     }
 
     /// Merge per-edge values into one, as a right-folded `ITE` over the edge
@@ -1591,6 +1608,7 @@ impl Explorer<'_> {
         // stored-value knowledge is no longer reliable: forget it (sound
         // over-approximation; loads then return fresh unknowns).
         state.heap.clear();
+        state.unwritten_reads.clear();
 
         // Equality-exit induction variables (`while i != n { … i += c }`): capture
         // each one's start (its pre-havoc value) and bound now, before the havoc
@@ -2470,6 +2488,7 @@ impl Explorer<'_> {
                     // and keep the path exact — the value is genuinely free, not an
                     // over-approximation. (Just invalidate stale stored values.)
                     state.heap.clear();
+        state.unwritten_reads.clear();
                     return;
                 }
                 // Model the bulk *write*. Clearing the heap alone is not enough:
@@ -2496,6 +2515,7 @@ impl Explorer<'_> {
                 };
                 // A bulk write invalidates the symbolic heap's stored values.
                 state.heap.clear();
+        state.unwritten_reads.clear();
                 match concrete_len {
                     Some(n) => {
                         let dstp = self.eval_pointer(dst, state);
@@ -2674,6 +2694,7 @@ impl Explorer<'_> {
         let (writes, frees) = summary.as_ref().map_or((true, true), |s| (s.writes, s.frees));
         if writes || frees {
             state.heap.clear();
+        state.unwritten_reads.clear();
         }
         if frees {
             for r in &mut state.regions {
@@ -3317,7 +3338,7 @@ impl Explorer<'_> {
         p: &SymPointer,
         asize: u64,
         ty: &Type,
-        state: &PathState,
+        state: &mut PathState,
     ) -> (SymValue, LoadOrigin) {
         for k in (0..state.heap.len()).rev() {
             let rec_size = state.heap[k].size;
@@ -3336,6 +3357,22 @@ impl Explorer<'_> {
         let user = matches!(p.prov, Prov::Region(rid) if state.regions.get(rid).is_some_and(|r| r.user_controlled));
         if user && !ty.is_ptr() {
             return (SymValue::Scalar(self.fresh_genuine_scalar(type_width(ty))), LoadOrigin::Stored);
+        }
+        // Read-consistency: no store aliases this location, so it is unwritten. Two reads of
+        // the same never-written `(region, concrete offset, width)` must agree (unwritten
+        // memory holds one fixed unknown value). Reuse the value first materialized here;
+        // materialize (and cache) it otherwise. Only for a concrete offset — a symbolic
+        // offset stays a fresh over-approximation. The cache is dropped on every heap havoc.
+        if let Prov::Region(rid) = p.prov {
+            if let Some(off) = self.ctx.as_const(p.offset).map(|bv| bv.unsigned()) {
+                let key = (rid, off, ty.size_bytes(&LAYOUT).unwrap_or(0) as u32);
+                if let Some(v) = state.unwritten_reads.get(&key) {
+                    return (v.clone(), LoadOrigin::Unwritten);
+                }
+                let v = self.fresh_value(ty, POrigin::Load);
+                state.unwritten_reads.insert(key, v.clone());
+                return (v, LoadOrigin::Unwritten);
+            }
         }
         (self.fresh_value(ty, POrigin::Load), LoadOrigin::Unwritten)
     }
