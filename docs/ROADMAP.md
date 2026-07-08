@@ -305,11 +305,16 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
      plain field loads); (2) provenance labels survive **loop havoc** (an iterator over a foreign list
      stays foreign); (3) labels survive **CFG merges by intersection** (the meet — sound, entry-seeds on
      all paths survive; fixes the DeepSeek recall gap on `opaque_labels`/region labels). The taint now
-     survives control flow. Firing on the *unmodified* algif_aead is still blocked by that worker's
-     specifics, each a precision task: `ctx = alg_sk(sk)->private` is a `container_of` negative-offset
-     cast (sk→ctx taint not modelled); the deeply nested `areq->first_rsgl.sgl.sg`; and the opaque
-     `af_alg_get_rsgl` building the rsgl into a fresh `areq` (the foreign must reach it via
-     `crypto_aead_copy_sgl`'s propagate). The (a)+(b)+(c) machinery is complete and sound.
+     survives control flow. **The definitive blocker to firing on the unmodified algif_aead is that the
+     crypto API is `static inline`:** the real optimized `aead_recvmsg` IR has **zero calls** to
+     `aead_request_set_crypt`/`crypto_aead_copy_sgl` — they inline to field STORES into the request struct
+     (`store src -> req.…src`, `store dst -> req.…dst`), then `crypto_aead_encrypt(%req)`. So a call-arg
+     `require-if-alias` can never trigger. Detecting the CVE on real IR needs **field-level modelling of the
+     inlined request**: recognise the `aead_request.src`/`.dst` field offsets, see the same foreign pointer
+     stored to both (in-place), and a contract on `crypto_aead_encrypt` that reads `req->dst` back and checks
+     `alias(src, dst)` + `foreign`. That is a substantially different (harder) detection design than call-arg
+     contracts — a separate effort. The (a)+(b)+(c) machinery is complete and sound and fires on the direct-CALL
+     shape; the direct-call reproduction is the demonstrable proof of the mechanism.
    - **(ii) materialized-field region identity — DONE.** A `RefWitness` now carries the field
      address it was loaded from and caches the materialised region by `(region, offset)`
      (`PathState.ref_regions`, cleared on heap havoc), so two loads of the same raw-pointer
