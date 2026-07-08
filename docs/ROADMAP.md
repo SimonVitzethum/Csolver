@@ -263,12 +263,13 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
      (a *different* syscall) and must persist on the shared `ctx`/socket so `_aead_recvmsg`
      sees it. Needs a whole-object provenance summary threaded across the object's
      operations (not per-function).
-   - **(ii) materialized-field region identity.** `areq->first_rsgl.sgl.sg` is loaded from
-     an opaque struct built by `af_alg_get_rsgl`; two loads must resolve to the *same*
-     tracked region for `require-if-alias` to see `src == dst`. Extends the existing
-     `assume_valid_params`/member-provenance materialisation with per-field read-consistency
-     (repeated loads of one field alias). Materialising a region for an unknown pointer is
-     only sound under the opt-in — doing it unconditionally would be a false-PASS hole.
+   - **(ii) materialized-field region identity — DONE.** A `RefWitness` now carries the field
+     address it was loaded from and caches the materialised region by `(region, offset)`
+     (`PathState.ref_regions`, cleared on heap havoc), so two loads of the same raw-pointer
+     field resolve to the *same* region and `require-if-alias` sees `src == dst` through field
+     loads. Both share the field's declared size, so conflation is never a false PASS. Validated
+     sound: differentials SOUND, VPS core AND assume-valid-params driver scans byte-identical.
+     (Still needs (i) to supply the label on the real unmodified kernel.)
    - **(iii) read-consistency for unwritten locations — DONE.** Two reads of the same
      never-written `(region, concrete offset, width)` now agree (cached in
      `PathState.unwritten_reads`, store-wins-first, cleared on every heap havoc). Correct
