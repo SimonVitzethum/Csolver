@@ -349,6 +349,12 @@ pub enum Inst {
         /// type system (a Rust `&T`/C++ `T&`, always valid). The executor
         /// materialises an `assumed` witness only when that mode is on.
         assumed: bool,
+        /// The **field address** the reference was loaded from (`&struct->field`),
+        /// when known. Lets the executor give two loads of the *same* field the *same*
+        /// materialised region (keyed by that address's region + offset), so an in-place
+        /// `src == dst` through struct-field loads is recognised. `None` ⇒ always a fresh
+        /// region (the sound default; e.g. a Rust `&place` with no field identity).
+        src: Option<Operand>,
     },
     /// A bulk memory operation (`memcpy`/`memmove`/`memset`): touches `len`
     /// bytes at `dst` (write) and, for copy/move, `len` bytes at `src` (read).

@@ -193,7 +193,11 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                     op(index);
                 }
                 Inst::FieldPtr { base, .. } => op(base),
-                Inst::RefWitness { .. } => {}
+                Inst::RefWitness { src, .. } => {
+                    if let Some(s) = src {
+                        op(s);
+                    }
+                }
                 Inst::Assign { value, .. } => match value {
                     RValue::Use(o) => op(o),
                     RValue::Bin { lhs, rhs, .. } | RValue::Cmp { lhs, rhs, .. } => {
@@ -482,6 +486,7 @@ fn discharge_inner(
         facts,
         heap: initial_heap,
         unwritten_reads: HashMap::new(),
+        ref_regions: HashMap::new(),
         exact: true,
     };
     ex.run_merged(state);
@@ -1011,6 +1016,11 @@ struct PathState {
     /// Cleared on every heap havoc (an opaque call may have written the location), so it can
     /// never return a stale post-write value — sound.
     unwritten_reads: HashMap<(usize, u128, u32), SymValue>,
+    /// **Materialised-field region identity**: the region a `RefWitness` materialised for a
+    /// raw-pointer field at `(base region, concrete offset)`, so two loads of the *same* field
+    /// yield the *same* tracked region (an in-place `src == dst` through field loads is then
+    /// recognised). Cleared on every heap havoc (a call may have reassigned the field) — sound.
+    ref_regions: HashMap<(usize, u128), usize>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -1512,6 +1522,7 @@ impl Explorer<'_> {
             facts,
             heap: Vec::new(),
             unwritten_reads: HashMap::new(),
+            ref_regions: HashMap::new(),
             exact: false,
         }
     }
@@ -1609,6 +1620,7 @@ impl Explorer<'_> {
         // over-approximation; loads then return fresh unknowns).
         state.heap.clear();
         state.unwritten_reads.clear();
+        state.ref_regions.clear();
 
         // Equality-exit induction variables (`while i != n { … i += c }`): capture
         // each one's start (its pre-havoc value) and bound now, before the havoc
@@ -2447,7 +2459,7 @@ impl Explorer<'_> {
                     "an in-place operation writes a region whose provenance may not grant it",
                 );
             }
-            Inst::RefWitness { dst, size, align, writable, assumed } => {
+            Inst::RefWitness { dst, size, align, writable, assumed, src } => {
                 // A raw-pointer field (`assumed`) is a valid reference only under the
                 // `assume_valid_params` opt-in; otherwise leave the loaded pointer with
                 // its opaque provenance (sound — accesses through it stay UNKNOWN).
@@ -2457,10 +2469,30 @@ impl Explorer<'_> {
                 if *assumed {
                     self.assumptions.insert("param-valid");
                 }
-                // A valid reference to a fresh live region (see
-                // `materialize_ref_region`): a known size is refutable, an
-                // unknown size (slice/`str`) prove-only.
-                let rid = self.materialize_ref_region(*size, *writable, *assumed, state);
+                // Field identity: if the reference was loaded from a known field address that
+                // resolves to a concrete `(region, offset)`, reuse the region materialised for
+                // that field on an earlier load — so two loads of the same field alias (an
+                // in-place `src == dst` through field loads is then recognised). The cache is
+                // cleared on every heap havoc, so a reassigned field re-materialises.
+                let key = src.as_ref().and_then(|s| {
+                    let p = self.eval_pointer(s, state);
+                    match p.prov {
+                        Prov::Region(rid) => self.ctx.as_const(p.offset).map(|o| (rid, o.unsigned())),
+                        _ => None,
+                    }
+                });
+                // A valid reference to a fresh live region (see `materialize_ref_region`): a
+                // known size is refutable, an unknown size (slice/`str`) prove-only.
+                let rid = match key.and_then(|k| state.ref_regions.get(&k).copied()) {
+                    Some(rid) => rid,
+                    None => {
+                        let rid = self.materialize_ref_region(*size, *writable, *assumed, state);
+                        if let Some(k) = key {
+                            state.ref_regions.insert(k, rid);
+                        }
+                        rid
+                    }
+                };
                 let zero = self.ctx.int(PTR_WIDTH, 0);
                 state.env.insert(
                     *dst,
@@ -2489,6 +2521,7 @@ impl Explorer<'_> {
                     // over-approximation. (Just invalidate stale stored values.)
                     state.heap.clear();
         state.unwritten_reads.clear();
+        state.ref_regions.clear();
                     return;
                 }
                 // Model the bulk *write*. Clearing the heap alone is not enough:
@@ -2516,6 +2549,7 @@ impl Explorer<'_> {
                 // A bulk write invalidates the symbolic heap's stored values.
                 state.heap.clear();
         state.unwritten_reads.clear();
+        state.ref_regions.clear();
                 match concrete_len {
                     Some(n) => {
                         let dstp = self.eval_pointer(dst, state);
@@ -2695,6 +2729,7 @@ impl Explorer<'_> {
         if writes || frees {
             state.heap.clear();
         state.unwritten_reads.clear();
+        state.ref_regions.clear();
         }
         if frees {
             for r in &mut state.regions {

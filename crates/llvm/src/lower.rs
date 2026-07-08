@@ -592,8 +592,11 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         // then materialise its result as a valid reference — the loaded pointer
         // is a `&T`/`&mut T` by the field's declared type, so accesses through it
         // prove. Without this the loaded field pointer has lost provenance.
-        if let LInst::Load { dst, align_meta, .. } = inst {
+        if let LInst::Load { dst, ptr, align_meta, .. } = inst {
             if let Some(&(size, align, writable, assumed)) = ctx.field_ref_loads.get(dst) {
+                // The field address the pointer was loaded from — so the executor can give
+                // two loads of the *same* field the same materialised region.
+                let src = ctx.operand(ptr, 64).ok();
                 insts.push(lower_inst(ctx, inst)?);
                 insts.push(Inst::RefWitness {
                     dst: ctx.reg(dst)?,
@@ -605,6 +608,7 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                     writable,
                     // A raw-pointer field is only valid under `assume_valid_params`.
                     assumed,
+                    src,
                 });
                 continue;
             }
