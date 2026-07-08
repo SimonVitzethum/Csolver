@@ -267,14 +267,23 @@ bug assembled across syscall boundaries. Covering this class needs, in order:
      (`require-if-alias(%sk,%sk)` after labelling `%sk` stays PASS — verified). So (i) is not
      one step but three interlocking ones, each with real false-FAIL risk: (a) make the socket
      parameter a *tracked, labelable* region (like `assume_valid_params` for pointees, but for
-     the object itself); (b) **taint-on-read** — a reference materialised from a `foreign`
-     container inherits its provenance (implemented + reverted: sound but inert until (a)+(c)
-     land, so not committed undemonstrated); (c) a **whole-object seed** — at a sink's entry,
-     join in the labels sibling operations leave on that object type (the actual cross-syscall
-     step, and the one that can false-FAIL the patched path if the seed is too coarse). This is
-     the multi-entry-typestate research finale; it must be built as a dedicated effort with
-     kernel-wide false-FAIL auditing, not a rushed increment. The in-place gate (require-if-alias,
-     done) is what will keep (c) from false-FAILing the out-of-place patched path once it fires.
+     the object itself). **DONE** as decoupled `PathState.reg_labels` — an opaque pointer is
+     labelled on its holding SSA register, touching no safety check, so it is sound (no false
+     PASS) and `require-if-alias(%sk,%sk)` now fires when `%sk` is labelled. Validated
+     byte-identical on the kernel.
+     (b) **taint-on-read** — a reference materialised from a `foreign` container inherits its
+     provenance. (c) a **whole-object seed** — at a sink's entry, join in the labels sibling
+     operations leave on that object type (the actual cross-syscall step, and the one that can
+     false-FAIL the patched path if too coarse).
+
+     **Next concrete blocker for (b): opaque pointers have no identity.** `%c1 = gep %sk, 8` and
+     `%c2 = gep %sk, 8` are both `Prov::Unknown` (deliberately equal), so neither the field-region
+     identity (ii) nor a reg-label flow can trace a field address back to its base object `%sk`.
+     Closing (b)+(c) therefore needs opaque pointers to carry a real **provenance identity** (a
+     unique id on `Prov::Unknown`, threaded through the manual `PartialEq`, the alias logic, and
+     gep/copy propagation) — a substantial, soundness-critical refactor. The in-place gate
+     (require-if-alias, done) is what will keep (c) from false-FAILing the out-of-place patched
+     path once it fires. Build as a dedicated effort with kernel-wide false-FAIL auditing.
    - **(ii) materialized-field region identity — DONE.** A `RefWitness` now carries the field
      address it was loaded from and caches the materialised region by `(region, offset)`
      (`PathState.ref_regions`, cleared on heap havoc), so two loads of the same raw-pointer
