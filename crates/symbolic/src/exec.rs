@@ -297,6 +297,7 @@ fn discharge_inner(
     let mut ex = Explorer {
         ctx: ExprCtx::new(),
         fresh: 0,
+        prov_ids: 0,
         bug_finding: limits.bug_finding,
         exported: limits.exported,
         assume_valid_params: limits.assume_valid_params,
@@ -487,7 +488,7 @@ fn discharge_inner(
         heap: initial_heap,
         unwritten_reads: HashMap::new(),
         ref_regions: HashMap::new(),
-            reg_labels: HashMap::new(),
+            opaque_labels: HashMap::new(),
         exact: true,
     };
     ex.run_merged(state);
@@ -537,6 +538,14 @@ fn discharge_inner(
     }
 }
 
+/// The base a materialised field region is keyed by: a tracked region, or an opaque
+/// provenance identity (so `obj->field` off an *opaque* object also gets a stable region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RefBase {
+    Region(usize),
+    Opaque(u32),
+}
+
 /// Provenance of a symbolic pointer.
 #[derive(Debug, Clone)]
 enum Prov {
@@ -554,7 +563,15 @@ enum Prov {
     /// sweep can split the "requires known provenance" residual by origin and
     /// separate the sound-extensible cases (provenance through memory) from the
     /// assumption-needed ones (raw-pointer call results, int→ptr).
-    Unknown(POrigin),
+    ///
+    /// The `Option<u32>` is a **provenance identity**: a unique id minted for an opaque
+    /// pointer (a raw-pointer parameter and anything derived from it by `gep`/copy, which
+    /// carry the id through `prov.clone()`), or `None`. It is used *only* by the provenance
+    /// machinery — labelling an opaque pointer, recognising two derived pointers as sharing
+    /// a base, and materialised-field identity — and is **deliberately excluded from
+    /// `PartialEq`** (see below), so aliasing, merging, and every existing verdict stay
+    /// byte-identical: two opaque pointers remain interchangeable for the memory model.
+    Unknown(POrigin, Option<u32>),
 }
 
 /// Why a pointer has no tracked provenance. Diagnostic only.
@@ -873,7 +890,7 @@ impl Prov {
         match self {
             // A null (or integer-derived) pointer reaching a provenance check.
             Prov::Null => "pointer provenance is not tracked: null or integer-derived pointer",
-            Prov::Unknown(o) => o.residual(),
+            Prov::Unknown(o, _) => o.residual(),
             // Unreachable at the emission sites (they fire on the non-Region else),
             // but a total function is cheaper to keep correct than a panic.
             Prov::Region(_) | Prov::Select { .. } => "pointer provenance is not tracked",
@@ -890,7 +907,7 @@ impl PartialEq for Prov {
         match (self, other) {
             (Prov::Null, Prov::Null) => true,
             (Prov::Region(a), Prov::Region(b)) => a == b,
-            (Prov::Unknown(_), Prov::Unknown(_)) => true,
+            (Prov::Unknown(..), Prov::Unknown(..)) => true,
             (
                 Prov::Select { cond: c1, then_ptr: t1, else_ptr: e1 },
                 Prov::Select { cond: c2, then_ptr: t2, else_ptr: e2 },
@@ -1020,15 +1037,19 @@ struct PathState {
     /// **Materialised-field region identity**: the region a `RefWitness` materialised for a
     /// raw-pointer field at `(base region, concrete offset)`, so two loads of the *same* field
     /// yield the *same* tracked region (an in-place `src == dst` through field loads is then
-    /// recognised). Cleared on every heap havoc (a call may have reassigned the field) — sound.
-    ref_regions: HashMap<(usize, u128), usize>,
-    /// Provenance labels attached to an **opaque pointer** by the SSA register that holds it
-    /// (a raw-pointer parameter is opaque provenance, not a region, so it has no `prov_labels`
-    /// of its own). Decoupled from the region/safety model entirely — a `reg_label` affects
-    /// **only** the provenance checks (`CapRequire`/`CapRequireIfAlias`), never null-deref,
-    /// bounds, liveness, or permissions — so it cannot introduce a false PASS. Persistent (a
-    /// register's provenance is a fact about the SSA value, not memory), so not cleared on havoc.
-    reg_labels: HashMap<RegId, HashSet<u32>>,
+    /// recognised). Keyed by the base's identity — a materialised region or an opaque
+    /// provenance id — and the field offset. Cleared on every heap havoc (a call may have
+    /// reassigned the field) — sound.
+    ref_regions: HashMap<(RefBase, u128), usize>,
+    /// Provenance labels attached to an **opaque pointer** by its provenance identity
+    /// (`Prov::Unknown`'s id — see there), which flows through `gep`/copy so a field address
+    /// off a labelled object carries the object's labels. A raw-pointer parameter is opaque
+    /// provenance, not a region, so it has no `prov_labels` of its own. Decoupled from the
+    /// region/safety model entirely — an opaque label affects **only** the provenance checks
+    /// (`CapRequire`/`CapRequireIfAlias`), never null-deref, bounds, liveness, or permissions —
+    /// so it cannot introduce a false PASS. Persistent (a fact about the SSA value, not memory),
+    /// so not cleared on havoc.
+    opaque_labels: HashMap<u32, HashSet<u32>>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -1090,6 +1111,9 @@ enum RefuteMode {
 struct Explorer<'f> {
     ctx: ExprCtx,
     fresh: u32,
+    /// A monotone counter for opaque-pointer provenance ids (see `Prov::Unknown`); separate
+    /// from `fresh` so symbol numbering — and hence witnesses/determinism — is unchanged.
+    prov_ids: u32,
     /// Bug-finding mode: relax the memory-refutation gate so a spatial violation
     /// whose offset/size depend only on genuine inputs (parameters) is reported
     /// even on a globally-inexact path (e.g. after an init loop). Off by default
@@ -1175,8 +1199,13 @@ impl Explorer<'_> {
 
     fn fresh_value(&mut self, ty: &Type, origin: POrigin) -> SymValue {
         if ty.is_ptr() {
+            // Mint a fresh provenance identity for this opaque pointer (see `Prov::Unknown`).
+            // A separate counter keeps symbol numbering (and thus witnesses / determinism)
+            // byte-identical to before the id existed.
+            let id = self.prov_ids;
+            self.prov_ids += 1;
             SymValue::Ptr(SymPointer {
-                prov: Prov::Unknown(origin),
+                prov: Prov::Unknown(origin, Some(id)),
                 offset: self.ctx.int(PTR_WIDTH, 0),
                 align: 1,
             })
@@ -1498,7 +1527,7 @@ impl Explorer<'_> {
             if let SymValue::Ptr(p) = v {
                 if let Prov::Region(rid) = p.prov {
                     if rid >= rcount {
-                        p.prov = Prov::Unknown(POrigin::RegionDrop);
+                        p.prov = Prov::Unknown(POrigin::RegionDrop, None);
                     }
                 }
             }
@@ -1531,7 +1560,7 @@ impl Explorer<'_> {
             heap: Vec::new(),
             unwritten_reads: HashMap::new(),
             ref_regions: HashMap::new(),
-            reg_labels: HashMap::new(),
+            opaque_labels: HashMap::new(),
             exact: false,
         }
     }
@@ -1567,7 +1596,7 @@ impl Explorer<'_> {
             (SymValue::Ptr(pa), SymValue::Ptr(pb)) => {
                 if prov_select_depth(&pa.prov).max(prov_select_depth(&pb.prov)) >= 8 {
                     SymValue::Ptr(SymPointer {
-                        prov: Prov::Unknown(POrigin::SelectJoin),
+                        prov: Prov::Unknown(POrigin::SelectJoin, None),
                         offset: self.ctx.int(PTR_WIDTH, 0),
                         align: 1,
                     })
@@ -1721,7 +1750,7 @@ impl Explorer<'_> {
                     state.env.insert(
                         reg,
                         SymValue::Ptr(SymPointer {
-                            prov: Prov::Unknown(POrigin::Loop),
+                            prov: Prov::Unknown(POrigin::Loop, None),
                             offset,
                             align: 1,
                         }),
@@ -2459,23 +2488,31 @@ impl Explorer<'_> {
                     self.assumptions.insert("param-valid");
                 }
                 // Field identity: if the reference was loaded from a known field address that
-                // resolves to a concrete `(region, offset)`, reuse the region materialised for
-                // that field on an earlier load — so two loads of the same field alias (an
-                // in-place `src == dst` through field loads is then recognised). The cache is
-                // cleared on every heap havoc, so a reassigned field re-materialises.
+                // resolves to a concrete `(base, offset)` — a tracked region OR an opaque
+                // provenance id — reuse the region materialised for that field on an earlier
+                // load, so two loads of the same field alias (an in-place `src == dst` through
+                // field loads is then recognised). Cleared on heap havoc, so a reassigned
+                // field re-materialises.
                 let key = src.as_ref().and_then(|s| {
                     let p = self.eval_pointer(s, state);
-                    match p.prov {
-                        Prov::Region(rid) => self.ctx.as_const(p.offset).map(|o| (rid, o.unsigned())),
-                        _ => None,
-                    }
+                    let base = match p.prov {
+                        Prov::Region(rid) => RefBase::Region(rid),
+                        Prov::Unknown(_, Some(id)) => RefBase::Opaque(id),
+                        _ => return None,
+                    };
+                    self.ctx.as_const(p.offset).map(|o| (base, o.unsigned()))
                 });
+                // The base object's provenance labels, so a field materialised from a
+                // `foreign` object is itself foreign (taint-on-read).
+                let src_labels =
+                    src.as_ref().map(|s| self.ptr_labels(s, state)).unwrap_or_default();
                 // A valid reference to a fresh live region (see `materialize_ref_region`): a
                 // known size is refutable, an unknown size (slice/`str`) prove-only.
                 let rid = match key.and_then(|k| state.ref_regions.get(&k).copied()) {
                     Some(rid) => rid,
                     None => {
                         let rid = self.materialize_ref_region(*size, *writable, *assumed, state);
+                        state.regions[rid].prov_labels.extend(src_labels);
                         if let Some(k) = key {
                             state.ref_regions.insert(k, rid);
                         }
@@ -2684,21 +2721,20 @@ impl Explorer<'_> {
     }
 
     /// The provenance labels attached to a pointer operand: a materialised region's own
-    /// labels, or — for an **opaque pointer** (a raw-pointer parameter) — the labels on its
-    /// holding SSA register (`PathState::reg_labels`). Unifies both provenance channels.
+    /// labels, or — for an **opaque pointer** — the labels on its provenance identity
+    /// (`Prov::Unknown`'s id, which flows through `gep`/copy). Unifies both channels.
     fn ptr_labels(&mut self, ptr: &Operand, state: &PathState) -> HashSet<u32> {
         match self.eval_pointer(ptr, state).prov {
             Prov::Region(rid) => state.regions[rid].prov_labels.clone(),
-            _ => match ptr {
-                Operand::Reg(r) => state.reg_labels.get(r).cloned().unwrap_or_default(),
-                _ => HashSet::new(),
-            },
+            Prov::Unknown(_, Some(id)) => state.opaque_labels.get(&id).cloned().unwrap_or_default(),
+            _ => HashSet::new(),
         }
     }
 
     /// Attach a provenance label to a pointer operand: its region if it has one, else its
-    /// holding SSA register (so an opaque parameter becomes labelable without being modelled
-    /// as a region — sound: `reg_labels` touch no safety check but the provenance ones).
+    /// opaque provenance identity (so an opaque parameter — and any field address derived
+    /// from it — becomes labelable without being modelled as a region; sound: `opaque_labels`
+    /// touch no safety check but the provenance ones).
     fn add_ptr_label(&mut self, ptr: &Operand, label: u32, state: &mut PathState) {
         match self.eval_pointer(ptr, state).prov {
             Prov::Region(rid) => {
@@ -2706,21 +2742,26 @@ impl Explorer<'_> {
                     r.prov_labels.insert(label);
                 }
             }
-            _ => {
-                if let Operand::Reg(r) = ptr {
-                    state.reg_labels.entry(*r).or_default().insert(label);
-                }
+            Prov::Unknown(_, Some(id)) => {
+                state.opaque_labels.entry(id).or_default().insert(label);
             }
+            _ => {}
         }
     }
 
     /// Whether two pointer operands have the **same provenance identity**: the same
-    /// materialised region, or the same opaque SSA register. Conservative — distinct
-    /// registers holding the same opaque value are not unified (a sound under-approximation).
+    /// materialised region (at any offset — the in-place gate is region-granular), or the
+    /// same opaque provenance id **at the same offset** (so `obj->f` and `obj->g` off one
+    /// object are *not* aliased, but two loads of `obj->f` are). Conservative — an opaque
+    /// pointer with no id is never unified (a sound under-approximation).
     fn same_ptr_identity(&mut self, a: &Operand, b: &Operand, state: &PathState) -> bool {
-        match (self.eval_pointer(a, state).prov, self.eval_pointer(b, state).prov) {
+        let (pa, pb) = (self.eval_pointer(a, state), self.eval_pointer(b, state));
+        match (pa.prov, pb.prov) {
             (Prov::Region(ra), Prov::Region(rb)) => ra == rb,
-            _ => matches!((a, b), (Operand::Reg(x), Operand::Reg(y)) if x == y),
+            (Prov::Unknown(_, Some(ia)), Prov::Unknown(_, Some(ib))) => {
+                ia == ib && pa.offset == pb.offset
+            }
+            _ => false,
         }
     }
 
@@ -3694,7 +3735,7 @@ impl Explorer<'_> {
                     _ => ScalarPtrCause::Other,
                 };
                 SymPointer {
-                    prov: Prov::Unknown(POrigin::ScalarAsPtr(cause)),
+                    prov: Prov::Unknown(POrigin::ScalarAsPtr(cause), None),
                     offset: self.ctx.int(PTR_WIDTH, 0),
                     align: 1,
                 }
@@ -3716,7 +3757,7 @@ impl Explorer<'_> {
             RValue::Cast { op, operand, .. } => match op {
                 CastOp::Bitcast => self.eval_value(operand, state),
                 CastOp::IntToPtr => SymValue::Ptr(SymPointer {
-                    prov: Prov::Unknown(POrigin::IntToPtr),
+                    prov: Prov::Unknown(POrigin::IntToPtr, None),
                     offset: self.ctx.int(PTR_WIDTH, 0),
                     align: 1,
                 }),
