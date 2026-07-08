@@ -39,10 +39,17 @@ USAGE:
                                     ABI — opt-in, unsound in general, surfaced as an assumption);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
-    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world]
+    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>]
                                     verify EVERY .ll under <dir> without stopping, then
                                     report coverage (% of functions decided) and list
                                     every memory-safety violation found, with a witness
+                                    (--entries <file>: treat ONLY functions whose name
+                                    matches a listed pattern — an exact name or a
+                                    trailing-`*` prefix, one per line — as attacker
+                                    entries; every other function's parameters are taken
+                                    as caller-validated. The sound kernel model: external
+                                    linkage is not userspace-reachability, so this removes
+                                    the internal-helper false positives.)
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
     solver report <result.json>     re-render a saved JSON report
     solver --help                   show this help
@@ -79,6 +86,18 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         .position(|a| a == "--pre")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
+    // `--entries <file>`: an opt-in entry-point list (exact names or trailing-`*`
+    // prefixes). Restricts adversarial (attacker-input) analysis to genuine entries —
+    // the sound kernel model (external linkage != userspace-reachable).
+    let entries_file = args
+        .iter()
+        .position(|a| a == "--entries")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    let entry_patterns = match &entries_file {
+        Some(p) => Some(read_entry_patterns(p)?),
+        None => None,
+    };
     match command.as_str() {
         "--help" | "-h" | "help" => {
             print!("{HELP}");
@@ -96,22 +115,26 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         }
         "verify" => {
             // The path is the first non-flag argument that is not a flag's value
-            // (`--pre <file>`).
-            let pre_value = pre_file.as_ref().and_then(|p| p.to_str());
+            // (`--pre <file>` / `--entries <file>`).
+            let flag_values: Vec<&str> = [pre_file.as_ref(), entries_file.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.to_str())
+                .collect();
             let path = args
                 .iter()
                 .skip(1)
-                .find(|a| !a.starts_with("--") && Some(a.as_str()) != pre_value)
+                .find(|a| !a.starts_with("--") && !flag_values.contains(&a.as_str()))
                 .ok_or("`verify` needs a path argument")?;
-            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, pre_file.as_deref())
+            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, pre_file.as_deref(), entry_patterns)
         }
         "scan" => {
             let dir = args
                 .iter()
                 .skip(1)
-                .find(|a| !a.starts_with("--"))
+                .find(|a| !a.starts_with("--") && entries_file.as_ref().and_then(|p| p.to_str()) != Some(a.as_str()))
                 .ok_or("`scan` needs a directory argument")?;
-            let config = Config { closed_world, bug_finding, assume_valid_params, ..Config::default() };
+            let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns, ..Config::default() };
             scan_dir(Path::new(dir), &config)
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
@@ -128,6 +151,7 @@ fn verify_path(
     bug_finding: bool,
     assume_valid_params: bool,
     pre_file: Option<&Path>,
+    entry_patterns: Option<Vec<String>>,
 ) -> Result<ExitCode, String> {
     // Turnkey: a `.rs` file is compiled to MIR by us, then verified with a
     // coverage report — the user does not hand-run rustc.
@@ -188,6 +212,7 @@ fn verify_path(
                 closed_world,
                 bug_finding,
                 assume_valid_params,
+                entry_patterns,
                 ..Config::default()
             };
             let report = verify_module(&module, &config);
@@ -301,6 +326,23 @@ fn scan_dir(dir: &Path, config: &Config) -> Result<ExitCode, String> {
     println!("files with tool error: {errored}");
     // A scan is an inventory, not a single verdict — exit non-zero iff any bug was found.
     Ok(if fail > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// Read an entry-point pattern file: one pattern per line (an exact function name
+/// or a trailing-`*` prefix like `__x64_sys_*`). Blank lines and `#` comments are
+/// ignored.
+fn read_entry_patterns(path: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let pats: Vec<String> = text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    if pats.is_empty() {
+        return Err(format!("{}: no entry patterns found", path.display()));
+    }
+    Ok(pats)
 }
 
 /// Recursively collect every `*.ll` file under `dir`.

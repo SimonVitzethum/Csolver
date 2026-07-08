@@ -76,6 +76,27 @@ pub struct Config {
     /// analysis whose dominant `UNKNOWN` cause is an uncontracted pointer parameter
     /// (per-TU kernel/driver code).
     pub assume_valid_params: bool,
+    /// Optional **entry-point name patterns** (exact, or a trailing-`*` prefix). When
+    /// present, ONLY a function whose name matches is treated as an attacker-reachable
+    /// entry — its `arg…` parameters are genuine adversarial inputs in bug-finding mode;
+    /// every other function is analysed as an internal helper whose parameters are
+    /// caller-validated. This replaces the default heuristic (LLVM external linkage) for
+    /// kernel analysis, where external linkage means "callable by other kernel code",
+    /// NOT "reachable from userspace" — the source of the internal-helper false positives
+    /// (e.g. `notify_cpu_starting(cpu)` flagged OOB at `cpu = UINT_MAX`, impossible since
+    /// the hotplug machinery always passes a valid cpu). Excluding a non-entry can only
+    /// reduce recall (a wrongly-excluded entry's obligation stays UNKNOWN), never turn a
+    /// FAIL into a PASS, so it is sound. `None` ⇒ the linkage default (unchanged).
+    pub entry_patterns: Option<Vec<String>>,
+}
+
+/// Whether `name` matches an entry pattern: exact, or a trailing-`*` prefix
+/// (e.g. `__x64_sys_*` matches `__x64_sys_read`).
+pub fn matches_entry(name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| match p.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == p,
+    })
 }
 
 impl Default for Config {
@@ -87,6 +108,7 @@ impl Default for Config {
             closed_world: false,
             bug_finding: false,
             assume_valid_params: false,
+            entry_patterns: None,
         }
     }
 }
@@ -235,7 +257,12 @@ fn verify_one_function(
     let field_contracts: Vec<Vec<FieldContract>> = (0..f.params.len())
         .map(|i| field_synth.get(&(f.id, i as u32)).cloned().unwrap_or_default())
         .collect();
-    let exported = !module.internal.contains(&f.id);
+    // An entry policy (if given) decides attacker-reachability by name — the sound
+    // kernel model, where LLVM external linkage does NOT mean userspace-reachable.
+    let exported = match &config.entry_patterns {
+        Some(pats) => matches_entry(&f.name, pats),
+        None => !module.internal.contains(&f.id),
+    };
     let mut local_id = 0u32;
     verify_function_with(
         f,
@@ -711,5 +738,24 @@ fn render_operand(op: &Operand) -> String {
         Operand::Const(Const::Undef) => "undef".into(),
         Operand::Const(Const::Symbol(s)) => format!("@{s}"),
         Operand::Const(Const::SymbolOffset(s, off)) => format!("@{s}+{off}"),
+    }
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::matches_entry;
+
+    #[test]
+    fn exact_and_prefix_patterns_match() {
+        let pats = vec!["aead_recvmsg".to_string(), "__x64_sys_*".to_string()];
+        // Exact name.
+        assert!(matches_entry("aead_recvmsg", &pats));
+        // Trailing-`*` prefix.
+        assert!(matches_entry("__x64_sys_read", &pats));
+        assert!(matches_entry("__x64_sys_", &pats));
+        // Non-entries: an internal helper is not adversarial under the policy.
+        assert!(!matches_entry("notify_cpu_starting", &pats));
+        assert!(!matches_entry("aead_recvmsg_nokey", &pats)); // exact, not a prefix
+        assert!(!matches_entry("__x64_sy", &pats));
     }
 }
