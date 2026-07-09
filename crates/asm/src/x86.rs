@@ -82,6 +82,27 @@ fn decode_one(
     flags: &mut Option<(Operand, Operand)>,
 ) -> csolver_core::Result<Decoded> {
     let mut p = pos;
+    // CET / alignment **no-ops**, special-cased before any prefix handling so no
+    // general legacy prefix is ever *guessed* at (that would risk mis-decoding).
+    // `endbr64`/`endbr32` (`f3 0f 1e fa|fb`) open almost every function in a
+    // CET/IBT-built kernel; a multi-byte `nop` (`66? 0f 1f /M`) pads inside functions.
+    // Both are pure no-ops regardless of operand size, so consuming them is sound.
+    if code.get(p) == Some(&0xf3)
+        && code.get(p + 1) == Some(&0x0f)
+        && code.get(p + 2) == Some(&0x1e)
+        && matches!(code.get(p + 3), Some(&(0xfa | 0xfb)))
+    {
+        return Ok(Decoded { insts: vec![], next: p + 4, ctrl: Ctrl::Fall });
+    }
+    if code.get(p) == Some(&0x66) && code.get(p + 1) == Some(&0x0f) && code.get(p + 2) == Some(&0x1f) {
+        let m = modrm(code, p + 3, false, false)?;
+        let next = if m.mode == 0b11 {
+            p + 4
+        } else {
+            mem_operand(code, p + 4, &m, false, false)?.next
+        };
+        return Ok(Decoded { insts: vec![], next, ctrl: Ctrl::Fall });
+    }
     // Optional REX prefix (0x40..0x4F): W=wide(64), R=reg ext, X=index ext,
     // B=rm/base ext.
     let (rex_w, rex_r, rex_x, rex_b) = match code.get(p) {
@@ -139,6 +160,40 @@ fn decode_one(
                 RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(src) }
             };
             done(vec![Inst::Assign { dst, ty, value }], p)
+        }
+        // <alu> r, r/m — reg destination, r/m source (reg or memory): add/or/and/sub/xor.
+        0x03 | 0x0b | 0x23 | 0x2b | 0x33 => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            let bin = match op {
+                0x03 => BinOp::Add,
+                0x0b => BinOp::Or,
+                0x23 => BinOp::And,
+                0x2b => BinOp::Sub,
+                0x33 => BinOp::Xor,
+                _ => unreachable!(),
+            };
+            let dst = reg(m.reg);
+            if m.mode == 0b11 {
+                // `xor r, r` is the zeroing idiom.
+                let value = if op == 0x33 && m.rm == m.reg {
+                    RValue::Use(Operand::int(width, 0))
+                } else {
+                    RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(reg(m.rm)) }
+                };
+                done(vec![Inst::Assign { dst, ty, value }], p)
+            } else {
+                let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1 });
+                insts.push(Inst::Assign {
+                    dst,
+                    ty,
+                    value: RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(loaded) },
+                });
+                done(insts, mem.next)
+            }
         }
         0x89 => {
             // mov r/m, r — register move (mod 11) or store [base+disp].
@@ -708,6 +763,36 @@ fn decode_one(
             let op2 = *code.get(p).ok_or_else(|| CoreError::parse(format!("x86: truncated 0F opcode at offset {p}")))?;
             p += 1;
             match op2 {
+                // multi-byte nop (`0f 1f /M`) — consume the ModR/M operand, emit nothing.
+                0x1f => {
+                    let m = modrm(code, p, rex_r, rex_b)?;
+                    let next = if m.mode == 0b11 {
+                        p + 1
+                    } else {
+                        mem_operand(code, p + 1, &m, rex_x, rex_b)?.next
+                    };
+                    Ok(Decoded { insts: vec![], next, ctrl: Ctrl::Fall })
+                }
+                // cmovcc r, r/m (`0f 40..4f`) — conditional move. Reg-reg only; the moved
+                // value depends on flags we do not model precisely, so the destination
+                // becomes an unknown (sound over-approximation) rather than dropping the
+                // whole function. A memory-operand form is rejected (its load would need
+                // its own obligations).
+                0x40..=0x4f => {
+                    let m = modrm(code, p, rex_r, rex_b)?;
+                    p += 1;
+                    if m.mode != 0b11 {
+                        return Err(CoreError::unsupported("x86: cmovcc with a memory operand"));
+                    }
+                    done(
+                        vec![Inst::Assign {
+                            dst: reg(m.reg),
+                            ty,
+                            value: RValue::Use(Operand::Const(csolver_ir::Const::Undef)),
+                        }],
+                        p,
+                    )
+                }
                 // jcc rel32.
                 0x80..=0x8f => {
                     let rel = read_imm(code, p, 4)? as u32 as i32 as i64;
@@ -3763,6 +3848,38 @@ mod tests {
         let m = decode_function("f", &[0x0f, 0x05]);
         assert!(m.functions.is_empty());
         assert_eq!(m.unanalyzed.len(), 1);
+    }
+
+    #[test]
+    fn decodes_endbr_nop_cmov_and_alu_mem() {
+        // f3 0f 1e fa  endbr64
+        // 0f 1f 00     nop dword [rax]        (multi-byte nop)
+        // 0f 4f c7     cmovg eax, edi         (reg-reg cmov -> dst becomes unknown)
+        // 48 03 07     add rax, [rdi]         (alu r, r/m memory)
+        // 03 c1        add eax, ecx           (alu r, r/m reg)
+        // c3           ret
+        let code = [
+            0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x1f, 0x00, 0x0f, 0x4f, 0xc7, 0x48, 0x03, 0x07, 0x03,
+            0xc1, 0xc3,
+        ];
+        let m = decode_function("f", &code);
+        assert!(m.unanalyzed.is_empty(), "must fully decode: {:?}", m.unanalyzed);
+        assert_eq!(m.functions.len(), 1);
+        // The `add rax, [rdi]` emits a Load (a memory obligation the analysis sees).
+        let has_load = m.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Load { .. }));
+        assert!(has_load, "the memory-operand ALU form must emit a load");
+    }
+
+    /// endbr64 opens almost every CET-built kernel function; without it the whole
+    /// function dropped at byte 0.
+    #[test]
+    fn endbr_at_entry_does_not_drop_the_function() {
+        let m = decode_function("f", &[0xf3, 0x0f, 0x1e, 0xfa, 0x31, 0xc0, 0xc3]);
+        assert!(m.unanalyzed.is_empty(), "endbr64 entry must not drop: {:?}", m.unanalyzed);
     }
 
     #[test]
