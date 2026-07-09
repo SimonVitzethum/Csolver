@@ -86,6 +86,10 @@ const ACTIVITY_RESCALE_LIMIT: f64 = 1e100;
 /// fire on a genuinely hard one, but never churn on an easy one.
 const RESTART_UNIT: u64 = 50;
 
+/// Floor for the learnt-clause budget, so small formulas still permit a healthy
+/// pool before any reduction kicks in.
+const MIN_LEARNT_LIMIT: usize = 100;
+
 /// Wall-clock backstop per `solve`. The decision budget bounds *work* but not
 /// *time* — a single hard query (e.g. wide byte-pointer arithmetic in a SIMD
 /// search) can grind for many seconds before exhausting 2M decisions and hang the
@@ -137,6 +141,19 @@ pub struct Solver {
     luby_v: u64,
     /// How many restarts have happened (telemetry; asserted on in tests).
     restarts: u64,
+    /// Clauses `[0, num_original)` are the input; they are never deleted and keep
+    /// their indices for the whole solve. Learnt clauses are appended after and are
+    /// the only deletion candidates.
+    num_original: usize,
+    /// Per-clause LBD (literal block distance = distinct decision levels at learning
+    /// time). Lower is better; `≤ 2` clauses are "glue" and kept forever. Parallel
+    /// to `clauses`. Originals carry `0` (unused — they are never candidates).
+    lbd: Vec<u32>,
+    /// When the learnt-clause count exceeds this, the next level-0 restart reduces
+    /// the database; the bound then grows so reductions become rarer.
+    max_learnt: usize,
+    /// How many database reductions have happened (telemetry; asserted on in tests).
+    reductions: u64,
 }
 
 impl Solver {
@@ -149,6 +166,8 @@ impl Solver {
                 watches[lit_code(clause[1])].push(ci);
             }
         }
+        let num_original = clauses.len();
+        let lbd = vec![0; num_original];
         Solver {
             num_vars,
             clauses,
@@ -166,6 +185,10 @@ impl Solver {
             luby_u: 1,
             luby_v: 1,
             restarts: 0,
+            num_original,
+            lbd,
+            max_learnt: (num_original / 3).max(MIN_LEARNT_LIMIT),
+            reductions: 0,
         }
     }
 
@@ -275,7 +298,11 @@ impl Solver {
     /// The learnt clause is a chain of resolutions of clauses already in the
     /// store, so it is entailed by the input: adding it prunes the search without
     /// removing any model. This is the crux of the soundness argument.
-    fn analyze(&mut self, confl: usize) -> (Vec<Lit>, u32) {
+    ///
+    /// Returns `(learnt clause, backjump level, LBD)`. The LBD (count of distinct
+    /// decision levels among the clause's literals) is computed here, before the
+    /// backjump undoes those levels.
+    fn analyze(&mut self, confl: usize) -> (Vec<Lit>, u32, u32) {
         let d = self.decision_level();
         let mut learnt: Vec<Lit> = vec![Lit::pos(0)]; // slot 0 = asserting literal
         let mut counter = 0u32; // current-level literals not yet resolved
@@ -354,20 +381,26 @@ impl Solver {
         for &lit in &learnt[1..] {
             self.seen[lit.var as usize] = false;
         }
-        (learnt, btlevel)
+        // LBD: the number of distinct decision levels in the clause, measured now
+        // while the assignment is still intact.
+        let mut levels: Vec<u32> = learnt.iter().map(|l| self.level[l.var as usize]).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        (learnt, btlevel, levels.len() as u32)
     }
 
     /// Append a learnt clause and start watching its first two literals (already
     /// ordered by `analyze`: `lits[0]` asserting, `lits[1]` highest-level). A
     /// learnt unit has no second watch — it is enqueued at level 0 and never
     /// falsified again, so it needs none. Returns the new clause index.
-    fn add_learnt(&mut self, learnt: Vec<Lit>) -> usize {
+    fn add_learnt(&mut self, learnt: Vec<Lit>, lbd: u32) -> usize {
         let ci = self.clauses.len();
         if learnt.len() >= 2 {
             self.watches[lit_code(learnt[0])].push(ci);
             self.watches[lit_code(learnt[1])].push(ci);
         }
         self.clauses.push(learnt);
+        self.lbd.push(lbd);
         ci
     }
 
@@ -460,6 +493,12 @@ impl Solver {
                 self.conflicts_since_restart = 0;
                 self.restarts += 1;
                 self.advance_luby();
+                // At level 0 with the trail quiescent — the one safe point to prune
+                // the learnt-clause pool (no clause above level 0 is a live reason).
+                if self.clauses.len() - self.num_original > self.max_learnt {
+                    self.reduce_db();
+                    self.max_learnt += self.max_learnt / 2;
+                }
             }
 
             let Some(v) = self.pick_branch() else {
@@ -487,9 +526,9 @@ impl Solver {
                 if timed_out(&start, &mut ticks) {
                     return SatResult::Unknown;
                 }
-                let (learnt, btlevel) = self.analyze(confl);
+                let (learnt, btlevel, lbd) = self.analyze(confl);
                 self.backtrack_to(btlevel);
-                let ci = self.add_learnt(learnt);
+                let ci = self.add_learnt(learnt, lbd);
                 let asserting = self.clauses[ci][0];
                 let _ = self.enqueue(asserting, Some(ci));
                 self.conflicts_since_restart += 1;
@@ -505,6 +544,93 @@ impl Solver {
             self.luby_v = 1;
         } else {
             self.luby_v *= 2;
+        }
+    }
+
+    /// Drop the worse half of the deletable learnt clauses (highest LBD first),
+    /// then compact the store. MUST be called only at decision level 0.
+    ///
+    /// Only *learnt* clauses are ever removed, and never a "glue" clause (LBD ≤ 2)
+    /// nor one that is currently a reason for an assigned variable ("locked").
+    /// Deleting entailed learnt clauses only forgoes some learned pruning — it can
+    /// never remove a model nor an original clause, so `Unsat` stays sound; a
+    /// forgotten clause can simply be relearnt. Original clauses keep their indices
+    /// (they are contiguous at the front and never removed); learnt-clause indices
+    /// are remapped in every `reason` that survives.
+    fn reduce_db(&mut self) {
+        debug_assert_eq!(self.decision_level(), 0, "reduce_db only at level 0");
+        let n = self.clauses.len();
+        // Locked = the reason clause of any currently-assigned variable.
+        let mut locked = vec![false; n];
+        for &v in &self.trail {
+            if let Some(r) = self.reason[v as usize] {
+                locked[r] = true;
+            }
+        }
+        // Deletable learnt clauses, worst (highest LBD) first.
+        let mut candidates: Vec<usize> = (self.num_original..n)
+            .filter(|&ci| self.lbd[ci] > 2 && !locked[ci])
+            .collect();
+        candidates.sort_by_key(|&ci| std::cmp::Reverse(self.lbd[ci]));
+        let remove_count = candidates.len() / 2;
+        if remove_count == 0 {
+            return;
+        }
+        let mut remove = vec![false; n];
+        for &ci in candidates.iter().take(remove_count) {
+            remove[ci] = true;
+        }
+        // Compact, preserving order, and record the old→new index map.
+        let mut map = vec![usize::MAX; n];
+        let mut new_clauses: Vec<Vec<Lit>> = Vec::with_capacity(n - remove_count);
+        let mut new_lbd: Vec<u32> = Vec::with_capacity(n - remove_count);
+        for ci in 0..n {
+            if !remove[ci] {
+                map[ci] = new_clauses.len();
+                new_clauses.push(std::mem::take(&mut self.clauses[ci]));
+                new_lbd.push(self.lbd[ci]);
+            }
+        }
+        self.clauses = new_clauses;
+        self.lbd = new_lbd;
+        // Remap the reasons of assigned (level-0) variables; each such clause is
+        // locked, hence kept, so its new index exists.
+        for v in 0..self.num_vars {
+            if let Some(r) = self.reason[v] {
+                if self.assign[v].is_some() {
+                    self.reason[v] = Some(map[r]);
+                }
+            }
+        }
+        self.rebuild_watches();
+        self.reductions += 1;
+    }
+
+    /// Rebuild every watch list from scratch after the clause store was compacted.
+    /// Called at level 0, where each surviving clause has a valid pair of non-false
+    /// literals to watch (or is satisfied by a true one).
+    fn rebuild_watches(&mut self) {
+        for w in &mut self.watches {
+            w.clear();
+        }
+        for ci in 0..self.clauses.len() {
+            if self.clauses[ci].len() >= 2 {
+                self.reorder_watches(ci);
+                self.watches[lit_code(self.clauses[ci][0])].push(ci);
+                self.watches[lit_code(self.clauses[ci][1])].push(ci);
+            }
+        }
+    }
+
+    /// Move up to two non-false literals to indices 0 and 1 so the clause can be
+    /// watched consistently at the current (level-0) assignment.
+    fn reorder_watches(&mut self, ci: usize) {
+        let len = self.clauses[ci].len();
+        if let Some(k) = (0..len).find(|&k| self.lit_value(self.clauses[ci][k]) != Some(false)) {
+            self.clauses[ci].swap(0, k);
+        }
+        if let Some(k) = (1..len).find(|&k| self.lit_value(self.clauses[ci][k]) != Some(false)) {
+            self.clauses[ci].swap(1, k);
         }
     }
 }
@@ -648,6 +774,18 @@ mod tests {
         let mut s = Solver::new(n, clauses);
         assert_eq!(s.solve(DEFAULT_BUDGET), SatResult::Unsat);
         assert!(s.restarts > 0, "expected a restart, got {}", s.restarts);
+    }
+
+    #[test]
+    fn clause_deletion_fires_without_changing_the_verdict() {
+        // Pigeonhole 6→5 learns enough clauses to cross the reduction threshold, so
+        // at least one database reduction must run — and the verdict must still be
+        // exactly Unsat. Deleting learnt clauses may only forgo pruning, never a
+        // model nor an original clause.
+        let (n, clauses) = pigeonhole(6, 5);
+        let mut s = Solver::new(n, clauses);
+        assert_eq!(s.solve(DEFAULT_BUDGET), SatResult::Unsat);
+        assert!(s.reductions > 0, "expected a reduction, got {}", s.reductions);
     }
 
     #[test]
