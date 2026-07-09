@@ -39,9 +39,10 @@
 //! `internal-call-contract` assumption, not `param-contracts` — the trust basis
 //! is different (derived from call-site completeness, not declared attributes).
 
+use csolver_absint::{analyze_intervals, Bound, IntervalAnalysis};
 use csolver_ir::{
-    Callee, Condition, Const, FieldContract, FuncId, Inst, Module, Operand, PtrContract, RegId,
-    SizeSpec, Terminator,
+    BlockId, Callee, Condition, Const, FieldContract, FuncId, Inst, Module, Operand, PtrContract,
+    RegId, SizeSpec, Terminator, Type,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -205,6 +206,109 @@ fn synthesize_round(
                     sentinel: None,
                 },
             ))
+        })
+        .collect()
+}
+
+/// The interval of a call-site argument (the value flowing into a parameter),
+/// as a finite `[lo, hi]` — `None` if it is not a bounded integer there.
+fn arg_interval(arg: &Operand, iv: &IntervalAnalysis, block: BlockId) -> Option<(i128, i128)> {
+    match arg {
+        Operand::Const(Const::Int(bv)) => Some((bv.signed(), bv.signed())),
+        Operand::Reg(r) => {
+            let interval = iv.entry_interval(block, *r);
+            let (Bound::Fin(lo), Bound::Fin(hi)) = (interval.lower()?, interval.upper()?) else {
+                return None;
+            };
+            (lo <= hi).then_some((lo, hi))
+        }
+        _ => None,
+    }
+}
+
+/// Interprocedural **scalar value-range preconditions**. For each integer parameter of a
+/// function whose call sites are provably complete (internal linkage, or any function under
+/// closed-world), take the **union** of the interval the argument holds at every call site:
+/// the callee may then assume `param ∈ [lo, hi]`, since the union covers every value any
+/// visible caller can pass. This is the interprocedural analogue of the pointer-contract
+/// synthesis (same completeness/soundness basis), for scalars — e.g. a `switch (optname)
+/// case A..B:` guard at the call site bounds the callee's `optname`, so an array index
+/// `t[optname - A]` inside the callee is proven in-bounds instead of flagged at `optname =
+/// UINT_MAX` no caller can produce. Prove-only (an out-of-range witness is the caller's
+/// fault). Single pass — scalar ranges do not feed one another.
+pub(crate) fn synthesize_scalars(
+    module: &Module,
+    closed_world: bool,
+) -> HashMap<(FuncId, u32), (i128, i128)> {
+    let escaped = address_taken_names(module);
+    let mut candidates: HashSet<(FuncId, u32)> = HashSet::new();
+    let mut candidate_callees: HashSet<FuncId> = HashSet::new();
+    for f in &module.functions {
+        let complete = closed_world || module.internal.contains(&f.id);
+        if !complete || escaped.contains(&f.name) {
+            continue;
+        }
+        for (i, (_, ty)) in f.params.iter().enumerate() {
+            if matches!(ty, Type::Int { .. }) {
+                candidates.insert((f.id, i as u32));
+                candidate_callees.insert(f.id);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+
+    // Fold every call site's argument interval by UNION. `None` = a site whose argument we
+    // could not bound — the parameter is then left unconstrained (permanently ineligible).
+    let mut folded: HashMap<(FuncId, u32), Option<(i128, i128)>> = HashMap::new();
+    for caller in &module.functions {
+        let calls_candidate = caller.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+            matches!(inst, Inst::Call { callee: Callee::Direct(g), .. } if candidate_callees.contains(g))
+        });
+        if !calls_candidate {
+            continue;
+        }
+        let iv = analyze_intervals(caller);
+        for block in &caller.blocks {
+            for inst in &block.insts {
+                let Inst::Call { callee: Callee::Direct(g), args, .. } = inst else {
+                    continue;
+                };
+                if !candidate_callees.contains(g) {
+                    continue;
+                }
+                let Some(callee) = module.function(*g) else { continue };
+                if args.len() != callee.params.len() {
+                    for i in 0..callee.params.len() as u32 {
+                        if candidates.contains(&(*g, i)) {
+                            folded.insert((*g, i), None);
+                        }
+                    }
+                    continue;
+                }
+                for (i, arg) in args.iter().enumerate() {
+                    let key = (*g, i as u32);
+                    if !candidates.contains(&key) {
+                        continue;
+                    }
+                    let site = arg_interval(arg, &iv, block.id);
+                    let entry = folded.entry(key).or_insert(site);
+                    *entry = match (*entry, site) {
+                        (Some((la, ha)), Some((lb, hb))) => Some((la.min(lb), ha.max(hb))),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+
+    folded
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let (lo, hi) = v?;
+            // A full-width range constrains nothing; drop it to avoid a useless assumption.
+            (lo > i64::MIN as i128 || hi < i64::MAX as i128).then_some((k, (lo, hi)))
         })
         .collect()
 }

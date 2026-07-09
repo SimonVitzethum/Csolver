@@ -39,7 +39,8 @@ use csolver_ir::{
     Condition, Const, FieldContract, FuncId, Function, Inst, Module, Operand, PtrContract, SizeSpec,
 };
 use csolver_symbolic::{
-    discharge_function, discharge_with_fields, summarize_module, Summary, SymOutcome, SymbolicReport,
+    discharge_function, discharge_with_scalars, summarize_module, Summary, SymOutcome,
+    SymbolicReport,
 };
 use std::collections::HashMap;
 
@@ -155,8 +156,19 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
     // Interprocedural member-provenance: which fields of a contracted parameter
     // every call site fills with a valid pointer (empty unless internal/closed).
     let field_synth = contracts::synthesize_fields(module, &synthesized, config.closed_world);
-    let mut functions =
-        verify_functions(module, summaries.as_ref(), &synthesized, &field_synth, config, threads);
+    // Interprocedural scalar value-range preconditions: the range each integer parameter
+    // is bounded to by the union of its (complete) call sites — so a callee proves an index
+    // in bounds using its callers' validation (e.g. a `switch (optname) case A..B:` guard).
+    let scalar_synth = contracts::synthesize_scalars(module, config.closed_world);
+    let mut functions = verify_functions(
+        module,
+        summaries.as_ref(),
+        &synthesized,
+        &field_synth,
+        &scalar_synth,
+        config,
+        threads,
+    );
 
     // Assign global obligation ids by a serial pass in function order — this
     // reproduces exactly the sequential ids a serial run would give, regardless of
@@ -220,11 +232,13 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
 /// Verify one function in isolation with a *local* obligation-id counter (the
 /// caller renumbers globally). Self-contained: its own solver context, read-only
 /// summaries/contracts/config — so it is safe to run on any worker thread.
+#[allow(clippy::too_many_arguments)]
 fn verify_one_function(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
     field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
+    scalar_synth: &HashMap<(FuncId, u32), (i128, i128)>,
     config: &Config,
     f: &Function,
 ) -> FunctionReport {
@@ -268,6 +282,10 @@ fn verify_one_function(
     let field_contracts: Vec<Vec<FieldContract>> = (0..f.params.len())
         .map(|i| field_synth.get(&(f.id, i as u32)).cloned().unwrap_or_default())
         .collect();
+    // Per-parameter scalar value-range preconditions (None = unconstrained).
+    let scalar_pre: Vec<Option<(i128, i128)>> = (0..f.params.len())
+        .map(|i| scalar_synth.get(&(f.id, i as u32)).copied())
+        .collect();
     // An entry policy (if given) decides attacker-reachability by name — the sound
     // kernel model, where LLVM external linkage does NOT mean userspace-reachable.
     let exported = match &config.entry_patterns {
@@ -280,6 +298,7 @@ fn verify_one_function(
         summaries,
         &contracts,
         &field_contracts,
+        &scalar_pre,
         &module.globals,
         &module.prov_grants,
         config,
@@ -297,6 +316,7 @@ fn verify_functions(
     summaries: Option<&HashMap<FuncId, Summary>>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
     field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
+    scalar_synth: &HashMap<(FuncId, u32), (i128, i128)>,
     config: &Config,
     threads: usize,
 ) -> Vec<FunctionReport> {
@@ -305,7 +325,7 @@ fn verify_functions(
     if threads <= 1 || n <= 1 {
         return fns
             .iter()
-            .map(|f| verify_one_function(module, summaries, synthesized, field_synth, config, f))
+            .map(|f| verify_one_function(module, summaries, synthesized, field_synth, scalar_synth, config, f))
             .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -317,8 +337,9 @@ fn verify_functions(
                 if i >= n {
                     break;
                 }
-                let r =
-                    verify_one_function(module, summaries, synthesized, field_synth, config, &fns[i]);
+                let r = verify_one_function(
+                    module, summaries, synthesized, field_synth, scalar_synth, config, &fns[i],
+                );
                 // Recover from a poisoned lock (a worker panicked) rather than
                 // cascading the panic — the collected data is still valid.
                 out.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((i, r));
@@ -333,6 +354,17 @@ fn verify_functions(
 /// Expand a known assumption id into its full record for the report.
 fn assumption_record(id: String) -> Assumption {
     match id.as_str() {
+        "caller-range-precondition" => Assumption {
+            id,
+            statement: "a non-entry function's integer parameter stays within the range \
+                        that every visible call site passes it"
+                .into(),
+            justification: "the callee's call sites are provably complete (internal linkage, \
+                            or the whole-program assertion), so the union of the argument \
+                            ranges over all sites bounds the parameter; the callee is not an \
+                            attacker-reachable entry, so no unseen caller can escape the range"
+                .into(),
+        },
         LINEAR_ASSUMPTION => Assumption {
             id,
             statement: "the integer/offset/size quantities reasoned about are \
@@ -462,7 +494,7 @@ fn assumption_record(id: String) -> Assumption {
 /// Verify a single function in isolation (no interprocedural summaries or
 /// parameter contracts), drawing obligation ids from `next_id`.
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
-    verify_function_with(f, None, &[], &[], &HashMap::new(), &HashMap::new(), config, true, next_id)
+    verify_function_with(f, None, &[], &[], &[], &HashMap::new(), &HashMap::new(), config, true, next_id)
 }
 
 /// Verify a single function, optionally using module-wide summaries for calls
@@ -473,6 +505,7 @@ fn verify_function_with(
     summaries: Option<&HashMap<FuncId, Summary>>,
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
+    scalar_pre: &[Option<(i128, i128)>],
     globals: &HashMap<String, csolver_ir::GlobalDef>,
     prov_grants: &HashMap<u32, std::collections::HashSet<u32>>,
     config: &Config,
@@ -481,9 +514,9 @@ fn verify_function_with(
 ) -> FunctionReport {
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
-        Some(s) => discharge_with_fields(
-            f, s, contracts, field_contracts, globals, prov_grants, config.bug_finding, exported,
-            config.assume_valid_params,
+        Some(s) => discharge_with_scalars(
+            f, s, contracts, field_contracts, scalar_pre, globals, prov_grants, config.bug_finding,
+            exported, config.assume_valid_params,
         ),
         None => discharge_function(f),
     });

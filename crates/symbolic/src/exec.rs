@@ -43,6 +43,9 @@ const ISIZE_MAX: u128 = i64::MAX as u128;
 const ALLOC_SUCCEEDS: &str = "alloc-succeeds";
 const LINEAR_NO_OVERFLOW: &str = "linear-no-overflow";
 const PARAM_CONTRACTS: &str = "param-contracts";
+/// A callee assuming its integer parameter stays in the range every visible caller
+/// passes (interprocedural scalar precondition — see `discharge_with_scalars`).
+const SCALAR_PRECONDITION: &str = "caller-range-precondition";
 const SLICE_ABI: &str = "slice-abi";
 /// Proofs about accesses to global/static definitions rest on the module's
 /// declared global layout (size/alignment/mutability of `@name = global/constant …`).
@@ -111,7 +114,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &HashMap::new(), &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new())
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -120,7 +123,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &HashMap::new(), &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &[], &HashMap::new(), &HashMap::new())
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -133,7 +136,7 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], globals, &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], &[], globals, &HashMap::new())
 }
 
 /// As [`discharge_full`], plus interprocedural **member-provenance**:
@@ -154,8 +157,32 @@ pub fn discharge_with_fields(
     exported: bool,
     assume_valid_params: bool,
 ) -> SymbolicReport {
+    discharge_with_scalars(
+        f, summaries, contracts, field_contracts, &[], globals, prov_grants, bug_finding, exported,
+        assume_valid_params,
+    )
+}
+
+/// As [`discharge_with_fields`], plus per-parameter **scalar value-range preconditions**:
+/// `scalar_pre[i] = Some((lo, hi))` lets a *non-entry* function assume its integer
+/// parameter `i` stays in `[lo, hi]` — the union of the ranges every visible caller passes
+/// (see the interprocedural scalar synthesis). Prove-only, surfaced as a
+/// `caller-range-precondition` assumption.
+#[allow(clippy::too_many_arguments)]
+pub fn discharge_with_scalars(
+    f: &Function,
+    summaries: &HashMap<FuncId, Summary>,
+    contracts: &[Option<PtrContract>],
+    field_contracts: &[Vec<FieldContract>],
+    scalar_pre: &[Option<(i128, i128)>],
+    globals: &HashMap<String, GlobalDef>,
+    prov_grants: &HashMap<u32, HashSet<u32>>,
+    bug_finding: bool,
+    exported: bool,
+    assume_valid_params: bool,
+) -> SymbolicReport {
     let limits = ExecLimits { bug_finding, exported, assume_valid_params, ..ExecLimits::default() };
-    discharge_inner(f, limits, summaries, contracts, field_contracts, globals, prov_grants)
+    discharge_inner(f, limits, summaries, contracts, field_contracts, scalar_pre, globals, prov_grants)
 }
 
 /// As [`discharge_function`], with explicit limits and no summaries.
@@ -166,7 +193,7 @@ pub fn discharge_with_fields(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &[], &[], &HashMap::new(), &HashMap::new())
+    discharge_inner(f, limits, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new())
 }
 
 /// Every symbol name referenced by an operand of `f` (`Const::Symbol` /
@@ -246,6 +273,7 @@ fn discharge_inner(
     summaries: &HashMap<FuncId, Summary>,
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
+    scalar_pre: &[Option<(i128, i128)>],
     globals: &HashMap<String, GlobalDef>,
     prov_grants: &HashMap<u32, HashSet<u32>>,
 ) -> SymbolicReport {
@@ -338,7 +366,27 @@ fn discharge_inner(
             let v = if ty.is_ptr() {
                 ex.fresh_value(ty, POrigin::Param)
             } else {
-                SymValue::Scalar(ex.ctx.symbol(format!("arg{i}"), type_width(ty)))
+                let width = type_width(ty);
+                let sym = ex.ctx.symbol(format!("arg{i}"), width);
+                // Interprocedural scalar precondition: a NON-entry function's integer
+                // parameter is bounded by the union of the ranges its (all visible) callers
+                // pass — so an index derived from it is proven in bounds instead of flagged
+                // at a value no caller can produce. Not applied to an adversarial entry,
+                // whose parameters are attacker-controlled. Prove-only (a `caller-range`
+                // assumption), so an out-of-range witness is not a real counterexample.
+                if !limits.exported {
+                    if let Some(Some((lo, hi))) = scalar_pre.get(i) {
+                        let mask = |v: i128| if width >= 128 { v as u128 } else { (v as u128) & ((1u128 << width) - 1) };
+                        let lo_e = ex.ctx.int(width, mask(*lo));
+                        let hi_e = ex.ctx.int(width, mask(*hi));
+                        let ge = ex.ctx.cmp(SCmp::Sle, lo_e, sym);
+                        let le = ex.ctx.cmp(SCmp::Sle, sym, hi_e);
+                        facts.push(ge);
+                        facts.push(le);
+                        ex.assumptions.insert(SCALAR_PRECONDITION);
+                    }
+                }
+                SymValue::Scalar(sym)
             };
             env.insert(*reg, v);
         }
