@@ -16,11 +16,15 @@
 //! (never as a refutation), so a budget bail can only ever lose precision, never
 //! soundness.
 //!
-//! The implementation is deliberately simple: chronological backtracking with
-//! unit propagation driven by per-variable occurrence lists. It is complete for
-//! the formulas it is given (within the budget) but makes no attempt at the
-//! sophistication of a modern CDCL solver — the bit-blasted memory-safety
-//! queries are small.
+//! The engine is CDCL (conflict-driven clause learning): unit propagation over
+//! per-variable occurrence lists, and on every conflict a **1-UIP** analysis
+//! that derives an *asserting* learnt clause and backjumps non-chronologically
+//! to its assertion level. Every learnt clause is a resolvent of clauses already
+//! present, hence a logical consequence of the input — it removes no models, so
+//! `Unsat` stays exactly as trustworthy as under plain DPLL (the soundness
+//! contract above is preserved; learning only prunes the search, never the
+//! model set). A learnt-clause store that only grows within a single bounded
+//! `solve` keeps the whole thing pure Rust with no external solver.
 
 /// A boolean literal: a variable together with a polarity.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -77,26 +81,29 @@ pub const DEFAULT_BUDGET: u64 = 200_000;
 /// it (so they stay deterministic); it fires only on a pathological grind.
 const SOLVE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// A DPLL solver over a fixed set of variables and clauses.
+/// A CDCL solver over a fixed set of variables and clauses.
 pub struct Solver {
     num_vars: usize,
     clauses: Vec<Vec<Lit>>,
-    /// `var_clauses[v]` = indices of clauses that mention variable `v`.
+    /// `var_clauses[v]` = indices of clauses that mention variable `v` (kept in
+    /// sync as learnt clauses are appended).
     var_clauses: Vec<Vec<usize>>,
     assign: Vec<Option<bool>>,
+    /// Decision level at which each variable was assigned (valid while assigned).
+    level: Vec<u32>,
+    /// Antecedent: the clause that *forced* a variable during propagation, or
+    /// `None` for a decision (or a level-0 unit seed). Drives 1-UIP analysis.
+    reason: Vec<Option<usize>>,
     /// Variables assigned, in chronological order (for backtracking).
     trail: Vec<u32>,
+    /// `trail_lim[d]` = trail length just before the `(d+1)`-th decision; its
+    /// length is the current decision level.
+    trail_lim: Vec<usize>,
     /// Variables newly assigned and awaiting propagation.
     prop_queue: Vec<u32>,
-}
-
-/// One decision frame for iterative backtracking.
-struct Decision {
-    var: u32,
-    /// Whether the second (negative) phase has been tried.
-    second: bool,
-    /// Trail length just before the decision was made.
-    mark: usize,
+    /// Reusable "touched in this conflict analysis" scratch (avoids a per-conflict
+    /// allocation); always fully reset before `analyze` returns.
+    seen: Vec<bool>,
 }
 
 impl Solver {
@@ -117,9 +124,18 @@ impl Solver {
             clauses,
             var_clauses,
             assign: vec![None; num_vars],
+            level: vec![0; num_vars],
+            reason: vec![None; num_vars],
             trail: Vec::new(),
+            trail_lim: Vec::new(),
             prop_queue: Vec::new(),
+            seen: vec![false; num_vars],
         }
+    }
+
+    /// The current decision level (number of decisions on the trail).
+    fn decision_level(&self) -> u32 {
+        self.trail_lim.len() as u32
     }
 
     /// The truth value of a literal under the current partial assignment.
@@ -127,14 +143,17 @@ impl Solver {
         self.assign[lit.var as usize].map(|b| b != lit.neg)
     }
 
-    /// Assign `lit` to true if unassigned. Returns `false` on a direct conflict
-    /// (the variable is already assigned the opposite value).
-    fn enqueue(&mut self, lit: Lit) -> bool {
+    /// Assign `lit` to true if unassigned, recording its decision level and the
+    /// `reason` clause that forced it (`None` for a decision). Returns `false` on
+    /// a direct conflict (the variable already holds the opposite value).
+    fn enqueue(&mut self, lit: Lit, reason: Option<usize>) -> bool {
         let v = lit.var as usize;
         match self.assign[v] {
             Some(b) => b != lit.neg,
             None => {
                 self.assign[v] = Some(!lit.neg);
+                self.level[v] = self.decision_level();
+                self.reason[v] = reason;
                 self.trail.push(lit.var);
                 self.prop_queue.push(lit.var);
                 true
@@ -142,8 +161,9 @@ impl Solver {
         }
     }
 
-    /// Unit-propagate to a fixpoint. Returns `false` if a conflict is reached.
-    fn propagate(&mut self) -> bool {
+    /// Unit-propagate to a fixpoint. Returns the index of a falsified clause on
+    /// conflict, else `None`.
+    fn propagate(&mut self) -> Option<usize> {
         while let Some(v) = self.prop_queue.pop() {
             // Re-examine every clause mentioning `v`. We index by position so we
             // do not hold a borrow of `self.var_clauses` across `enqueue`.
@@ -171,27 +191,119 @@ impl Solver {
                     continue;
                 }
                 match (count, unassigned) {
-                    (0, _) => return false, // all literals false ⇒ conflict
+                    (0, _) => return Some(ci), // all literals false ⇒ conflict
                     (1, Some(unit)) => {
-                        // Unit clause: the lone unassigned literal is forced.
-                        if !self.enqueue(unit) {
-                            return false;
-                        }
+                        // Unit clause: the lone unassigned literal is forced, with
+                        // `ci` as its antecedent. It is unassigned, so this never
+                        // conflicts here.
+                        self.enqueue(unit, Some(ci));
                     }
                     _ => {}
                 }
             }
         }
-        true
+        None
     }
 
-    /// Undo all assignments made after `mark`, and discard pending propagations.
-    fn backtrack_to(&mut self, mark: usize) {
-        while self.trail.len() > mark {
+    /// 1-UIP conflict analysis. Given the falsified clause `confl` (reached at a
+    /// decision level ≥ 1), resolve backwards along the implication graph until a
+    /// single literal of the current level remains — the *unique implication
+    /// point* — and return the asserting learnt clause (with the UIP literal at
+    /// index 0) together with the level to backjump to.
+    ///
+    /// The learnt clause is a chain of resolutions of clauses already in the
+    /// store, so it is entailed by the input: adding it prunes the search without
+    /// removing any model. This is the crux of the soundness argument.
+    fn analyze(&mut self, confl: usize) -> (Vec<Lit>, u32) {
+        let d = self.decision_level();
+        let mut learnt: Vec<Lit> = vec![Lit::pos(0)]; // slot 0 = asserting literal
+        let mut counter = 0u32; // current-level literals not yet resolved
+        let mut pivot: Option<u32> = None;
+        let mut confl_ci = confl;
+        let mut idx = self.trail.len();
+        let uip = loop {
+            for &lit in &self.clauses[confl_ci] {
+                let v = lit.var;
+                if Some(v) == pivot {
+                    continue; // the literal we are resolving on
+                }
+                if !self.seen[v as usize] && self.level[v as usize] > 0 {
+                    self.seen[v as usize] = true;
+                    if self.level[v as usize] == d {
+                        counter += 1;
+                    } else {
+                        learnt.push(lit); // a lower-level reason literal
+                    }
+                }
+            }
+            // Walk the trail back to the most recent literal seen at this level.
+            while !self.seen[self.trail[idx - 1] as usize] {
+                idx -= 1;
+            }
+            idx -= 1;
+            let tv = self.trail[idx];
+            self.seen[tv as usize] = false;
+            counter -= 1;
+            if counter == 0 {
+                break tv; // the UIP
+            }
+            pivot = Some(tv);
+            // `tv` was propagated, so it has an antecedent; the `None` arm is
+            // unreachable in a correct 1-UIP walk. Treating it as the UIP is a
+            // panic-free fallback that keeps the clause a valid resolvent; it
+            // fully clears the scratch so no marks leak into the next analysis.
+            match self.reason[tv as usize] {
+                Some(r) => confl_ci = r,
+                None => {
+                    self.seen.iter_mut().for_each(|b| *b = false);
+                    break tv;
+                }
+            }
+        };
+        // The asserting literal is the one that is *false* under the current
+        // assignment (so after backjump the clause becomes unit and flips it).
+        learnt[0] = Lit {
+            var: uip,
+            neg: self.assign[uip as usize] == Some(true),
+        };
+        // Backjump to the second-highest level in the clause (0 for a unit).
+        let mut btlevel = 0u32;
+        for &lit in &learnt[1..] {
+            btlevel = btlevel.max(self.level[lit.var as usize]);
+        }
+        // Reset the scratch: exactly the lower-level literals are still marked.
+        for &lit in &learnt[1..] {
+            self.seen[lit.var as usize] = false;
+        }
+        (learnt, btlevel)
+    }
+
+    /// Append a learnt clause and index it in the occurrence lists. Returns its
+    /// clause index; the asserting literal is at position 0.
+    fn add_learnt(&mut self, learnt: Vec<Lit>) -> usize {
+        let ci = self.clauses.len();
+        for &lit in &learnt {
+            let v = lit.var as usize;
+            if self.var_clauses[v].last() != Some(&ci) {
+                self.var_clauses[v].push(ci);
+            }
+        }
+        self.clauses.push(learnt);
+        ci
+    }
+
+    /// Undo every assignment made above decision level `level`.
+    fn backtrack_to(&mut self, level: u32) {
+        if self.decision_level() <= level {
+            return;
+        }
+        let target = self.trail_lim[level as usize];
+        while self.trail.len() > target {
             if let Some(v) = self.trail.pop() {
                 self.assign[v as usize] = None;
             }
         }
+        self.trail_lim.truncate(level as usize);
         self.prop_queue.clear();
     }
 
@@ -214,18 +326,17 @@ impl Solver {
             match self.clauses[ci].len() {
                 0 => return SatResult::Unsat,
                 1 => {
-                    if !self.enqueue(self.clauses[ci][0]) {
+                    if !self.enqueue(self.clauses[ci][0], Some(ci)) {
                         return SatResult::Unsat;
                     }
                 }
                 _ => {}
             }
         }
-        if !self.propagate() {
-            return SatResult::Unsat;
+        if self.propagate().is_some() {
+            return SatResult::Unsat; // conflict at level 0
         }
 
-        let mut decisions: Vec<Decision> = Vec::new();
         let mut budget_left = budget;
         let start = std::time::Instant::now();
         let mut ticks: u32 = 0;
@@ -237,45 +348,43 @@ impl Solver {
                 return SatResult::Unknown;
             }
             budget_left -= 1;
-            // Wall-clock backstop (see `SOLVE_TIME_BUDGET`): checked every 8192
-            // decisions so the clock read is negligible.
-            ticks += 1;
-            if ticks >= 8192 {
-                ticks = 0;
-                if start.elapsed() > SOLVE_TIME_BUDGET {
-                    return SatResult::Unknown;
-                }
+            if timed_out(&start, &mut ticks) {
+                return SatResult::Unknown;
             }
 
-            // Decide v = true first.
-            decisions.push(Decision {
-                var: v,
-                second: false,
-                mark: self.trail.len(),
-            });
-            let _ = self.enqueue(Lit::pos(v));
+            // New decision level: decide v = true.
+            self.trail_lim.push(self.trail.len());
+            let _ = self.enqueue(Lit::pos(v), None);
 
-            // Propagate; on conflict, backtrack (flipping/popping decisions).
-            while !self.propagate() {
-                loop {
-                    let Some(top) = decisions.last_mut() else {
-                        return SatResult::Unsat;
-                    };
-                    let mark = top.mark;
-                    let var = top.var;
-                    self.backtrack_to(mark);
-                    if !top.second {
-                        top.second = true;
-                        let _ = self.enqueue(Lit::neg(var));
-                        break; // re-propagate with the flipped decision
-                    }
-                    // Both phases exhausted: drop this decision and keep
-                    // backtracking.
-                    decisions.pop();
+            // Propagate; on each conflict, learn a 1-UIP clause and backjump.
+            while let Some(confl) = self.propagate() {
+                if self.trail_lim.is_empty() {
+                    return SatResult::Unsat; // conflict at level 0 ⇒ refuted
                 }
+                // A conflict chain does not consume the *decision* budget, so guard
+                // its runtime with the same wall-clock backstop.
+                if timed_out(&start, &mut ticks) {
+                    return SatResult::Unknown;
+                }
+                let (learnt, btlevel) = self.analyze(confl);
+                self.backtrack_to(btlevel);
+                let ci = self.add_learnt(learnt);
+                let asserting = self.clauses[ci][0];
+                let _ = self.enqueue(asserting, Some(ci));
             }
         }
     }
+}
+
+/// Wall-clock backstop, checked every 8192 calls so the clock read is negligible.
+/// Returns `true` when [`SOLVE_TIME_BUDGET`] is exceeded (⇒ bail to `Unknown`).
+fn timed_out(start: &std::time::Instant, ticks: &mut u32) -> bool {
+    *ticks += 1;
+    if *ticks >= 8192 {
+        *ticks = 0;
+        return start.elapsed() > SOLVE_TIME_BUDGET;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -354,10 +463,120 @@ mod tests {
     }
 
     #[test]
+    fn pigeonhole_4_into_3_is_unsat() {
+        // 4 pigeons into 3 holes — the smallest hole-principle instance that
+        // actually forces conflict-driven learning + backjumping. var(p,h) = p*3+h.
+        let v = |p: u32, h: u32| p * 3 + h;
+        let mut clauses = Vec::new();
+        // each pigeon sits in some hole
+        for p in 0..4 {
+            clauses.push((0..3).map(|h| Lit::pos(v(p, h))).collect());
+        }
+        // no two pigeons share a hole
+        for h in 0..3 {
+            for p1 in 0..4 {
+                for p2 in (p1 + 1)..4 {
+                    clauses.push(vec![Lit::neg(v(p1, h)), Lit::neg(v(p2, h))]);
+                }
+            }
+        }
+        let mut s = Solver::new(12, clauses);
+        assert_eq!(s.solve(DEFAULT_BUDGET), SatResult::Unsat);
+    }
+
+    #[test]
+    fn learned_clause_never_loses_a_model() {
+        // A satisfiable instance that drives several conflicts before a model is
+        // found; the learnt clauses must not prune the (only) solution.
+        // (a∨b)(¬a∨c)(¬b∨c)(¬c∨d)(a∨¬d∨e) with a forced route.
+        let clauses = vec![
+            vec![Lit::pos(0), Lit::pos(1)],
+            vec![Lit::neg(0), Lit::pos(2)],
+            vec![Lit::neg(1), Lit::pos(2)],
+            vec![Lit::neg(2), Lit::pos(3)],
+            vec![Lit::pos(0), Lit::neg(3), Lit::pos(4)],
+        ];
+        let mut s = Solver::new(5, clauses.clone());
+        match s.solve(DEFAULT_BUDGET) {
+            SatResult::Sat(m) => assert!(check_model(&clauses, &m)),
+            other => panic!("expected SAT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflict_at_level_zero_after_learning_is_unsat() {
+        // Forces a learnt unit that then propagates into a top-level conflict.
+        // (x∨y)(x∨¬y)(¬x∨z)(¬x∨¬z) ⇒ x must be false (first two) and true
+        // (last two, once y/z resolved) — unsatisfiable via learning.
+        let clauses = vec![
+            vec![Lit::pos(0), Lit::pos(1)],
+            vec![Lit::pos(0), Lit::neg(1)],
+            vec![Lit::neg(0), Lit::pos(2)],
+            vec![Lit::neg(0), Lit::neg(2)],
+        ];
+        let mut s = Solver::new(3, clauses);
+        assert_eq!(s.solve(DEFAULT_BUDGET), SatResult::Unsat);
+    }
+
+    #[test]
     fn budget_zero_on_open_problem_is_unknown() {
         // A problem needing at least one decision, with budget 0 ⇒ Unknown.
         let clauses = vec![vec![Lit::pos(0), Lit::pos(1)]];
         let mut s = Solver::new(2, clauses);
         assert_eq!(s.solve(0), SatResult::Unknown);
+    }
+
+    /// Brute-force oracle: is `clauses` satisfiable over `n` variables?
+    fn brute_force_sat(n: u32, clauses: &[Vec<Lit>]) -> bool {
+        (0u32..(1u32 << n)).any(|mask| {
+            let model: Vec<bool> = (0..n).map(|v| mask & (1 << v) != 0).collect();
+            check_model(clauses, &model)
+        })
+    }
+
+    #[test]
+    fn cdcl_agrees_with_brute_force_on_random_instances() {
+        // The decisive "nothing is lost" guard: over many random small 3-CNFs,
+        // CDCL's verdict must match an exhaustive truth-table oracle exactly —
+        // in particular it must NEVER report Unsat on a satisfiable instance
+        // (a false refutation) nor Sat with an invalid model.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let n: u32 = 3 + (rng() % 4) as u32; // 3..=6 vars
+            let m = 1 + (rng() % 14) as usize; // 1..=14 clauses
+            let clauses: Vec<Vec<Lit>> = (0..m)
+                .map(|_| {
+                    let k = 1 + (rng() % 3) as usize; // 1..=3 literals
+                    (0..k)
+                        .map(|_| {
+                            let var = (rng() % n as u64) as u32;
+                            if rng() & 1 == 0 { Lit::pos(var) } else { Lit::neg(var) }
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let oracle = brute_force_sat(n, &clauses);
+            let mut s = Solver::new(n as usize, clauses.clone());
+            match s.solve(DEFAULT_BUDGET) {
+                SatResult::Sat(model) => {
+                    assert!(oracle, "CDCL said SAT but oracle says UNSAT: {clauses:?}");
+                    assert!(
+                        check_model(&clauses, &model),
+                        "CDCL returned an invalid model: {clauses:?} / {model:?}"
+                    );
+                }
+                SatResult::Unsat => {
+                    assert!(!oracle, "CDCL falsely refuted a satisfiable instance: {clauses:?}");
+                }
+                SatResult::Unknown => panic!("small instance hit the budget: {clauses:?}"),
+            }
+        }
     }
 }
