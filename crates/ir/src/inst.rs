@@ -484,6 +484,9 @@ impl Inst {
             Inst::CapRequire { .. } => &[WriteCapability],
             Inst::CapRequireIfAlias { .. } => &[WriteCapability],
             Inst::CapRequireIfAliasFields { .. } => &[WriteCapability],
+            // Bug-finding only: a lock-acquiring call must not re-acquire a lock already
+            // held on the same path (an AA self-deadlock).
+            Inst::Call { .. } => &[DataRace],
             _ => &[],
         }
     }

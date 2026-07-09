@@ -55,6 +55,22 @@ const GLOBAL_MEMORY: &str = "global-memory";
 const VALID_REFERENCE: &str = "valid-reference";
 const STRUCT_ABI: &str = "struct-abi";
 
+/// Lock-acquiring kernel primitives (by argument-0 = the lock). Re-acquiring one
+/// already held on a path is an AA self-deadlock (`SafetyProperty::DataRace`).
+const LOCK_ACQUIRE: &[&str] = &[
+    "spin_lock", "_raw_spin_lock", "spin_lock_irq", "spin_lock_bh",
+    "_raw_spin_lock_irq", "_raw_spin_lock_bh", "raw_spin_lock", "raw_spin_lock_irq",
+    "mutex_lock", "mutex_lock_nested", "read_lock", "write_lock",
+    "_raw_read_lock", "_raw_write_lock", "down", "down_write", "down_read",
+];
+/// The matching lock-releasing primitives (drop the held lock).
+const LOCK_RELEASE: &[&str] = &[
+    "spin_unlock", "_raw_spin_unlock", "spin_unlock_irq", "spin_unlock_bh",
+    "_raw_spin_unlock_irq", "_raw_spin_unlock_bh", "raw_spin_unlock", "raw_spin_unlock_irq",
+    "mutex_unlock", "read_unlock", "write_unlock", "_raw_read_unlock",
+    "_raw_write_unlock", "up", "up_write", "up_read",
+];
+
 /// Whether a scalar `SafetyCheck` was discharged symbolically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymOutcome {
@@ -559,6 +575,7 @@ fn discharge_inner(
         ref_regions: HashMap::new(),
             opaque_labels: HashMap::new(),
         fn_ptrs: HashMap::new(),
+        locks_held: HashSet::new(),
         exact: true,
     };
     ex.run_merged(state);
@@ -1126,6 +1143,11 @@ struct PathState {
     /// with the callee's summary rather than an opaque havoc. Persistent (a fact
     /// about the SSA value, not memory).
     fn_ptrs: HashMap<RegId, FuncId>,
+    /// **Locks held** on this path, by the identity of the lock pointer's base object
+    /// (`spin_lock`/`mutex_lock`/… acquired and not yet released). Re-acquiring a base
+    /// already here is an AA self-deadlock. Structural per-path state (not memory), so
+    /// not cleared on a heap havoc; joined by meet at control-flow merges.
+    locks_held: HashSet<RefBase>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -1679,6 +1701,16 @@ impl Explorer<'_> {
             .map(|(r, fid)| (*r, *fid))
             .collect();
 
+        // A lock counts as held after the join only if held on *every* incoming edge
+        // (meet), so a subsequent re-acquire is flagged only when it is a definite
+        // double-lock on all paths — sound (a partial hold never fabricates one).
+        let locks_held: HashSet<RefBase> = first
+            .locks_held
+            .iter()
+            .copied()
+            .filter(|b| edges.iter().all(|e| e.pred_state.locks_held.contains(b)))
+            .collect();
+
         // The heap is computed by `merge_multi` (it needs the edge discriminators
         // to *join* differing stores); leave it empty here.
         PathState {
@@ -1691,6 +1723,7 @@ impl Explorer<'_> {
             ref_regions: HashMap::new(),
             opaque_labels,
             fn_ptrs,
+            locks_held,
             exact: false,
         }
     }
@@ -2636,6 +2669,7 @@ impl Explorer<'_> {
                 self.check_dealloc(block, idx, &p, state);
             }
             Inst::Call { dst, callee, args, ret_ty, ret_ref } => {
+                self.check_lock_call((block, idx), callee, args, state);
                 self.step_call(dst.as_ref(), callee, args, ret_ty, *ret_ref, state);
             }
             Inst::Intrinsic { dst: Some(d), .. } => {
@@ -3104,6 +3138,64 @@ impl Explorer<'_> {
         labels
             .iter()
             .any(|l| self.prov_grants.get(l).is_some_and(|caps| !caps.contains(&cap)))
+    }
+
+    /// AA self-deadlock detection (bug-finding). Maintains the per-path set of held
+    /// locks by the identity of the lock pointer's base object; re-acquiring a base
+    /// already held is a definite deadlock (refuted with a reachability witness). A
+    /// release drops the base. Every call records a `DataRace` decision so the
+    /// obligation the verifier enumerates (bug-finding only) is never left Open on a
+    /// non-lock call. Only external `Callee::Symbol` locks are recognised (the kernel
+    /// lock primitives are declarations, not in-TU definitions).
+    fn check_lock_call(
+        &mut self,
+        at: (BlockId, usize),
+        callee: &Callee,
+        args: &[Operand],
+        state: &mut PathState,
+    ) {
+        let (block, idx) = at;
+        let name = match callee {
+            Callee::Symbol(n) => n.as_str(),
+            _ => {
+                self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", "");
+                return;
+            }
+        };
+        let base = args.first().map(|a| self.eval_value(a, state)).and_then(|v| Self::ptr_base_key(&v));
+        if LOCK_ACQUIRE.contains(&name) {
+            match base {
+                // Re-acquiring a lock already held on this path: a definite AA deadlock.
+                Some(b) if state.locks_held.contains(&b) => {
+                    let model = self.feasibility_witness(state);
+                    let entry = self.mem.entry((block, idx, SafetyProperty::DataRace)).or_insert(MemAgg {
+                        all_proven: true,
+                        refutation: None,
+                        predicate: "no lock re-acquired while held".to_string(),
+                        residual: String::new(),
+                    });
+                    entry.all_proven = false;
+                    if let Some(m) = model {
+                        entry.refutation.get_or_insert(m);
+                    }
+                    entry.residual = "re-acquires a lock already held on this path (AA self-deadlock)".to_string();
+                }
+                Some(b) => {
+                    state.locks_held.insert(b);
+                    self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", "");
+                }
+                // Unknown lock identity: cannot decide — record as proven (a `None`
+                // never fabricates a deadlock; it only omits the check). Sound.
+                None => self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", ""),
+            }
+        } else {
+            if LOCK_RELEASE.contains(&name) {
+                if let Some(b) = base {
+                    state.locks_held.remove(&b);
+                }
+            }
+            self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", "");
+        }
     }
 
     fn step_call(
@@ -4618,6 +4710,71 @@ mod tests {
             blocks: vec![bb0],
             entry: BlockId(0),
         }
+    }
+
+    /// Two `spin_lock(&l)` on the same lock without an intervening unlock is an AA
+    /// self-deadlock; releasing between them (unlock) clears it.
+    fn double_lock_fn(unlock_between: bool) -> Function {
+        let l = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        // A local lock object so the two acquisitions share a base identity.
+        bb0.insts.push(Inst::Alloc {
+            dst: l,
+            region: RegionKind::Stack,
+            elem: Type::int(32),
+            count: Operand::int(64, 1),
+            align: 4,
+        });
+        let lock = |b: &mut BasicBlock| b.insts.push(Inst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Symbol("spin_lock".into()),
+            args: vec![Operand::Reg(l)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        });
+        lock(&mut bb0);
+        if unlock_between {
+            bb0.insts.push(Inst::Call {
+                dst: None,
+                callee: csolver_ir::Callee::Symbol("spin_unlock".into()),
+                args: vec![Operand::Reg(l)],
+                ret_ty: Type::Unit,
+                ret_ref: None,
+            });
+        }
+        lock(&mut bb0);
+        Function {
+            id: FuncId(0),
+            name: "dl".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn double_lock_is_flagged_as_a_deadlock() {
+        let f = double_lock_fn(false);
+        let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+        let r = discharge_with(&f, limits);
+        // alloc=0, lock=1, lock=2 → the second lock is the deadlock.
+        let d = r
+            .mem_decision(BlockId(0), 2, SafetyProperty::DataRace)
+            .expect("DataRace obligation at the second lock");
+        assert!(d.refutation.is_some(), "re-acquiring a held lock must be flagged: {d:?}");
+    }
+
+    #[test]
+    fn lock_unlock_lock_is_not_a_deadlock() {
+        let f = double_lock_fn(true);
+        let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+        let r = discharge_with(&f, limits);
+        // alloc=0, lock=1, unlock=2, lock=3 → the last lock is fine.
+        let d = r
+            .mem_decision(BlockId(0), 3, SafetyProperty::DataRace)
+            .expect("DataRace obligation");
+        assert!(d.refutation.is_none() && d.proven, "lock/unlock/lock is balanced: {d:?}");
     }
 
     #[test]

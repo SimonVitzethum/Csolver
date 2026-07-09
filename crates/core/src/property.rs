@@ -52,6 +52,11 @@ pub enum SafetyProperty {
     /// element size must not wrap the pointer width to a small value (which
     /// under-allocates, leading to a heap overflow). A bug-finding-only obligation.
     NoSizeOverflow,
+    /// No **concurrency-safety violation**. Currently the soundly single-function-decidable
+    /// subclass: an AA self-deadlock — acquiring a lock (`spin_lock`/`mutex_lock`/…) that
+    /// is already held on the same path, which deadlocks. A bug-finding-only obligation.
+    /// (Inter-thread data races proper need a concurrency model and are future work.)
+    DataRace,
 }
 
 impl SafetyProperty {
@@ -75,6 +80,7 @@ impl SafetyProperty {
             SafetyProperty::WriteCapability => "write_capability",
             SafetyProperty::NoInfoLeak => "no_info_leak",
             SafetyProperty::NoSizeOverflow => "no_size_overflow",
+            SafetyProperty::DataRace => "data_race",
         }
     }
 
@@ -98,6 +104,7 @@ impl SafetyProperty {
             SafetyProperty::WriteCapability => "access target's provenance grants the capability",
             SafetyProperty::NoInfoLeak => "no uninitialized memory is disclosed to userspace",
             SafetyProperty::NoSizeOverflow => "allocation size computation does not overflow",
+            SafetyProperty::DataRace => "no concurrency-safety violation (AA self-deadlock)",
         }
     }
 
@@ -122,6 +129,7 @@ impl SafetyProperty {
             WriteCapability,
             NoInfoLeak,
             NoSizeOverflow,
+            DataRace,
         ]
     }
 }
