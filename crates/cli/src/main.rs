@@ -18,7 +18,7 @@ use std::process::ExitCode;
 
 use csolver_core::{SourceLevel, Verdict};
 use csolver_report::{render_json, render_text};
-use csolver_verifier::{verify_module, Config};
+use csolver_verifier::{verify_module, verify_module_with_threads, Config};
 
 mod demo;
 
@@ -241,9 +241,22 @@ struct Finding {
 /// Scan **every** `.ll` file under `dir` (recursively), verify all of them without
 /// stopping at any UNKNOWN or FAIL, and report the coverage (how much of the code is
 /// actually decided) plus every memory-safety violation found, with its witness.
+/// The per-file scan result, aggregated deterministically after the parallel pass.
+#[derive(Default)]
+struct FileScan {
+    pass: u64,
+    fail: u64,
+    unknown: u64,
+    dropped: u64,
+    errored: bool,
+    findings: Vec<Finding>,
+}
+
 fn scan_dir(dir: &Path, config: &Config) -> Result<ExitCode, String> {
     use csolver_core::ObligationResult;
     use csolver_ir::Frontend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     let mut files = Vec::new();
     collect_ll(dir, &mut files);
@@ -251,59 +264,91 @@ fn scan_dir(dir: &Path, config: &Config) -> Result<ExitCode, String> {
     if files.is_empty() {
         return Err(format!("no .ll files found under {}", dir.display()));
     }
-    eprintln!("scanning {} .ll files under {} …", files.len(), dir.display());
+    let total_files = files.len();
+    // Parallelise across FILES (work-stealing), each file verified single-threaded — a
+    // large tree of small translation units otherwise leaves most cores idle (per-module
+    // threading has too little to parallelise per file). The result is deterministic:
+    // per-file results are re-sorted into file order, and each function's verdict is
+    // independent of the thread count, so the output is byte-identical to a serial scan.
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(total_files);
+    eprintln!("scanning {total_files} .ll files under {} … ({workers} workers)", dir.display());
 
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_files));
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= total_files {
+                    break;
+                }
+                let path = &files[i];
+                let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+                let mut fs = FileScan::default();
+                match std::fs::read_to_string(path) {
+                    Err(_) => fs.errored = true,
+                    Ok(source) => match (csolver_llvm::LlvmFrontend)
+                        .lower(csolver_llvm::LlvmInput { source, name: rel.clone() })
+                    {
+                        Err(_) => fs.errored = true,
+                        Ok(module) => {
+                            fs.dropped = module.unanalyzed.len() as u64;
+                            let report = verify_module_with_threads(&module, config, 1);
+                            for f in &report.functions {
+                                match f.verdict {
+                                    Verdict::Pass => fs.pass += 1,
+                                    Verdict::Unknown => fs.unknown += 1,
+                                    Verdict::Fail => {
+                                        fs.fail += 1;
+                                        for o in &f.outcomes {
+                                            if let ObligationResult::Refuted(cx) = &o.result {
+                                                let witness = cx
+                                                    .model
+                                                    .assignments
+                                                    .iter()
+                                                    .filter(|a| !a.name.starts_with('?'))
+                                                    .map(|a| format!("{}={}", a.name, a.value))
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ");
+                                                fs.findings.push(Finding {
+                                                    file: rel.clone(),
+                                                    function: f.function.clone(),
+                                                    property: format!("{:?}", o.obligation.property),
+                                                    witness,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d.is_multiple_of(50) {
+                    eprintln!("  … {d}/{total_files} files");
+                }
+                results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
+            });
+        }
+    });
+
+    // Aggregate in file order (deterministic output, identical to a serial scan).
+    let mut all = results.into_inner().unwrap_or_else(|p| p.into_inner());
+    all.sort_by_key(|(i, _)| *i);
     let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut findings: Vec<Finding> = Vec::new();
-
-    for (n, path) in files.iter().enumerate() {
-        let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
-        let Ok(source) = std::fs::read_to_string(path) else { errored += 1; continue };
-        let module = match (csolver_llvm::LlvmFrontend)
-            .lower(csolver_llvm::LlvmInput { source, name: rel.clone() })
-        {
-            Ok(m) => m,
-            Err(_) => {
-                errored += 1;
-                continue;
-            }
-        };
-        dropped += module.unanalyzed.len() as u64;
-        let report = verify_module(&module, config);
-        for f in &report.functions {
-            match f.verdict {
-                Verdict::Pass => pass += 1,
-                Verdict::Unknown => unknown += 1,
-                Verdict::Fail => {
-                    fail += 1;
-                    // Record each refuted obligation (the concrete bug + its witness).
-                    for o in &f.outcomes {
-                        if let ObligationResult::Refuted(cx) = &o.result {
-                            // Show the genuine triggering inputs (parameters `arg…`,
-                            // user data `user…`, loop counters `ind…`); an internal
-                            // havoc symbol (`?…`) is noise, not a reproducible input.
-                            let witness = cx
-                                .model
-                                .assignments
-                                .iter()
-                                .filter(|a| !a.name.starts_with('?'))
-                                .map(|a| format!("{}={}", a.name, a.value))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            findings.push(Finding {
-                                file: rel.clone(),
-                                function: f.function.clone(),
-                                property: format!("{:?}", o.obligation.property),
-                                witness,
-                            });
-                        }
-                    }
-                }
-            }
+    for (_, fs) in all {
+        pass += fs.pass;
+        fail += fs.fail;
+        unknown += fs.unknown;
+        dropped += fs.dropped;
+        if fs.errored {
+            errored += 1;
         }
-        if (n + 1) % 50 == 0 {
-            eprintln!("  … {}/{} files", n + 1, files.len());
-        }
+        findings.extend(fs.findings);
     }
 
     let total = pass + fail + unknown;
