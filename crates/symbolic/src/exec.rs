@@ -3293,7 +3293,17 @@ impl Explorer<'_> {
         // the call. Only *owned* regions (a local `alloc`, `contract == None`)
         // can be moved into and freed by a callee. (Without this a `&[T]` passed
         // to any helper — e.g. `s.is_empty()` — would defeat every later access.)
-        let (writes, frees) = summary.as_ref().map_or((true, true), |s| (s.writes, s.frees));
+        // Register-only inline asm (`<inline asm nomem>`, decided from its constraint
+        // string by the frontend: no memory clobber, no output memory operand) writes and
+        // frees no tracked memory — so it does NOT havoc the heap/provenance, unlike an
+        // unknown call. Sound: a memory-clobbering asm keeps the `<inline asm>` marker and
+        // the full havoc below.
+        let nomem_asm = matches!(callee, Callee::Symbol(n) if n == "<inline asm nomem>");
+        let (writes, frees) = if nomem_asm {
+            (false, false)
+        } else {
+            summary.as_ref().map_or((true, true), |s| (s.writes, s.frees))
+        };
         if writes || frees {
             // In BUG-FINDING mode, assume an opaque call writes only through the objects
             // reachable from its pointer arguments: preserve store records whose target
@@ -6246,6 +6256,38 @@ mod tests {
             blocks: vec![bb0],
             entry: BlockId(0),
         }
+    }
+
+    /// slot ← buf; call `asm`; p = load slot; store through p. A register-only
+    /// (`<inline asm nomem>`) call must NOT havoc the heap, so the round-trip survives
+    /// and the final store proves temporal safety; a memory-clobbering `<inline asm>`
+    /// does havoc, so it does not.
+    fn asm_roundtrip(asm_name: &str) -> Function {
+        let slot = RegId(0);
+        let buf = RegId(1);
+        let p = RegId(2);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc { dst: slot, region: RegionKind::Heap, elem: Type::ptr(Type::int(8)), count: Operand::int(64, 1), align: 8 });
+        bb0.insts.push(Inst::Alloc { dst: buf, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 1 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), value: Operand::Reg(buf), align: 8 });
+        bb0.insts.push(Inst::Call { dst: None, callee: csolver_ir::Callee::Symbol(asm_name.into()), args: vec![], ret_ty: Type::Unit, ret_ref: None });
+        bb0.insts.push(Inst::Load { dst: p, ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::int(8), ptr: Operand::Reg(p), value: Operand::int(8, 0), align: 1 });
+        Function { id: FuncId(0), name: "asm_rt".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) }
+    }
+
+    #[test]
+    fn register_only_inline_asm_does_not_havoc_the_heap() {
+        let r = discharge_function(&asm_roundtrip("<inline asm nomem>"));
+        let d = r.mem_decision(BlockId(0), 5, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(d.proven, "register-only asm must preserve the heap: {}", d.residual);
+    }
+
+    #[test]
+    fn memory_clobbering_inline_asm_havocs_the_heap() {
+        let r = discharge_function(&asm_roundtrip("<inline asm>"));
+        let d = r.mem_decision(BlockId(0), 5, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(!d.proven, "a memory-clobbering asm must havoc (stay conservative)");
     }
 
     #[test]

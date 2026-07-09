@@ -1902,15 +1902,28 @@ impl Parser {
             // The template and constraint strings (each a quoted `Word`), separated
             // by a comma; tolerate either being absent.
             if matches!(self.peek(), Tok::Word(_)) {
-                self.pos += 1;
+                self.pos += 1; // template (not needed to decide the memory effect)
             }
+            let mut constraints = String::new();
             if matches!(self.peek(), Tok::Punct(',')) {
                 self.pos += 1;
-                if matches!(self.peek(), Tok::Word(_)) {
+                if let Tok::Word(c) = self.peek() {
+                    constraints = c.clone();
                     self.pos += 1;
                 }
             }
-            "<inline asm>".to_string()
+            // Decide the memory effect from the constraint string. A "memory" clobber
+            // or an OUTPUT memory operand (`=m`/`+m`/`=*m`/`=&m`, …) means the asm may
+            // write memory we track → the sound unknown-callee havoc (`<inline asm>`).
+            // Otherwise (register/immediate operands, or a read-only `m` input) it is
+            // register-only and touches no tracked memory (`<inline asm nomem>`), which
+            // the executor treats as a non-clobbering call — preserving the heap and
+            // provenance that a havoc would destroy (kernel C is saturated with such asm).
+            if asm_may_write_memory(&constraints) {
+                "<inline asm>".to_string()
+            } else {
+                "<inline asm nomem>".to_string()
+            }
         } else {
             self.callee_name()?
         };
@@ -2014,6 +2027,23 @@ enum InstOrPhi {
 
 fn is_int_type(w: &str) -> bool {
     w.starts_with('i') && w.len() > 1 && w[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether an inline-asm constraint string means the asm may **write memory** we
+/// track — a `"memory"` clobber, or an OUTPUT operand that references memory
+/// (`=m`/`+m`/`=*m`/`=&m`/`=*A`…). A register/immediate output, or a read-only
+/// memory *input* (`m` with no `=`/`+`), touches no tracked memory. Conservative
+/// by direction: any doubt about an output resolves to "may write" (a false havoc,
+/// never a missed write), so an unrecognised shape can only lose precision.
+fn asm_may_write_memory(constraints: &str) -> bool {
+    // A `~{memory}` clobber, or an indirect operand (`*` — the asm is handed a pointer
+    // and may write through it, in any direction), or an OUTPUT memory operand
+    // (`=m`/`+m`). Register/immediate operands and a read-only register output do not.
+    constraints.contains("memory")
+        || constraints.contains('*')
+        || constraints
+            .split(',')
+            .any(|tok| (tok.contains('=') || tok.contains('+')) && tok.contains('m'))
 }
 
 /// Round `v` up to a multiple of the power-of-two `align`; `None` on overflow.

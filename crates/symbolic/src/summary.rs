@@ -185,10 +185,16 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
         !matches!(b.term, csolver_ir::Terminator::Unreachable)
     };
 
-    // Any non-direct call (external symbol / indirect) may do anything.
+    // Any non-direct call (external symbol / indirect) may do anything — EXCEPT
+    // register-only inline asm (`<inline asm nomem>`), which writes/frees no tracked
+    // memory (decided from its constraint string), so it must not poison the summary.
+    let opaque = |callee: &Callee| {
+        !matches!(callee, Callee::Direct(_))
+            && !matches!(callee, Callee::Symbol(n) if n == "<inline asm nomem>")
+    };
     for f in &module.functions {
         let opaque_call = f.blocks.iter().filter(|b| observable(b)).flat_map(|b| &b.insts).any(
-            |i| matches!(i, Inst::Call { callee, .. } if !matches!(callee, Callee::Direct(_))),
+            |i| matches!(i, Inst::Call { callee, .. } if opaque(callee)),
         );
         if opaque_call {
             if let Some(s) = map.get_mut(&f.id) {

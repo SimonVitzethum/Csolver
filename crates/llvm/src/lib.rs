@@ -168,6 +168,39 @@ panic:
         assert!(has_add, "checked-add field 0 must recover the addition");
     }
 
+    /// Register-only inline asm (`rdtsc`, no memory clobber) lowers to the
+    /// non-clobbering `<inline asm nomem>` marker; a memory-clobbering asm (`mfence`
+    /// with `~{memory}`) keeps the havoc-ing `<inline asm>` marker.
+    #[test]
+    fn inline_asm_memory_effect_is_decided_from_constraints() {
+        let src = r#"
+define i32 @uses_asm(ptr %p) {
+b:
+  %t = call i32 asm sideeffect "rdtsc", "={ax}"()
+  call void asm sideeffect "mfence", "~{memory}"()
+  %u = call i32 asm "movl $1, $0", "=r,*m"(ptr %p)
+  ret i32 %t
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let names: Vec<&str> = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                csolver_ir::Inst::Call { callee: csolver_ir::Callee::Symbol(s), .. } => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"<inline asm nomem>"), "rdtsc is register-only: {names:?}");
+        assert!(names.contains(&"<inline asm>"), "mfence clobbers memory: {names:?}");
+        // The `=r,*m` output-memory asm must be havoc'd (writes through %p), not nomem.
+        assert_eq!(names.iter().filter(|n| **n == "<inline asm>").count(), 2, "{names:?}");
+    }
+
     /// An indirect call through a loaded function pointer lowers to `Callee::Indirect`
     /// (carrying the dispatch register), NOT an opaque `Symbol` — the prerequisite for
     /// devirtualization to fire on real LLVM/C code (regression: it used to become
