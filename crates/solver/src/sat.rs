@@ -81,6 +81,11 @@ const VAR_DECAY: f64 = 0.95;
 /// f64 range can never overflow.
 const ACTIVITY_RESCALE_LIMIT: f64 = 1e100;
 
+/// Conflicts per Luby unit: the restart interval is `RESTART_UNIT * luby(n)`. Kept
+/// modest because the bit-blasted queries are small — a restart should be able to
+/// fire on a genuinely hard one, but never churn on an easy one.
+const RESTART_UNIT: u64 = 50;
+
 /// Wall-clock backstop per `solve`. The decision budget bounds *work* but not
 /// *time* — a single hard query (e.g. wide byte-pointer arithmetic in a SIMD
 /// search) can grind for many seconds before exhausting 2M decisions and hang the
@@ -120,6 +125,15 @@ pub struct Solver {
     /// The current activity bump. It grows by `1/VAR_DECAY` each conflict, which is
     /// an O(1) way to make older bumps decay relative to newer ones.
     var_inc: f64,
+    /// Conflicts seen since the last restart; when it reaches the current Luby
+    /// threshold the search restarts (backjumps to level 0, keeping what it learnt).
+    conflicts_since_restart: u64,
+    /// Reluctant-doubling state generating the Luby sequence 1,1,2,1,1,2,4,… — the
+    /// restart interval (in units of [`RESTART_UNIT`] conflicts).
+    luby_u: u64,
+    luby_v: u64,
+    /// How many restarts have happened (telemetry; asserted on in tests).
+    restarts: u64,
 }
 
 impl Solver {
@@ -148,6 +162,10 @@ impl Solver {
             seen: vec![false; num_vars],
             activity: vec![0.0; num_vars],
             var_inc: 1.0,
+            conflicts_since_restart: 0,
+            luby_u: 1,
+            luby_v: 1,
+            restarts: 0,
         }
     }
 
@@ -393,6 +411,21 @@ impl Solver {
         let start = std::time::Instant::now();
         let mut ticks: u32 = 0;
         loop {
+            // Restart? A pure "pause and re-descend": drop the current guesses back
+            // to level 0 but keep every learnt clause and all VSIDS activity, so the
+            // fresh descent is guided by what the abandoned one discovered. It only
+            // reorders the search — models are untouched — so it cannot make a false
+            // verdict; and because it never resets the decision budget, total work
+            // stays bounded (a stuck search still bottoms out at `Unknown`).
+            if self.decision_level() > 0
+                && self.conflicts_since_restart >= RESTART_UNIT * self.luby_v
+            {
+                self.backtrack_to(0);
+                self.conflicts_since_restart = 0;
+                self.restarts += 1;
+                self.advance_luby();
+            }
+
             let Some(v) = self.pick_branch() else {
                 return SatResult::Sat(self.model());
             };
@@ -423,7 +456,19 @@ impl Solver {
                 let ci = self.add_learnt(learnt);
                 let asserting = self.clauses[ci][0];
                 let _ = self.enqueue(asserting, Some(ci));
+                self.conflicts_since_restart += 1;
             }
+        }
+    }
+
+    /// Advance the Luby sequence by one term via Knuth's reluctant doubling, so
+    /// `luby_v` holds the next restart multiplier (1,1,2,1,1,2,4,…).
+    fn advance_luby(&mut self) {
+        if self.luby_u & self.luby_u.wrapping_neg() == self.luby_v {
+            self.luby_u += 1;
+            self.luby_v = 1;
+        } else {
+            self.luby_v *= 2;
         }
     }
 }
@@ -534,6 +579,34 @@ mod tests {
         }
         let mut s = Solver::new(12, clauses);
         assert_eq!(s.solve(DEFAULT_BUDGET), SatResult::Unsat);
+    }
+
+    /// Pigeonhole `pigeons` into `holes` as a CNF over vars `v(p,h)=p*holes+h`.
+    fn pigeonhole(pigeons: u32, holes: u32) -> (usize, Vec<Vec<Lit>>) {
+        let v = |p: u32, h: u32| p * holes + h;
+        let mut clauses = Vec::new();
+        for p in 0..pigeons {
+            clauses.push((0..holes).map(|h| Lit::pos(v(p, h))).collect());
+        }
+        for h in 0..holes {
+            for p1 in 0..pigeons {
+                for p2 in (p1 + 1)..pigeons {
+                    clauses.push(vec![Lit::neg(v(p1, h)), Lit::neg(v(p2, h))]);
+                }
+            }
+        }
+        ((pigeons * holes) as usize, clauses)
+    }
+
+    #[test]
+    fn restarts_fire_on_a_hard_unsat_without_changing_the_verdict() {
+        // Pigeonhole 6→5 is unsatisfiable and needs well over RESTART_UNIT
+        // conflicts, so at least one restart must fire — and the verdict must
+        // still be exactly Unsat (a restart only reorders the search).
+        let (n, clauses) = pigeonhole(6, 5);
+        let mut s = Solver::new(n, clauses);
+        assert_eq!(s.solve(DEFAULT_BUDGET), SatResult::Unsat);
+        assert!(s.restarts > 0, "expected a restart, got {}", s.restarts);
     }
 
     #[test]
