@@ -95,6 +95,9 @@ pub struct Relocation {
 /// A parsed object image.
 #[derive(Debug, Clone, Default)]
 pub struct Image {
+    /// The `e_machine` architecture id (`EM_X86_64` = 62, `EM_AARCH64` = 183) —
+    /// selects which machine-code decoder interprets a function's bytes.
+    pub machine: u16,
     /// The object's sections.
     pub sections: Vec<Section>,
     /// The object's symbols.
@@ -140,12 +143,18 @@ impl Image {
         if sym.size == 0 {
             return None;
         }
-        let sec = self.section_at(sym.address)?;
+        // Resolve the symbol's section by its `st_shndx` INDEX, not by address:
+        // in a relocatable object (`.o`) every section has address 0, so an
+        // address lookup is ambiguous and slices the wrong bytes. `image.sections`
+        // is parsed 1:1 with the section-header table (index 0 = the NULL section),
+        // so `section_index` indexes it directly; special indices (`SHN_ABS`/… ≥
+        // 0xff00) fall out of range and yield `None`.
+        let sec = self.sections.get(sym.section_index as usize)?;
         if !sec.has_data || sec.compressed {
             return None;
         }
-        // sym.address - sec.address cannot underflow because section_at
-        // guarantees addr >= s.address.
+        // Offset of the symbol within its section (address-relative; 0-based in a
+        // `.o` where `sec.address == 0`, vaddr-relative in a linked image).
         let in_sec_off = sym.address.checked_sub(sec.address)?;
         // sym.address + sym.size must stay within sec.address + sec.size.
         let sec_end = sec.address.checked_add(sec.size)?;
@@ -651,6 +660,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
         return Err(Error::unsupported("ELF: only little-endian is supported"));
     }
 
+    let machine = read_u16(bytes, 18)?;
     let entry = read_u64(bytes, 24)?;
     let phoff = read_u64(bytes, 32)?;
     let shoff = read_u64(bytes, 40)?;
@@ -1000,6 +1010,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
     }
 
     Ok(Image {
+        machine,
         sections,
         symbols,
         program_headers,
@@ -1013,6 +1024,11 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
         verneeds,
     })
 }
+
+/// `e_machine` for x86-64.
+pub const EM_X86_64: u16 = 62;
+/// `e_machine` for AArch64.
+pub const EM_AARCH64: u16 = 183;
 
 /// The GNU hash function (a DJB2 variant with shift=33, init=5381).
 pub fn gnu_hash(name: &[u8]) -> u32 {
@@ -1633,6 +1649,48 @@ mod tests {
         };
         // Should return None, not panic.
         assert!(img.function_code(&sym, &elf).is_none());
+    }
+
+    /// Regression: in a relocatable object every section has address 0, so the
+    /// symbol's section must be resolved by its `section_index`, not by address —
+    /// otherwise a colliding earlier section slices the wrong bytes (this made
+    /// every `.o` function decode into garbage → UNKNOWN).
+    #[test]
+    fn function_code_resolves_by_section_index_not_address() {
+        let bytes = vec![0xAA, 0xBB, 0x31, 0xc0, 0xc3]; // [.other | .text]
+        let sec = |name: &str, addr, size, off, exec| Section {
+            name: name.into(),
+            address: addr,
+            size,
+            file_offset: off,
+            has_data: true,
+            writable: false,
+            executable: exec,
+            compressed: false,
+            region: RegionKind::Global,
+        };
+        let mut null = sec("", 0, 0, 0, false);
+        null.has_data = false;
+        let img = Image {
+            sections: vec![
+                null,                          // index 0: NULL
+                sec(".other", 0, 2, 0, false), // index 1: also at address 0
+                sec(".text", 0, 3, 2, true),   // index 2: the real function bytes
+            ],
+            ..Default::default()
+        };
+        let sym = Symbol {
+            name: "f".into(),
+            address: 0,
+            size: 3,
+            is_function: true,
+            section_index: 2,
+        };
+        assert_eq!(
+            img.function_code(&sym, &bytes),
+            Some(&[0x31, 0xc0, 0xc3][..]),
+            "must slice from section index 2 (.text), not the colliding .other at address 0"
+        );
     }
 
     #[test]

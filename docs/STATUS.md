@@ -71,6 +71,16 @@ Highlights beyond the historical log below:
   full-effort decision rather than a premature UNKNOWN (`Config.time_budget`,
   `ModuleReport::any_truncated`).
 
+- **ELF binary verification (2026-07).** `solver verify <elf>` now decodes a compiled
+  object/binary: `csolver-elf` parses it and, per defined function symbol, the
+  `csolver-asm` machine-code decoder (x86-64 via `e_machine`, or AArch64) lowers its
+  `.text` bytes to MSIR; the functions are linked (`merge_modules`) and verified. Lower
+  precision than the LLVM path (flat byte memory, no types) and bounded by the decoder's
+  opcode coverage, but real — no source needed. The textual `.s` frontend and C inline-asm
+  modelling remain future work (see the roadmap). Fixed en route: `Image::function_code`
+  resolved a symbol's section by *address*, which is ambiguous in a relocatable `.o` (all
+  sections at address 0) — now by `section_index`.
+
 Known open frontend gap on real kernel IR: complex `getelementptr` shapes
 (multi-index / vector) still drop the enclosing function to `unanalyzed`.
 

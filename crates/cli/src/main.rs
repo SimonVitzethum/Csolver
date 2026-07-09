@@ -216,8 +216,9 @@ fn verify_path(
         return verify_rust_source(path, json);
     }
     let level = detect_level(path)?;
-    // The frontends are M0 stubs; report their honest status rather than
-    // pretending to have analyzed the input.
+    // LLVM/MIR are mature; an ELF object is decoded via `csolver-asm` (x86-64 /
+    // AArch64) and verified; the textual `.s` frontend is still a stub (reports its
+    // honest status rather than pretending to have analyzed the input).
     let lowering = match level {
         SourceLevel::Llvm => {
             use csolver_ir::Frontend;
@@ -241,7 +242,7 @@ fn verify_path(
         }
         SourceLevel::Elf => {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-            csolver_elf::load(&bytes).map(|_| unreachable!("stub always errors"))
+            lower_elf(&bytes)
         }
         SourceLevel::Mir => {
             use csolver_ir::Frontend;
@@ -285,6 +286,35 @@ fn verify_path(
             ))
         }
     }
+}
+
+/// Lower an ELF object/binary to MSIR: parse it (`csolver-elf`), then decode each
+/// defined function symbol's `.text` bytes with the machine-code decoder for the
+/// object's architecture (`csolver-asm`) and link them into one whole-program module.
+/// So `solver verify <elf>` analyses a compiled binary with no source — lower precision
+/// than the LLVM path (flat byte memory, no types), but real. `Unsupported` when the
+/// architecture is not decodable or the object has no sized function symbols.
+fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module> {
+    let image = csolver_elf::load(bytes)?;
+    let decode: fn(&str, &[u8]) -> csolver_ir::Module = match image.machine {
+        csolver_elf::EM_X86_64 => csolver_asm::x86::decode_function,
+        csolver_elf::EM_AARCH64 => csolver_asm::arm64::decode_function,
+        m => {
+            return Err(csolver_core::Error::unsupported(format!(
+                "ELF e_machine {m} is not decodable (only x86-64 and AArch64)"
+            )))
+        }
+    };
+    let modules: Vec<csolver_ir::Module> = image
+        .functions()
+        .filter_map(|sym| image.function_code(sym, bytes).map(|code| decode(&sym.name, code)))
+        .collect();
+    if modules.is_empty() {
+        return Err(csolver_core::Error::unsupported(
+            "ELF: no decodable function symbols (need a symbol table with sized functions)",
+        ));
+    }
+    Ok(csolver_ir::merge_modules(modules, "elf"))
 }
 
 /// One found memory-safety violation, for the scan summary.
