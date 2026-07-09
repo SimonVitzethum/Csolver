@@ -296,26 +296,74 @@ fn verify_path(
 /// than the LLVM path (flat byte memory, no types), but real. `Unsupported` when the
 /// architecture is not decodable or the object has no sized function symbols.
 fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module> {
+    use std::collections::HashMap;
     let image = csolver_elf::load(bytes)?;
-    let decode: fn(&str, &[u8]) -> csolver_ir::Module = match image.machine {
-        csolver_elf::EM_X86_64 => csolver_asm::x86::decode_function,
-        csolver_elf::EM_AARCH64 => csolver_asm::arm64::decode_function,
-        m => {
-            return Err(csolver_core::Error::unsupported(format!(
-                "ELF e_machine {m} is not decodable (only x86-64 and AArch64)"
-            )))
-        }
+    if !matches!(image.machine, csolver_elf::EM_X86_64 | csolver_elf::EM_AARCH64) {
+        return Err(csolver_core::Error::unsupported(format!(
+            "ELF e_machine {} is not decodable (only x86-64 and AArch64)",
+            image.machine
+        )));
+    }
+    // The offset a PC-relative relocation addresses *within* its target symbol:
+    // `addend + 4` (the disp32 is measured from the end of its own 4 bytes). Only
+    // the direct PC-relative kinds — a GOT-indirect access reads a pointer *to* the
+    // symbol, a different shape, so it stays an opaque access.
+    let pcrel_off = |r: &csolver_elf::Relocation| -> Option<i64> {
+        // R_X86_64_PC32=2, PLT32=4, GOTPCRELX=41, REX_GOTPCRELX=42 (relaxed to direct).
+        matches!(r.kind, 2 | 4 | 41 | 42).then(|| r.addend + 4)
     };
-    let modules: Vec<csolver_ir::Module> = image
-        .functions()
-        .filter_map(|sym| image.function_code(sym, bytes).map(|code| decode(&sym.name, code)))
-        .collect();
+    // Global regions the RIP-relative accesses resolve to (name → size/writability).
+    let mut globals: HashMap<String, csolver_ir::GlobalDef> = HashMap::new();
+    let mut modules: Vec<csolver_ir::Module> = Vec::new();
+    for sym in image.functions() {
+        let Some(code) = image.function_code(sym, bytes) else { continue };
+        let sec_addr = image.sections.get(sym.section_index as usize).map_or(0, |s| s.address);
+        let func_off = sym.address.saturating_sub(sec_addr); // function start within its section
+        // Relocations patching this function's section (by `sh_info`).
+        let relocs: Vec<&csolver_elf::Relocation> = image
+            .relocations
+            .iter()
+            .filter(|(patched, _)| *patched == sym.section_index as usize)
+            .flat_map(|(_, rs)| rs.iter())
+            .collect();
+        // Register every resolvable target global (known size) so the executor seeds it.
+        for r in &relocs {
+            if pcrel_off(r).is_some() {
+                if let Some(t) = image.symbols.get(r.symbol as usize) {
+                    if t.size > 0 && !t.name.is_empty() {
+                        let writable =
+                            image.sections.get(t.section_index as usize).is_none_or(|s| s.writable);
+                        globals.entry(t.name.clone()).or_insert(csolver_ir::GlobalDef {
+                            size: t.size,
+                            align: 1,
+                            writable,
+                        });
+                    }
+                }
+            }
+        }
+        // Map a function-relative disp32 position to (target global, offset-within-it).
+        let resolve = |disp_pos: usize| -> Option<(String, i64)> {
+            let at = func_off + disp_pos as u64;
+            let r = relocs.iter().find(|r| r.offset == at)?;
+            let off = pcrel_off(r)?;
+            let t = image.symbols.get(r.symbol as usize)?;
+            (t.size > 0 && !t.name.is_empty()).then(|| (t.name.clone(), off))
+        };
+        let m = match image.machine {
+            csolver_elf::EM_X86_64 => csolver_asm::x86::decode_function_reloc(&sym.name, code, &resolve),
+            _ => csolver_asm::arm64::decode_function(&sym.name, code),
+        };
+        modules.push(m);
+    }
     if modules.is_empty() {
         return Err(csolver_core::Error::unsupported(
             "ELF: no decodable function symbols (need a symbol table with sized functions)",
         ));
     }
-    Ok(csolver_ir::merge_modules(modules, "elf"))
+    let mut m = csolver_ir::merge_modules(modules, "elf");
+    m.globals = globals;
+    Ok(m)
 }
 
 /// One found memory-safety violation, for the scan summary.

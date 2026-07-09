@@ -23,8 +23,17 @@ use csolver_ir::{BinOp, CastOp, CmpOp, FuncId, Function, Inst, Module, Operand, 
 /// unsupported construct the function is recorded as `unanalyzed` (⇒ `UNKNOWN`),
 /// never silently mis-modelled.
 pub fn decode_function(name: &str, code: &[u8]) -> Module {
+    // No relocations available (raw bytes): RIP-relative accesses resolve to nothing
+    // and become opaque-global sentinels (the function still decodes).
+    decode_function_reloc(name, code, &|_| None)
+}
+
+/// As [`decode_function`], with a **relocation resolver**: `resolve(disp_pos)` maps a
+/// `disp32`'s function-relative byte position to `(global symbol, offset)` so a
+/// RIP-relative / absolute access is checked against that global's region.
+pub fn decode_function_reloc(name: &str, code: &[u8], resolve: RelocResolver) -> Module {
     let mut m = Module::new("bin");
-    match decode_cfg(code).and_then(build_blocks) {
+    match decode_cfg(code, resolve).and_then(build_blocks) {
         Ok((blocks, entry)) => m.functions.push(Function {
             id: FuncId(0),
             name: name.into(),
@@ -58,12 +67,12 @@ struct Decoded {
 /// Linearly decode every instruction of the function body, threading the
 /// `flags` state (the last `cmp`/`test` operands) so a following `jcc` knows its
 /// condition.
-fn decode_cfg(code: &[u8]) -> csolver_core::Result<Vec<DecodedInsn>> {
+fn decode_cfg(code: &[u8], resolve: RelocResolver) -> csolver_core::Result<Vec<DecodedInsn>> {
     let mut out = Vec::new();
     let mut pos = 0;
     let mut flags: Option<(Operand, Operand)> = None;
     while pos < code.len() {
-        let d = decode_one(code, pos, &mut flags)?;
+        let d = decode_one(code, pos, &mut flags, resolve)?;
         out.push(DecodedInsn { offset: pos, next: d.next, insts: d.insts, ctrl: d.ctrl });
         pos = d.next;
     }
@@ -80,6 +89,7 @@ fn decode_one(
     code: &[u8],
     pos: usize,
     flags: &mut Option<(Operand, Operand)>,
+    resolve: RelocResolver,
 ) -> csolver_core::Result<Decoded> {
     let mut p = pos;
     // CET / alignment **no-ops**, special-cased before any prefix handling so no
@@ -99,7 +109,7 @@ fn decode_one(
         let next = if m.mode == 0b11 {
             p + 4
         } else {
-            mem_operand(code, p + 4, &m, false, false)?.next
+            mem_operand(code, p + 4, &m, false, false, resolve)?.next
         };
         return Ok(Decoded { insts: vec![], next, ctrl: Ctrl::Fall });
     }
@@ -183,7 +193,7 @@ fn decode_one(
                 };
                 done(vec![Inst::Assign { dst, ty, value }], p)
             } else {
-                let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
                 insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1 });
@@ -209,7 +219,7 @@ fn decode_one(
                     p,
                 )
             } else {
-                let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::Reg(reg(m.reg)), align: 1 });
                 done(insts, mem.next)
@@ -229,7 +239,7 @@ fn decode_one(
                     p,
                 )
             } else {
-                let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 insts.push(Inst::Load { dst: reg(m.reg), ty, ptr: Operand::Reg(ptr), align: 1 });
                 done(insts, mem.next)
@@ -242,7 +252,7 @@ fn decode_one(
             if m.mode == 0b11 {
                 return Err(CoreError::unsupported("x86: lea requires a memory operand"));
             }
-            let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+            let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
             let (mut insts, ptr) = mem.lower(pos);
             insts.push(Inst::Assign { dst: reg(m.reg), ty, value: RValue::Use(Operand::Reg(ptr)) });
             done(insts, mem.next)
@@ -361,7 +371,7 @@ fn decode_one(
             p,
         )
     } else {
-        let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
         let (mut insts, ptr) = mem.lower(pos);
         let tmp = temp_reg(pos);
         insts.push(Inst::Load { dst: tmp, ty: Type::int(32), ptr: Operand::Reg(ptr), align: 1 });
@@ -556,7 +566,7 @@ fn decode_one(
                     p,
                 )
             } else {
-                let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::int(width, imm), align: 1 });
                 done(insts, mem.next)
@@ -578,7 +588,7 @@ fn decode_one(
                     p,
                 )
             } else {
-                let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 insts.push(Inst::Store { ty: Type::int(8), ptr: Operand::Reg(ptr), value: Operand::int(8, imm), align: 1 });
                 done(insts, mem.next)
@@ -769,7 +779,7 @@ fn decode_one(
                     let next = if m.mode == 0b11 {
                         p + 1
                     } else {
-                        mem_operand(code, p + 1, &m, rex_x, rex_b)?.next
+                        mem_operand(code, p + 1, &m, rex_x, rex_b, resolve)?.next
                     };
                     Ok(Decoded { insts: vec![], next, ctrl: Ctrl::Fall })
                 }
@@ -846,7 +856,7 @@ fn decode_one(
                             p,
                         )
                     } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                         let (mut insts, ptr) = mem.lower(pos);
                         let tmp = temp_reg(pos);
                         insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 });
@@ -876,7 +886,7 @@ fn decode_one(
                             p,
                         )
                     } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                         let (mut insts, ptr) = mem.lower(pos);
                         let tmp = temp_reg(pos);
                         insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 });
@@ -906,7 +916,7 @@ fn decode_one(
                             p,
                         )
                     } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                         let (mut insts, ptr) = mem.lower(pos);
                         let tmp = temp_reg(pos);
                         insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 });
@@ -936,7 +946,7 @@ fn decode_one(
                             p,
                         )
                     } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b)?;
+                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                         let (mut insts, ptr) = mem.lower(pos);
                         let tmp = temp_reg(pos);
                         insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 });
@@ -1038,6 +1048,10 @@ pub(crate) struct MemOperand {
     pub(crate) index: Option<(RegId, u8)>,
     pub(crate) disp: i64,
     pub(crate) next: usize,
+    /// A **global symbol base** instead of a register (a resolved RIP-relative
+    /// access): the address is `@symbol + disp`. The executor resolves the symbol
+    /// to the global's region (known size), so `[rip+disp]` is bounds-checked.
+    pub(crate) symbol: Option<String>,
 }
 
 impl MemOperand {
@@ -1045,7 +1059,20 @@ impl MemOperand {
     /// holding it: `base (+ index*scale) (+ disp)`.
     pub(crate) fn lower(&self, pos: usize) -> (Vec<Inst>, RegId) {
         let mut insts = Vec::new();
-        let mut ptr = self.base;
+        // A resolved RIP-relative access uses the global symbol as its base (the
+        // executor turns `@symbol` into that global's region); otherwise a register.
+        let mut ptr = match &self.symbol {
+            Some(name) => {
+                let dst = RegId(3500 + pos as u32);
+                insts.push(Inst::Assign {
+                    dst,
+                    ty: Type::ptr(Type::Unit),
+                    value: RValue::Use(Operand::Const(csolver_ir::Const::Symbol(name.clone()))),
+                });
+                dst
+            }
+            None => self.base,
+        };
         if let Some((index, scale)) = self.index {
             let dst = temp_reg(pos);
             insts.push(Inst::PtrOffset {
@@ -1072,10 +1099,25 @@ impl MemOperand {
     }
 }
 
+/// Maps the function-relative byte position of a `disp32` to the global it
+/// addresses — `(symbol name, byte offset within the symbol)` — from the ELF
+/// relocations. `None` when no relocation names it (then the access is modelled
+/// through an opaque sentinel symbol, so the function still decodes).
+pub type RelocResolver<'a> = &'a dyn Fn(usize) -> Option<(String, i64)>;
+
 /// Decode the `[base + index*scale + disp]` memory operand of a ModR/M
-/// (mode ≠ 11), including a SIB byte. RIP-relative and base-less disp32 forms are
-/// a clean `Err`.
-fn mem_operand(code: &[u8], p: usize, m: &ModRm, rex_x: bool, rex_b: bool) -> csolver_core::Result<MemOperand> {
+/// (mode ≠ 11), including a SIB byte. RIP-relative and base-less `disp32` forms
+/// resolve to a **global symbol base** (via `resolve`) — an access to that
+/// global's region — or an opaque sentinel symbol when unresolved (so the
+/// function decodes rather than dropping).
+fn mem_operand(
+    code: &[u8],
+    p: usize,
+    m: &ModRm,
+    rex_x: bool,
+    rex_b: bool,
+    resolve: RelocResolver,
+) -> csolver_core::Result<MemOperand> {
     let mut p = p;
     let mut base = m.rm; // low 3 bits + REX.B (from `modrm`)
     let mut index = None;
@@ -1092,11 +1134,15 @@ fn mem_operand(code: &[u8], p: usize, m: &ModRm, rex_x: bool, rex_b: bool) -> cs
             index = Some((reg(index_field + if rex_x { 8 } else { 0 }), scale));
         }
         if m.mode == 0b00 && base_field & 7 == 5 {
-            return Err(CoreError::unsupported("x86: base-less disp32 is unsupported"));
+            // base-less disp32: an absolute / global base (optionally `+ index`).
+            let (name, off) = resolve(p).unwrap_or_else(|| ("<abs-unknown>".to_string(), 0));
+            return Ok(MemOperand { base: reg(0), index, disp: off, next: p + 4, symbol: Some(name) });
         }
         base = base_field;
     } else if rm_low == 5 && m.mode == 0b00 {
-        return Err(CoreError::unsupported("x86: RIP-relative addressing is unsupported"));
+        // RIP-relative `[rip + disp32]` → a global.
+        let (name, off) = resolve(p).unwrap_or_else(|| ("<rip-unknown>".to_string(), 0));
+        return Ok(MemOperand { base: reg(0), index: None, disp: off, next: p + 4, symbol: Some(name) });
     }
     let disp = match m.mode {
         0b00 => 0i64,
@@ -1112,7 +1158,7 @@ fn mem_operand(code: &[u8], p: usize, m: &ModRm, rex_x: bool, rex_b: bool) -> cs
         }
         _ => return Err(CoreError::unsupported("x86: register operand has no memory form")),
     };
-    Ok(MemOperand { base: reg(base), index, disp, next: p })
+    Ok(MemOperand { base: reg(base), index, disp, next: p, symbol: None })
 }
 
 fn modrm(code: &[u8], at: usize, rex_r: bool, rex_b: bool) -> csolver_core::Result<ModRm> {
@@ -3872,6 +3918,28 @@ mod tests {
             .flat_map(|b| &b.insts)
             .any(|i| matches!(i, Inst::Load { .. }));
         assert!(has_load, "the memory-operand ALU form must emit a load");
+    }
+
+    #[test]
+    fn rip_relative_resolves_to_a_global_symbol() {
+        // 8b 05 00000000  mov eax, [rip+disp32] ; c3 ret. The resolver maps the disp32
+        // at function offset 2 to the global `g`, so the access uses `@g` as its base.
+        let code = [0x8b, 0x05, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        let m = decode_function_reloc("f", &code, &|pos| (pos == 2).then(|| ("g".to_string(), 0)));
+        assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
+        let has_sym = m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(i, Inst::Assign { value: RValue::Use(Operand::Const(csolver_ir::Const::Symbol(s))), .. } if s == "g")
+        });
+        assert!(has_sym, "a resolved RIP-relative access must materialize the global symbol");
+    }
+
+    #[test]
+    fn rip_relative_unresolved_still_decodes() {
+        // Without a relocation the RIP-relative access becomes an opaque sentinel — the
+        // function must still decode (previously it dropped whole).
+        let code = [0x8b, 0x05, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        let m = decode_function("f", &code);
+        assert!(m.unanalyzed.is_empty(), "unresolved RIP-relative must decode, not drop: {:?}", m.unanalyzed);
     }
 
     /// endbr64 opens almost every CET-built kernel function; without it the whole

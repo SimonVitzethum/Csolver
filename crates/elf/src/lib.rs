@@ -206,6 +206,7 @@ const STT_FUNC: u8 = 2;
 const STT_OBJECT: u8 = 1;
 const STT_GNU_IFUNC: u8 = 10;
 
+#[allow(dead_code)]
 const SHN_UNDEF: u16 = 0;
 const SHN_XINDEX: u16 = 0xffff;
 
@@ -822,16 +823,10 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
             } else {
                 read_str(&strtab, raw.st_name).unwrap_or_else(|_| format!("<sym-{}>", i))
             };
-            // Skip the null symbol and unnamed locals; always skip the
-            // null symbol (name empty, st_info == 0, st_shndx == SHN_UNDEF).
-            let is_null = raw.st_name == 0
-                && raw.st_info == 0
-                && raw.st_value == 0
-                && raw.st_size == 0
-                && raw.st_shndx == SHN_UNDEF;
-            if is_null {
-                continue;
-            }
+            // Keep EVERY entry (including the index-0 null symbol as an empty
+            // placeholder), so `symbols[i]` stays aligned with the symbol-table index
+            // — a relocation's `symbol` field indexes this table directly. The null
+            // symbol is harmless (empty name, size 0, not a function).
             let st_type = raw.st_info & 0xf;
             symbols.push(Symbol {
                 name,
@@ -893,7 +888,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
 
     // --- relocations (from SHT_RELA / SHT_REL sections) ---
     let mut relocations: Vec<(usize, Vec<Relocation>)> = Vec::new();
-    for (sec_idx, hdr) in headers.iter().enumerate() {
+    for hdr in &headers {
         if hdr.sh_type == SHT_RELA {
             let rel_data = section_bytes(bytes, hdr)?;
             let rel_entsize = if hdr.entsize == 0 { RELA_ENTRY_LEN } else { hdr.entsize };
@@ -917,7 +912,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
                     addend: read_i64(&rel_data, base + 16)?,
                 });
             }
-            relocations.push((sec_idx, rels));
+            relocations.push((hdr.info as usize, rels));
         } else if hdr.sh_type == SHT_REL {
             // REL format: 8-byte entries (offset + info), no explicit addend.
             let rel_data = section_bytes(bytes, hdr)?;
@@ -944,7 +939,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
                     addend: 0,
                 });
             }
-            relocations.push((sec_idx, rels));
+            relocations.push((hdr.info as usize, rels));
         }
     }
 

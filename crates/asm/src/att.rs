@@ -330,9 +330,21 @@ fn parse_mem(tok: &str) -> Option<crate::x86::MemOperand> {
     if !tok.ends_with(')') {
         return None;
     }
-    let disp: i64 = if open == 0 { 0 } else { parse_disp(&tok[..open])? };
+    let disp_str = tok[..open].trim();
     let inner = &tok[open + 1..tok.len() - 1];
     let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    // A RIP-relative access `symbol(%rip)`: the base is `%rip` and the displacement is
+    // a symbol name → a global symbol base (the executor resolves it to that region).
+    if parts.first().copied() == Some("%rip") {
+        return Some(crate::x86::MemOperand {
+            base: reg(0),
+            index: None,
+            disp: 0,
+            next: 0,
+            symbol: Some(disp_str.to_string()),
+        });
+    }
+    let disp: i64 = if open == 0 { 0 } else { parse_disp(disp_str)? };
     let base = parse_reg(parts.first().copied().unwrap_or(""))?;
     let index = match parts.get(1) {
         Some(r) if !r.is_empty() => {
@@ -342,7 +354,7 @@ fn parse_mem(tok: &str) -> Option<crate::x86::MemOperand> {
         }
         _ => None,
     };
-    Some(crate::x86::MemOperand { base: reg(base), index, disp, next: 0 })
+    Some(crate::x86::MemOperand { base: reg(base), index, disp, next: 0, symbol: None })
 }
 
 fn parse_disp(s: &str) -> Option<i64> {
