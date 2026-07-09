@@ -627,7 +627,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
         findings.extend(fs.findings);
     }
     let mut seen_find = HashSet::new();
-    findings.retain(|f| seen_find.insert((f.file.clone(), f.function.clone(), f.property.clone(), f.witness.clone())));
+    findings.retain(|f| seen_find.insert(finding_key(f)));
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -670,6 +670,7 @@ fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: &Config) ->
 /// whole-program module (so a call across a translation-unit boundary resolves to its
 /// definition and the caller's context flows in) and verify closed-world; otherwise verify
 /// the single module per-TU. `threads` is the per-unit function-level parallelism.
+#[allow(clippy::too_many_arguments)]
 fn scan_one_unit(
     unit: &[std::path::PathBuf],
     label: &str,
@@ -677,23 +678,42 @@ fn scan_one_unit(
     config: &Config,
     cross: bool,
     threads: usize,
+    content_seen: &std::sync::Mutex<std::collections::HashSet<u64>>,
 ) -> FileScan {
     use csolver_core::ObligationResult;
     use csolver_ir::Frontend;
+    use std::hash::{Hash, Hasher};
 
     let mut fs = FileScan::default();
-    let mut modules = Vec::with_capacity(unit.len());
+    // Read all sources first and hash their content. If an identical unit was already
+    // verified (a byte-for-byte duplicate file — literally copied code, or the same
+    // generated TU), skip it: identical input ⇒ identical result, so re-running the
+    // (expensive) verification would only inflate the counts and re-report the same bugs.
+    // Sound and deterministic (first occurrence wins; results are unit-ordered).
+    let mut sources = Vec::with_capacity(unit.len());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for path in unit {
         let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
         match std::fs::read_to_string(path) {
             Err(_) => fs.errored += 1,
-            Ok(source) => match (csolver_llvm::LlvmFrontend).lower(csolver_llvm::LlvmInput {
-                source,
-                name: rel,
-            }) {
-                Err(_) => fs.errored += 1,
-                Ok(m) => modules.push(m),
-            },
+            Ok(source) => {
+                source.hash(&mut hasher);
+                sources.push((rel, source));
+            }
+        }
+    }
+    if sources.is_empty() {
+        return fs;
+    }
+    if !content_seen.lock().unwrap_or_else(|p| p.into_inner()).insert(hasher.finish()) {
+        return FileScan::default(); // an identical unit was already verified
+    }
+
+    let mut modules = Vec::with_capacity(sources.len());
+    for (rel, source) in sources {
+        match (csolver_llvm::LlvmFrontend).lower(csolver_llvm::LlvmInput { source, name: rel }) {
+            Err(_) => fs.errored += 1,
+            Ok(m) => modules.push(m),
         }
     }
     if modules.is_empty() {
@@ -803,10 +823,14 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let active = AtomicUsize::new(0);
-    // Live findings counter: each bug is streamed to stderr the moment its unit finishes
-    // (unbuffered, so a long scan surfaces bugs as they are found — visible in `tail -f`).
-    // The final `report_scan` still prints the complete, unit-ordered inventory.
+    // Live findings counter + de-dup set: each bug is streamed to stderr the moment its
+    // unit finishes (unbuffered, so a long scan surfaces bugs as they are found — visible
+    // in `tail -f`), and the same bug appearing in many files is reported once.
     let found = AtomicUsize::new(0);
+    let seen_find: Mutex<std::collections::HashSet<FindingKey>> = Mutex::new(std::collections::HashSet::new());
+    // Byte-identical units are verified once (see `scan_one_unit`): skips re-analysis of
+    // literally duplicated files and keeps the coverage counts free of those duplicates.
+    let content_seen: Mutex<std::collections::HashSet<u64>> = Mutex::new(std::collections::HashSet::new());
     let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_units));
     // Units whose exploration hit the budget: deferred to a full-effort serial phase
     // instead of being counted as Unknown now (A3 — "pause the file until the others
@@ -825,7 +849,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
                 await_memory(&active);
                 active.fetch_add(1, Ordering::Relaxed);
                 let (label, unit) = &units[i];
-                let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit);
+                let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit, &content_seen);
                 active.fetch_sub(1, Ordering::Relaxed);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d.is_multiple_of(50) {
@@ -836,7 +860,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
                     // do not stream the discarded partial result here (avoids duplicates).
                     deferred.lock().unwrap_or_else(|p| p.into_inner()).push(i);
                 } else {
-                    stream_findings(&fs, &found);
+                    stream_findings(&fs, &found, &seen_find);
                     results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
                 }
             });
@@ -856,8 +880,8 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
         let all_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         for i in deferred {
             let (label, unit) = &units[i];
-            let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads);
-            stream_findings(&fs, &found);
+            let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen);
+            stream_findings(&fs, &found, &seen_find);
             results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
         }
     }
@@ -875,16 +899,36 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
         errored += fs.errored;
         findings.extend(fs.findings);
     }
+    // De-duplicate the inventory: the same bug in many files (a duplicated / static-inline
+    // function) is one finding, not N. Keeps the first (unit-ordered) occurrence.
+    let mut seen: std::collections::HashSet<FindingKey> = std::collections::HashSet::new();
+    findings.retain(|f| seen.insert(finding_key(f)));
 
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
+/// A finding's identity for de-duplication: the same `(function, property, witness)`
+/// is the *same bug* even when it appears in many files (a `static inline` emitted
+/// into every TU, a header helper, or literally copied code). The file is deliberately
+/// excluded so N copies collapse to one report.
+type FindingKey = (String, String, String);
+fn finding_key(b: &Finding) -> FindingKey {
+    (b.function.clone(), b.property.clone(), b.witness.clone())
+}
+
 /// Stream a finished unit's findings to stderr immediately (live feed), tagging each
-/// with a running global index. `found` gives a stable, monotonic count across the
-/// concurrent workers. stderr is unbuffered, so each line reaches the console / log the
-/// moment it is written — a long scan no longer withholds every bug until the end.
-fn stream_findings(fs: &FileScan, found: &std::sync::atomic::AtomicUsize) {
+/// with a running global index. De-duplicated against `seen` so the same bug found in
+/// many files is streamed only once (`found` then counts distinct bugs). stderr is
+/// unbuffered, so each line reaches the console / log the moment it is written.
+fn stream_findings(
+    fs: &FileScan,
+    found: &std::sync::atomic::AtomicUsize,
+    seen: &std::sync::Mutex<std::collections::HashSet<FindingKey>>,
+) {
     for b in &fs.findings {
+        if !seen.lock().unwrap_or_else(|p| p.into_inner()).insert(finding_key(b)) {
+            continue; // already reported (a duplicate copy in another file)
+        }
         let n = found.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         eprintln!("  [FOUND #{n}] {}::{}  [{}]  witness: {}", b.file, b.function, b.property, b.witness);
     }
