@@ -599,7 +599,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
                     }
                 }
                 let group: Vec<&csolver_ir::Module> = seen.iter().map(|&i| &modules[i].1).collect();
-                let linked = csolver_ir::merge_modules(&group.iter().map(|m| (*m).clone()).collect::<Vec<_>>(), ename.as_str());
+                let linked = csolver_ir::merge_modules(group.iter().map(|m| (*m).clone()).collect::<Vec<_>>(), ename.as_str());
                 let fs = scan_linked_module(&linked, ename, &cfg);
                 entry_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let d = entry_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -703,7 +703,7 @@ fn scan_one_unit(
         unit[0].strip_prefix(dir).unwrap_or(&unit[0]).display().to_string()
     };
     let module = if cross {
-        csolver_ir::merge_modules(&modules, label)
+        csolver_ir::merge_modules(modules, label)
     } else {
         // Normal per-TU scan: exactly one module per unit (unchanged behaviour).
         modules.into_iter().next().unwrap_or_else(|| csolver_ir::Module::new(label))

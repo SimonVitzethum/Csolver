@@ -313,7 +313,7 @@ impl Module {
 /// `static`/internal function's name may collide across files, so internal functions keep
 /// their per-file identity and are only reachable through their own `Callee::Direct` edges.
 /// Declarations (no definition anywhere) stay `Callee::Symbol` (opaque, contract-modelled).
-pub fn merge_modules(mods: &[Module], name: impl Into<String>) -> Module {
+pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
     let mut merged = Module::new(name);
     if let Some(m) = mods.first() {
         merged.layout = m.layout;
@@ -322,7 +322,7 @@ pub fn merge_modules(mods: &[Module], name: impl Into<String>) -> Module {
     let mut name_to_id: HashMap<String, FuncId> = HashMap::new();
     let mut remaps: Vec<HashMap<FuncId, FuncId>> = Vec::with_capacity(mods.len());
     let mut next: u32 = 0;
-    for m in mods {
+    for m in &mods {
         let mut remap = HashMap::new();
         for f in &m.functions {
             let nid = FuncId(next);
@@ -334,12 +334,15 @@ pub fn merge_modules(mods: &[Module], name: impl Into<String>) -> Module {
         }
         remaps.push(remap);
     }
-    // Pass 2: clone functions with remapped ids and resolved call edges; merge side tables.
-    for (mi, m) in mods.iter().enumerate() {
+    // Pass 2: **move** functions in with remapped ids and resolved call edges; merge side
+    // tables. Taking ownership avoids cloning every function/instruction of the group — the
+    // dominant cost when linking large driver TUs for cross-file scanning.
+    for (mi, m) in mods.into_iter().enumerate() {
         let remap = &remaps[mi];
-        for f in &m.functions {
-            let mut nf = f.clone();
-            nf.id = remap[&f.id];
+        let internal = &m.internal;
+        for mut nf in m.functions {
+            let was_internal = internal.contains(&nf.id);
+            nf.id = remap[&nf.id];
             for block in &mut nf.blocks {
                 for inst in &mut block.insts {
                     if let Inst::Call { callee, .. } = inst {
@@ -349,37 +352,37 @@ pub fn merge_modules(mods: &[Module], name: impl Into<String>) -> Module {
                             // Cross-file edge: resolve to the definition if we now have it.
                             Callee::Symbol(nm) => match name_to_id.get(nm) {
                                 Some(&id) => Callee::Direct(id),
-                                None => Callee::Symbol(nm.clone()),
+                                None => Callee::Symbol(std::mem::take(nm)),
                             },
                             Callee::Indirect(op) => Callee::Indirect(op.clone()),
                         };
                     }
                 }
             }
-            if m.internal.contains(&f.id) {
+            if was_internal {
                 merged.internal.insert(nf.id);
             }
             merged.functions.push(nf);
         }
-        for ((fid, idx), c) in &m.param_contracts {
-            merged.param_contracts.insert((remap[fid], *idx), *c);
+        for ((fid, idx), c) in m.param_contracts {
+            merged.param_contracts.insert((remap[&fid], idx), c);
         }
-        for ((fid, idx), h) in &m.raw_ptr_hints {
-            merged.raw_ptr_hints.insert((remap[fid], *idx), *h);
+        for ((fid, idx), h) in m.raw_ptr_hints {
+            merged.raw_ptr_hints.insert((remap[&fid], idx), h);
         }
-        for (k, v) in &m.globals {
-            merged.globals.entry(k.clone()).or_insert(*v);
+        for (k, v) in m.globals {
+            merged.globals.entry(k).or_insert(v);
         }
-        for (k, v) in &m.global_fn_ptrs {
+        for (k, v) in m.global_fn_ptrs {
             merged
                 .global_fn_ptrs
-                .entry(k.clone())
-                .or_insert_with(|| v.iter().map(|(off, fid)| (*off, remap[fid])).collect());
+                .entry(k)
+                .or_insert_with(|| v.into_iter().map(|(off, fid)| (off, remap[&fid])).collect());
         }
-        for (k, v) in &m.prov_grants {
-            merged.prov_grants.entry(*k).or_default().extend(v.iter().copied());
+        for (k, v) in m.prov_grants {
+            merged.prov_grants.entry(k).or_default().extend(v);
         }
-        merged.unanalyzed.extend(m.unanalyzed.iter().cloned());
+        merged.unanalyzed.extend(m.unanalyzed);
     }
     merged
 }
@@ -505,7 +508,7 @@ mod tests {
     fn merge_resolves_cross_file_call_by_name() {
         let a = one_fn("caller", Some(Callee::Symbol("foo".into())), false);
         let b = one_fn("foo", None, false);
-        let merged = merge_modules(&[a, b], "prog");
+        let merged = merge_modules(vec![a, b], "prog");
         assert_eq!(merged.functions.len(), 2);
         let caller = merged.functions.iter().find(|f| f.name == "caller").unwrap();
         let foo = merged.functions.iter().find(|f| f.name == "foo").unwrap();
@@ -522,7 +525,7 @@ mod tests {
         let a = one_fn("helper", None, true);
         let b = one_fn("helper", None, true);
         let caller = one_fn("c", Some(Callee::Symbol("helper".into())), false);
-        let merged = merge_modules(&[a, b, caller], "prog");
+        let merged = merge_modules(vec![a, b, caller], "prog");
         assert_eq!(merged.functions.len(), 3);
         let c = merged.functions.iter().find(|f| f.name == "c").unwrap();
         let Inst::Call { callee, .. } = &c.blocks[0].insts[0] else {
