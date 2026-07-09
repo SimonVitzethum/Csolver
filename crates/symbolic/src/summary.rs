@@ -126,6 +126,13 @@ pub struct Summary {
     pub writes: bool,
     /// Whether the function may free memory.
     pub frees: bool,
+    /// The parameter index this function **definitely frees** (`kfree`-style wrapper),
+    /// when that can be established with certainty — used to detect a double-free
+    /// through *two* freeing-wrapper calls on the same pointer (which the coarse
+    /// `frees` havoc alone cannot attribute). `None` when no single parameter is
+    /// provably freed on every path. A `Some(k)` only ever *adds* a definite
+    /// double-free check; it never affects liveness (so never a false PASS).
+    pub frees_arg: Option<usize>,
     /// How a call moves provenance labels between its pointer arguments.
     pub prov: ProvTransfer,
 }
@@ -291,7 +298,31 @@ fn summarize_fn(f: &Function) -> Summary {
         }
     }
 
-    Summary { ret: ret_of_fn(f), writes, frees, prov: prov_transfer_of_fn(f) }
+    Summary { ret: ret_of_fn(f), writes, frees, frees_arg: derive_frees_arg(f), prov: prov_transfer_of_fn(f) }
+}
+
+/// The parameter a **single-block** function definitely frees: it has exactly one
+/// `Dealloc` and that deallocates a bare parameter (a `kfree(p)`-style wrapper). A
+/// single block means the free is unconditional (executes on every call), so a call
+/// to it definitely frees that argument — the basis for detecting a double-free
+/// through two such wrapper calls. Conservative: any other shape (multi-block,
+/// several deallocs, inline asm, a non-parameter pointer) yields `None`, so this
+/// never over-claims a free (which would risk a false double-free FAIL).
+fn derive_frees_arg(f: &Function) -> Option<usize> {
+    if f.blocks.len() != 1 {
+        return None;
+    }
+    let params: HashMap<RegId, usize> =
+        f.params.iter().enumerate().map(|(i, (r, _))| (*r, i)).collect();
+    let mut deallocs = f.blocks[0].insts.iter().filter_map(|i| match i {
+        Inst::Dealloc { ptr: Operand::Reg(r), .. } => Some(params.get(r).copied()),
+        Inst::Dealloc { .. } | Inst::Asm { .. } => Some(None),
+        _ => None,
+    });
+    match (deallocs.next(), deallocs.next()) {
+        (Some(hit), None) => hit,
+        _ => None,
+    }
 }
 
 /// Which pointer parameter (by index) a register **definitely** aliases: the parameter

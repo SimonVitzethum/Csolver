@@ -55,20 +55,22 @@ const GLOBAL_MEMORY: &str = "global-memory";
 const VALID_REFERENCE: &str = "valid-reference";
 const STRUCT_ABI: &str = "struct-abi";
 
-/// Lock-acquiring kernel primitives (by argument-0 = the lock). Re-acquiring one
-/// already held on a path is an AA self-deadlock (`SafetyProperty::DataRace`).
+/// **Unconditional** lock-acquiring kernel primitives (by argument-0 = the lock).
+/// Re-acquiring one already held on a path is an AA self-deadlock
+/// (`SafetyProperty::DataRace`). Only primitives that *always* take the lock are
+/// listed — `*_trylock` may fail, so it is deliberately excluded (adding it would
+/// false-flag a `trylock`-then-`lock` retry). A *release* needs no list: any call
+/// handed a held lock's base drops it (see `check_lock_call`), which covers matched
+/// unlocks (incl. `spin_unlock_irqrestore`), unlock wrappers, and callees that unlock.
 const LOCK_ACQUIRE: &[&str] = &[
-    "spin_lock", "_raw_spin_lock", "spin_lock_irq", "spin_lock_bh",
-    "_raw_spin_lock_irq", "_raw_spin_lock_bh", "raw_spin_lock", "raw_spin_lock_irq",
-    "mutex_lock", "mutex_lock_nested", "read_lock", "write_lock",
+    "spin_lock", "_raw_spin_lock", "spin_lock_irq", "spin_lock_bh", "spin_lock_irqsave",
+    "_raw_spin_lock_irq", "_raw_spin_lock_bh", "_raw_spin_lock_irqsave",
+    "raw_spin_lock", "raw_spin_lock_irq", "raw_spin_lock_irqsave", "raw_spin_lock_bh",
+    "mutex_lock", "mutex_lock_nested", "mutex_lock_interruptible", "mutex_lock_killable",
+    "read_lock", "write_lock", "read_lock_irq", "write_lock_irq",
+    "read_lock_irqsave", "write_lock_irqsave", "read_lock_bh", "write_lock_bh",
     "_raw_read_lock", "_raw_write_lock", "down", "down_write", "down_read",
-];
-/// The matching lock-releasing primitives (drop the held lock).
-const LOCK_RELEASE: &[&str] = &[
-    "spin_unlock", "_raw_spin_unlock", "spin_unlock_irq", "spin_unlock_bh",
-    "_raw_spin_unlock_irq", "_raw_spin_unlock_bh", "raw_spin_unlock", "raw_spin_unlock_irq",
-    "mutex_unlock", "read_unlock", "write_unlock", "_raw_read_unlock",
-    "_raw_write_unlock", "up", "up_write", "up_read",
+    "down_interruptible", "down_killable", "down_write_killable",
 ];
 
 /// Whether a scalar `SafetyCheck` was discharged symbolically.
@@ -578,6 +580,7 @@ fn discharge_inner(
             opaque_labels: HashMap::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
+        freed_bases: HashSet::new(),
         exact: true,
     };
     ex.run_merged(state);
@@ -1150,6 +1153,11 @@ struct PathState {
     /// already here is an AA self-deadlock. Structural per-path state (not memory), so
     /// not cleared on a heap havoc; joined by meet at control-flow merges.
     locks_held: HashSet<RefBase>,
+    /// **Bases freed by an attributed freeing call** (`Summary.frees_arg`) on this path —
+    /// so a second freeing-wrapper call on the same pointer is a definite double-free
+    /// (which the coarse `frees` region havoc cannot attribute). Joined by meet at merges
+    /// (only a base freed on *every* incoming path counts). Structural, not memory.
+    freed_bases: HashSet<RefBase>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -1712,6 +1720,15 @@ impl Explorer<'_> {
             .copied()
             .filter(|b| edges.iter().all(|e| e.pred_state.locks_held.contains(b)))
             .collect();
+        // Same meet for freed bases: a base counts as freed after the join only if it was
+        // freed on every incoming path, so a re-free is flagged only when it is a definite
+        // double-free on all paths.
+        let freed_bases: HashSet<RefBase> = first
+            .freed_bases
+            .iter()
+            .copied()
+            .filter(|b| edges.iter().all(|e| e.pred_state.freed_bases.contains(b)))
+            .collect();
 
         // The heap is computed by `merge_multi` (it needs the edge discriminators
         // to *join* differing stores); leave it empty here.
@@ -1726,6 +1743,7 @@ impl Explorer<'_> {
             opaque_labels,
             fn_ptrs,
             locks_held,
+            freed_bases,
             exact: false,
         }
     }
@@ -2672,7 +2690,7 @@ impl Explorer<'_> {
             }
             Inst::Call { dst, callee, args, ret_ty, ret_ref } => {
                 self.check_lock_call((block, idx), callee, args, state);
-                self.step_call(dst.as_ref(), callee, args, ret_ty, *ret_ref, state);
+                self.step_call((block, idx), dst.as_ref(), callee, args, ret_ty, *ret_ref, state);
             }
             Inst::Intrinsic { dst: Some(d), .. } => {
                 let s = self.fresh_scalar(PTR_WIDTH);
@@ -2849,9 +2867,11 @@ impl Explorer<'_> {
                             _ => None,
                         };
                         if let Some(n) = n.filter(|n| *n > 0) {
-                            let vty = Type::int((n * 8).clamp(8, 128) as u32);
-                            let (_, origin) = self.load_value(&srcp, n, &vty, state);
-                            if matches!(origin, LoadOrigin::Unwritten) {
+                            // Scan the WHOLE copied range (not just the first word): a leak
+                            // fires if any chunk is definitely never-written — so a buffer
+                            // whose head is written but whose tail is uninitialized (a
+                            // too-large `copy_to_user`) is caught, not only a wholly-fresh one.
+                            if self.range_has_unwritten_bytes(&srcp, n, state) {
                                 if let Some(model) = self.feasibility_witness(state) {
                                     self.record_info_leak(block, idx, model);
                                 }
@@ -3191,8 +3211,15 @@ impl Explorer<'_> {
                 None => self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", ""),
             }
         } else {
-            if LOCK_RELEASE.contains(&name) {
-                if let Some(b) = base {
+            // Any other call: a call handed a held lock's base MAY release it — a matched
+            // unlock (`spin_unlock`/`spin_unlock_irqrestore`/…), an unlock wrapper, or a
+            // callee that unlocks internally. Conservatively drop every held base passed to
+            // this call as a pointer argument, so a later re-acquire is NOT a false
+            // double-lock. Sound: this only ever *forgets* a lock (lower recall), never
+            // fabricates one — a genuine `lock(l); … lock(l)` with no intervening call
+            // taking `l` still refutes.
+            for a in args {
+                if let Some(b) = Self::ptr_base_key(&self.eval_value(a, state)) {
                     state.locks_held.remove(&b);
                 }
             }
@@ -3200,8 +3227,10 @@ impl Explorer<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn step_call(
         &mut self,
+        at: (BlockId, usize),
         dst: Option<&RegId>,
         callee: &Callee,
         args: &[Operand],
@@ -3209,12 +3238,7 @@ impl Explorer<'_> {
         ret_ref: Option<RefResult>,
         state: &mut PathState,
     ) {
-        // A call is an over-approximation point (havoc'd heap/return unless a
-        // precise summary applies); conservatively mark the path inexact so we
-        // never refute through a call. Proofs are unaffected (this only gates
-        // refutation, not PASS).
-        state.exact = false;
-
+        let (block, idx) = at;
         let argvals: Vec<SymValue> = args.iter().map(|a| self.eval_value(a, state)).collect();
         // Resolve the callee. An indirect call whose target register was devirtualised
         // from a constant ops-struct load (see `global_fnptrs`) is treated as a direct
@@ -3233,6 +3257,31 @@ impl Explorer<'_> {
             _ => None,
         };
         let summary = resolved_fid.and_then(|fid| self.summaries.get(&fid).cloned());
+
+        // Double-free through a freeing *wrapper*: a callee that definitely frees its
+        // parameter `k` (`Summary.frees_arg`) re-frees a base an earlier freeing call
+        // already freed. Done BEFORE `state.exact` is cleared below, so it refutes with a
+        // witness on an exact path exactly like a `Dealloc` double-free; then the freed
+        // base is recorded. Every other call records `NoDoubleFree` proven, so the
+        // per-call obligation is never left Open. (The coarse `frees` havoc below is
+        // unchanged, so liveness/PASS is unaffected — this only *adds* a definite check.)
+        match summary.as_ref().and_then(|s| s.frees_arg) {
+            Some(k) => match argvals.get(k).and_then(Self::ptr_base_key) {
+                Some(b) => {
+                    let dup = state.freed_bases.contains(&b);
+                    self.record_temporal((block, idx), SafetyProperty::NoDoubleFree, dup, state, "no double free through freeing calls", "re-frees a pointer an earlier freeing call already freed");
+                    state.freed_bases.insert(b);
+                }
+                None => self.record(block, idx, SafetyProperty::NoDoubleFree, true, "no double free through freeing calls", ""),
+            },
+            None => self.record(block, idx, SafetyProperty::NoDoubleFree, true, "no double free through freeing calls", ""),
+        }
+
+        // A call is an over-approximation point (havoc'd heap/return unless a
+        // precise summary applies); conservatively mark the path inexact so we
+        // never refute through a call. Proofs are unaffected (this only gates
+        // refutation, not PASS).
+        state.exact = false;
 
         // Effects: a writing or freeing callee invalidates the symbolic heap;
         // a *freeing* callee additionally invalidates region liveness (we do
@@ -4059,6 +4108,41 @@ impl Explorer<'_> {
         entry.residual = "reads uninitialized (never-written) freshly-allocated memory".to_string();
     }
 
+    /// Whether the range `[base, base+n)` contains a chunk that **no store definitely
+    /// determines** — i.e. some copied byte is uninitialized. Scans in 8-byte words (plus
+    /// a byte tail), bounded to a fixed number of chunks so a huge buffer cannot blow up
+    /// the check; a `LoadOrigin::Unwritten` chunk (every store `No`-aliases it) is a
+    /// definite never-written region. Only *definite* uninit counts (a `May`/`Stored`
+    /// chunk does not), so this never fabricates a leak.
+    fn range_has_unwritten_bytes(&mut self, base: &SymPointer, n: u64, state: &mut PathState) -> bool {
+        const MAX_CHUNKS: u64 = 512; // cap the scan (covers 4 KiB at 8-byte words)
+        let word = 8u64;
+        let full = n / word;
+        let tail = n % word;
+        let scanned = full.min(MAX_CHUNKS);
+        for k in 0..scanned {
+            let delta = self.ctx.int(PTR_WIDTH, (k * word) as u128);
+            let off = self.ctx.bin(BvOp::Add, base.offset, delta);
+            let p = SymPointer { prov: base.prov.clone(), offset: off, align: 1 };
+            let (_, origin) = self.load_value(&p, word, &Type::int(64), state);
+            if matches!(origin, LoadOrigin::Unwritten) {
+                return true;
+            }
+        }
+        // The sub-word tail (only when the whole-word scan wasn't truncated).
+        if tail > 0 && full <= MAX_CHUNKS {
+            let delta = self.ctx.int(PTR_WIDTH, (full * word) as u128);
+            let off = self.ctx.bin(BvOp::Add, base.offset, delta);
+            let p = SymPointer { prov: base.prov.clone(), offset: off, align: 1 };
+            let ty = Type::int((tail * 8) as u32);
+            let (_, origin) = self.load_value(&p, tail, &ty, state);
+            if matches!(origin, LoadOrigin::Unwritten) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Record a `copy_to_user` disclosure of never-written source bytes as a
     /// `NoInfoLeak` refutation (a kernel information leak: uninitialized memory
     /// copied out to userspace).
@@ -4779,6 +4863,49 @@ mod tests {
         assert!(d.refutation.is_none() && d.proven, "lock/unlock/lock is balanced: {d:?}");
     }
 
+    /// Soundness (no false FAIL): a lock released via an *unrecognized* helper that
+    /// takes the lock as an argument must NOT be reported as a double-lock when
+    /// re-acquired — the escape-bounded clear drops the base on any call handed it.
+    #[test]
+    fn lock_then_unlock_via_unknown_helper_then_lock_is_not_a_deadlock() {
+        let l = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: l,
+            region: RegionKind::Stack,
+            elem: Type::int(32),
+            count: Operand::int(64, 1),
+            align: 4,
+        });
+        let call = |b: &mut BasicBlock, name: &str| b.insts.push(Inst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Symbol(name.into()),
+            args: vec![Operand::Reg(l)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        });
+        call(&mut bb0, "spin_lock"); // 1
+        call(&mut bb0, "my_custom_unlock"); // 2 — NOT in LOCK_ACQUIRE, takes l → drops it
+        call(&mut bb0, "spin_lock"); // 3 — must NOT be a double-lock
+        let f = Function {
+            id: FuncId(0),
+            name: "dl_helper".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+        let r = discharge_with(&f, limits);
+        let d = r
+            .mem_decision(BlockId(0), 3, SafetyProperty::DataRace)
+            .expect("DataRace obligation");
+        assert!(
+            d.refutation.is_none() && d.proven,
+            "an unlock via an unrecognized helper must clear the lock (no false double-lock): {d:?}"
+        );
+    }
+
     #[test]
     fn attacker_controlled_alloc_size_overflow_is_flagged() {
         // buf = alloc [n x i32]: size = n * 4, n attacker-controlled → can wrap.
@@ -4868,6 +4995,50 @@ mod tests {
         assert!(
             d.refutation.is_some(),
             "copy_to_user of a never-written buffer must be refuted as an info leak: {d:?}"
+        );
+    }
+
+    #[test]
+    fn copy_to_user_with_uninitialized_tail_is_an_info_leak() {
+        // 32-byte buffer, only the first 8 bytes written, all 32 copied out → the tail
+        // [8,32) is disclosed uninitialized. The single-word check missed this; the
+        // whole-range scan must catch it.
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 32),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(64),
+            ptr: Operand::Reg(buf),
+            value: Operand::int(64, 0),
+            align: 8,
+        });
+        bb0.insts.push(Inst::MemIntrinsic {
+            kind: MemKind::UserDrain,
+            dst: Operand::Reg(buf),
+            src: None,
+            len: Operand::int(64, 32),
+        });
+        let f = Function {
+            id: FuncId(0),
+            name: "drain_tail".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let r = discharge_function(&f);
+        let d = r
+            .mem_decision(BlockId(0), 2, SafetyProperty::NoInfoLeak)
+            .expect("NoInfoLeak obligation for the drain");
+        assert!(
+            d.refutation.is_some(),
+            "copy_to_user of a buffer with an uninitialized tail must be flagged: {d:?}"
         );
     }
 
@@ -6208,12 +6379,76 @@ mod tests {
                 ret: crate::summary::RetSummary::Unknown,
                 writes: false,
                 frees: true,
+                frees_arg: None,
                 prov: crate::summary::ProvTransfer::default(),
             },
         );
         let r = discharge_with_summaries(&f, &summaries);
         let uaf = r.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
         assert!(!uaf.proven, "use after a freeing call must not prove temporal safety");
+    }
+
+    /// Double-free through a freeing *wrapper* (a callee that definitely frees its
+    /// parameter): calling it twice on the same pointer is a double-free (flagged in
+    /// bug-finding mode); calling it once is not.
+    #[test]
+    fn double_free_through_a_freeing_wrapper_is_flagged() {
+        use std::collections::HashMap;
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        let free_call = |b: &mut BasicBlock| b.insts.push(Inst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Direct(FuncId(9)),
+            args: vec![Operand::Reg(buf)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        });
+        free_call(&mut bb0); // idx 1 — first free
+        free_call(&mut bb0); // idx 2 — double free
+        let f = Function {
+            id: FuncId(0),
+            name: "double_free_wrapper".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let mut summaries = HashMap::new();
+        summaries.insert(
+            FuncId(9),
+            Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default() },
+        );
+        let r = discharge_with_fields(
+            &f, &summaries, &[], &[], &HashMap::new(), &HashMap::new(), true, true, false,
+        );
+        let first = r.mem_decision(BlockId(0), 1, SafetyProperty::NoDoubleFree).expect("first free");
+        assert!(first.refutation.is_none(), "the first free must not be flagged: {first:?}");
+        let second = r.mem_decision(BlockId(0), 2, SafetyProperty::NoDoubleFree).expect("second free");
+        assert!(second.refutation.is_some(), "the second free of the same pointer is a double-free: {second:?}");
+    }
+
+    /// Soundness: `frees_arg` is derived only for a single-block `kfree`-style wrapper;
+    /// a multi-block callee gets `frees_arg = None`, so two calls are NOT a double-free.
+    #[test]
+    fn derive_frees_arg_only_for_single_block_wrapper() {
+        let p = RegId(0);
+        // Single block: `free(p)` → frees_arg = Some(0).
+        let mut single = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        single.insts.push(Inst::Dealloc { region: RegionKind::Heap, ptr: Operand::Reg(p) });
+        let wrapper = Function {
+            id: FuncId(0), name: "w".into(), params: vec![(p, Type::ptr(Type::int(8)))],
+            ret_ty: Type::Unit, blocks: vec![single], entry: BlockId(0),
+        };
+        assert_eq!(crate::summary::summarize_module(&{
+            let mut m = csolver_ir::Module::new("m"); m.functions.push(wrapper); m
+        }).get(&FuncId(0)).unwrap().frees_arg, Some(0));
     }
 
     /// Build a caller that stores `buf` into `slot`, loads a function pointer
@@ -6289,7 +6524,7 @@ mod tests {
         // A pure callee: no writes, no frees.
         summaries.insert(
             FuncId(1),
-            Summary { ret: RetSummary::Unknown, writes: false, frees: false, prov: ProvTransfer::default() },
+            Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default() },
         );
         let mut globals = HashMap::new();
         globals.insert("G".to_string(), csolver_ir::GlobalDef { size: 8, align: 8, writable: false });

@@ -484,9 +484,10 @@ impl Inst {
             Inst::CapRequire { .. } => &[WriteCapability],
             Inst::CapRequireIfAlias { .. } => &[WriteCapability],
             Inst::CapRequireIfAliasFields { .. } => &[WriteCapability],
-            // Bug-finding only: a lock-acquiring call must not re-acquire a lock already
-            // held on the same path (an AA self-deadlock).
-            Inst::Call { .. } => &[DataRace],
+            // A freeing-wrapper call must not re-free a pointer an earlier freeing call
+            // already freed (`NoDoubleFree`); a lock-acquiring call must not re-acquire a
+            // held lock (`DataRace`, bug-finding only).
+            Inst::Call { .. } => &[NoDoubleFree, DataRace],
             _ => &[],
         }
     }
