@@ -16,15 +16,19 @@
 //! (never as a refutation), so a budget bail can only ever lose precision, never
 //! soundness.
 //!
-//! The engine is CDCL (conflict-driven clause learning): unit propagation over
-//! per-variable occurrence lists, and on every conflict a **1-UIP** analysis
-//! that derives an *asserting* learnt clause and backjumps non-chronologically
-//! to its assertion level. Every learnt clause is a resolvent of clauses already
-//! present, hence a logical consequence of the input — it removes no models, so
-//! `Unsat` stays exactly as trustworthy as under plain DPLL (the soundness
-//! contract above is preserved; learning only prunes the search, never the
-//! model set). A learnt-clause store that only grows within a single bounded
-//! `solve` keeps the whole thing pure Rust with no external solver.
+//! The engine is CDCL (conflict-driven clause learning) with the usual modern
+//! machinery: two-watched-literal unit propagation, **1-UIP** conflict analysis
+//! that derives an *asserting* learnt clause and backjumps non-chronologically to
+//! its assertion level, a VSIDS branch heuristic, Luby restarts, and LBD-based
+//! deletion that keeps the learnt-clause database bounded.
+//!
+//! None of that touches soundness. Every learnt clause is a resolvent of clauses
+//! already present, hence a logical consequence of the input — it removes no
+//! models. VSIDS and restarts only reorder the search. Deletion only ever drops
+//! *learnt* clauses (never an original, never a live reason), so it can forgo
+//! pruning but never a model. Thus `Unsat` stays exactly as trustworthy as under
+//! plain DPLL (the soundness contract above is preserved throughout), and the
+//! whole thing stays pure Rust with no external solver.
 
 /// A boolean literal: a variable together with a polarity.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
