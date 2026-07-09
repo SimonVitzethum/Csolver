@@ -253,6 +253,35 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_extent_needs_a_no_overflow_guard() {
+        // Demonstrates the in-bounds false-PASS hole the symbolic executor's
+        // no-overflow conjunct closes. Pin offset to 2^63 - 4 (signed-positive),
+        // access size 8, region size 16 — a blatant OOB.
+        let w = 64;
+        let mut c = ExprCtx::new();
+        let off = c.symbol("off", w);
+        let pin = c.int(w, (1u128 << 63) - 4);
+        let assume = c.cmp(CmpOp::Eq, off, pin);
+        let eight = c.int(w, 8);
+        let end = c.bin(BvOp::Add, off, eight); // wraps to a negative value
+        let size = c.int(w, 16);
+        // The naive upper bound `offset + 8 <=s 16` is *vacuously* provable because
+        // the wrapped `end` is negative — exactly the false PASS.
+        let upper = c.cmp(CmpOp::Sle, end, size);
+        assert!(
+            prove_implies(&c, &[assume], upper),
+            "wrapping makes the naive upper bound vacuously true (the hole)",
+        );
+        // The no-overflow guard `offset <=s offset+8` is NOT provable here, so the
+        // strengthened conjunction correctly declines to prove in-bounds.
+        let no_overflow = c.cmp(CmpOp::Sle, off, end);
+        assert!(
+            !prove_implies(&c, &[assume], no_overflow),
+            "the no-overflow guard rejects the wrapped extent",
+        );
+    }
+
+    #[test]
     fn unblastable_goal_is_not_proved() {
         // Division is not bit-blasted ⇒ sound fallback (false), never a crash.
         let mut c = ExprCtx::new();

@@ -3025,8 +3025,14 @@ impl Explorer<'_> {
         let zero = self.ctx.int(PTR_WIDTH, 0);
         let end = self.ctx.bin(BvOp::Add, offset, len);
         let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
+        // No-overflow: the extent `offset + len` must not wrap past 2^63. Without
+        // this, a wrapped (negative) `end` satisfies `end <=s size` vacuously, so a
+        // pathological huge offset/len would prove "in bounds" — a false PASS. With
+        // `offset <=s end` and `end <=s size` (size a real, sub-2^63 region size),
+        // `end` is pinned to the non-wrapped range, so it equals the true sum.
+        let no_overflow = self.ctx.cmp(SCmp::Sle, offset, end);
         let upper = self.ctx.cmp(SCmp::Sle, end, size);
-        self.prove(lower, state) && self.prove(upper, state)
+        self.prove(lower, state) && self.prove(no_overflow, state) && self.prove(upper, state)
     }
 
     /// Handle a call using the callee's summary: effect-aware heap handling and
@@ -3666,24 +3672,30 @@ impl Explorer<'_> {
         }
     }
 
-    /// The conjuncts of in-bounds: `0 <= offset` and `offset + asize <= size`.
-    fn in_bounds_conjuncts(&mut self, offset: ExprId, asize: u64, size: ExprId) -> [ExprId; 2] {
+    /// The conjuncts of in-bounds: `0 <= offset`, no-overflow of the extent, and
+    /// `offset + asize <= size`. The middle conjunct (`offset <= offset+asize`)
+    /// rules out a wrapped `end` that would satisfy the upper bound vacuously (see
+    /// [`Self::prove_in_bounds_len`]).
+    fn in_bounds_conjuncts(&mut self, offset: ExprId, asize: u64, size: ExprId) -> [ExprId; 3] {
         let zero = self.ctx.int(PTR_WIDTH, 0);
         let asize_e = self.ctx.int(PTR_WIDTH, asize as u128);
         let end = self.ctx.bin(BvOp::Add, offset, asize_e);
         let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
+        let no_overflow = self.ctx.cmp(SCmp::Sle, offset, end);
         let upper = self.ctx.cmp(SCmp::Sle, end, size);
-        [lower, upper]
+        [lower, no_overflow, upper]
     }
 
-    /// `0 <= offset && offset + len <= size` for a **symbolic** byte length `len`
-    /// (a bulk copy). The refutable form of [`prove_in_bounds_len`].
-    fn in_bounds_len_conjuncts(&mut self, offset: ExprId, len: ExprId, size: ExprId) -> [ExprId; 2] {
+    /// `0 <= offset`, no-overflow, and `offset + len <= size` for a **symbolic**
+    /// byte length `len` (a bulk copy). The refutable form of
+    /// [`prove_in_bounds_len`].
+    fn in_bounds_len_conjuncts(&mut self, offset: ExprId, len: ExprId, size: ExprId) -> [ExprId; 3] {
         let zero = self.ctx.int(PTR_WIDTH, 0);
         let end = self.ctx.bin(BvOp::Add, offset, len);
         let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
+        let no_overflow = self.ctx.cmp(SCmp::Sle, offset, end);
         let upper = self.ctx.cmp(SCmp::Sle, end, size);
-        [lower, upper]
+        [lower, no_overflow, upper]
     }
 
     /// The goal "the allocation byte size does not overflow the pointer width",
