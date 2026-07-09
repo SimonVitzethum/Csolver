@@ -73,6 +73,25 @@ EXIT CODES:
 ";
 
 fn main() -> ExitCode {
+    // Bound glibc's per-thread malloc arenas. By default glibc opens up to 8×CPUs arenas and
+    // retains each thread's high-water mark instead of returning freed pages to the OS, so a
+    // many-threaded scan of large translation units accumulates RSS across arenas until it
+    // exhausts RAM. Capping the arena count (and lowering the trim threshold) makes freed
+    // memory actually return to the OS. glibc reads these at init, so re-exec once with them
+    // set. Safe: a plain re-exec of ourselves with two extra env vars.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok(status) = std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env("MALLOC_ARENA_MAX", "2")
+                .env("MALLOC_TRIM_THRESHOLD_", "67108864")
+                .status()
+            {
+                return ExitCode::from(status.code().unwrap_or(1) as u8);
+            }
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(code) => code,
@@ -275,6 +294,37 @@ struct FileScan {
     findings: Vec<Finding>,
 }
 
+/// System memory available to start new work, in MiB (Linux: `/proc/meminfo`
+/// `MemAvailable`). `u64::MAX` where it cannot be read, so the throttle is a no-op.
+fn available_mb() -> u64 {
+    match std::fs::read_to_string("/proc/meminfo") {
+        Ok(s) => s
+            .lines()
+            .find_map(|l| l.strip_prefix("MemAvailable:"))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+            .unwrap_or(u64::MAX),
+        Err(_) => u64::MAX,
+    }
+}
+
+/// **Memory backpressure.** Before a worker starts a new file, wait while free memory is
+/// below `MEM_FLOOR_MB` AND at least one other file is in flight (which will free memory as
+/// it finishes) — so the scan never starts so many concurrent analyses that it exhausts RAM
+/// and thrashes/OOMs, without aborting or skipping any analysis. Progress is guaranteed: if
+/// no file is in flight (`active == 0`) the worker proceeds regardless, so at least one
+/// analysis always runs even under memory pressure. `active` counts in-flight files.
+/// The floor is generous because an in-flight file's own analysis keeps growing after it
+/// starts (the backpressure only gates STARTS), so headroom must cover that growth.
+const MEM_FLOOR_MB: u64 = 4096;
+fn await_memory(active: &std::sync::atomic::AtomicUsize) {
+    use std::sync::atomic::Ordering;
+    while active.load(Ordering::Relaxed) > 0 && available_mb() < MEM_FLOOR_MB {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// The external functions a module DEFINES and the external symbols it CALLS — the edges
 /// of the cross-file call graph. Internal (static) definitions are file-local, so they are
 /// not exported as reachability targets; a `Callee::Symbol(name)` is a cross-file call.
@@ -367,6 +417,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
     let cfg = Config { closed_world: true, entry_patterns: Some(entry_patterns.to_vec()), ..config.clone() };
     let entry_next = std::sync::atomic::AtomicUsize::new(0);
     let entry_done = std::sync::atomic::AtomicUsize::new(0);
+    let entry_active = std::sync::atomic::AtomicUsize::new(0);
     let agg: std::sync::Mutex<Vec<FileScan>> = std::sync::Mutex::new(Vec::new());
     let n_entries = entry_fns.len();
     std::thread::scope(|s| {
@@ -376,6 +427,8 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
                 if ei >= n_entries {
                     break;
                 }
+                await_memory(&entry_active);
+                entry_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (m0, ref ename) = entry_fns[ei];
                 // BFS reachable modules from the entry's module.
                 let mut seen: BTreeSet<usize> = BTreeSet::new();
@@ -396,6 +449,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
                 let group: Vec<&csolver_ir::Module> = seen.iter().map(|&i| &modules[i].1).collect();
                 let linked = csolver_ir::merge_modules(&group.iter().map(|m| (*m).clone()).collect::<Vec<_>>(), ename.as_str());
                 let fs = scan_linked_module(&linked, ename, &cfg);
+                entry_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let d = entry_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if d.is_multiple_of(20) {
                     eprintln!("  … {d}/{n_entries} entries");
@@ -576,7 +630,15 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     // function-level threads, so the cores stay busy either way. Deterministic: per-unit
     // results are re-sorted into unit order and each verdict is thread-count independent.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let workers = cores.min(total_units).max(1);
+    // Concurrent file analyses each hold their own LIVE memory (a large translation unit
+    // peaks at a few GB), so on a memory-constrained box the number of files analysed at
+    // once — not the core count — is what bounds peak RSS. Cap the workers by the memory
+    // available at start (budgeting ~`PER_WORKER_MB` per concurrent analysis), never above
+    // the cores. `CSOLVER_JOBS=N` overrides. The backpressure below is the reactive net.
+    const PER_WORKER_MB: u64 = 3072;
+    let mem_workers = (available_mb() / PER_WORKER_MB).max(1) as usize;
+    let job_cap = std::env::var("CSOLVER_JOBS").ok().and_then(|v| v.parse::<usize>().ok());
+    let workers = job_cap.unwrap_or(mem_workers).min(cores).min(total_units).max(1);
     let threads_per_unit = (cores / workers).max(1);
     eprintln!(
         "scanning {total_files} .ll files under {} … ({total_units} units, {workers} workers × {threads_per_unit} threads{})",
@@ -586,6 +648,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
 
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let active = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_units));
 
     std::thread::scope(|s| {
@@ -595,8 +658,13 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
                 if i >= total_units {
                     break;
                 }
+                // Memory backpressure: hold off starting this file while RAM is tight and
+                // other files are still in flight (they free memory as they finish).
+                await_memory(&active);
+                active.fetch_add(1, Ordering::Relaxed);
                 let (label, unit) = &units[i];
                 let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit);
+                active.fetch_sub(1, Ordering::Relaxed);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d.is_multiple_of(50) {
                     eprintln!("  … {d}/{total_units} units");
