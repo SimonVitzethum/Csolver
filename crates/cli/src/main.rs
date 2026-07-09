@@ -309,6 +309,9 @@ struct FileScan {
     dropped: u64,
     errored: u64,
     findings: Vec<Finding>,
+    /// Symbolic exploration hit its budget on ≥1 function: the unit is a
+    /// candidate for a full-effort *deferred* re-run rather than accepting Unknown.
+    truncated: bool,
 }
 
 /// The syscall-wrapper name prefixes (SYSCALL_DEFINE* expands to these) — precise entry
@@ -715,6 +718,7 @@ fn scan_one_unit(
     // caller in another subsystem could violate a synthesized contract → false PASS).
     fs.dropped = module.unanalyzed.len() as u64;
     let report = verify_module_with_threads(&module, config, threads.max(1));
+    fs.truncated = report.any_truncated();
     for f in &report.functions {
         match f.verdict {
             Verdict::Pass => fs.pass += 1,
@@ -800,6 +804,10 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     let done = AtomicUsize::new(0);
     let active = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_units));
+    // Units whose exploration hit the budget: deferred to a full-effort serial phase
+    // instead of being counted as Unknown now (A3 — "pause the file until the others
+    // are done, then finish it with the whole machine").
+    let deferred: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
     std::thread::scope(|s| {
         for _ in 0..workers {
@@ -819,10 +827,32 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
                 if d.is_multiple_of(50) {
                     eprintln!("  … {d}/{total_units} units");
                 }
-                results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
+                if fs.truncated {
+                    deferred.lock().unwrap_or_else(|p| p.into_inner()).push(i);
+                } else {
+                    results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
+                }
             });
         }
     });
+
+    // Phase 2: re-scan the budget-limited units serially with the clock disabled, so each
+    // gets the full machine and a real chance to *decide* instead of an Unknown that was
+    // only a resource limit. Serial (workers=1, all threads to one unit): the parallel pass
+    // is done, so there is no contention to yield to. Deterministic: results are re-sorted.
+    let mut deferred = deferred.into_inner().unwrap_or_else(|p| p.into_inner());
+    if !deferred.is_empty() {
+        deferred.sort_unstable();
+        eprintln!("  deferred {} budget-limited unit(s) → full-effort re-scan …", deferred.len());
+        let mut unbounded = config.clone();
+        unbounded.time_budget = None;
+        let all_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for i in deferred {
+            let (label, unit) = &units[i];
+            let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads);
+            results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
+        }
+    }
 
     // Aggregate in unit order (deterministic output).
     let mut all = results.into_inner().unwrap_or_else(|p| p.into_inner());

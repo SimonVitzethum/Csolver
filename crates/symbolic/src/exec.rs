@@ -175,7 +175,7 @@ pub fn discharge_with_fields(
 ) -> SymbolicReport {
     discharge_with_scalars(
         f, summaries, contracts, field_contracts, &[], globals, prov_grants, &HashMap::new(), None,
-        bug_finding, exported, assume_valid_params,
+        ExecLimits::default().time_budget, bug_finding, exported, assume_valid_params,
     )
 }
 
@@ -195,11 +195,13 @@ pub fn discharge_with_scalars(
     prov_grants: &HashMap<u32, HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     analysis_in: Option<&IntervalAnalysis>,
+    time_budget: Option<std::time::Duration>,
     bug_finding: bool,
     exported: bool,
     assume_valid_params: bool,
 ) -> SymbolicReport {
-    let limits = ExecLimits { bug_finding, exported, assume_valid_params, ..ExecLimits::default() };
+    let limits =
+        ExecLimits { bug_finding, exported, assume_valid_params, time_budget, ..ExecLimits::default() };
     discharge_inner(
         f, limits, summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
         global_fn_ptrs, analysis_in,

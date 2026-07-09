@@ -89,6 +89,11 @@ pub struct Config {
     /// reduce recall (a wrongly-excluded entry's obligation stays UNKNOWN), never turn a
     /// FAIL into a PASS, so it is sound. `None` ⇒ the linkage default (unchanged).
     pub entry_patterns: Option<Vec<String>>,
+    /// Per-function symbolic exploration wall-clock budget. `None` disables the
+    /// clock (unbounded — used by a scan's *deferred* second phase to give a
+    /// budget-limited unit a full-effort re-run). Defaults to the executor's
+    /// generous 30 s termination guarantee.
+    pub time_budget: Option<std::time::Duration>,
 }
 
 /// Whether `name` matches an entry pattern. A single `*` is a wildcard at the
@@ -121,6 +126,7 @@ impl Default for Config {
             bug_finding: false,
             assume_valid_params: false,
             entry_patterns: None,
+            time_budget: Some(std::time::Duration::from_secs(30)),
         }
     }
 }
@@ -205,6 +211,7 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
             function: uname.clone(),
             verdict: Verdict::Unknown,
             outcomes: vec![ObligationOutcome { obligation, result }],
+            truncated: false,
         });
     }
 
@@ -523,11 +530,13 @@ fn verify_function_with(
         // the executor so it is not recomputed — a clone instead of a 2nd fixpoint.
         Some(s) => discharge_with_scalars(
             f, s, contracts, field_contracts, scalar_pre, globals, prov_grants, global_fn_ptrs,
-            analysis.as_ref(), config.bug_finding, exported, config.assume_valid_params,
+            analysis.as_ref(), config.time_budget, config.bug_finding, exported,
+            config.assume_valid_params,
         ),
         None => discharge_function(f),
     });
 
+    let truncated = symbolic.as_ref().is_some_and(|r| r.truncated);
     let sym_assumptions = symbolic
         .as_ref()
         .map(|r| r.assumptions.clone())
@@ -609,6 +618,7 @@ fn verify_function_with(
         function: f.name.clone(),
         verdict,
         outcomes,
+        truncated,
     }
 }
 

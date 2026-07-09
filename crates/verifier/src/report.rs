@@ -27,6 +27,11 @@ pub struct FunctionReport {
     pub verdict: Verdict,
     /// Per-obligation outcomes.
     pub outcomes: Vec<ObligationOutcome>,
+    /// Whether symbolic exploration was **truncated at its budget** (visit or
+    /// wall-clock) for this function — so its `Unknown` obligations are a
+    /// resource limit, not genuine undecidability. Lets a scan *defer* a
+    /// budget-limited unit for a full-effort re-run instead of accepting Unknown.
+    pub truncated: bool,
 }
 
 impl FunctionReport {
@@ -56,5 +61,10 @@ impl ModuleReport {
     /// Total obligations with the given verdict across the module.
     pub fn count(&self, verdict: Verdict) -> usize {
         self.functions.iter().map(|f| f.count(verdict)).sum()
+    }
+
+    /// Whether any function's symbolic exploration was truncated at its budget.
+    pub fn any_truncated(&self) -> bool {
+        self.functions.iter().any(|f| f.truncated)
     }
 }
