@@ -253,6 +253,41 @@ mod tests {
     }
 
     #[test]
+    fn zone_difference_fact_is_overflow_safe() {
+        // The loop zone invariant `a - b <= 5` holds in a reachable state with
+        // b = i64::MAX and a = 10 (10 - (2^63-1) is hugely negative ≤ 5). But
+        // `b + 5` wraps, so the naive fact `a <=s b+5` reads FALSE there — it would
+        // wrongly exclude that state (a possible false PASS). The overflow-safe
+        // guarded form `(b+5 <s b) ∨ (a <=s b+5)` stays true, admitting the state.
+        let w = 64;
+        let mut c = ExprCtx::new();
+        let a = c.symbol("a", w);
+        let b = c.symbol("b", w);
+        let pin_a = {
+            let k = c.int(w, 10);
+            c.cmp(CmpOp::Eq, a, k)
+        };
+        let pin_b = {
+            let k = c.int(w, (1u128 << 63) - 1);
+            c.cmp(CmpOp::Eq, b, k)
+        };
+        let five = c.int(w, 5);
+        let sum = c.bin(BvOp::Add, b, five);
+        let naive = c.cmp(CmpOp::Sle, a, sum);
+        let not_naive = c.not(naive);
+        assert!(
+            prove_implies(&c, &[pin_a, pin_b], not_naive),
+            "the naive zone fact excludes a reachable state (the unsound hole)",
+        );
+        let overflow = c.cmp(CmpOp::Slt, sum, b);
+        let guarded = c.or(vec![overflow, naive]);
+        assert!(
+            prove_implies(&c, &[pin_a, pin_b], guarded),
+            "the overflow-safe zone fact admits the reachable state",
+        );
+    }
+
+    #[test]
     fn wrapping_extent_needs_a_no_overflow_guard() {
         // Demonstrates the in-bounds false-PASS hole the symbolic executor's
         // no-overflow conjunct closes. Pin offset to 2^63 - 4 (signed-positive),

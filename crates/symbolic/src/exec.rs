@@ -2063,10 +2063,35 @@ impl Explorer<'_> {
             })
             .collect();
         for (ea, eb, c) in diffs {
-            // a - b <= c   ⟺   a <= b + c.
+            // The zone invariant `a - b <= c`, encoded as `a <=s b + c`. A *wrapping*
+            // `b + c` makes the naive fact unsound: if the add signed-overflows, the
+            // wrapped sum is wrong and the fact can read FALSE on a state where the
+            // invariant genuinely holds — excluding a reachable state, which could
+            // license a false PASS. Guard it to be vacuously true exactly when the
+            // add overflows: then the fact is sound *bit-precisely* (no
+            // linear-no-overflow tax on its consumers), and on the common no-overflow
+            // path it collapses to the same strong `a <=s b + c` as before.
+            //
+            // `c` is a compile-time constant, so (a) skip bounds that do not fit the
+            // blastable signed width — `const_expr` would misrepresent them — and
+            // (b) its sign picks the overflow direction.
+            if i64::try_from(c).is_err() {
+                continue;
+            }
             let cexpr = self.const_expr(c);
-            let rhs = self.ctx.bin(BvOp::Add, eb, cexpr);
-            let fact = self.ctx.cmp(SCmp::Sle, ea, rhs);
+            let sum = self.ctx.bin(BvOp::Add, eb, cexpr);
+            let le = self.ctx.cmp(SCmp::Sle, ea, sum); // a <=s b + c
+            let fact = if c == 0 {
+                le // b + 0 = b: never overflows
+            } else if c > 0 {
+                // adding c > 0 overflowed iff the sum dropped below b
+                let overflow = self.ctx.cmp(SCmp::Slt, sum, eb);
+                self.ctx.or(vec![overflow, le])
+            } else {
+                // adding c < 0 underflowed iff the sum rose above b
+                let underflow = self.ctx.cmp(SCmp::Sgt, sum, eb);
+                self.ctx.or(vec![underflow, le])
+            };
             state.facts.push(fact);
         }
 
