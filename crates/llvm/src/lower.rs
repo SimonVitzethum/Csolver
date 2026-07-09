@@ -661,10 +661,7 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
         // a false-PASS hole.
         LTerm::Invoke { dst, ret, callee, args, ok, cleanup } => {
             let call_dst = dst.as_deref().map(|d| ctx.reg(d)).transpose()?;
-            let callee_ir = match ctx.func_ids.get(callee) {
-                Some(id) => Callee::Direct(*id),
-                None => Callee::Symbol(callee.clone()),
-            };
+            let callee_ir = resolve_callee(ctx, callee);
             let call_args = args
                 .iter()
                 .map(|a| ctx.operand(a, 64))
@@ -848,10 +845,7 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                     }
                 }
             } else {
-                let callee = match ctx.func_ids.get(callee) {
-                    Some(id) => Callee::Direct(*id),
-                    None => Callee::Symbol(callee.clone()),
-                };
+                let callee = resolve_callee(ctx, callee);
                 let args = args
                     .iter()
                     .map(|a| ctx.operand(a, 64))
@@ -1380,6 +1374,24 @@ fn emit_contract(
 
 /// Evaluate a contract [`SizeExpr`] to a byte-length operand, or `None` if it references
 /// an argument the call does not have (then the effect is skipped — a sound fallthrough).
+/// Resolve a call's textual callee to an MSIR [`Callee`]. A defined function name
+/// becomes `Direct`; the parser's indirect-call marker `<indirect via %n>` becomes a
+/// real `Indirect(Operand::Reg(..))` on the dispatched register — so an indirect call
+/// through a function pointer can be **devirtualized** (a load from a constant
+/// ops-struct/vtable global resolves it to the callee summary) instead of staying an
+/// opaque symbol. Any other name is an external `Symbol` (opaque, contract-modelled).
+fn resolve_callee(ctx: &Ctx, callee: &str) -> Callee {
+    if let Some(local) = callee.strip_prefix("<indirect via %").and_then(|s| s.strip_suffix('>')) {
+        if let Ok(r) = ctx.reg(local) {
+            return Callee::Indirect(Operand::Reg(r));
+        }
+    }
+    match ctx.func_ids.get(callee) {
+        Some(id) => Callee::Direct(*id),
+        None => Callee::Symbol(callee.to_string()),
+    }
+}
+
 fn size_operand(
     ctx: &mut Ctx,
     insts: &mut Vec<Inst>,

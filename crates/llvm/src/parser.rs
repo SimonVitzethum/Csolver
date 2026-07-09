@@ -41,7 +41,7 @@ pub struct LGlobal {
     pub writable: bool,
     /// Declared `align` (1 if unspecified).
     pub align: u32,
-    /// The type was a *packed* struct `<{ … }>`: its size is the plain sum of
+    /// The type was a *packed* struct `<{ … }>`: its size is the plain sum ofgrep FAIL ~/fullscan.log
     /// the field sizes (no padding). Packed types stay rejected in instruction
     /// contexts (a padded stand-in could oversize them); here the exact packed
     /// size is computable, so global definitions can be recorded.
@@ -177,19 +177,45 @@ pub enum LValue {
 /// Integer binary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LBin {
-    Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr,
+    Add,
+    Sub,
+    Mul,
+    UDiv,
+    SDiv,
+    URem,
+    SRem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    LShr,
+    AShr,
 }
 
 /// Comparison predicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LPred {
-    Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge,
+    Eq,
+    Ne,
+    Ult,
+    Ule,
+    Ugt,
+    Uge,
+    Slt,
+    Sle,
+    Sgt,
+    Sge,
 }
 
 /// Cast operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LCast {
-    Trunc, ZExt, SExt, PtrToInt, IntToPtr, Bitcast,
+    Trunc,
+    ZExt,
+    SExt,
+    PtrToInt,
+    IntToPtr,
+    Bitcast,
 }
 
 /// A parsed straight-line instruction.
@@ -198,40 +224,98 @@ pub enum LInst {
     /// `dst = alloca ty[, align n]`.
     Alloca { dst: String, ty: LType, align: u32 },
     /// `dst = load ty, ptr p[, align n]`.
-    Load { dst: String, ty: LType, ptr: LValue, align: u32, align_meta: Option<u32> },
+    Load {
+        dst: String,
+        ty: LType,
+        ptr: LValue,
+        align: u32,
+        align_meta: Option<u32>,
+    },
     /// `store ty v, ptr p[, align n]`.
-    Store { ty: LType, val: LValue, ptr: LValue, align: u32 },
+    Store {
+        ty: LType,
+        val: LValue,
+        ptr: LValue,
+        align: u32,
+    },
     /// `dst = getelementptr [inbounds] elem, ptr base, i.. index`.
-    Gep { dst: String, elem: LType, base: LValue, index: LValue },
+    Gep {
+        dst: String,
+        elem: LType,
+        base: LValue,
+        index: LValue,
+    },
     /// A binary op.
-    Bin { dst: String, op: LBin, ty: LType, a: LValue, b: LValue },
+    Bin {
+        dst: String,
+        op: LBin,
+        ty: LType,
+        a: LValue,
+        b: LValue,
+    },
     /// `dst = icmp pred ty a, b`.
-    Icmp { dst: String, pred: LPred, ty: LType, a: LValue, b: LValue },
+    Icmp {
+        dst: String,
+        pred: LPred,
+        ty: LType,
+        a: LValue,
+        b: LValue,
+    },
     /// A cast.
-    Cast { dst: String, op: LCast, val: LValue, to: LType },
+    Cast {
+        dst: String,
+        op: LCast,
+        val: LValue,
+        to: LType,
+    },
     /// `[dst =] call ret @callee(args)`.
-    Call { dst: Option<String>, ret: LType, callee: String, args: Vec<LValue> },
+    Call {
+        dst: Option<String>,
+        ret: LType,
+        callee: String,
+        args: Vec<LValue>,
+    },
     /// `dst = extractvalue AGG %agg, index` — a field of an aggregate value (the
     /// first index only; nested indices are skipped). Used to recover a
     /// checked-arithmetic tuple's sum (index 0) and overflow flag (index 1).
-    ExtractValue { dst: String, agg: LValue, index: u32 },
+    ExtractValue {
+        dst: String,
+        agg: LValue,
+        index: u32,
+    },
     /// `dst = atomicrmw <op> ptr p, T v <ord>` / `dst = cmpxchg ptr p, T c, T n
     /// <ord> <ord>` — an atomic read-modify-write of `sizeof(T)` bytes at `p`.
     /// At this abstraction both are a *load* (the returned old value) plus a
     /// *store* of an unknown value; `tuple` marks cmpxchg's `{T, i1}` result,
     /// which stays opaque (destructured by `extractvalue`).
-    AtomicRmw { dst: String, ty: LType, ptr: LValue, tuple: bool },
+    AtomicRmw {
+        dst: String,
+        ty: LType,
+        ptr: LValue,
+        tuple: bool,
+    },
     /// `dst = getelementptr {S}, ptr base, iN index, i32 field` — an array-of-
     /// structs element's *field*: `base + index * sizeof(S) + offsetof(S, field)`.
     /// Lowered as a two-step pointer-offset chain with the exact padded field
     /// offset (a dropped field offset would misplace every subsequent access).
-    GepField { dst: String, struct_ty: LType, base: LValue, index: LValue, field: u32 },
+    GepField {
+        dst: String,
+        struct_ty: LType,
+        base: LValue,
+        index: LValue,
+        field: u32,
+    },
     /// A **multi-level** gep into a nested aggregate with an all-constant navigation
     /// path: `base + index * sizeof(agg) + offsetof(agg, path)` where `path` walks
     /// struct fields and constant array indices (`gep %S, ptr, i, K1, K2, …`). The
     /// exact nested byte offset is resolved at lowering from the type layout. This
     /// is pervasive in real C/kernel IR; without it the whole function was dropped.
-    GepChain { dst: String, agg_ty: LType, base: LValue, indices: Vec<LValue> },
+    GepChain {
+        dst: String,
+        agg_ty: LType,
+        base: LValue,
+        indices: Vec<LValue>,
+    },
     /// A value the frontend models opaquely — e.g. `landingpad`'s exception
     /// object, which carries no memory-safety content. Lowered to `undef` (sound;
     /// unconstrained), so a function that merely has an unwind-cleanup path is
@@ -277,14 +361,22 @@ pub enum LTerm {
     /// **goto**: an opaque asm effect whose control may continue at the fallthrough
     /// or any listed label. Pervasive in the kernel (static keys, exception tables).
     /// Lowered to an asm havoc + a branch to *every* target (sound over-approximation).
-    CallBr { dst: Option<String>, targets: Vec<String> },
+    CallBr {
+        dst: Option<String>,
+        targets: Vec<String>,
+    },
 }
 
 /// Parse a `.ll` source into an [`LModule`].
 pub fn parse_module(src: &str) -> Result<LModule> {
     let debuginfo = crate::debuginfo::parse(src);
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0, types: HashMap::new(), meta_ints: scan_meta_ints(src) };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        types: HashMap::new(),
+        meta_ints: scan_meta_ints(src),
+    };
     // Pre-scan for `%"name" = type <T>` definitions: a definition may lexically
     // follow its first use, so the table must be complete before any function
     // parses. An unparseable definition is skipped — a function using it then
@@ -325,7 +417,12 @@ pub fn parse_module(src: &str) -> Result<LModule> {
             _ => p.skip_to_eol(),
         }
     }
-    Ok(LModule { funcs, unanalyzed, globals, debuginfo })
+    Ok(LModule {
+        funcs,
+        unanalyzed,
+        globals,
+        debuginfo,
+    })
 }
 
 struct Parser {
@@ -349,11 +446,21 @@ struct Parser {
 fn scan_meta_ints(src: &str) -> HashMap<u32, u64> {
     let mut m = HashMap::new();
     for line in src.lines() {
-        let Some((id, after)) = line.trim().strip_prefix('!').and_then(|r| r.split_once(" = ")) else {
+        let Some((id, after)) = line
+            .trim()
+            .strip_prefix('!')
+            .and_then(|r| r.split_once(" = "))
+        else {
             continue;
         };
-        let Ok(id) = id.trim().parse::<u32>() else { continue };
-        let Some(inner) = after.trim().strip_prefix("!{").and_then(|s| s.strip_suffix('}')) else {
+        let Ok(id) = id.trim().parse::<u32>() else {
+            continue;
+        };
+        let Some(inner) = after
+            .trim()
+            .strip_prefix("!{")
+            .and_then(|s| s.strip_suffix('}'))
+        else {
             continue;
         };
         let mut parts = inner.split_whitespace();
@@ -407,13 +514,17 @@ impl Parser {
     fn global(&mut self) -> Result<String> {
         match self.bump() {
             Tok::Global(s) => Ok(s),
-            other => Err(Error::parse(format!("expected global @name, found {other:?}"))),
+            other => Err(Error::parse(format!(
+                "expected global @name, found {other:?}"
+            ))),
         }
     }
     fn local(&mut self) -> Result<String> {
         match self.bump() {
             Tok::Local(s) => Ok(s),
-            other => Err(Error::parse(format!("expected local %name, found {other:?}"))),
+            other => Err(Error::parse(format!(
+                "expected local %name, found {other:?}"
+            ))),
         }
     }
 
@@ -448,17 +559,19 @@ impl Parser {
         Ok(match ty {
             LType::Named(n) => match self.types.get(n) {
                 Some(def) => self.resolve_named(&def.clone(), depth + 1)?,
-                None => {
-                    return Err(Error::unsupported(format!("unknown named type %\"{n}\"")))
-                }
+                None => return Err(Error::unsupported(format!("unknown named type %\"{n}\""))),
             },
             LType::Array(e, n) => LType::Array(Box::new(self.resolve_named(e, depth + 1)?), *n),
             LType::Vector(e, n) => LType::Vector(Box::new(self.resolve_named(e, depth + 1)?), *n),
             LType::Struct(fs) => LType::Struct(
-                fs.iter().map(|f| self.resolve_named(f, depth + 1)).collect::<Result<_>>()?,
+                fs.iter()
+                    .map(|f| self.resolve_named(f, depth + 1))
+                    .collect::<Result<_>>()?,
             ),
             LType::PackedStruct(fs) => LType::PackedStruct(
-                fs.iter().map(|f| self.resolve_named(f, depth + 1)).collect::<Result<_>>()?,
+                fs.iter()
+                    .map(|f| self.resolve_named(f, depth + 1))
+                    .collect::<Result<_>>()?,
             ),
             other => other.clone(),
         })
@@ -560,7 +673,9 @@ impl Parser {
             // parenthesised body — `getelementptr inbounds (…)`, `bitcast (…)`,
             // `inttoptr (…)`, … . The value is opaque (memory safety needs the
             // access, not the constant address), so consume the body and forget it.
-            Tok::Word(w) if !matches!(w.as_str(), "null" | "undef" | "poison" | "true" | "false") => {
+            Tok::Word(w)
+                if !matches!(w.as_str(), "null" | "undef" | "poison" | "true" | "false") =>
+            {
                 let is_gep = w == "getelementptr";
                 let mut j = self.pos;
                 while matches!(self.toks.get(j), Some(Tok::Word(_))) {
@@ -666,7 +781,8 @@ impl Parser {
 
     /// `, align N` if present.
     fn maybe_align(&mut self) -> Option<u32> {
-        if matches!(self.peek(), Tok::Punct(',')) && matches!(self.peek2(), Tok::Word(w) if w == "align")
+        if matches!(self.peek(), Tok::Punct(','))
+            && matches!(self.peek2(), Tok::Word(w) if w == "align")
         {
             self.pos += 2; // ',' 'align'
             if let Tok::Int(n) = self.bump() {
@@ -787,10 +903,24 @@ impl Parser {
                 // A value has begun: a literal, or a constant-expression operator
                 // (whose `(…)` body would otherwise be mistaken for an attribute).
                 Tok::Word(w)
-                    if matches!(w.as_str(),
-                        "null" | "undef" | "poison" | "true" | "false" | "zeroinitializer"
-                        | "getelementptr" | "bitcast" | "inttoptr" | "ptrtoint"
-                        | "addrspacecast" | "trunc" | "zext" | "sext" | "blockaddress") =>
+                    if matches!(
+                        w.as_str(),
+                        "null"
+                            | "undef"
+                            | "poison"
+                            | "true"
+                            | "false"
+                            | "zeroinitializer"
+                            | "getelementptr"
+                            | "bitcast"
+                            | "inttoptr"
+                            | "ptrtoint"
+                            | "addrspacecast"
+                            | "trunc"
+                            | "zext"
+                            | "sext"
+                            | "blockaddress"
+                    ) =>
                 {
                     break
                 }
@@ -885,7 +1015,7 @@ impl Parser {
             _ => unreachable!("caller matched Tok::Global"),
         };
         self.pos += 1; // '='
-        // Skip linkage/visibility/attribute words up to `global`/`constant`.
+                       // Skip linkage/visibility/attribute words up to `global`/`constant`.
         let writable = loop {
             match self.peek() {
                 Tok::Word(w) if w == "constant" => {
@@ -958,7 +1088,14 @@ impl Parser {
             }
             self.pos += 1;
         }
-        Some(LGlobal { name, ty, writable, align, packed, fn_ptrs })
+        Some(LGlobal {
+            name,
+            ty,
+            writable,
+            align,
+            packed,
+            fn_ptrs,
+        })
     }
 
     /// Walk a constant initializer *value* whose type is `ty` (already resolved),
@@ -989,7 +1126,8 @@ impl Parser {
                     loop {
                         let ety = self.ltype()?;
                         let a = if packed { 1 } else { ltype_align(&ety)? };
-                        off = align_up(off, a).ok_or_else(|| Error::unsupported("init overflow"))?;
+                        off =
+                            align_up(off, a).ok_or_else(|| Error::unsupported("init overflow"))?;
                         let ep = matches!(ety, LType::PackedStruct(_));
                         self.scan_init_value(&ety, ep, off, out)?;
                         off = off
@@ -1012,8 +1150,16 @@ impl Parser {
                 if self.eat_aggregate_zero() {
                     return Ok(());
                 }
-                let close = if matches!(ty, LType::Vector(..)) { '>' } else { ']' };
-                let open = if matches!(ty, LType::Vector(..)) { '<' } else { '[' };
+                let close = if matches!(ty, LType::Vector(..)) {
+                    '>'
+                } else {
+                    ']'
+                };
+                let open = if matches!(ty, LType::Vector(..)) {
+                    '<'
+                } else {
+                    '['
+                };
                 // A `c"…"` string body is not a bracketed element list: skip it
                 // exactly (no pointer fields), consuming the string token.
                 if !matches!(self.peek(), Tok::Punct(p) if *p == open) {
@@ -1029,9 +1175,10 @@ impl Parser {
                         let ety = self.ltype()?;
                         let ep = matches!(ety, LType::PackedStruct(_));
                         let off = base
-                            .checked_add(idx.checked_mul(stride).ok_or_else(|| {
-                                Error::unsupported("init overflow")
-                            })?)
+                            .checked_add(
+                                idx.checked_mul(stride)
+                                    .ok_or_else(|| Error::unsupported("init overflow"))?,
+                            )
                             .ok_or_else(|| Error::unsupported("init overflow"))?;
                         self.scan_init_value(&ety, ep, off, out)?;
                         idx += 1;
@@ -1071,7 +1218,10 @@ impl Parser {
             self.expect_punct('{').ok()?;
             let fields = self.struct_fields().ok()?;
             self.expect_punct('>').ok()?;
-            fields.iter().map(|f| self.resolve_named(f, 0).ok()).collect()
+            fields
+                .iter()
+                .map(|f| self.resolve_named(f, 0).ok())
+                .collect()
         };
         match attempt() {
             Some(f) => Some(f),
@@ -1088,8 +1238,7 @@ impl Parser {
         // this module — captured, because it licenses call-site contract
         // synthesis. Everything else up to the return type is skipped
         // (`dso_local`, `noundef`, `signext`, `dereferenceable(N)`, …).
-        let internal =
-            matches!(self.peek(), Tok::Word(w) if w == "internal" || w == "private");
+        let internal = matches!(self.peek(), Tok::Word(w) if w == "internal" || w == "private");
         self.skip_to_type()?;
         let ret = self.ltype()?;
         let name = self.global()?;
@@ -1113,7 +1262,15 @@ impl Parser {
                 } else {
                     String::new() // unnamed parameter
                 };
-                params.push(LParam { ty, name, deref, abi_buf, align, readonly, writeonly });
+                params.push(LParam {
+                    ty,
+                    name,
+                    deref,
+                    abi_buf,
+                    align,
+                    readonly,
+                    writeonly,
+                });
                 if matches!(self.peek(), Tok::Punct(',')) {
                     self.pos += 1;
                 } else {
@@ -1138,7 +1295,14 @@ impl Parser {
         self.expect_punct('{')?;
         let blocks = self.blocks(params.len())?;
         self.expect_punct('}')?;
-        Ok(LFunc { name, ret, params, blocks, internal, dbg })
+        Ok(LFunc {
+            name,
+            ret,
+            params,
+            blocks,
+            internal,
+            dbg,
+        })
     }
 
     fn blocks(&mut self, param_count: usize) -> Result<Vec<LBlock>> {
@@ -1195,7 +1359,12 @@ impl Parser {
                 }
                 self.skip_to_eol(); // drop trailing metadata
             };
-            blocks.push(LBlock { label, phis, insts, term });
+            blocks.push(LBlock {
+                label,
+                phis,
+                insts,
+                term,
+            });
         }
         Ok(blocks)
     }
@@ -1251,7 +1420,14 @@ impl Parser {
                 self.expect_word("unwind")?;
                 self.expect_word("label")?;
                 let cleanup = self.local()?;
-                return Ok(Some(LTerm::Invoke { dst: invoke_dst, ret, callee, args, ok, cleanup }));
+                return Ok(Some(LTerm::Invoke {
+                    dst: invoke_dst,
+                    ret,
+                    callee,
+                    args,
+                    ok,
+                    cleanup,
+                }));
             }
         }
         if kw == "callbr" {
@@ -1285,7 +1461,10 @@ impl Parser {
                 }
                 self.expect_punct(']')?;
             }
-            return Ok(Some(LTerm::CallBr { dst: invoke_dst, targets }));
+            return Ok(Some(LTerm::CallBr {
+                dst: invoke_dst,
+                targets,
+            }));
         }
         match kw.as_str() {
             "ret" => {
@@ -1344,7 +1523,12 @@ impl Parser {
                     cases.push((cv, self.local()?));
                 }
                 self.expect_punct(']')?;
-                Ok(Some(LTerm::Switch { value, width, default, cases }))
+                Ok(Some(LTerm::Switch {
+                    value,
+                    width,
+                    default,
+                    cases,
+                }))
             }
             "unreachable" => {
                 self.pos += 1;
@@ -1402,13 +1586,20 @@ impl Parser {
             other => return Err(Error::parse(format!("expected an opcode, found {other:?}"))),
         };
         self.pos += 1;
-        let need_dst = || dst.clone().ok_or_else(|| Error::parse(format!("`{op}` needs a destination")));
+        let need_dst = || {
+            dst.clone()
+                .ok_or_else(|| Error::parse(format!("`{op}` needs a destination")))
+        };
 
         let inst = match op.as_str() {
             "alloca" => {
                 let ty = self.ltype()?;
                 let align = self.maybe_align().unwrap_or(0);
-                LInst::Alloca { dst: need_dst()?, ty, align }
+                LInst::Alloca {
+                    dst: need_dst()?,
+                    ty,
+                    align,
+                }
             }
             "load" => {
                 // `atomic`/`volatile` qualifiers don't change the memory-safety
@@ -1425,7 +1616,13 @@ impl Parser {
                 // LLVM guarantee independent of the pointee type, so it is recorded
                 // and later folded into the loaded reference's alignment.
                 let align_meta = self.peek_load_align_meta();
-                LInst::Load { dst: need_dst()?, ty, ptr, align, align_meta }
+                LInst::Load {
+                    dst: need_dst()?,
+                    ty,
+                    ptr,
+                    align,
+                    align_meta,
+                }
             }
             "store" => {
                 self.skip_memory_qualifiers();
@@ -1436,7 +1633,12 @@ impl Parser {
                 let ptr = self.value()?;
                 self.skip_atomic_ordering();
                 let align = self.maybe_align().unwrap_or(0);
-                LInst::Store { ty, val, ptr, align }
+                LInst::Store {
+                    ty,
+                    val,
+                    ptr,
+                    align,
+                }
             }
             "getelementptr" => self.gep(need_dst()?)?,
             "icmp" => {
@@ -1447,7 +1649,13 @@ impl Parser {
                 let a = self.value()?;
                 self.expect_punct(',')?;
                 let b = self.value()?;
-                LInst::Icmp { dst: need_dst()?, pred, ty, a, b }
+                LInst::Icmp {
+                    dst: need_dst()?,
+                    pred,
+                    ty,
+                    a,
+                    b,
+                }
             }
             "extractvalue" => {
                 let _agg_ty = self.ltype()?;
@@ -1459,7 +1667,11 @@ impl Parser {
                     self.pos += 1;
                     let _ = self.int();
                 }
-                LInst::ExtractValue { dst: need_dst()?, agg, index }
+                LInst::ExtractValue {
+                    dst: need_dst()?,
+                    agg,
+                    index,
+                }
             }
             "landingpad" => {
                 let _ty = self.ltype()?;
@@ -1507,7 +1719,11 @@ impl Parser {
                 // The RMW operator (`add`, `xchg`, `umax`, …).
                 let _op = match self.bump() {
                     Tok::Word(w) => w,
-                    other => return Err(Error::parse(format!("expected atomicrmw op, found {other:?}"))),
+                    other => {
+                        return Err(Error::parse(format!(
+                            "expected atomicrmw op, found {other:?}"
+                        )))
+                    }
                 };
                 let _pty = self.ltype()?; // `ptr`
                 let ptr = self.value()?;
@@ -1515,7 +1731,12 @@ impl Parser {
                 let ty = self.ltype()?;
                 let _val = self.value()?;
                 self.skip_atomic_ordering();
-                LInst::AtomicRmw { dst: need_dst()?, ty, ptr, tuple: false }
+                LInst::AtomicRmw {
+                    dst: need_dst()?,
+                    ty,
+                    ptr,
+                    tuple: false,
+                }
             }
             "cmpxchg" => {
                 while self.eat_word("weak") || self.eat_word("volatile") {}
@@ -1528,7 +1749,12 @@ impl Parser {
                 let _nty = self.ltype()?;
                 let _new = self.value()?;
                 self.skip_atomic_ordering(); // consumes both orderings
-                LInst::AtomicRmw { dst: need_dst()?, ty, ptr, tuple: true }
+                LInst::AtomicRmw {
+                    dst: need_dst()?,
+                    ty,
+                    ptr,
+                    tuple: true,
+                }
             }
             "insertelement" | "extractelement" | "shufflevector" | "freeze" => {
                 // Vector shuffling and `freeze` produce values with no
@@ -1545,24 +1771,37 @@ impl Parser {
             other => {
                 if let Some(bop) = bin_op(other) {
                     // Skip flags like `nuw`, `nsw`, `exact`, `disjoint`.
-                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "exact" | "disjoint")) {
+                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "exact" | "disjoint"))
+                    {
                         self.pos += 1;
                     }
                     let ty = self.ltype()?;
                     let a = self.value()?;
                     self.expect_punct(',')?;
                     let b = self.value()?;
-                    LInst::Bin { dst: need_dst()?, op: bop, ty, a, b }
+                    LInst::Bin {
+                        dst: need_dst()?,
+                        op: bop,
+                        ty,
+                        a,
+                        b,
+                    }
                 } else if let Some(cop) = cast_op(other) {
                     // Skip cast flags (`trunc nuw`, `trunc nsw`, `zext nneg`).
-                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "nneg")) {
+                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "nneg"))
+                    {
                         self.pos += 1;
                     }
                     let _from = self.ltype()?;
                     let val = self.value()?;
                     self.expect_word("to")?;
                     let to = self.ltype()?;
-                    LInst::Cast { dst: need_dst()?, op: cop, val, to }
+                    LInst::Cast {
+                        dst: need_dst()?,
+                        op: cop,
+                        val,
+                        to,
+                    }
                 } else {
                     return Err(Error::unsupported(format!("instruction `{other}`")));
                 }
@@ -1591,11 +1830,27 @@ impl Parser {
         // indices, constant *or* variable) becomes a `GepChain`, resolved to a
         // PtrOffset chain at lowering by walking the aggregate type.
         match indices.as_slice() {
-            [idx] => Ok(LInst::Gep { dst, elem: base_ty.clone(), base, index: idx.clone() }),
-            _ if matches!(base_ty, LType::Struct(_) | LType::PackedStruct(_) | LType::Array(..)) => {
-                Ok(LInst::GepChain { dst, agg_ty: base_ty.clone(), base, indices })
+            [idx] => Ok(LInst::Gep {
+                dst,
+                elem: base_ty.clone(),
+                base,
+                index: idx.clone(),
+            }),
+            _ if matches!(
+                base_ty,
+                LType::Struct(_) | LType::PackedStruct(_) | LType::Array(..)
+            ) =>
+            {
+                Ok(LInst::GepChain {
+                    dst,
+                    agg_ty: base_ty.clone(),
+                    base,
+                    indices,
+                })
             }
-            _ => Err(Error::unsupported("getelementptr with a navigation into a non-aggregate")),
+            _ => Err(Error::unsupported(
+                "getelementptr with a navigation into a non-aggregate",
+            )),
         }
     }
 
@@ -1664,7 +1919,12 @@ impl Parser {
         // read and no memory-safety content — skip its argument list wholesale.
         if callee.starts_with("llvm.dbg.") {
             self.skip_balanced('(', ')')?;
-            return Ok(LInst::Call { dst, ret, callee, args: Vec::new() });
+            return Ok(LInst::Call {
+                dst,
+                ret,
+                callee,
+                args: Vec::new(),
+            });
         }
         self.expect_punct('(')?;
         let mut args = Vec::new();
@@ -1694,7 +1954,12 @@ impl Parser {
             }
         }
         self.expect_punct(')')?;
-        Ok(LInst::Call { dst, ret, callee, args })
+        Ok(LInst::Call {
+            dst,
+            ret,
+            callee,
+            args,
+        })
     }
 
     fn phi(&mut self, dst: String) -> Result<LPhi> {
@@ -1720,7 +1985,11 @@ impl Parser {
     fn pred(&mut self) -> Result<LPred> {
         let w = match self.bump() {
             Tok::Word(w) => w,
-            other => return Err(Error::parse(format!("expected icmp predicate, found {other:?}"))),
+            other => {
+                return Err(Error::parse(format!(
+                    "expected icmp predicate, found {other:?}"
+                )))
+            }
         };
         Ok(match w.as_str() {
             "eq" => LPred::Eq,
@@ -1812,9 +2081,7 @@ fn ltype_align(ty: &LType) -> Result<u64> {
 /// `, !dbg …` metadata in comma-separated operand lists).
 fn is_type_start(t: &Tok) -> bool {
     match t {
-        Tok::Word(w) => {
-            is_int_type(w) || float_bits(w).is_some() || w == "ptr" || w == "void"
-        }
+        Tok::Word(w) => is_int_type(w) || float_bits(w).is_some() || w == "ptr" || w == "void",
         // `%"name"` — a named-type reference.
         Tok::Local(_) => true,
         Tok::Punct('[') | Tok::Punct('<') | Tok::Punct('{') => true,
@@ -1823,7 +2090,9 @@ fn is_type_start(t: &Tok) -> bool {
 }
 
 fn int_bits(w: &str) -> Result<u32> {
-    w[1..].parse().map_err(|_| Error::parse(format!("bad integer type `{w}`")))
+    w[1..]
+        .parse()
+        .map_err(|_| Error::parse(format!("bad integer type `{w}`")))
 }
 
 /// The byte-accurate bit width of an LLVM floating-point type, or `None` if `w`
@@ -1844,8 +2113,19 @@ fn float_bits(w: &str) -> Option<u32> {
 fn is_float_op(op: &str) -> bool {
     matches!(
         op,
-        "fadd" | "fsub" | "fmul" | "fdiv" | "frem" | "fneg" | "fcmp"
-            | "fptrunc" | "fpext" | "fptoui" | "fptosi" | "uitofp" | "sitofp"
+        "fadd"
+            | "fsub"
+            | "fmul"
+            | "fdiv"
+            | "frem"
+            | "fneg"
+            | "fcmp"
+            | "fptrunc"
+            | "fpext"
+            | "fptoui"
+            | "fptosi"
+            | "uitofp"
+            | "sitofp"
     )
 }
 
@@ -1939,7 +2219,11 @@ done:
         let src = "define i64 @sum(i32 %0, ...) {\nentry:\n  ret i64 0\n}\n";
         let m = parse_module(src).expect("parse");
         assert_eq!(m.unanalyzed.len(), 0, "variadic fn must not be dropped");
-        assert_eq!(m.funcs[0].params.len(), 1, "only the fixed i32 param is kept");
+        assert_eq!(
+            m.funcs[0].params.len(),
+            1,
+            "only the fixed i32 param is kept"
+        );
     }
 
     #[test]
@@ -1959,7 +2243,11 @@ define i64 @f(ptr %0, i32 %1) {
 }
 "#;
         let m = parse_module(src).expect("parse");
-        assert_eq!(m.unanalyzed.len(), 0, "entry-referencing phi must not drop the fn");
+        assert_eq!(
+            m.unanalyzed.len(),
+            0,
+            "entry-referencing phi must not drop the fn"
+        );
         // The entry block is labeled with its implicit number "2".
         assert_eq!(m.funcs[0].blocks[0].label, "2");
     }
@@ -1977,7 +2265,11 @@ entry:
 }
 "#;
         let m = parse_module(src).expect("parse");
-        assert_eq!(m.unanalyzed.len(), 0, "variadic call must not drop the caller");
+        assert_eq!(
+            m.unanalyzed.len(),
+            0,
+            "variadic call must not drop the caller"
+        );
         // The call parsed with its fixed + variadic arguments and callee.
         let call = m.funcs[0].blocks[0].insts.iter().find_map(|i| match i {
             LInst::Call { callee, args, .. } => Some((callee.clone(), args.len())),

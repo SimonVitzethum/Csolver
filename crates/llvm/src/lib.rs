@@ -168,6 +168,32 @@ panic:
         assert!(has_add, "checked-add field 0 must recover the addition");
     }
 
+    /// An indirect call through a loaded function pointer lowers to `Callee::Indirect`
+    /// (carrying the dispatch register), NOT an opaque `Symbol` — the prerequisite for
+    /// devirtualization to fire on real LLVM/C code (regression: it used to become
+    /// `Callee::Symbol("<indirect via %n>")`, so devirt never ran on the kernel scan).
+    #[test]
+    fn indirect_call_lowers_to_callee_indirect() {
+        let src = r#"
+define void @dispatch(ptr %ops) {
+b:
+  %fp = load ptr, ptr %ops, align 8
+  call void %fp()
+  ret void
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let has_indirect = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, csolver_ir::Inst::Call { callee: csolver_ir::Callee::Indirect(_), .. }));
+        assert!(has_indirect, "an indirect call must lower to Callee::Indirect, not an opaque Symbol");
+    }
+
     /// A constant ops-struct global's function-pointer fields are extracted with
     /// correct byte offsets (padded struct layout) and resolved to defined
     /// functions, so an indirect load-then-call through them can be devirtualised.
@@ -460,8 +486,9 @@ start:
 
     /// A multi-line `switch` case table, a float literal as a call argument, and
     /// an *indirect* call through a function pointer — each dropped whole
-    /// functions before. The indirect callee must stay unresolved (a symbol no
-    /// global can shadow), so the engine applies unknown-callee havoc semantics.
+    /// functions before. The indirect callee lowers to `Callee::Indirect` on its
+    /// dispatch register (so it can be devirtualized); an unresolved target still
+    /// gets the unknown-callee havoc semantics.
     #[test]
     fn switch_table_float_args_and_indirect_calls_parse() {
         let src = r#"
@@ -490,9 +517,8 @@ d:
             .iter()
             .flat_map(|f| &f.blocks)
             .flat_map(|b| &b.insts)
-            .any(|i| matches!(i, csolver_ir::Inst::Call { callee: csolver_ir::Callee::Symbol(s), .. }
-                if s.contains("indirect")));
-        assert!(has_indirect, "the indirect call lowers to an unresolved symbol callee");
+            .any(|i| matches!(i, csolver_ir::Inst::Call { callee: csolver_ir::Callee::Indirect(_), .. }));
+        assert!(has_indirect, "the indirect call lowers to Callee::Indirect on its register");
     }
 
     /// `load atomic` / `store volatile` must lower as *real* accesses — an opaque
