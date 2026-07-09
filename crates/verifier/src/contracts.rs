@@ -691,6 +691,11 @@ fn address_taken_names(module: &Module) -> HashSet<String> {
                             op(rhs);
                         }
                         csolver_ir::RValue::Cast { operand, .. } => op(operand),
+                        csolver_ir::RValue::Select { cond, then_val, else_val } => {
+                            op(cond);
+                            op(then_val);
+                            op(else_val);
+                        }
                     },
                     Inst::Call { args, .. } => args.iter().for_each(&mut op),
                     Inst::Intrinsic { args, .. } => args.iter().for_each(&mut op),

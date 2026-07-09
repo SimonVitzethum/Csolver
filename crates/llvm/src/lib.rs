@@ -168,6 +168,30 @@ panic:
         assert!(has_add, "checked-add field 0 must recover the addition");
     }
 
+    /// `select i1 %c, ptr %a, ptr %b` lowers to `RValue::Select` (not an opaque
+    /// value), so the executor keeps both pointers as a provenance join and proves an
+    /// access through the result in-bounds for each alternative.
+    #[test]
+    fn pointer_select_lowers_to_rvalue_select() {
+        let src = r#"
+define ptr @pick(i1 %c, ptr %a, ptr %b) {
+e:
+  %p = select i1 %c, ptr %a, ptr %b
+  ret ptr %p
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let has_select = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, csolver_ir::Inst::Assign { value: csolver_ir::RValue::Select { .. }, .. }));
+        assert!(has_select, "select must lower to RValue::Select, not an opaque value");
+    }
+
     /// Register-only inline asm (`rdtsc`, no memory clobber) lowers to the
     /// non-clobbering `<inline asm nomem>` marker; a memory-clobbering asm (`mfence`
     /// with `~{memory}`) keeps the havoc-ing `<inline asm>` marker.

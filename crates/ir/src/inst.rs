@@ -151,6 +151,18 @@ pub enum RValue {
         /// Target type.
         to: Type,
     },
+    /// `cond ? then_val : else_val` — an operand-level select (LLVM `select`). For
+    /// pointers this keeps BOTH operands as a provenance join, so an access through
+    /// the result is proved in-bounds for each alternative under its guard (rather
+    /// than degrading to an opaque pointer). For scalars it is an `ite`.
+    Select {
+        /// The `i1` condition operand.
+        cond: Operand,
+        /// The value when `cond` is true.
+        then_val: Operand,
+        /// The value when `cond` is false.
+        else_val: Operand,
+    },
 }
 
 /// A boolean predicate over operands, used to express a [`Inst::SafetyCheck`]

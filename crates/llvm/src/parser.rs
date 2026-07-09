@@ -321,6 +321,9 @@ pub enum LInst {
     /// unconstrained), so a function that merely has an unwind-cleanup path is
     /// analysed rather than dropped whole.
     Opaque { dst: String },
+    /// `dst = select i1 cond, T a, T b` — an operand-level select. Kept (not opaque)
+    /// so a pointer select becomes a provenance join and a scalar select an `ite`.
+    Select { dst: String, cond: LValue, then_val: LValue, else_val: LValue },
 }
 
 /// A parsed terminator.
@@ -1679,18 +1682,18 @@ impl Parser {
                 LInst::Opaque { dst: need_dst()? }
             }
             "select" => {
-                // `select i1 %c, T %a, T %b`. Modelled opaquely: sound, and precise
-                // ite-recovery (to prove a select-of-in-bounds-indices) is a later
-                // refinement, not a soundness need.
+                // `select i1 %c, T %a, T %b` — kept as `LInst::Select` so a pointer
+                // select is a provenance join (each alternative proved under its guard)
+                // and a scalar select an `ite`.
                 let _cty = self.ltype()?;
-                let _c = self.value()?;
+                let cond = self.value()?;
                 self.expect_punct(',')?;
                 let _aty = self.ltype()?;
-                let _a = self.value()?;
+                let then_val = self.value()?;
                 self.expect_punct(',')?;
                 let _bty = self.ltype()?;
-                let _b = self.value()?;
-                LInst::Opaque { dst: need_dst()? }
+                let else_val = self.value()?;
+                LInst::Select { dst: need_dst()?, cond, then_val, else_val }
             }
             "insertvalue" => {
                 // `insertvalue AGG %agg, T %val, idx…` — the resulting aggregate is

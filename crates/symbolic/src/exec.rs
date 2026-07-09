@@ -257,6 +257,11 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                         op(rhs);
                     }
                     RValue::Cast { operand, .. } => op(operand),
+                    RValue::Select { cond, then_val, else_val } => {
+                        op(cond);
+                        op(then_val);
+                        op(else_val);
+                    }
                 },
                 Inst::Call { args, .. } | Inst::Intrinsic { args, .. } => {
                     args.iter().for_each(&mut op)
@@ -909,6 +914,13 @@ fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
                             _ => ScalarPtrCause::IntArith,
                         },
                         RValue::Cmp { .. } => ScalarPtrCause::IntArith,
+                        RValue::Select { then_val, else_val, .. } => {
+                            if op_is_ptr(then_val) || op_is_ptr(else_val) {
+                                ScalarPtrCause::PtrArith
+                            } else {
+                                ScalarPtrCause::IntArith
+                            }
+                        }
                     };
                     (*dst, c)
                 }
@@ -4427,6 +4439,13 @@ impl Explorer<'_> {
                 },
                 CastOp::Trunc | CastOp::PtrToInt => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
             },
+            RValue::Select { cond, then_val, else_val } => {
+                let d = self.eval_scalar(cond, state);
+                let a = self.eval_value(then_val, state);
+                let b = self.eval_value(else_val, state);
+                let ty = Type::ptr(Type::Unit); // a hint; `select` builds Prov::Select for ptrs, ite for scalars
+                self.select(d, a, b, &ty)
+            }
         }
     }
 

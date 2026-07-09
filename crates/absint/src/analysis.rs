@@ -508,6 +508,10 @@ fn eval_rvalue(rv: &RValue, state: &IntervalState) -> Interval {
                 _ => Interval::top(),
             }
         }
+        // The result is one of the two operands; the interval domain has no join, so
+        // stay conservative here (`top`). The symbolic executor recovers the precise
+        // per-alternative reasoning via `Prov::Select` / `ite`.
+        RValue::Select { .. } => Interval::top(),
     }
 }
 

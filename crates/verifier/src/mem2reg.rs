@@ -361,6 +361,11 @@ fn visit_operands(inst: &Inst, op: &mut impl FnMut(&Operand)) {
                 op(rhs);
             }
             RValue::Cast { operand, .. } => op(operand),
+            RValue::Select { cond, then_val, else_val } => {
+                op(cond);
+                op(then_val);
+                op(else_val);
+            }
         },
         Inst::Call { args, .. } | Inst::Intrinsic { args, .. } => args.iter().for_each(op),
         Inst::MemIntrinsic { dst, src, len, .. } => {
