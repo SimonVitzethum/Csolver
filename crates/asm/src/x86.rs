@@ -44,7 +44,7 @@ pub fn decode_function(name: &str, code: &[u8]) -> Module {
 /// guard (`cmp rcx, 16`) constrain a later access (`[rsp + rcx*4]`). The order is
 /// the SysV order (`rdi, rsi, rdx, rcx, r8, r9`), so the model names them
 /// `arg0..arg5`.
-fn arg_registers() -> Vec<(RegId, Type)> {
+pub(crate) fn arg_registers() -> Vec<(RegId, Type)> {
     [7u8, 6, 2, 1, 8, 9].iter().map(|&r| (reg(r), Type::int(64))).collect()
 }
 
@@ -70,7 +70,7 @@ fn decode_cfg(code: &[u8]) -> csolver_core::Result<Vec<DecodedInsn>> {
     Ok(out)
 }
 
-fn reg(num: u8) -> RegId {
+pub(crate) fn reg(num: u8) -> RegId {
     RegId(num as u32)
 }
 
@@ -965,7 +965,7 @@ struct ModRm {
 /// A fresh MSIR register for the address computed by a memory operand. The byte
 /// position is unique per instruction, so the temporaries never clash (and stay
 /// clear of the x86 register numbers 0..15).
-fn temp_reg(pos: usize) -> RegId {
+pub(crate) fn temp_reg(pos: usize) -> RegId {
     RegId(1000 + pos as u32)
 }
 
@@ -1015,7 +1015,7 @@ fn jcc(
 
 /// The comparison a condition code tests: `cmp a, b` then `jcc` jumps iff
 /// `a <op> b`. `None` for codes we do not model (parity / sign / overflow).
-fn cc_cmpop(cc: u8) -> Option<CmpOp> {
+pub(crate) fn cc_cmpop(cc: u8) -> Option<CmpOp> {
     Some(match cc {
         0x2 => CmpOp::Ult, // jb / jc
         0x3 => CmpOp::Uge, // jae / jnc
@@ -1032,18 +1032,18 @@ fn cc_cmpop(cc: u8) -> Option<CmpOp> {
 }
 
 /// A decoded `[base + index*scale + disp]` memory operand.
-struct MemOperand {
-    base: RegId,
+pub(crate) struct MemOperand {
+    pub(crate) base: RegId,
     /// `(index register, scale in bytes ∈ {1,2,4,8})`, if an index is present.
-    index: Option<(RegId, u8)>,
-    disp: i64,
-    next: usize,
+    pub(crate) index: Option<(RegId, u8)>,
+    pub(crate) disp: i64,
+    pub(crate) next: usize,
 }
 
 impl MemOperand {
     /// Emit the `PtrOffset` chain computing the address and return the register
     /// holding it: `base (+ index*scale) (+ disp)`.
-    fn lower(&self, pos: usize) -> (Vec<Inst>, RegId) {
+    pub(crate) fn lower(&self, pos: usize) -> (Vec<Inst>, RegId) {
         let mut insts = Vec::new();
         let mut ptr = self.base;
         if let Some((index, scale)) = self.index {

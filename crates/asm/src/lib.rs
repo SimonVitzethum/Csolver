@@ -11,15 +11,18 @@
 //! and [`arm64::decode_function`] lower a `.text` function (bytes) into MSIR,
 //! reconstructing its CFG (~197 x86 mnemonics incl. VEX/EVEX/ModRM/SIB).
 //!
-//! The **textual-assembly** entry point [`AsmFrontend::lower`] (a `.s` source or
-//! a C inline-asm template → MSIR) is still a stub — it reports
-//! [`csolver_core::Error::Unsupported`] (planned milestone M4). Until it exists,
-//! a C inline-asm block is an opaque havoc in the executor.
+//! The **textual-assembly** entry point [`AsmFrontend::lower`] handles
+//! **AT&T-syntax x86-64** (`clang/gcc -S`) via [`att::decode_att`] — a focused
+//! common-instruction subset that reuses the CFG assembly and register helpers;
+//! an unrecognised mnemonic drops its function to `unanalyzed` (sound). Intel
+//! syntax and textual AArch64 are not supported yet (use an ELF object).
 
+mod att;
 mod blocks;
 pub mod arm64;
 pub mod x86;
 
+pub use att::decode_att;
 pub use x86::decode_function;
 
 use csolver_core::{Error, Result};
@@ -65,9 +68,16 @@ impl Frontend for AsmFrontend {
         "asm"
     }
 
-    fn lower(&self, _input: AsmInput) -> Result<Module> {
-        Err(Error::unsupported(
-            "assembly lowering is not implemented yet (planned milestone M4)",
-        ))
+    fn lower(&self, input: AsmInput) -> Result<Module> {
+        match (input.arch, input.syntax) {
+            // Textual AT&T-syntax x86-64 (`clang/gcc -S` default on Linux).
+            (Architecture::X86_64, Syntax::Att) => Ok(att::decode_att(&input.source)),
+            (Architecture::X86_64, Syntax::Intel) => Err(Error::unsupported(
+                "asm: Intel-syntax textual assembly is not supported yet (use AT&T, or an ELF object)",
+            )),
+            (Architecture::AArch64, _) => Err(Error::unsupported(
+                "asm: textual AArch64 assembly is not supported yet (use an ELF object)",
+            )),
+        }
     }
 }

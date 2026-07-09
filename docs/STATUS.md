@@ -76,8 +76,12 @@ Highlights beyond the historical log below:
   `csolver-asm` machine-code decoder (x86-64 via `e_machine`, or AArch64) lowers its
   `.text` bytes to MSIR; the functions are linked (`merge_modules`) and verified. Lower
   precision than the LLVM path (flat byte memory, no types) and bounded by the decoder's
-  opcode coverage, but real — no source needed. The textual `.s` frontend and C inline-asm
-  modelling remain future work (see the roadmap). Fixed en route: `Image::function_code`
+  opcode coverage, but real — no source needed. `solver verify <file.s>` also verifies
+  **AT&T-syntax** textual x86-64 assembly directly (`att::decode_att`). C **inline asm** is
+  now modelled from its constraint string: register-only asm (no memory clobber / output
+  memory operand) no longer havocs the heap (`<inline asm nomem>`), a large precision gain
+  on kernel C. Decoder coverage was extended with endbr64/CET, multi-byte nop, cmovcc, and
+  the ALU `r, r/m` forms. Fixed en route: `Image::function_code`
   resolved a symbol's section by *address*, which is ambiguous in a relocatable `.o` (all
   sections at address 0) — now by `section_index`.
 

@@ -237,7 +237,8 @@ fn verify_path(
             csolver_asm::AsmFrontend.lower(csolver_asm::AsmInput {
                 source,
                 arch: csolver_asm::Architecture::X86_64,
-                syntax: csolver_asm::Syntax::Intel,
+                // clang/gcc `-S` emit AT&T syntax by default on Linux.
+                syntax: csolver_asm::Syntax::Att,
             })
         }
         SourceLevel::Elf => {
