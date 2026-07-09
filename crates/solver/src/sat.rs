@@ -71,6 +71,16 @@ pub enum SatResult {
 /// more work than this is a pathological grind the wall-clock already caps on time.
 pub const DEFAULT_BUDGET: u64 = 200_000;
 
+/// VSIDS decay: each conflict multiplies the activity bump by `1/VAR_DECAY`, so a
+/// bump loses ~5% of its relative weight per later conflict. The classic MiniSat
+/// value; it makes the branch order track *recent* conflict structure.
+const VAR_DECAY: f64 = 0.95;
+
+/// When any activity (or the bump) exceeds this, all activities are rescaled down
+/// by `1e-100`. Ratios — the only thing that matters — are preserved, and the
+/// f64 range can never overflow.
+const ACTIVITY_RESCALE_LIMIT: f64 = 1e100;
+
 /// Wall-clock backstop per `solve`. The decision budget bounds *work* but not
 /// *time* — a single hard query (e.g. wide byte-pointer arithmetic in a SIMD
 /// search) can grind for many seconds before exhausting 2M decisions and hang the
@@ -104,6 +114,12 @@ pub struct Solver {
     /// Reusable "touched in this conflict analysis" scratch (avoids a per-conflict
     /// allocation); always fully reset before `analyze` returns.
     seen: Vec<bool>,
+    /// VSIDS activity per variable: how often it has recently taken part in a
+    /// conflict. The next decision branches on the most active unassigned variable.
+    activity: Vec<f64>,
+    /// The current activity bump. It grows by `1/VAR_DECAY` each conflict, which is
+    /// an O(1) way to make older bumps decay relative to newer ones.
+    var_inc: f64,
 }
 
 impl Solver {
@@ -130,6 +146,8 @@ impl Solver {
             trail_lim: Vec::new(),
             prop_queue: Vec::new(),
             seen: vec![false; num_vars],
+            activity: vec![0.0; num_vars],
+            var_inc: 1.0,
         }
     }
 
@@ -271,6 +289,13 @@ impl Solver {
         for &lit in &learnt[1..] {
             btlevel = btlevel.max(self.level[lit.var as usize]);
         }
+        // VSIDS: reward the variables in the learnt clause, then decay globally so
+        // recent conflicts weigh more. A pure branch-order heuristic — it changes
+        // only the order the space is explored, never which verdicts are reachable.
+        for &lit in &learnt {
+            self.bump_var(lit.var as usize);
+        }
+        self.decay_var_inc();
         // Reset the scratch: exactly the lower-level literals are still marked.
         for &lit in &learnt[1..] {
             self.seen[lit.var as usize] = false;
@@ -307,9 +332,36 @@ impl Solver {
         self.prop_queue.clear();
     }
 
-    /// The lowest-indexed unassigned variable, if any.
+    /// The most active unassigned variable (VSIDS), with the lowest index winning
+    /// ties. With all activities zero (the initial state) this is just the
+    /// lowest-indexed unassigned variable, so early behaviour is deterministic.
     fn pick_branch(&self) -> Option<u32> {
-        self.assign.iter().position(|a| a.is_none()).map(|i| i as u32)
+        let mut best: Option<u32> = None;
+        let mut best_act = f64::NEG_INFINITY;
+        for v in 0..self.num_vars {
+            if self.assign[v].is_none() && self.activity[v] > best_act {
+                best_act = self.activity[v];
+                best = Some(v as u32);
+            }
+        }
+        best
+    }
+
+    /// Reward a variable for taking part in the current conflict, rescaling all
+    /// activities down if this one grows too large for f64.
+    fn bump_var(&mut self, v: usize) {
+        self.activity[v] += self.var_inc;
+        if self.activity[v] > ACTIVITY_RESCALE_LIMIT {
+            for a in &mut self.activity {
+                *a *= 1e-100;
+            }
+            self.var_inc *= 1e-100;
+        }
+    }
+
+    /// Grow the bump so that future conflicts outweigh past ones (VSIDS decay).
+    fn decay_var_inc(&mut self) {
+        self.var_inc *= 1.0 / VAR_DECAY;
     }
 
     fn model(&self) -> Vec<bool> {
