@@ -140,9 +140,12 @@ pub struct Solver {
     /// threshold the search restarts (backjumps to level 0, keeping what it learnt).
     conflicts_since_restart: u64,
     /// Reluctant-doubling state generating the Luby sequence 1,1,2,1,1,2,4,… — the
-    /// restart interval (in units of [`RESTART_UNIT`] conflicts).
+    /// restart interval (in units of `restart_unit` conflicts).
     luby_u: u64,
     luby_v: u64,
+    /// Conflicts per Luby unit (default [`RESTART_UNIT`]). A field so tests can drive
+    /// the restart/reduction machinery hard on tiny instances.
+    restart_unit: u64,
     /// How many restarts have happened (telemetry; asserted on in tests).
     restarts: u64,
     /// Clauses `[0, num_original)` are the input; they are never deleted and keep
@@ -188,6 +191,7 @@ impl Solver {
             conflicts_since_restart: 0,
             luby_u: 1,
             luby_v: 1,
+            restart_unit: RESTART_UNIT,
             restarts: 0,
             num_original,
             lbd,
@@ -491,7 +495,7 @@ impl Solver {
             // verdict; and because it never resets the decision budget, total work
             // stays bounded (a stuck search still bottoms out at `Unknown`).
             if self.decision_level() > 0
-                && self.conflicts_since_restart >= RESTART_UNIT * self.luby_v
+                && self.conflicts_since_restart >= self.restart_unit * self.luby_v
             {
                 self.backtrack_to(0);
                 self.conflicts_since_restart = 0;
@@ -840,6 +844,68 @@ mod tests {
             let model: Vec<bool> = (0..n).map(|v| mask & (1 << v) != 0).collect();
             check_model(clauses, &model)
         })
+    }
+
+    #[test]
+    fn cdcl_agrees_with_brute_force_under_forced_restarts_and_reductions() {
+        // The plain fuzz below never triggers restarts or DB reductions (tiny
+        // instances solve in < RESTART_UNIT conflicts), leaving the two paths where
+        // a bug could fabricate a false Unsat untested. Here we force both to fire
+        // constantly (restart almost every conflict, keep almost no learnt clauses)
+        // and still demand exact agreement with the exhaustive oracle.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut total_reductions = 0u64;
+        let mut total_restarts = 0u64;
+        for _ in 0..500 {
+            // Deeper trees (10..=13 vars) so learnt clauses reach LBD > 2 and are
+            // actually deletable — tiny instances only ever make glue (LBD ≤ 2).
+            let n: u32 = 10 + (rng() % 4) as u32; // 10..=13 vars (≤8192 brute force)
+            // Proper hard random 3-SAT near the phase transition (ratio ≈ 4.3):
+            // exactly three distinct variables per clause, which actually forces
+            // deep search, conflicts, restarts and LBD>2 learnt clauses.
+            let m = (n as usize * 43) / 10 + (rng() % 5) as usize;
+            let clauses: Vec<Vec<Lit>> = (0..m)
+                .map(|_| {
+                    let mut vars = [0u32; 3];
+                    let mut count = 0;
+                    while count < 3 {
+                        let cand = (rng() % n as u64) as u32;
+                        if !vars[..count].contains(&cand) {
+                            vars[count] = cand;
+                            count += 1;
+                        }
+                    }
+                    vars.iter()
+                        .map(|&var| if rng() & 1 == 0 { Lit::pos(var) } else { Lit::neg(var) })
+                        .collect()
+                })
+                .collect();
+            let oracle = brute_force_sat(n, &clauses);
+            let mut s = Solver::new(n as usize, clauses.clone());
+            s.restart_unit = 2; // restart frequently
+            s.max_learnt = 3; // reduce the learnt DB aggressively
+            match s.solve(DEFAULT_BUDGET) {
+                SatResult::Sat(model) => {
+                    assert!(oracle, "SAT but oracle says UNSAT: {clauses:?}");
+                    assert!(check_model(&clauses, &model), "invalid model: {clauses:?} / {model:?}");
+                }
+                SatResult::Unsat => {
+                    assert!(!oracle, "false refutation under restart/reduce: {clauses:?}");
+                }
+                SatResult::Unknown => panic!("tiny instance hit the budget: {clauses:?}"),
+            }
+            total_reductions += s.reductions;
+            total_restarts += s.restarts;
+        }
+        // Prove the stressed paths were actually exercised.
+        assert!(total_restarts > 0, "no restarts fired");
+        assert!(total_reductions > 0, "no reductions fired");
     }
 
     #[test]
