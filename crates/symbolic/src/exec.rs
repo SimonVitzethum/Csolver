@@ -365,6 +365,7 @@ fn discharge_inner(
         scalar_ptr_cause: classify_scalar_ptr_defs(f),
         global_rids: HashMap::new(),
         global_fnptrs: HashMap::new(),
+        prove_cache: HashMap::new(),
         f,
     };
 
@@ -1252,6 +1253,14 @@ struct Explorer<'f> {
     /// pointer field at a matching offset resolves the loaded function pointer,
     /// so an indirect call through it uses the callee's summary (see `step_call`).
     global_fnptrs: HashMap<usize, HashMap<u64, FuncId>>,
+    /// **Prove-result cache** over the function's single `ExprCtx`: a memo from
+    /// `(assumptions, goal)` to the proof method (or `None`). Sound because the
+    /// `ExprCtx` is append-only — an `ExprId` denotes the same formula for the
+    /// whole discharge — so `prove_implies_method` is a pure function of the key.
+    /// Repeated identical bounds/alias queries (loops, many accesses under one
+    /// path condition) then skip re-bit-blasting. The `linear-no-overflow` side
+    /// effect is re-applied on a hit.
+    prove_cache: HashMap<(Box<[ExprId]>, ExprId), Option<ProofMethod>>,
     f: &'f Function,
 }
 
@@ -3742,7 +3751,16 @@ impl Explorer<'_> {
     fn prove(&mut self, goal: ExprId, state: &PathState) -> bool {
         let mut assumptions = state.pathcond.clone();
         assumptions.extend_from_slice(&state.facts);
-        match prove_implies_method(&self.ctx, &assumptions, goal) {
+        let key = (assumptions.clone().into_boxed_slice(), goal);
+        let method = match self.prove_cache.get(&key) {
+            Some(m) => *m,
+            None => {
+                let m = prove_implies_method(&self.ctx, &assumptions, goal);
+                self.prove_cache.insert(key, m);
+                m
+            }
+        };
+        match method {
             Some(ProofMethod::BitPrecise) => true,
             Some(ProofMethod::Linear) => {
                 self.assumptions.insert(LINEAR_NO_OVERFLOW);
