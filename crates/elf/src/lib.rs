@@ -173,6 +173,15 @@ impl Image {
     pub fn functions(&self) -> impl Iterator<Item = &Symbol> {
         self.symbols.iter().filter(|s| s.is_function && s.size > 0)
     }
+
+    /// The raw file bytes of the named section (e.g. `.debug_info`), sliced from the
+    /// original image `bytes`. `None` if absent, `NOBITS`, or out of range.
+    pub fn section_bytes_by_name<'a>(&self, name: &str, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        let s = self.sections.iter().find(|s| s.name == name && s.has_data && s.size > 0)?;
+        let start = usize::try_from(s.file_offset).ok()?;
+        let end = start.checked_add(usize::try_from(s.size).ok()?)?;
+        bytes.get(start..end)
+    }
 }
 
 // --- ELF constants ---------------------------------------------------------
@@ -638,6 +647,10 @@ fn read_sym(bytes: &[u8], base: usize) -> Result<RawSym> {
         st_size: read_u64(bytes, base + 16)?,
     })
 }
+
+/// A focused DWARF `.debug_info` reader for recovering pointer-parameter pointee sizes.
+pub mod dwarf;
+pub use dwarf::parameter_pointee_sizes;
 
 // --- Load an ELF64 (little-endian) object image from raw bytes --------------
 

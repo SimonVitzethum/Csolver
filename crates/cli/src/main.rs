@@ -363,6 +363,21 @@ fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module> {
     }
     let mut m = csolver_ir::merge_modules(modules, "elf");
     m.globals = globals;
+    // DWARF `.debug_info`: recover each pointer parameter's pointee byte size, which the
+    // machine code alone cannot supply. Installed as `raw_ptr_hints` (like the LLVM/DWARF
+    // path) — applied only under the opt-in `--assume-valid-params`, where a pointer
+    // parameter becomes a valid region of that size (a prove-only `param-valid` assumption).
+    let pointee = csolver_elf::parameter_pointee_sizes(&image, bytes);
+    for f in &m.functions {
+        if let Some(sizes) = pointee.get(&f.name) {
+            for (i, sz) in sizes.iter().enumerate() {
+                if let Some(size) = sz.filter(|s| *s > 0) {
+                    let align = 1u32 << size.trailing_zeros().min(4);
+                    m.raw_ptr_hints.insert((f.id, i as u32), (size, align));
+                }
+            }
+        }
+    }
     Ok(m)
 }
 
