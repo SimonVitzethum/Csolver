@@ -2780,6 +2780,33 @@ impl Explorer<'_> {
         state.ref_regions.clear();
                     return;
                 }
+                // `copy_to_user` discloses the source buffer to userspace: if it is a
+                // freshly-allocated kernel buffer whose copied bytes were never written,
+                // that is an information leak (uninitialized heap/stack disclosed). Uses
+                // the same unwritten-read machinery as a scalar uninit read: an exact path
+                // where the source range has no aliasing store is a definite leak, witnessed.
+                if matches!(kind, MemKind::UserDrain) {
+                    let exact_before = state.exact;
+                    let srcp = self.eval_pointer(dst, state);
+                    if exact_before && self.is_fresh_alloc(&srcp, state) {
+                        let n = match len {
+                            Operand::Const(Const::Int(bv)) => u64::try_from(bv.unsigned()).ok(),
+                            _ => None,
+                        };
+                        if let Some(n) = n.filter(|n| *n > 0) {
+                            let vty = Type::int((n * 8).clamp(8, 128) as u32);
+                            let (_, origin) = self.load_value(&srcp, n, &vty, state);
+                            if matches!(origin, LoadOrigin::Unwritten) {
+                                if let Some(model) = self.feasibility_witness(state) {
+                                    self.record_info_leak(block, idx, model);
+                                }
+                            }
+                        }
+                    }
+                    // A pure read: nothing to model on the (kernel) side beyond the
+                    // obligations already recorded by `check_mem_intrinsic`.
+                    return;
+                }
                 // Model the bulk *write*. Clearing the heap alone is not enough:
                 // the destination bytes are now written, and forgetting that made
                 // every later load from a fresh alloca a "definite uninitialized
@@ -3867,6 +3894,26 @@ impl Explorer<'_> {
         entry.residual = "reads uninitialized (never-written) freshly-allocated memory".to_string();
     }
 
+    /// Record a `copy_to_user` disclosure of never-written source bytes as a
+    /// `NoInfoLeak` refutation (a kernel information leak: uninitialized memory
+    /// copied out to userspace).
+    fn record_info_leak(&mut self, block: BlockId, idx: usize, model: Model) {
+        let entry = self
+            .mem
+            .entry((block, idx, SafetyProperty::NoInfoLeak))
+            .or_insert(MemAgg {
+                all_proven: true,
+                refutation: None,
+                predicate: String::new(),
+                residual: String::new(),
+            });
+        entry.all_proven = false;
+        entry.refutation.get_or_insert(model);
+        entry.predicate = "copies only initialized bytes to userspace".to_string();
+        entry.residual =
+            "discloses uninitialized (never-written) kernel memory to userspace".to_string();
+    }
+
     /// Classify the alias relationship between two accesses `a` (`sizea` bytes)
     /// and `b` (`sizeb` bytes) under the current path condition.
     fn alias_check(
@@ -4463,6 +4510,70 @@ mod tests {
             d.refutation.is_none(),
             "a load of memcpy-initialized bytes must not be refuted: {d:?}"
         );
+    }
+
+    /// Allocate an 8-byte kernel buffer, optionally initialize it, then `copy_to_user`
+    /// (a `UserDrain`) its bytes. Copying the uninitialized buffer is an information
+    /// leak (`NoInfoLeak` refuted); initializing it first must clear the leak.
+    fn info_leak_fn(init: bool) -> Function {
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 8,
+        });
+        if init {
+            bb0.insts.push(Inst::MemIntrinsic {
+                kind: MemKind::Set,
+                dst: Operand::Reg(buf),
+                src: None,
+                len: Operand::int(64, 8),
+            });
+        }
+        bb0.insts.push(Inst::MemIntrinsic {
+            kind: MemKind::UserDrain,
+            dst: Operand::Reg(buf),
+            src: None,
+            len: Operand::int(64, 8),
+        });
+        Function {
+            id: FuncId(0),
+            name: "drain".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn copy_to_user_of_uninitialized_buffer_is_an_info_leak() {
+        let f = info_leak_fn(false);
+        let r = discharge_function(&f);
+        // The drain is the last instruction (index 1: alloc=0, drain=1).
+        let d = r
+            .mem_decision(BlockId(0), 1, SafetyProperty::NoInfoLeak)
+            .expect("NoInfoLeak obligation for the drain");
+        assert!(
+            d.refutation.is_some(),
+            "copy_to_user of a never-written buffer must be refuted as an info leak: {d:?}"
+        );
+    }
+
+    #[test]
+    fn copy_to_user_of_initialized_buffer_does_not_leak() {
+        let f = info_leak_fn(true);
+        let r = discharge_function(&f);
+        // alloc=0, memset=1, drain=2.
+        if let Some(d) = r.mem_decision(BlockId(0), 2, SafetyProperty::NoInfoLeak) {
+            assert!(
+                d.refutation.is_none(),
+                "a memset-initialized buffer copied out must not be flagged as a leak: {d:?}"
+            );
+        }
     }
 
     /// A straight-line function: allocate a 16-byte region, optionally label it with

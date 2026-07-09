@@ -43,6 +43,10 @@ pub enum SafetyProperty {
     /// page (the Copy-Fail class). Driven by external contract labels; see
     /// `csolver_contracts`.
     WriteCapability,
+    /// No **uninitialized memory is disclosed to userspace**: a `copy_to_user`-style
+    /// drain must not read source bytes that were never written (a freshly-allocated
+    /// kernel buffer copied out before being filled — the classic kernel info-leak).
+    NoInfoLeak,
 }
 
 impl SafetyProperty {
@@ -64,6 +68,7 @@ impl SafetyProperty {
             SafetyProperty::ValidStackFrame => "valid_stack_frame",
             SafetyProperty::ValidIndirectTarget => "valid_indirect_target",
             SafetyProperty::WriteCapability => "write_capability",
+            SafetyProperty::NoInfoLeak => "no_info_leak",
         }
     }
 
@@ -85,6 +90,7 @@ impl SafetyProperty {
             SafetyProperty::ValidStackFrame => "stack frame is well-formed",
             SafetyProperty::ValidIndirectTarget => "indirect branch target is valid",
             SafetyProperty::WriteCapability => "access target's provenance grants the capability",
+            SafetyProperty::NoInfoLeak => "no uninitialized memory is disclosed to userspace",
         }
     }
 
@@ -107,6 +113,7 @@ impl SafetyProperty {
             ValidStackFrame,
             ValidIndirectTarget,
             WriteCapability,
+            NoInfoLeak,
         ]
     }
 }

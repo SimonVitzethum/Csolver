@@ -8,7 +8,7 @@
 use crate::parser::{
     LBin, LBlock, LCast, LFunc, LInst, LModule, LPred, LTerm, LType, LValue,
 };
-use csolver_contracts::{ApiContract, Contracts, Effect, Fill, SizeExpr};
+use csolver_contracts::{ApiContract, Contracts, Effect, Fill, ReadSink, SizeExpr};
 use csolver_core::{BitVector, Error, RegionKind, Result};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Const, DataLayout, FuncId, Function, Inst,
@@ -1295,17 +1295,18 @@ fn emit_contract(
                     handled = true;
                 }
             }
-            // A bulk read is modelled as a bounded `Set` of the buffer: it carries the
-            // same in-bounds obligation (the read must stay within the region), no taint.
-            Effect::Read { ptr, len } => {
+            // A bulk read carries the in-bounds obligation (the read must stay within the
+            // region). A plain in-kernel read is modelled as a bounded `Set`; a read whose
+            // bytes are disclosed to userspace (`copy_to_user`, `sink=user`) is a `UserDrain`
+            // that additionally carries the `NoInfoLeak` obligation.
+            Effect::Read { ptr, len, sink } => {
                 if let Some(a) = args.get(*ptr) {
                     let Some(len) = size_operand(ctx, insts, len, args)? else { continue };
-                    insts.push(Inst::MemIntrinsic {
-                        kind: MemKind::Set,
-                        dst: ctx.operand(a, 64)?,
-                        src: None,
-                        len,
-                    });
+                    let kind = match sink {
+                        ReadSink::Internal => MemKind::Set,
+                        ReadSink::User => MemKind::UserDrain,
+                    };
+                    insts.push(Inst::MemIntrinsic { kind, dst: ctx.operand(a, 64)?, src: None, len });
                     handled = true;
                 }
             }

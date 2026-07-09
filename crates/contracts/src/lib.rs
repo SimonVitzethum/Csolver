@@ -60,6 +60,17 @@ pub enum Fill {
     User,
 }
 
+/// Where a bulk read's bytes are disclosed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadSink {
+    /// An ordinary in-kernel read (only the in-bounds obligation applies).
+    #[default]
+    Internal,
+    /// The bytes are copied out to **userspace** (`copy_to_user`): reading
+    /// never-written source bytes is a kernel information leak (`NoInfoLeak`).
+    User,
+}
+
 /// One abstract memory effect of an API call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -91,6 +102,8 @@ pub enum Effect {
         ptr: usize,
         /// How many bytes are read.
         len: SizeExpr,
+        /// Where the read bytes go (in-kernel vs. disclosed to userspace).
+        sink: ReadSink,
     },
     /// Attaches a **provenance label** to the region pointed to by argument `ptr`. The
     /// label's granted capabilities are declared by a `prov` line (see [`Contracts`]).
@@ -360,7 +373,12 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
         "read" => {
             let ptr = parse_arg(rest.first().copied().unwrap_or(""))?;
             let len = parse_kv_size(&rest, "len")?;
-            Ok(Effect::Read { ptr, len })
+            let sink = match kv(&rest, "sink") {
+                None | Some("internal") => ReadSink::Internal,
+                Some("user") => ReadSink::User,
+                Some(other) => return Err(format!("unknown sink `{other}`")),
+            };
+            Ok(Effect::Read { ptr, len, sink })
         }
         // `label arg<k> <labelname>` and `require arg<k> <capname>` (positional).
         "label" => {
@@ -475,7 +493,7 @@ mod tests {
         );
         assert_eq!(
             c.lookup("copy_to_user").unwrap().effects,
-            vec![Effect::Read { ptr: 1, len: SizeExpr::Arg(2) }]
+            vec![Effect::Read { ptr: 1, len: SizeExpr::Arg(2), sink: ReadSink::User }]
         );
         // An unknown API has no contract.
         assert!(c.lookup("definitely_not_an_api").is_none());

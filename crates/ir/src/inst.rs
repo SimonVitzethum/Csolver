@@ -191,6 +191,12 @@ pub enum MemKind {
     /// is a *genuine adversarial input* (an attacker picks it) — a length read back
     /// from a user-copied struct can then drive a refutable overflow.
     UserFill,
+    /// A `copy_to_user`-style bulk **read** of the kernel source buffer that is
+    /// disclosed to userspace: bounds-checked like a read, and additionally
+    /// carries the `NoInfoLeak` obligation — the copied source bytes must have
+    /// been initialized (a never-written freshly-allocated buffer copied out is a
+    /// kernel information leak).
+    UserDrain,
 }
 
 /// The target of a [`Inst::Call`].
@@ -466,6 +472,9 @@ impl Inst {
                 }
                 MemKind::Copy | MemKind::Move => {
                     &[NoNullDeref, NoUseAfterFree, InBounds, ValidRead, ValidWrite]
+                }
+                MemKind::UserDrain => {
+                    &[NoNullDeref, NoUseAfterFree, InBounds, ValidRead, NoInfoLeak]
                 }
             },
             Inst::CapRequire { .. } => &[WriteCapability],
