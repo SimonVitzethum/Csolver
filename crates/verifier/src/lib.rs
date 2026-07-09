@@ -519,9 +519,11 @@ fn verify_function_with(
 ) -> FunctionReport {
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
+        // Hand the interval analysis (already computed for interval discharge) to
+        // the executor so it is not recomputed — a clone instead of a 2nd fixpoint.
         Some(s) => discharge_with_scalars(
             f, s, contracts, field_contracts, scalar_pre, globals, prov_grants, global_fn_ptrs,
-            config.bug_finding, exported, config.assume_valid_params,
+            analysis.as_ref(), config.bug_finding, exported, config.assume_valid_params,
         ),
         None => discharge_function(f),
     });

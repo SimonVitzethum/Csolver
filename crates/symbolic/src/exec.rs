@@ -114,7 +114,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -123,7 +123,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -136,7 +136,7 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], &[], globals, &HashMap::new(), &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], &[], globals, &HashMap::new(), &HashMap::new(), None)
 }
 
 /// As [`discharge_full`], plus interprocedural **member-provenance**:
@@ -158,7 +158,7 @@ pub fn discharge_with_fields(
     assume_valid_params: bool,
 ) -> SymbolicReport {
     discharge_with_scalars(
-        f, summaries, contracts, field_contracts, &[], globals, prov_grants, &HashMap::new(),
+        f, summaries, contracts, field_contracts, &[], globals, prov_grants, &HashMap::new(), None,
         bug_finding, exported, assume_valid_params,
     )
 }
@@ -178,6 +178,7 @@ pub fn discharge_with_scalars(
     globals: &HashMap<String, GlobalDef>,
     prov_grants: &HashMap<u32, HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
+    analysis_in: Option<&IntervalAnalysis>,
     bug_finding: bool,
     exported: bool,
     assume_valid_params: bool,
@@ -185,7 +186,7 @@ pub fn discharge_with_scalars(
     let limits = ExecLimits { bug_finding, exported, assume_valid_params, ..ExecLimits::default() };
     discharge_inner(
         f, limits, summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
-        global_fn_ptrs,
+        global_fn_ptrs, analysis_in,
     )
 }
 
@@ -197,7 +198,7 @@ pub fn discharge_with_scalars(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new())
+    discharge_inner(f, limits, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
 }
 
 /// Every symbol name referenced by an operand of `f` (`Const::Symbol` /
@@ -281,8 +282,15 @@ fn discharge_inner(
     globals: &HashMap<String, GlobalDef>,
     prov_grants: &HashMap<u32, HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
+    analysis_in: Option<&IntervalAnalysis>,
 ) -> SymbolicReport {
-    let analysis = analyze_intervals(f);
+    // Reuse the caller's interval analysis when supplied (the verifier already
+    // computes it for interval-based discharge), so it is not recomputed here —
+    // a single clone instead of a second fixpoint. Falls back to computing it.
+    let analysis = match analysis_in {
+        Some(a) => a.clone(),
+        None => analyze_intervals(f),
+    };
     let zones = analyze_zones(f);
     let inductions = analyze_induction(f);
     let dominators = Dominators::new(analysis.cfg());
@@ -5856,6 +5864,7 @@ mod tests {
         table.insert("G".to_string(), vec![(0u64, FuncId(1))]);
         let r = discharge_inner(
             &f, ExecLimits::default(), &summaries, &[], &[], &[], &globals, &empty_grants, &table,
+            None,
         );
         assert!(
             r.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
@@ -5868,7 +5877,7 @@ mod tests {
         // havoc ⇒ the final write is not proven safe.
         let r2 = discharge_inner(
             &f, ExecLimits::default(), &summaries, &[], &[], &[], &globals, &empty_grants,
-            &HashMap::new(),
+            &HashMap::new(), None,
         );
         assert!(
             !r2.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
