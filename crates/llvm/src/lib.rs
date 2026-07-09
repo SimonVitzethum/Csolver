@@ -168,6 +168,48 @@ panic:
         assert!(has_add, "checked-add field 0 must recover the addition");
     }
 
+    /// A constant ops-struct global's function-pointer fields are extracted with
+    /// correct byte offsets (padded struct layout) and resolved to defined
+    /// functions, so an indirect load-then-call through them can be devirtualised.
+    #[test]
+    fn ops_struct_devirt_table_is_extracted_with_offsets() {
+        // `{ ptr, i32, [4 x i8], ptr, ptr }`: @fa@0, @fb@16, @fc@24. @ext is an
+        // undefined symbol and must be dropped from the table.
+        let src = r#"
+@MYOPS = constant { ptr, i32, [4 x i8], ptr, ptr } { ptr @fa, i32 42, [4 x i8] zeroinitializer, ptr @fb, ptr @fc }, align 8
+@OTHER = constant { ptr } { ptr @ext }, align 8
+define i32 @fa(i32 %x) {
+b:
+  ret i32 %x
+}
+define i32 @fb(i32 %x) {
+b:
+  ret i32 %x
+}
+define i32 @fc() {
+b:
+  ret i32 0
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let table = module
+            .global_fn_ptrs
+            .get("MYOPS")
+            .expect("MYOPS devirt table present");
+        let by_off: std::collections::HashMap<u64, &str> = table
+            .iter()
+            .map(|(off, fid)| (*off, module.function(*fid).unwrap().name.as_str()))
+            .collect();
+        assert_eq!(by_off.get(&0).copied(), Some("fa"));
+        assert_eq!(by_off.get(&16).copied(), Some("fb"));
+        assert_eq!(by_off.get(&24).copied(), Some("fc"));
+        assert_eq!(table.len(), 3, "no phantom fields");
+        // An undefined target resolves to nothing → the global has no table.
+        assert!(!module.global_fn_ptrs.contains_key("OTHER"));
+    }
+
     /// A panic-unwind cleanup path (`landingpad` + `insertvalue` + `resume`, with a
     /// `personality`) carries no memory-safety content and must not drop the whole
     /// function — before, every real obligation was dropped with it. rustc emits

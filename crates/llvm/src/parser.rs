@@ -46,6 +46,13 @@ pub struct LGlobal {
     /// contexts (a padded stand-in could oversize them); here the exact packed
     /// size is computable, so global definitions can be recorded.
     pub packed: bool,
+    /// **Function/symbol-pointer fields** of a *constant* initializer: `(byte
+    /// offset, symbol name)` for every element that is the address of a named
+    /// symbol (`ptr @foo`). Used to devirtualise an indirect call whose target
+    /// is loaded from a known constant ops-struct global. Populated only when the
+    /// whole initializer's layout could be tracked exactly (else left empty — a
+    /// missed field only lowers recall, an imprecise one would be unsound).
+    pub fn_ptrs: Vec<(u64, String)>,
 }
 
 /// A parsed function definition.
@@ -926,6 +933,21 @@ impl Parser {
                 }
             }
         };
+        // For a *constant* global, walk the initializer to collect symbol-pointer
+        // fields (offset → name) for indirect-call devirtualisation. Purely a
+        // side analysis: snapshot the position, try to track the layout exactly,
+        // and restore — the `, align N` scan below runs from the same point
+        // regardless. A tracking failure discards *all* fields for this global
+        // (an imprecise offset would be unsound), so recovery is silent.
+        let init_start = self.pos;
+        let mut fn_ptrs = Vec::new();
+        if !writable {
+            let mut collected = Vec::new();
+            if self.scan_init_value(&ty, packed, 0, &mut collected).is_ok() {
+                fn_ptrs = collected;
+            }
+        }
+        self.pos = init_start;
         // Scan the initializer tail for `, align N`, then consume the line.
         let mut align = 1u32;
         while !matches!(self.peek(), Tok::Newline | Tok::Eof) {
@@ -936,7 +958,108 @@ impl Parser {
             }
             self.pos += 1;
         }
-        Some(LGlobal { name, ty, writable, align, packed })
+        Some(LGlobal { name, ty, writable, align, packed, fn_ptrs })
+    }
+
+    /// Walk a constant initializer *value* whose type is `ty` (already resolved),
+    /// starting at byte `base`, appending `(offset, symbol)` for each `@symbol`
+    /// address it contains. `outer_packed` is `ty`'s packed-ness (only meaningful
+    /// for the top-level packed-struct value). Returns `Err` if the layout could
+    /// not be tracked exactly, so the caller discards partial results.
+    fn scan_init_value(
+        &mut self,
+        ty: &LType,
+        outer_packed: bool,
+        base: u64,
+        out: &mut Vec<(u64, String)>,
+    ) -> Result<()> {
+        match ty {
+            LType::Struct(_) | LType::PackedStruct(_) => {
+                if self.eat_aggregate_zero() {
+                    return Ok(());
+                }
+                let packed = outer_packed || matches!(ty, LType::PackedStruct(_));
+                let angled = matches!(self.peek(), Tok::Punct('<'));
+                if angled {
+                    self.expect_punct('<')?;
+                }
+                self.expect_punct('{')?;
+                let mut off = base;
+                if !matches!(self.peek(), Tok::Punct('}')) {
+                    loop {
+                        let ety = self.ltype()?;
+                        let a = if packed { 1 } else { ltype_align(&ety)? };
+                        off = align_up(off, a).ok_or_else(|| Error::unsupported("init overflow"))?;
+                        let ep = matches!(ety, LType::PackedStruct(_));
+                        self.scan_init_value(&ety, ep, off, out)?;
+                        off = off
+                            .checked_add(ltype_size(&ety)?)
+                            .ok_or_else(|| Error::unsupported("init overflow"))?;
+                        if matches!(self.peek(), Tok::Punct(',')) {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct('}')?;
+                if angled {
+                    self.expect_punct('>')?;
+                }
+                Ok(())
+            }
+            LType::Array(elem, _) | LType::Vector(elem, _) => {
+                if self.eat_aggregate_zero() {
+                    return Ok(());
+                }
+                let close = if matches!(ty, LType::Vector(..)) { '>' } else { ']' };
+                let open = if matches!(ty, LType::Vector(..)) { '<' } else { '[' };
+                // A `c"…"` string body is not a bracketed element list: skip it
+                // exactly (no pointer fields), consuming the string token.
+                if !matches!(self.peek(), Tok::Punct(p) if *p == open) {
+                    let _ = self.value()?;
+                    return Ok(());
+                }
+                self.expect_punct(open)?;
+                let stride = align_up(ltype_size(elem)?, ltype_align(elem)?)
+                    .ok_or_else(|| Error::unsupported("init overflow"))?;
+                let mut idx: u64 = 0;
+                if !matches!(self.peek(), Tok::Punct(p) if *p == close) {
+                    loop {
+                        let ety = self.ltype()?;
+                        let ep = matches!(ety, LType::PackedStruct(_));
+                        let off = base
+                            .checked_add(idx.checked_mul(stride).ok_or_else(|| {
+                                Error::unsupported("init overflow")
+                            })?)
+                            .ok_or_else(|| Error::unsupported("init overflow"))?;
+                        self.scan_init_value(&ety, ep, off, out)?;
+                        idx += 1;
+                        if matches!(self.peek(), Tok::Punct(',')) {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(close)?;
+                Ok(())
+            }
+            // A scalar element: consume its value; a symbol address is a field.
+            _ => {
+                let v = self.value()?;
+                if let LValue::Global(n) = v {
+                    out.push((base, n));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Consume a whole-aggregate `zeroinitializer`/`undef`/`poison` value if the
+    /// current token is one (no pointer fields in it); return whether it did.
+    fn eat_aggregate_zero(&mut self) -> bool {
+        self.eat_word("zeroinitializer") || self.eat_word("undef") || self.eat_word("poison")
     }
 
     /// Parse `<{ T, T, … }>` (a packed struct type), resolving named fields;
@@ -1622,6 +1745,67 @@ enum InstOrPhi {
 
 fn is_int_type(w: &str) -> bool {
     w.starts_with('i') && w.len() > 1 && w[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Round `v` up to a multiple of the power-of-two `align`; `None` on overflow.
+fn align_up(v: u64, align: u64) -> Option<u64> {
+    debug_assert!(align.is_power_of_two());
+    let mask = align - 1;
+    v.checked_add(mask).map(|x| x & !mask)
+}
+
+/// Byte size of a resolved `LType` under the 64-bit layout (matches the IR's
+/// `DataLayout::LP64`, so an initializer offset agrees with the executor's gep).
+/// `None` for a type whose size cannot be determined (bails the whole scan).
+fn ltype_size(ty: &LType) -> Result<u64> {
+    let bad = || Error::unsupported("unsizable init element");
+    Ok(match ty {
+        LType::Void | LType::Metadata => 0,
+        LType::Int(bits) => (*bits as u64).div_ceil(8),
+        LType::Ptr => 8,
+        LType::Array(e, n) | LType::Vector(e, n) => {
+            let stride = align_up(ltype_size(e)?, ltype_align(e)?).ok_or_else(bad)?;
+            stride.checked_mul(*n).ok_or_else(bad)?
+        }
+        LType::Struct(fs) => {
+            let mut off = 0u64;
+            let mut max_a = 1u64;
+            for f in fs {
+                let a = ltype_align(f)?;
+                max_a = max_a.max(a);
+                off = align_up(off, a).ok_or_else(bad)?;
+                off = off.checked_add(ltype_size(f)?).ok_or_else(bad)?;
+            }
+            align_up(off, max_a).ok_or_else(bad)?
+        }
+        LType::PackedStruct(fs) => {
+            let mut off = 0u64;
+            for f in fs {
+                off = off.checked_add(ltype_size(f)?).ok_or_else(bad)?;
+            }
+            off
+        }
+        LType::Named(_) => return Err(bad()),
+    })
+}
+
+/// Byte alignment of a resolved `LType` under the 64-bit layout.
+fn ltype_align(ty: &LType) -> Result<u64> {
+    Ok(match ty {
+        LType::Void | LType::Metadata => 1,
+        LType::Int(bits) => (*bits as u64).div_ceil(8).max(1).next_power_of_two().min(8),
+        LType::Ptr => 8,
+        LType::Array(e, _) | LType::Vector(e, _) => ltype_align(e)?,
+        LType::Struct(fs) => {
+            let mut a = 1u64;
+            for f in fs {
+                a = a.max(ltype_align(f)?);
+            }
+            a
+        }
+        LType::PackedStruct(_) => 1,
+        LType::Named(_) => return Err(Error::unsupported("unsizable init element")),
+    })
 }
 
 /// Whether a token can begin a type (used to tell a real operand from trailing

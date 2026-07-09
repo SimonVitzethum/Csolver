@@ -301,6 +301,7 @@ fn verify_one_function(
         &scalar_pre,
         &module.globals,
         &module.prov_grants,
+        &module.global_fn_ptrs,
         config,
         exported,
         &mut local_id,
@@ -494,7 +495,10 @@ fn assumption_record(id: String) -> Assumption {
 /// Verify a single function in isolation (no interprocedural summaries or
 /// parameter contracts), drawing obligation ids from `next_id`.
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
-    verify_function_with(f, None, &[], &[], &[], &HashMap::new(), &HashMap::new(), config, true, next_id)
+    verify_function_with(
+        f, None, &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), config, true,
+        next_id,
+    )
 }
 
 /// Verify a single function, optionally using module-wide summaries for calls
@@ -508,6 +512,7 @@ fn verify_function_with(
     scalar_pre: &[Option<(i128, i128)>],
     globals: &HashMap<String, csolver_ir::GlobalDef>,
     prov_grants: &HashMap<u32, std::collections::HashSet<u32>>,
+    global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     config: &Config,
     exported: bool,
     next_id: &mut u32,
@@ -515,8 +520,8 @@ fn verify_function_with(
     let analysis = config.use_intervals.then(|| analyze_intervals(f));
     let symbolic = config.use_symbolic.then(|| match summaries {
         Some(s) => discharge_with_scalars(
-            f, s, contracts, field_contracts, scalar_pre, globals, prov_grants, config.bug_finding,
-            exported, config.assume_valid_params,
+            f, s, contracts, field_contracts, scalar_pre, globals, prov_grants, global_fn_ptrs,
+            config.bug_finding, exported, config.assume_valid_params,
         ),
         None => discharge_function(f),
     });

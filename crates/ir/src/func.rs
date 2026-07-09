@@ -249,6 +249,15 @@ pub struct Module {
     /// here (or an unlabelled region) grants **everything** — the sound default, so the
     /// capability mechanism never introduces a false FAIL on code that names no labels.
     pub prov_grants: HashMap<u32, std::collections::HashSet<u32>>,
+    /// **Constant symbol-pointer tables** for indirect-call devirtualisation:
+    /// global symbol name → `(byte offset, target function)` for each function
+    /// pointer stored in that global's constant initializer (an ops-struct /
+    /// vtable). A load of such a field, at a matching concrete offset from the
+    /// global's region, resolves the loaded function pointer to `FuncId` — so an
+    /// indirect call through it is analysed with the callee's summary instead of
+    /// an opaque havoc. Only external references that resolve to a defined
+    /// function are kept; the rest stay opaque (sound).
+    pub global_fn_ptrs: HashMap<String, Vec<(u64, FuncId)>>,
 }
 
 /// A global/static definition: what the analysis may assume about the memory
@@ -277,6 +286,7 @@ impl Module {
             globals: HashMap::new(),
             raw_ptr_hints: HashMap::new(),
             prov_grants: HashMap::new(),
+            global_fn_ptrs: HashMap::new(),
         }
     }
 
@@ -359,6 +369,12 @@ pub fn merge_modules(mods: &[Module], name: impl Into<String>) -> Module {
         }
         for (k, v) in &m.globals {
             merged.globals.entry(k.clone()).or_insert(*v);
+        }
+        for (k, v) in &m.global_fn_ptrs {
+            merged
+                .global_fn_ptrs
+                .entry(k.clone())
+                .or_insert_with(|| v.iter().map(|(off, fid)| (*off, remap[fid])).collect());
         }
         for (k, v) in &m.prov_grants {
             merged.prov_grants.entry(*k).or_default().extend(v.iter().copied());

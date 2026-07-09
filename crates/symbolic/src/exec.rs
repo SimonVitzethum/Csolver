@@ -114,7 +114,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new())
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -123,7 +123,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &[], &HashMap::new(), &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new())
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -136,7 +136,7 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], &[], globals, &HashMap::new())
+    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], &[], globals, &HashMap::new(), &HashMap::new())
 }
 
 /// As [`discharge_full`], plus interprocedural **member-provenance**:
@@ -158,8 +158,8 @@ pub fn discharge_with_fields(
     assume_valid_params: bool,
 ) -> SymbolicReport {
     discharge_with_scalars(
-        f, summaries, contracts, field_contracts, &[], globals, prov_grants, bug_finding, exported,
-        assume_valid_params,
+        f, summaries, contracts, field_contracts, &[], globals, prov_grants, &HashMap::new(),
+        bug_finding, exported, assume_valid_params,
     )
 }
 
@@ -177,12 +177,16 @@ pub fn discharge_with_scalars(
     scalar_pre: &[Option<(i128, i128)>],
     globals: &HashMap<String, GlobalDef>,
     prov_grants: &HashMap<u32, HashSet<u32>>,
+    global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     bug_finding: bool,
     exported: bool,
     assume_valid_params: bool,
 ) -> SymbolicReport {
     let limits = ExecLimits { bug_finding, exported, assume_valid_params, ..ExecLimits::default() };
-    discharge_inner(f, limits, summaries, contracts, field_contracts, scalar_pre, globals, prov_grants)
+    discharge_inner(
+        f, limits, summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
+        global_fn_ptrs,
+    )
 }
 
 /// As [`discharge_function`], with explicit limits and no summaries.
@@ -193,7 +197,7 @@ pub fn discharge_with_scalars(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new())
+    discharge_inner(f, limits, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new())
 }
 
 /// Every symbol name referenced by an operand of `f` (`Const::Symbol` /
@@ -276,6 +280,7 @@ fn discharge_inner(
     scalar_pre: &[Option<(i128, i128)>],
     globals: &HashMap<String, GlobalDef>,
     prov_grants: &HashMap<u32, HashSet<u32>>,
+    global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
 ) -> SymbolicReport {
     let analysis = analyze_intervals(f);
     let zones = analyze_zones(f);
@@ -351,6 +356,7 @@ fn discharge_inner(
         field_frontier: HashMap::new(),
         scalar_ptr_cause: classify_scalar_ptr_defs(f),
         global_rids: HashMap::new(),
+        global_fnptrs: HashMap::new(),
         f,
     };
 
@@ -526,6 +532,11 @@ fn discharge_inner(
             assumed: false,
             prov_labels: HashSet::new(),
         });
+        // A constant ops-struct/vtable global carries a devirtualisation table:
+        // record it against the region id so a field load can resolve its target.
+        if let Some(table) = global_fn_ptrs.get(&name) {
+            ex.global_fnptrs.insert(rid, table.iter().copied().collect());
+        }
         ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
     }
 
@@ -538,6 +549,7 @@ fn discharge_inner(
         unwritten_reads: HashMap::new(),
         ref_regions: HashMap::new(),
             opaque_labels: HashMap::new(),
+        fn_ptrs: HashMap::new(),
         exact: true,
     };
     ex.run_merged(state);
@@ -1099,6 +1111,12 @@ struct PathState {
     /// so it cannot introduce a false PASS. Persistent (a fact about the SSA value, not memory),
     /// so not cleared on havoc.
     opaque_labels: HashMap<u32, HashSet<u32>>,
+    /// **Resolved function-pointer values**: a register holding a function address
+    /// devirtualised from a constant ops-struct load (see `global_fnptrs`) maps to
+    /// its target `FuncId`, so an indirect call through that register is analysed
+    /// with the callee's summary rather than an opaque havoc. Persistent (a fact
+    /// about the SSA value, not memory).
+    fn_ptrs: HashMap<RegId, FuncId>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -1221,6 +1239,11 @@ struct Explorer<'f> {
     /// The regions are created once at state initialization (sorted by name for
     /// determinism) and are `Live` forever — globals are never freed.
     global_rids: HashMap<String, (usize, u64)>,
+    /// **Devirtualisation tables** keyed by the *region id* of a constant
+    /// ops-struct/vtable global: byte offset → target function. A load of a
+    /// pointer field at a matching offset resolves the loaded function pointer,
+    /// so an indirect call through it uses the callee's summary (see `step_call`).
+    global_fnptrs: HashMap<usize, HashMap<u64, FuncId>>,
     f: &'f Function,
 }
 
@@ -1628,6 +1651,17 @@ impl Explorer<'_> {
             })
             .collect();
 
+        // Resolved function-pointer identities survive the join by the same meet:
+        // a register keeps its target only if every incoming edge resolved it to
+        // the *same* function (an SSA value dominating the merge does; a phi does
+        // not appear here). Sound — a disagreement drops back to opaque dispatch.
+        let fn_ptrs: HashMap<RegId, FuncId> = first
+            .fn_ptrs
+            .iter()
+            .filter(|(r, fid)| edges.iter().all(|e| e.pred_state.fn_ptrs.get(r) == Some(fid)))
+            .map(|(r, fid)| (*r, *fid))
+            .collect();
+
         // The heap is computed by `merge_multi` (it needs the edge discriminators
         // to *join* differing stores); leave it empty here.
         PathState {
@@ -1639,6 +1673,7 @@ impl Explorer<'_> {
             unwritten_reads: HashMap::new(),
             ref_regions: HashMap::new(),
             opaque_labels,
+            fn_ptrs,
             exact: false,
         }
     }
@@ -2530,6 +2565,21 @@ impl Explorer<'_> {
                         }
                     }
                 }
+                // Devirtualisation: a pointer load from a constant ops-struct global
+                // at a concrete offset with a known function-pointer field resolves the
+                // loaded value to a specific callee, so a later indirect call through
+                // `dst` uses that summary instead of an opaque havoc.
+                if ty.is_ptr() {
+                    if let Prov::Region(rid) = p.prov {
+                        if let Some(table) = self.global_fnptrs.get(&rid) {
+                            if let Some(off) = self.ctx.as_const(p.offset).map(|bv| bv.unsigned()) {
+                                if let Some(&fid) = table.get(&(off as u64)) {
+                                    state.fn_ptrs.insert(*dst, fid);
+                                }
+                            }
+                        }
+                    }
+                }
                 state.env.insert(*dst, value);
             }
             Inst::Store { ty, ptr, value, align } => {
@@ -3009,10 +3059,23 @@ impl Explorer<'_> {
         state.exact = false;
 
         let argvals: Vec<SymValue> = args.iter().map(|a| self.eval_value(a, state)).collect();
-        let summary = match callee {
-            Callee::Direct(fid) => self.summaries.get(fid).cloned(),
+        // Resolve the callee. An indirect call whose target register was devirtualised
+        // from a constant ops-struct load (see `global_fnptrs`) is treated as a direct
+        // call to that function: its summary gives precise effects (writes/frees/return
+        // provenance) instead of the opaque havoc an unknown call would force. Recorded
+        // as an assumption — the resolution trusts the constant table's field layout.
+        let resolved_fid = match callee {
+            Callee::Direct(fid) => Some(*fid),
+            Callee::Indirect(Operand::Reg(r)) => {
+                let hit = state.fn_ptrs.get(r).copied();
+                if hit.is_some() {
+                    self.assumptions.insert("devirtualized-indirect-call");
+                }
+                hit
+            }
             _ => None,
         };
+        let summary = resolved_fid.and_then(|fid| self.summaries.get(&fid).cloned());
 
         // Effects: a writing or freeing callee invalidates the symbolic heap;
         // a *freeing* callee additionally invalidates region liveness (we do
@@ -5706,6 +5769,113 @@ mod tests {
         let r = discharge_with_summaries(&f, &summaries);
         let uaf = r.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
         assert!(!uaf.proven, "use after a freeing call must not prove temporal safety");
+    }
+
+    /// Build a caller that stores `buf` into `slot`, loads a function pointer
+    /// from constant global `G` at offset 0, calls it indirectly, reloads `slot`
+    /// and writes through it. The final write proves temporal safety **iff** the
+    /// indirect call was devirtualised to a pure summary (no havoc/free).
+    fn devirt_caller() -> Function {
+        let slot = RegId(0);
+        let buf = RegId(1);
+        let fp = RegId(2);
+        let p = RegId(3);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: slot,
+            region: RegionKind::Heap,
+            elem: Type::ptr(Type::int(8)),
+            count: Operand::int(64, 1),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::ptr(Type::int(8)),
+            ptr: Operand::Reg(slot),
+            value: Operand::Reg(buf),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Load {
+            dst: fp,
+            ty: Type::ptr(Type::int(8)),
+            ptr: Operand::Const(Const::Symbol("G".into())),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Indirect(Operand::Reg(fp)),
+            args: vec![],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        });
+        bb0.insts.push(Inst::Load {
+            dst: p,
+            ty: Type::ptr(Type::int(8)),
+            ptr: Operand::Reg(slot),
+            align: 8,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(8),
+            ptr: Operand::Reg(p),
+            value: Operand::int(8, 0),
+            align: 1,
+        });
+        Function {
+            id: FuncId(0),
+            name: "devirt_caller".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn indirect_call_devirtualised_to_a_pure_summary_preserves_state() {
+        use std::collections::HashMap;
+        let f = devirt_caller();
+        let mut summaries = HashMap::new();
+        // A pure callee: no writes, no frees.
+        summaries.insert(
+            FuncId(1),
+            Summary { ret: RetSummary::Unknown, writes: false, frees: false, prov: ProvTransfer::default() },
+        );
+        let mut globals = HashMap::new();
+        globals.insert("G".to_string(), csolver_ir::GlobalDef { size: 8, align: 8, writable: false });
+        let empty_grants = HashMap::new();
+
+        // With the devirt table, the indirect call resolves to the pure summary,
+        // so the store into `slot` survives and `buf`'s liveness/provenance too.
+        let mut table = HashMap::new();
+        table.insert("G".to_string(), vec![(0u64, FuncId(1))]);
+        let r = discharge_inner(
+            &f, ExecLimits::default(), &summaries, &[], &[], &[], &globals, &empty_grants, &table,
+        );
+        assert!(
+            r.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
+            "the indirect call should have been devirtualised: {:?}", r.assumptions,
+        );
+        let uaf = r.mem_decision(BlockId(0), 6, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(uaf.proven, "pure devirtualised call must preserve liveness: {}", uaf.residual);
+
+        // Control: no table ⇒ opaque indirect call ⇒ default (may write & free)
+        // havoc ⇒ the final write is not proven safe.
+        let r2 = discharge_inner(
+            &f, ExecLimits::default(), &summaries, &[], &[], &[], &globals, &empty_grants,
+            &HashMap::new(),
+        );
+        assert!(
+            !r2.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
+            "no table ⇒ no devirtualisation",
+        );
+        let uaf2 = r2.mem_decision(BlockId(0), 6, SafetyProperty::NoUseAfterFree).expect("uaf2");
+        assert!(!uaf2.proven, "an opaque indirect call must havoc, leaving the write unproven");
     }
 
     #[test]

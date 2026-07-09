@@ -50,6 +50,17 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
                 csolver_ir::GlobalDef { size, align: g.align.max(1), writable: g.writable },
             );
         }
+        // Symbol-pointer fields whose target is a function *defined in this
+        // module* become a devirtualisation table for the global. Fields naming
+        // an undefined/external symbol are dropped (they stay opaque — sound).
+        let resolved: Vec<(u64, FuncId)> = g
+            .fn_ptrs
+            .iter()
+            .filter_map(|(off, name)| func_ids.get(name).map(|fid| (*off, *fid)))
+            .collect();
+        if !resolved.is_empty() {
+            module.global_fn_ptrs.insert(g.name.clone(), resolved);
+        }
     }
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);
