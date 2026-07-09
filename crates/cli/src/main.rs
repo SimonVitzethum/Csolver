@@ -114,6 +114,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let assume_valid_params = args.iter().any(|a| a == "--assume-valid-params");
     let cross_file = args.iter().any(|a| a == "--cross-file");
     let reachable = args.iter().any(|a| a == "--reachable");
+    let auto_entries = args.iter().any(|a| a == "--auto-entries");
     // `--pre <file>`: an opt-in parameter-precondition sidecar.
     let pre_file = args
         .iter()
@@ -168,6 +169,22 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--") && entries_file.as_ref().and_then(|p| p.to_str()) != Some(a.as_str()))
                 .ok_or("`scan` needs a directory argument")?;
+            // `--auto-entries`: derive the entry set automatically — every syscall wrapper
+            // (precise prefixes) UNION the registered indirect handlers discovered in the
+            // ops-struct initialisers (devirtualisation). Covers all attacker-reachable APIs
+            // without a hand-written list, and merges with any `--entries` patterns given.
+            let entry_patterns = if auto_entries {
+                let mut pats: Vec<String> = SYSCALL_ENTRY_PREFIXES.iter().map(|s| s.to_string()).collect();
+                if let Some(extra) = &entry_patterns {
+                    pats.extend(extra.iter().cloned());
+                }
+                let handlers = discover_ops_handlers(Path::new(dir));
+                eprintln!("--auto-entries: {} ops-struct handlers discovered", handlers.len());
+                pats.extend(handlers);
+                Some(pats)
+            } else {
+                entry_patterns
+            };
             let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns: entry_patterns.clone(), ..Config::default() };
             if reachable {
                 let pats = entry_patterns
@@ -294,6 +311,126 @@ struct FileScan {
     findings: Vec<Finding>,
 }
 
+/// The syscall-wrapper name prefixes (SYSCALL_DEFINE* expands to these) — precise entry
+/// patterns covering every syscall, used by `--auto-entries`.
+const SYSCALL_ENTRY_PREFIXES: &[&str] = &[
+    "__x64_sys_*",
+    "__ia32_sys_*",
+    "__se_sys_*",
+    "__se_compat_sys_*",
+    "__do_sys_*",
+    "__do_compat_sys_*",
+    "__arm64_sys_*",
+    "__arm64_compat_sys_*",
+    "compat_sys_*",
+];
+
+/// Extract, from one `.ll`'s text, the functions it DEFINES and the function names its
+/// GLOBAL CONSTANT initialisers reference — i.e. the function pointers stored in ops
+/// structs (`proto_ops`, `file_operations`, …). The latter are the targets of the kernel's
+/// indirect dispatch (`sock->ops->recvmsg(…)`), which no direct call graph can follow: they
+/// are the real registered handlers. `@name` identifiers use the LLVM charset `[A-Za-z0-9_.$]`.
+fn ll_defs_and_global_refs(source: &str) -> (Vec<String>, Vec<String>) {
+    fn ident_at(bytes: &[u8], at: usize) -> Option<(String, usize)> {
+        // `bytes[at]` is `@`; read the identifier that follows (bare form; quoted names,
+        // rare for functions, are skipped).
+        let start = at + 1;
+        let mut end = start;
+        while end < bytes.len() {
+            let c = bytes[end];
+            if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$') {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        (end > start).then(|| (String::from_utf8_lossy(&bytes[start..end]).into_owned(), end))
+    }
+    fn ats(line: &str) -> Vec<String> {
+        let b = line.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'@' {
+                if let Some((name, end)) = ident_at(b, i) {
+                    out.push(name);
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+    let mut defined = Vec::new();
+    let mut refs = Vec::new();
+    for line in source.lines() {
+        let t = line.trim_start();
+        if t.starts_with("define ") {
+            // `define ... @name(` — the first `@ident` is the function name.
+            if let Some(pos) = line.find('@') {
+                if let Some((name, _)) = ident_at(line.as_bytes(), pos) {
+                    defined.push(name);
+                }
+            }
+        } else if t.starts_with('@') && line.contains(" = ") {
+            // A global definition. Its initialiser's `@` refs (after the first, which is the
+            // global's own name) are the stored pointers — the ops-struct handlers.
+            let names = ats(line);
+            refs.extend(names.into_iter().skip(1));
+        }
+    }
+    (defined, refs)
+}
+
+/// **Devirtualisation by ops-struct-initialiser analysis.** Scan every `.ll` under `dir` for
+/// the function pointers stored in its global constant initialisers, keeping only those that
+/// are actually defined functions — the complete set of the kernel's registered indirect
+/// handlers (proto_ops/file_operations/… callbacks). Used as entry points, this covers the
+/// attacker-reachable APIs a name-pattern list cannot, precisely and automatically (an
+/// internal helper never stored in an ops struct is correctly excluded).
+fn discover_ops_handlers(dir: &Path) -> std::collections::HashSet<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let mut files = Vec::new();
+    collect_ll(dir, &mut files);
+    if files.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let next = AtomicUsize::new(0);
+    // Per worker: local defined-set and ref-set, merged at the end (cheap, no lock churn).
+    let acc: Mutex<(std::collections::HashSet<String>, std::collections::HashSet<String>)> =
+        Mutex::new((std::collections::HashSet::new(), std::collections::HashSet::new()));
+    std::thread::scope(|s| {
+        for _ in 0..cores.min(files.len()).max(1) {
+            s.spawn(|| {
+                let (mut defs, mut refs) = (
+                    std::collections::HashSet::new(),
+                    std::collections::HashSet::new(),
+                );
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= files.len() {
+                        break;
+                    }
+                    if let Ok(src) = std::fs::read_to_string(&files[i]) {
+                        let (d, r) = ll_defs_and_global_refs(&src);
+                        defs.extend(d);
+                        refs.extend(r);
+                    }
+                }
+                let mut g = acc.lock().unwrap_or_else(|p| p.into_inner());
+                g.0.extend(defs);
+                g.1.extend(refs);
+            });
+        }
+    });
+    let (defined, refs) = acc.into_inner().unwrap_or_else(|p| p.into_inner());
+    // A handler is a global-stored pointer that is a defined function in the tree.
+    refs.into_iter().filter(|n| defined.contains(n)).collect()
+}
+
 /// System memory available to start new work, in MiB (Linux: `/proc/meminfo`
 /// `MemAvailable`). `u64::MAX` where it cannot be read, so the throttle is a no-op.
 fn available_mb() -> u64 {
@@ -315,12 +452,27 @@ fn available_mb() -> u64 {
 /// and thrashes/OOMs, without aborting or skipping any analysis. Progress is guaranteed: if
 /// no file is in flight (`active == 0`) the worker proceeds regardless, so at least one
 /// analysis always runs even under memory pressure. `active` counts in-flight files.
-/// The floor is generous because an in-flight file's own analysis keeps growing after it
-/// starts (the backpressure only gates STARTS), so headroom must cover that growth.
-const MEM_FLOOR_MB: u64 = 4096;
+///
+/// The gate is RESERVATION-based: a new file may start only if free memory covers a floor
+/// PLUS a per-in-flight-file reserve for every analysis already running — because an
+/// in-flight analysis keeps growing after it starts, and the gate only controls STARTS.
+/// So all workers run concurrently while memory is ample (a tree of small units), but when
+/// several large units are in flight the reserve blocks further starts, bounding peak RSS
+/// without ever capping the worker count or aborting an analysis.
+const MEM_FLOOR_MB: u64 = 1024;
+const MEM_RESERVE_PER_INFLIGHT_MB: u64 = 2560;
 fn await_memory(active: &std::sync::atomic::AtomicUsize) {
     use std::sync::atomic::Ordering;
-    while active.load(Ordering::Relaxed) > 0 && available_mb() < MEM_FLOOR_MB {
+    loop {
+        let inflight = active.load(Ordering::Relaxed) as u64;
+        // At least one analysis must always be allowed to run (progress guarantee).
+        if inflight == 0 {
+            return;
+        }
+        let need = MEM_FLOOR_MB + inflight * MEM_RESERVE_PER_INFLIGHT_MB;
+        if available_mb() >= need {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
@@ -630,15 +782,13 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     // function-level threads, so the cores stay busy either way. Deterministic: per-unit
     // results are re-sorted into unit order and each verdict is thread-count independent.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    // Concurrent file analyses each hold their own LIVE memory (a large translation unit
-    // peaks at a few GB), so on a memory-constrained box the number of files analysed at
-    // once — not the core count — is what bounds peak RSS. Cap the workers by the memory
-    // available at start (budgeting ~`PER_WORKER_MB` per concurrent analysis), never above
-    // the cores. `CSOLVER_JOBS=N` overrides. The backpressure below is the reactive net.
-    const PER_WORKER_MB: u64 = 3072;
-    let mem_workers = (available_mb() / PER_WORKER_MB).max(1) as usize;
+    // Use ALL cores as workers; the reservation-based memory backpressure (see `await_memory`)
+    // bounds peak RSS by throttling STARTS when several large analyses are in flight, rather
+    // than by permanently capping the worker count — so a tree of small units runs fully
+    // parallel while a cluster of large units is serialised only as much as memory requires.
+    // `CSOLVER_JOBS=N` overrides the worker count.
     let job_cap = std::env::var("CSOLVER_JOBS").ok().and_then(|v| v.parse::<usize>().ok());
-    let workers = job_cap.unwrap_or(mem_workers).min(cores).min(total_units).max(1);
+    let workers = job_cap.unwrap_or(cores).min(cores).min(total_units).max(1);
     let threads_per_unit = (cores / workers).max(1);
     eprintln!(
         "scanning {total_files} .ll files under {} … ({total_units} units, {workers} workers × {threads_per_unit} threads{})",
