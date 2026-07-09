@@ -1,7 +1,7 @@
 //! Blocks, terminators, functions and modules.
 
 use crate::id::{BlockId, FuncId, RegId};
-use crate::inst::{Inst, Operand};
+use crate::inst::{Callee, Inst, Operand};
 use crate::ty::{DataLayout, Type};
 use csolver_core::BitVector;
 use std::collections::HashMap;
@@ -294,6 +294,80 @@ impl Module {
     }
 }
 
+/// **Link** several single-translation-unit modules into one whole-program module
+/// (cross-file analysis). Every function is given a fresh global [`FuncId`]; a call
+/// that was opaque because the callee lived in another file — a `Callee::Symbol(name)`
+/// — is resolved to the defining function when that definition is present in the merged
+/// set, so a caller's context (e.g. a `switch (optname) case A..B:` validation) now flows
+/// into the callee. Only **external-linkage** definitions are resolved by name: a
+/// `static`/internal function's name may collide across files, so internal functions keep
+/// their per-file identity and are only reachable through their own `Callee::Direct` edges.
+/// Declarations (no definition anywhere) stay `Callee::Symbol` (opaque, contract-modelled).
+pub fn merge_modules(mods: &[Module], name: impl Into<String>) -> Module {
+    let mut merged = Module::new(name);
+    if let Some(m) = mods.first() {
+        merged.layout = m.layout;
+    }
+    // Pass 1: assign fresh ids and, for external definitions, a name → id map (first wins).
+    let mut name_to_id: HashMap<String, FuncId> = HashMap::new();
+    let mut remaps: Vec<HashMap<FuncId, FuncId>> = Vec::with_capacity(mods.len());
+    let mut next: u32 = 0;
+    for m in mods {
+        let mut remap = HashMap::new();
+        for f in &m.functions {
+            let nid = FuncId(next);
+            next += 1;
+            remap.insert(f.id, nid);
+            if !m.internal.contains(&f.id) {
+                name_to_id.entry(f.name.clone()).or_insert(nid);
+            }
+        }
+        remaps.push(remap);
+    }
+    // Pass 2: clone functions with remapped ids and resolved call edges; merge side tables.
+    for (mi, m) in mods.iter().enumerate() {
+        let remap = &remaps[mi];
+        for f in &m.functions {
+            let mut nf = f.clone();
+            nf.id = remap[&f.id];
+            for block in &mut nf.blocks {
+                for inst in &mut block.insts {
+                    if let Inst::Call { callee, .. } = inst {
+                        *callee = match callee {
+                            // In-module edge: renumber to the function's new id.
+                            Callee::Direct(old) => Callee::Direct(remap[old]),
+                            // Cross-file edge: resolve to the definition if we now have it.
+                            Callee::Symbol(nm) => match name_to_id.get(nm) {
+                                Some(&id) => Callee::Direct(id),
+                                None => Callee::Symbol(nm.clone()),
+                            },
+                            Callee::Indirect(op) => Callee::Indirect(op.clone()),
+                        };
+                    }
+                }
+            }
+            if m.internal.contains(&f.id) {
+                merged.internal.insert(nf.id);
+            }
+            merged.functions.push(nf);
+        }
+        for ((fid, idx), c) in &m.param_contracts {
+            merged.param_contracts.insert((remap[fid], *idx), *c);
+        }
+        for ((fid, idx), h) in &m.raw_ptr_hints {
+            merged.raw_ptr_hints.insert((remap[fid], *idx), *h);
+        }
+        for (k, v) in &m.globals {
+            merged.globals.entry(k.clone()).or_insert(*v);
+        }
+        for (k, v) in &m.prov_grants {
+            merged.prov_grants.entry(*k).or_default().extend(v.iter().copied());
+        }
+        merged.unanalyzed.extend(m.unanalyzed.iter().cloned());
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -378,5 +452,66 @@ mod tests {
     #[test]
     fn const_null_is_distinct() {
         assert_ne!(Const::Null, Const::Undef);
+    }
+
+    /// Cross-file linking resolves a call that crossed a translation-unit boundary:
+    /// file A calls `foo` (a `Callee::Symbol`, opaque per-TU); file B defines `foo`.
+    /// After `merge_modules`, A's call points at B's definition, and internal-linkage
+    /// functions keep their own identity (never resolved by name).
+    fn one_fn(name: &str, call: Option<Callee>, internal: bool) -> Module {
+        let mut m = Module::new("tu");
+        let mut b = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        if let Some(callee) = call {
+            b.insts.push(Inst::Call {
+                dst: None,
+                callee,
+                args: vec![],
+                ret_ty: Type::Unit,
+                ret_ref: None,
+            });
+        }
+        let f = Function {
+            id: FuncId(0),
+            name: name.into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![b],
+            entry: BlockId(0),
+        };
+        if internal {
+            m.internal.insert(f.id);
+        }
+        m.functions.push(f);
+        m
+    }
+
+    #[test]
+    fn merge_resolves_cross_file_call_by_name() {
+        let a = one_fn("caller", Some(Callee::Symbol("foo".into())), false);
+        let b = one_fn("foo", None, false);
+        let merged = merge_modules(&[a, b], "prog");
+        assert_eq!(merged.functions.len(), 2);
+        let caller = merged.functions.iter().find(|f| f.name == "caller").unwrap();
+        let foo = merged.functions.iter().find(|f| f.name == "foo").unwrap();
+        let Inst::Call { callee, .. } = &caller.blocks[0].insts[0] else {
+            panic!("expected a call");
+        };
+        assert_eq!(*callee, Callee::Direct(foo.id), "the cross-file call now resolves to foo");
+    }
+
+    #[test]
+    fn merge_keeps_internal_functions_unresolved_by_name() {
+        // Two files each with a `static helper` — same name, distinct functions. A call to
+        // an undefined external `helper` must stay opaque, never bind to a file-local static.
+        let a = one_fn("helper", None, true);
+        let b = one_fn("helper", None, true);
+        let caller = one_fn("c", Some(Callee::Symbol("helper".into())), false);
+        let merged = merge_modules(&[a, b, caller], "prog");
+        assert_eq!(merged.functions.len(), 3);
+        let c = merged.functions.iter().find(|f| f.name == "c").unwrap();
+        let Inst::Call { callee, .. } = &c.blocks[0].insts[0] else {
+            panic!("expected a call");
+        };
+        assert_eq!(*callee, Callee::Symbol("helper".into()), "internal names never resolve");
     }
 }

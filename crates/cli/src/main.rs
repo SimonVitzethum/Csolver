@@ -39,7 +39,7 @@ USAGE:
                                     ABI — opt-in, unsound in general, surfaced as an assumption);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
-    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>]
+    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>] [--cross-file]
                                     verify EVERY .ll under <dir> without stopping, then
                                     report coverage (% of functions decided) and list
                                     every memory-safety violation found, with a witness
@@ -49,7 +49,13 @@ USAGE:
                                     entries; every other function's parameters are taken
                                     as caller-validated. The sound kernel model: external
                                     linkage is not userspace-reachability, so this removes
-                                    the internal-helper false positives.)
+                                    the internal-helper false positives.
+                                    --cross-file: link each directory's .ll into ONE
+                                    whole-program module before verifying (closed-world),
+                                    so a call across a translation-unit boundary resolves
+                                    to its definition and a caller's validation flows into
+                                    the callee — finds deeper bugs and removes false
+                                    positives a per-file view cannot see.)
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
     solver report <result.json>     re-render a saved JSON report
     solver --help                   show this help
@@ -80,6 +86,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let closed_world = args.iter().any(|a| a == "--closed-world");
     let bug_finding = args.iter().any(|a| a == "--bugs");
     let assume_valid_params = args.iter().any(|a| a == "--assume-valid-params");
+    let cross_file = args.iter().any(|a| a == "--cross-file");
     // `--pre <file>`: an opt-in parameter-precondition sidecar.
     let pre_file = args
         .iter()
@@ -135,7 +142,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .find(|a| !a.starts_with("--") && entries_file.as_ref().and_then(|p| p.to_str()) != Some(a.as_str()))
                 .ok_or("`scan` needs a directory argument")?;
             let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns, ..Config::default() };
-            scan_dir(Path::new(dir), &config)
+            scan_dir(Path::new(dir), &config, cross_file)
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
@@ -241,20 +248,102 @@ struct Finding {
 /// Scan **every** `.ll` file under `dir` (recursively), verify all of them without
 /// stopping at any UNKNOWN or FAIL, and report the coverage (how much of the code is
 /// actually decided) plus every memory-safety violation found, with its witness.
-/// The per-file scan result, aggregated deterministically after the parallel pass.
+/// The per-unit scan result, aggregated deterministically after the parallel pass.
+/// A "unit" is a single `.ll` file (normal scan) or a whole directory group merged into
+/// one program (cross-file scan).
 #[derive(Default)]
 struct FileScan {
     pass: u64,
     fail: u64,
     unknown: u64,
     dropped: u64,
-    errored: bool,
+    errored: u64,
     findings: Vec<Finding>,
 }
 
-fn scan_dir(dir: &Path, config: &Config) -> Result<ExitCode, String> {
+/// Lower every `.ll` in `unit` (relative to `dir`); in cross-file mode link them into one
+/// whole-program module (so a call across a translation-unit boundary resolves to its
+/// definition and the caller's context flows in) and verify closed-world; otherwise verify
+/// the single module per-TU. `threads` is the per-unit function-level parallelism.
+fn scan_one_unit(
+    unit: &[std::path::PathBuf],
+    label: &str,
+    dir: &Path,
+    config: &Config,
+    cross: bool,
+    threads: usize,
+) -> FileScan {
     use csolver_core::ObligationResult;
     use csolver_ir::Frontend;
+
+    let mut fs = FileScan::default();
+    let mut modules = Vec::with_capacity(unit.len());
+    for path in unit {
+        let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+        match std::fs::read_to_string(path) {
+            Err(_) => fs.errored += 1,
+            Ok(source) => match (csolver_llvm::LlvmFrontend).lower(csolver_llvm::LlvmInput {
+                source,
+                name: rel,
+            }) {
+                Err(_) => fs.errored += 1,
+                Ok(m) => modules.push(m),
+            },
+        }
+    }
+    if modules.is_empty() {
+        return fs;
+    }
+    // The finding's file label: the single TU (normal) or the linked group (cross-file).
+    let file_label = if cross || unit.len() > 1 {
+        label.to_string()
+    } else {
+        unit[0].strip_prefix(dir).unwrap_or(&unit[0]).display().to_string()
+    };
+    let module = if cross {
+        csolver_ir::merge_modules(&modules, label)
+    } else {
+        // Normal per-TU scan: exactly one module per unit (unchanged behaviour).
+        modules.into_iter().next().unwrap_or_else(|| csolver_ir::Module::new(label))
+    };
+    // NOTE: cross-file does NOT enable closed-world. Linking the group only makes the call
+    // graph accurate (a cross-TU `Callee::Symbol` resolves to its definition, so the caller
+    // uses the callee's conservative summary instead of an opaque havoc — sound). Assuming
+    // the group holds ALL callers (closed-world) would be unsound on a partial merge (a
+    // caller in another subsystem could violate a synthesized contract → false PASS).
+    fs.dropped = module.unanalyzed.len() as u64;
+    let report = verify_module_with_threads(&module, config, threads.max(1));
+    for f in &report.functions {
+        match f.verdict {
+            Verdict::Pass => fs.pass += 1,
+            Verdict::Unknown => fs.unknown += 1,
+            Verdict::Fail => {
+                fs.fail += 1;
+                for o in &f.outcomes {
+                    if let ObligationResult::Refuted(cx) = &o.result {
+                        let witness = cx
+                            .model
+                            .assignments
+                            .iter()
+                            .filter(|a| !a.name.starts_with('?'))
+                            .map(|a| format!("{}={}", a.name, a.value))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        fs.findings.push(Finding {
+                            file: file_label.clone(),
+                            function: f.function.clone(),
+                            property: format!("{:?}", o.obligation.property),
+                            witness,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    fs
+}
+
+fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -265,77 +354,63 @@ fn scan_dir(dir: &Path, config: &Config) -> Result<ExitCode, String> {
         return Err(format!("no .ll files found under {}", dir.display()));
     }
     let total_files = files.len();
-    // Parallelise across FILES (work-stealing), each file verified single-threaded — a
-    // large tree of small translation units otherwise leaves most cores idle (per-module
-    // threading has too little to parallelise per file). The result is deterministic:
-    // per-file results are re-sorted into file order, and each function's verdict is
-    // independent of the thread count, so the output is byte-identical to a serial scan.
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(total_files);
-    eprintln!("scanning {total_files} .ll files under {} … ({workers} workers)", dir.display());
+
+    // A **unit** of work: one file (normal per-TU scan) or one directory group linked into
+    // a whole-program module (cross-file). Cross-file groups the .ll by their parent
+    // directory — a subsystem's files (e.g. all of net/rds/) link together, so a caller's
+    // validation flows into its callee across the file boundary.
+    let units: Vec<(String, Vec<std::path::PathBuf>)> = if cross_file {
+        let mut groups: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> =
+            std::collections::BTreeMap::new();
+        for f in &files {
+            let key = f.parent().unwrap_or(dir).strip_prefix(dir).unwrap_or(dir).display().to_string();
+            groups.entry(key).or_default().push(f.clone());
+        }
+        groups.into_iter().collect()
+    } else {
+        files
+            .iter()
+            .map(|f| (f.display().to_string(), vec![f.clone()]))
+            .collect()
+    };
+    let total_units = units.len();
+
+    // Parallelise across UNITS (work-stealing). With many units (a big tree) each worker
+    // takes a whole core; with few large units (cross-file groups) we also hand each unit
+    // function-level threads, so the cores stay busy either way. Deterministic: per-unit
+    // results are re-sorted into unit order and each verdict is thread-count independent.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let workers = cores.min(total_units).max(1);
+    let threads_per_unit = (cores / workers).max(1);
+    eprintln!(
+        "scanning {total_files} .ll files under {} … ({total_units} units, {workers} workers × {threads_per_unit} threads{})",
+        dir.display(),
+        if cross_file { ", cross-file" } else { "" }
+    );
 
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_files));
+    let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_units));
 
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= total_files {
+                if i >= total_units {
                     break;
                 }
-                let path = &files[i];
-                let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
-                let mut fs = FileScan::default();
-                match std::fs::read_to_string(path) {
-                    Err(_) => fs.errored = true,
-                    Ok(source) => match (csolver_llvm::LlvmFrontend)
-                        .lower(csolver_llvm::LlvmInput { source, name: rel.clone() })
-                    {
-                        Err(_) => fs.errored = true,
-                        Ok(module) => {
-                            fs.dropped = module.unanalyzed.len() as u64;
-                            let report = verify_module_with_threads(&module, config, 1);
-                            for f in &report.functions {
-                                match f.verdict {
-                                    Verdict::Pass => fs.pass += 1,
-                                    Verdict::Unknown => fs.unknown += 1,
-                                    Verdict::Fail => {
-                                        fs.fail += 1;
-                                        for o in &f.outcomes {
-                                            if let ObligationResult::Refuted(cx) = &o.result {
-                                                let witness = cx
-                                                    .model
-                                                    .assignments
-                                                    .iter()
-                                                    .filter(|a| !a.name.starts_with('?'))
-                                                    .map(|a| format!("{}={}", a.name, a.value))
-                                                    .collect::<Vec<_>>()
-                                                    .join(", ");
-                                                fs.findings.push(Finding {
-                                                    file: rel.clone(),
-                                                    function: f.function.clone(),
-                                                    property: format!("{:?}", o.obligation.property),
-                                                    witness,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                }
+                let (label, unit) = &units[i];
+                let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d.is_multiple_of(50) {
-                    eprintln!("  … {d}/{total_files} files");
+                    eprintln!("  … {d}/{total_units} units");
                 }
                 results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
             });
         }
     });
 
-    // Aggregate in file order (deterministic output, identical to a serial scan).
+    // Aggregate in unit order (deterministic output).
     let mut all = results.into_inner().unwrap_or_else(|p| p.into_inner());
     all.sort_by_key(|(i, _)| *i);
     let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -345,9 +420,7 @@ fn scan_dir(dir: &Path, config: &Config) -> Result<ExitCode, String> {
         fail += fs.fail;
         unknown += fs.unknown;
         dropped += fs.dropped;
-        if fs.errored {
-            errored += 1;
-        }
+        errored += fs.errored;
         findings.extend(fs.findings);
     }
 
