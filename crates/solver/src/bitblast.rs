@@ -478,7 +478,10 @@ impl<'c> Blaster<'c> {
     /// A shift by a constant amount.
     fn shift_const(&mut self, op: BvOp, a: &[Lit], k: u128, w: usize) -> Vec<Lit> {
         let zero = self.cnf.lit_false();
-        let k = k as usize;
+        // Clamp to the width first: any shift `≥ w` yields all-zero (Shl/LShr) or
+        // all-sign (AShr), so `w` is a faithful stand-in — and it keeps `i + k`
+        // from overflowing `usize` for a near-`u64::MAX` constant amount at w=64.
+        let k = k.min(w as u128) as usize;
         match op {
             BvOp::Shl => (0..w)
                 .map(|i| if i >= k { a[i - k] } else { zero })
@@ -682,5 +685,32 @@ mod tests {
     #[ignore = "slow exhaustive sweep; run on demand"]
     fn bitblast_matches_oracle_6bit() {
         check_exhaustive(6);
+    }
+
+    /// Regression for the `shift_const` overflow: at width 64 a constant shift
+    /// amount near `u64::MAX` used to overflow `i + k` and wrap to a small index,
+    /// fabricating `a[wrapped]` where the result must be all-zero / all-sign. A
+    /// huge shift must be provably 0 (Shl/LShr) for every `a`, and its negation
+    /// unprovable.
+    #[test]
+    fn huge_constant_shift_is_zero_at_width_64() {
+        let w = 64;
+        for op in [BvOp::Shl, BvOp::LShr] {
+            let mut c = ExprCtx::new();
+            let a = c.symbol("a", w);
+            let amt = c.int(w, u64::MAX as u128); // 2^64 - 1, well past the width
+            let shifted = c.bin(op, a, amt);
+            let zero = c.int(w, 0);
+            let is_zero = c.cmp(CmpOp::Eq, shifted, zero);
+            assert!(
+                prove_implies(&c, &[], is_zero),
+                "{op:?} by u64::MAX must be 0 for all a",
+            );
+            let nonzero = c.not(is_zero);
+            assert!(
+                !prove_implies(&c, &[], nonzero),
+                "{op:?} by u64::MAX must not be provably non-zero",
+            );
+        }
     }
 }
