@@ -107,7 +107,13 @@ already have.
   outside the analyzable set yield `ValidIndirectTarget` obligations/assumptions.
 
 ## Limits
-- M0 is interface-only (`lower` → `Unsupported`).
+- The **machine-code (byte) decoder** `x86::decode_function` / `arm64::decode_function`
+  is functional (→ MSIR; ~197 x86 mnemonics incl. VEX/EVEX/ModRM/SIB, 147 tests). The
+  **textual-assembly** frontend `AsmFrontend::lower` (source `.s` / GCC inline-asm
+  templates → MSIR) is **still a stub** (`Unsupported`, planned M4). So a C inline-asm
+  block (`Inst::Asm`) is currently treated as an **opaque havoc** by the executor —
+  modelling its side effects needs the text parser + a template→effect mapping, which
+  could reuse the byte decoder's per-mnemonic MSIR lowering.
 - Self-modifying code and unmodelled instructions become explicit assumptions.
 
 ## Proofs (arguments)

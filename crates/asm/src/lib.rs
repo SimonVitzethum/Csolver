@@ -1,4 +1,4 @@
-//! # csolver-asm — machine-assembly frontend (M0 stub)
+//! # csolver-asm — machine-assembly frontend
 //!
 //! Lowers x86-64 (Intel and AT&T syntax) and AArch64 assembly into MSIR. At the
 //! machine level the memory model becomes the flat byte space; registers,
@@ -7,9 +7,14 @@
 //!
 //! ## Status
 //!
-//! Interface only. [`AsmFrontend::lower`] reports
-//! [`csolver_core::Error::Unsupported`] (planned milestone M4). The supported
-//! [`Architecture`] and [`Syntax`] enums fix the public surface.
+//! The **machine-code (byte) decoders** are functional: [`x86::decode_function`]
+//! and [`arm64::decode_function`] lower a `.text` function (bytes) into MSIR,
+//! reconstructing its CFG (~197 x86 mnemonics incl. VEX/EVEX/ModRM/SIB).
+//!
+//! The **textual-assembly** entry point [`AsmFrontend::lower`] (a `.s` source or
+//! a C inline-asm template → MSIR) is still a stub — it reports
+//! [`csolver_core::Error::Unsupported`] (planned milestone M4). Until it exists,
+//! a C inline-asm block is an opaque havoc in the executor.
 
 mod blocks;
 pub mod arm64;

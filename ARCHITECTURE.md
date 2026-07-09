@@ -187,7 +187,10 @@ enum SafetyProperty {            // the properties in scope
     InBounds, NoUseAfterFree, NoDoubleFree, NoDanglingDeref,
     NoNullDeref, StackIntegrity, ValidPointerArith, ValidReference,
     ValidWrite, ValidRead, NoForbiddenOverlap, Alignment,
-    ValidStackFrame, ValidIndirectTarget,
+    ValidStackFrame, ValidIndirectTarget, WriteCapability,
+    NoInfoLeak,                  // copy_to_user of uninitialized memory
+    NoSizeOverflow,              // n*sizeof(C) alloc wrap        (bug-finding only)
+    DataRace,                    // AA self-deadlock (double-lock) (bug-finding only)
 }
 
 enum Decision { Proven(ProofTree), Refuted(Model), Unknown }
@@ -207,7 +210,7 @@ enum Inst {
     Dealloc { region: RegionKind, ptr },
     PtrOffset { dst, base, index, elem },   // byte-offset gep
     FieldPtr  { dst, base, field, size, align },
-    MemIntrinsic { kind: MemKind, dst, src, len }, // memcpy/memset/UserFill
+    MemIntrinsic { kind: MemKind, dst, src, len }, // memcpy/memset/UserFill/UserDrain
     Call { .. }, Intrinsic { .. }, Asm { .. },
     SafetyCheck { condition, .. },           // explicit proof obligation
 }
@@ -267,6 +270,11 @@ Per-obligation strategy (escalating, cheapest first):
 `Config` selects `closed_world` (whole-program contract synthesis) and
 `bug_finding` (see §1a). A **precondition sidecar** (`--pre`) supplies caller
 contracts C's types cannot express (`bytes`/`elements`/`cstring`/`sentinel`).
+`NoSizeOverflow` and `DataRace` are **bug-finding-only** obligations — the
+verifier does not enumerate them in sound `verify` mode, so PASS/FAIL there is
+unchanged. `Config.time_budget` bounds per-function exploration (`None` =
+unbounded); a `ModuleReport::any_truncated()` lets a scan **defer** a
+budget-limited unit for a full-effort re-run instead of reporting UNKNOWN.
 
 ### 4.7 External API effect contracts (`csolver-contracts`)
 
@@ -358,6 +366,15 @@ Verdicts are checked against **dynamic** oracles that observe real UB:
   once per path, so wide CFGs do not blow up the path count.
 - **Bounded exploration:** `ExecLimits` caps visits and wall-clock per function so
   an adversarial input cannot run unbounded.
+- **Shared per-function analyses:** the interval analysis is computed once and
+  handed from the verifier to the executor (no second fixpoint); a per-function
+  prove cache memoizes `(assumptions, goal) → result` across obligations (sound —
+  the `ExprCtx` is append-only). Cross-file linking (`merge_modules`) moves
+  functions instead of cloning them. All output-identical.
+- **Scan scheduling:** `solver scan` uses all cores with reservation-based memory
+  backpressure; a unit that hits its per-function budget is deferred and re-run in
+  a serial second phase with the clock disabled (a resource limit → a full-effort
+  decision, not a premature UNKNOWN).
 
 ---
 

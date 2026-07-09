@@ -11,8 +11,14 @@ CSolver has two modes:
   close the proof, or produces a concrete counterexample. A false `PASS` and a
   false `FAIL` are both treated as bugs.
 - **Bug-finding (`--bugs`).** A recall-oriented mode for finding real memory bugs
-  in kernel-style C (out-of-bounds, use-after-free, double-free,
-  `copy_from_user` overflows), each reported with a concrete triggering input.
+  in kernel-style C — out-of-bounds, use-after-free, double-free,
+  `copy_from_user` overflows, **uninitialized-memory disclosure to userspace**
+  (`copy_to_user` of never-written bytes), **allocation-size overflow**
+  (`n * sizeof(T)` wrapping to an under-allocation), and **AA self-deadlock**
+  (re-acquiring a held lock) — each reported with a concrete triggering input.
+  Indirect calls through constant ops-struct / vtable globals are
+  **devirtualized** so dispatch is analysed with the callee's summary instead of
+  an opaque havoc.
 
 ## Status
 
@@ -51,7 +57,13 @@ No out-of-bounds access · no use-after-free · no double-free · no dangling
 deref · no null deref · stack integrity · valid pointer arithmetic · valid
 references · valid reads/writes · no forbidden region overlap · alignment ·
 valid stack frames · valid indirect branch targets · write-capability
-(provenance: no write through a pointer to a read-only/foreign region).
+(provenance: no write through a pointer to a read-only/foreign region) ·
+no info-leak (no `copy_to_user` of uninitialized memory).
+
+Bug-finding mode adds two further classes as obligations: **no allocation-size
+overflow** (`n * sizeof(T)` wrap) and **no data race** (currently the
+soundly single-function-decidable AA self-deadlock). These are enumerated only
+under `--bugs`, so sound `verify` verdicts are unchanged.
 
 ## Soundness contract
 

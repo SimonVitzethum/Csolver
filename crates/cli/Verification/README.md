@@ -13,6 +13,14 @@ text/JSON reporting. Exit codes encode the verdict (0/1/2) or tool error (3).
   property, genuine-input witness) and a **coverage** breakdown (PASS/FAIL/UNKNOWN
   %, decided = PASS+FAIL, dropped). Exits `1` iff any bug was found (an inventory,
   not one verdict). Respects `--bugs` / `--assume-valid-params` / `--closed-world`.
+  Runs one worker per core with reservation-based **memory backpressure**
+  (`CSOLVER_JOBS=N` overrides); `--cross-file` links a directory's TUs before
+  verifying; `--auto-entries` discovers syscall + ops-struct handlers as entries;
+  `--entries <file>` supplies an explicit attacker-reachable entry policy. A unit
+  whose exploration hits its per-function budget is **deferred** and re-scanned in
+  a serial second phase with the wall-clock disabled and all threads — a resource
+  limit becomes a full-effort decision, not a premature UNKNOWN (deterministic,
+  results re-sorted by unit index).
 - `demo` verifies a built-in MSIR module to exercise the whole pipeline offline.
 - Exit codes: `PASS=0`, `FAIL=1`, `UNKNOWN=2`, tool error `=3`.
 

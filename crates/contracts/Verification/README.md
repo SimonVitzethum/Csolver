@@ -20,7 +20,8 @@ parser is std-only and line-based.
 alloc size=arg0 align=16          # result is a fresh region of arg0 bytes
 free arg0                         # frees the pointer in arg0
 write arg0 len=arg2 fill=user     # bulk-writes arg2 bytes of untrusted data to arg0
-read arg1 len=arg2                # bulk-reads arg2 bytes from arg1
+read arg1 len=arg2                # bulk-reads arg2 bytes from arg1 (in-kernel)
+read arg1 len=arg2 sink=user      # ...disclosed to userspace (copy_to_user): NoInfoLeak
 
 # provenance / capabilities (write-to-a-read-only-page class)
 prov foreign grants=read          # top-level lattice: what a label grants
@@ -36,7 +37,7 @@ A `<size>` is `arg<k>`, `arg<a>*arg<b>`, or a decimal integer (a byte count).
 | --- | --- |
 | `alloc` | `Inst::Alloc { Heap }`, result = the pointer |
 | `free` | `Inst::Dealloc` |
-| `write` / `read` | `Inst::MemIntrinsic` (a bounded write carrying the in-bounds obligation; `fill=user` taints the region so a value read back is a genuine adversarial input) |
+| `write` / `read` | `Inst::MemIntrinsic` (a bounded op carrying the in-bounds obligation; `fill=user` taints the region so a value read back is a genuine adversarial input; `read … sink=user` → `MemKind::UserDrain`, which additionally carries `NoInfoLeak` — a never-written source disclosed to userspace) |
 | `label` | `Inst::ProvLabel { ptr, label_id }` |
 | `propagate` | `Inst::ProvPropagate { dst, src }` (dst's region unions in src's labels — a container inherits its elements' provenance) |
 | `require` | `Inst::CapRequire { ptr, cap_id }` (implies `SafetyProperty::WriteCapability`) |

@@ -8,7 +8,12 @@ Provenance is carried by `ProvLabel` (tag a region's origin), `ProvPropagate`
 (a container absorbs an element's labels), `CapRequire` (demand a capability), and
 `CapRequireIfAlias` (demand it only for an in-place `src==dst` op), whose interned
 lattice rides on `Module::prov_grants` — the basis for `WriteCapability` (the
-Copy-Fail write-to-a-read-only-page class).
+Copy-Fail write-to-a-read-only-page class). `MemKind::UserDrain` marks a
+`copy_to_user`-style read disclosed to userspace (implies `NoInfoLeak`);
+`Module::global_fn_ptrs` (global name → `[(byte offset, FuncId)]`) is the
+devirtualization table for indirect calls loaded from constant ops-struct/vtable
+globals. `merge_modules(Vec<Module>, name)` links translation units by **moving**
+their functions/side tables (no per-function clone).
 
 ## Specification
 - Block-argument SSA: a value's single definition dominates its uses; PHIs are

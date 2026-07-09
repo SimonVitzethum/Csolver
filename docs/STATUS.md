@@ -25,6 +25,25 @@ Highlights beyond the historical log below:
   asm as an opaque havoc (keeps the function analysable), refutable bulk copies,
   and unit-stride loop-induction OOB (the off-by-one class). Finds all 8 memory-bug
   classes in the C differential corpus with **zero false positives**.
+- **New bug classes (2026-07).** `NoInfoLeak` — a `copy_to_user` (`MemKind::UserDrain`,
+  `read … sink=user`) of a fresh-alloc source with a never-written copied range on an
+  exact path (uninitialized-memory disclosure to userspace); refutes with a witness,
+  clears when the buffer is initialized first. `NoSizeOverflow` (bug-finding only) —
+  an `n * sizeof(C)` allocation with attacker `n` and constant `C > 1`, checked as the
+  cheap constant bound `n ≤ UINT_MAX/C` (the bit-blaster has no divider and a 128-bit
+  multiply exceeds the clause cap; the two-variable `n*m` case is left to the downstream
+  OOB against the wrapped size). `DataRace` (bug-finding only) — an **AA self-deadlock**:
+  re-acquiring a `spin_lock`/`mutex_lock`/… whose base object is already held on the path
+  (a per-path lockset by pointer-base identity, meet-joined). Full inter-thread races need
+  a concurrency model + atomicity preserved through lowering (currently erased) — future
+  work. `NoSizeOverflow`/`DataRace` are enumerated only under `--bugs`.
+- **Indirect-call devirtualization.** A load of a function-pointer field from a
+  **constant ops-struct / vtable global** resolves to its `FuncId`
+  (`Module.global_fn_ptrs`, filled from the initializer with exact byte offsets), so an
+  indirect call through it uses the callee summary instead of an opaque havoc.
+- **Executor performance (output-identical).** The interval analysis is computed once and
+  shared verifier→executor (no second fixpoint); a per-function prove cache memoizes
+  `(assumptions, goal) → result`; `merge_modules` moves functions instead of cloning them.
 - **Oracles.** Rust vs **Miri** (`differential/`), C vs **ASan+UBSan**
   (`differential/c/`), and a **kernel sweep** over real `make LLVM=1` IR
   (`scaling/kernel/`).
@@ -44,7 +63,13 @@ Highlights beyond the historical log below:
   lists every violation with a witness, and reports coverage (PASS/FAIL/UNKNOWN %,
   decided, dropped). On the debug-info kernel: ~31 % of driver functions and ~40 %
   of core functions are *decided* (proven-safe or refuted); the rest are UNKNOWN,
-  dominated by pointers from interprocedural calls/globals.
+  dominated by pointers from interprocedural calls/globals. Uses all cores with
+  memory backpressure; `--auto-entries` discovers syscall + ops-struct handlers as
+  attacker-reachable entries. A unit whose exploration hits its per-function budget
+  is **deferred** (not counted as UNKNOWN) and re-scanned in a serial second phase
+  with the wall-clock disabled and the whole machine, so a resource limit becomes a
+  full-effort decision rather than a premature UNKNOWN (`Config.time_budget`,
+  `ModuleReport::any_truncated`).
 
 Known open frontend gap on real kernel IR: complex `getelementptr` shapes
 (multi-index / vector) still drop the enclosing function to `unanalyzed`.

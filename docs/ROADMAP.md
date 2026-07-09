@@ -214,11 +214,21 @@ These are where "full safety" becomes "safety relative to a named contract":
   covering allocators, deallocators, user-copies, and provenance/capability rules;
   a new API is a contract, not a code change.
 - **`int → ptr` casts / inline asm**: provable only with an assumption that
-  re-establishes provenance / supplies a semantics.
+  re-establishes provenance / supplies a semantics. Inline asm is currently an
+  opaque havoc; modelling its effects needs the **textual-assembly** frontend
+  (`AsmFrontend::lower`, still an M4 stub) — the machine-code *byte* decoder
+  (`x86`/`arm64::decode_function`) is functional and its per-mnemonic MSIR
+  lowering could be reused once a template parser feeds it.
 - **Indirect calls/branches**: provable when the target set is recoverable
-  (vtables, jump tables), else a `ValidIndirectTarget` assumption.
-- **Concurrency / weak memory**: out of the current model; a data-race-aware
-  extension would be required for concurrent safety.
+  (vtables, jump tables), else a `ValidIndirectTarget` assumption. **PARTIAL** —
+  a call loaded from a *constant* ops-struct/vtable global is now devirtualized
+  (`Module::global_fn_ptrs`) and analysed with the callee summary; an opaque base
+  still falls back to the havoc.
+- **Concurrency / weak memory**: mostly out of the current model. **PARTIAL** —
+  the soundly single-function-decidable **AA self-deadlock** (double-lock) is
+  detected (`SafetyProperty::DataRace`, bug-finding only). Inter-thread data races
+  proper still need a concurrency model (thread interleavings or lockset +
+  happens-before) and atomicity preserved through lowering (currently erased).
 
 ## Bucket D — provenance across syscalls (the Copy-Fail class)
 
@@ -334,6 +344,21 @@ composed through direct callees to a fixpoint, so an *internal wrapper* around a
 primitive propagates without a hand-written contract — coverage scales without a contract per
 wrapper. Leaf primitives (body-less externals: `kmalloc`/`sg_set_page`/…) still need file
 contracts, which is irreducible (no body to derive from) and small.
+
+**2026-07 batch — coverage + performance (all differentials SOUND).**
+- **Indirect-call devirtualization** through constant ops-struct/vtable globals
+  (`Module::global_fn_ptrs`; parser extracts `ptr @func` initializer fields with exact
+  byte offsets) — the call uses the callee summary instead of an opaque havoc.
+- **New bug classes**: `NoInfoLeak` (`copy_to_user` of never-written memory, via
+  `MemKind::UserDrain`); `NoSizeOverflow` (bug-finding — `n*sizeof(C)` overflow, checked
+  as the constant bound `n ≤ UINT_MAX/C`; two-variable `n*m` left to downstream OOB, as the
+  bit-blaster has no divider); `DataRace` (bug-finding — AA self-deadlock / double-lock).
+- **Executor performance (output-identical)**: interval analysis reused verifier→executor;
+  per-function prove cache `(assumptions, goal)→result`; `merge_modules` moves instead of
+  clones.
+- **Scan scheduling**: budget-limited units are **deferred** and re-scanned unbounded in a
+  serial second phase (`Config.time_budget`, `ModuleReport::any_truncated`) — a resource
+  limit becomes a full-effort decision, not a premature UNKNOWN.
 
 ## Sequencing
 

@@ -28,6 +28,29 @@ to a fixpoint (`summarize_module`); `apply_prov_transfer` applies a callee's tra
 call site — so an internal wrapper around a provenance primitive propagates provenance with
 no hand-written contract. Only definite parameter aliasing is recorded (never spurious).
 
+**Indirect-call devirtualization.** A pointer load from a constant ops-struct/vtable
+global at a concrete offset with a known function-pointer field (`Module::global_fn_ptrs`,
+tracked into `PathState.fn_ptrs`, meet-joined at merges) resolves the loaded value to its
+`FuncId`; an indirect call through that register then uses the callee summary (precise
+writes/frees/return/provenance effects) instead of the opaque havoc an unknown call forces
+(assumption `devirtualized-indirect-call`). Sound — resolution only narrows an
+over-approximation; an unknown base falls back to the havoc.
+
+**Additional obligations.** `NoInfoLeak` — a `copy_to_user` (`MemKind::UserDrain`) whose
+source is a fresh allocation with an *unwritten* copied range on an exact path is refuted
+(reuses the uninit-read machinery). `NoSizeOverflow` (bug-finding only) — an `Alloc` whose
+byte size is `var * C` for a constant `C > 1` records the constant-bound goal
+`var ≤ UINT_MAX/C` (no wide multiply — the bit-blaster has no divider). `DataRace`
+(bug-finding only) — a per-path lockset by lock-pointer base identity
+(`LOCK_ACQUIRE`/`LOCK_RELEASE` symbol names, meet-joined) refutes re-acquiring a held lock
+(AA self-deadlock). The last two are gated to bug-finding and are never enumerated by the
+verifier in sound mode.
+
+**Performance (output-identical).** The interval analysis is reused from the verifier
+(`Option<&IntervalAnalysis>` into `discharge_*`) instead of a second fixpoint; a
+per-function prove cache memoizes `(assumptions, goal) → ProofMethod` (sound — the
+`ExprCtx` is append-only), re-applying the `linear-no-overflow` side effect on a hit.
+
 ## State merging (scaling — process each block once)
 The old executor enumerated paths recursively, so a CFG with *N* independent
 branches forked into *2^N* paths and could trip the visit budget into a

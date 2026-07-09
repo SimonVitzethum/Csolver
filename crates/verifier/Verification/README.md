@@ -4,8 +4,16 @@
 The orchestrator. For each function it runs the interval analysis, turns every
 `SafetyCheck` into a `ProofObligation`, discharges it (interval first, SMT
 later), and rolls up `Verdict`s into a `ModuleReport`. It threads module-wide
-context to the symbolic executor: parameter/field contracts, globals, and the
-provenance lattice (`Module::prov_grants`, for `WriteCapability`).
+context to the symbolic executor: parameter/field contracts, globals, the
+provenance lattice (`Module::prov_grants`, for `WriteCapability`), the
+devirtualization table (`Module::global_fn_ptrs`), and the already-computed
+interval analysis (so the executor reuses it instead of a second fixpoint).
+
+`NoSizeOverflow` and `DataRace` are **bug-finding-only** obligations — skipped in
+the implied-check enumeration unless `config.bug_finding`, so sound `verify`
+PASS/FAIL is unchanged. `Config.time_budget` (`None` = unbounded) bounds the
+executor's per-function wall-clock; `FunctionReport.truncated` /
+`ModuleReport::any_truncated()` surface a budget hit so a scan can defer the unit.
 
 ## Specification
 - `Trivalent::True → Proven(ProofTree)`, `False → Refuted(CounterExample)`,

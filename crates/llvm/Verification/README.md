@@ -9,11 +9,21 @@ leading `phi` nodes become MSIR block parameters and every in-edge supplies the
 matching incoming values as branch arguments.
 
 Recognized library/kernel calls (allocators, deallocators, `copy_from_user`,
-provenance-labelling primitives) are lowered from **external, file-driven
-contracts** (`csolver-contracts`, `data/*.contract`) rather than hardcoded name
-tables: `emit_contract` turns a contract's effects into the modelling MSIR
-(`Alloc`/`Dealloc`/`MemIntrinsic`/`ProvLabel`/`CapRequire`). A new API is a
-contract block, not a match arm.
+`copy_to_user`, provenance-labelling primitives) are lowered from **external,
+file-driven contracts** (`csolver-contracts`, `data/*.contract`) rather than
+hardcoded name tables: `emit_contract` turns a contract's effects into the
+modelling MSIR (`Alloc`/`Dealloc`/`MemIntrinsic`/`ProvLabel`/`CapRequire`). A
+`read … sink=user` effect (`copy_to_user`) lowers to `MemKind::UserDrain`. A new
+API is a contract block, not a match arm.
+
+**Constant-initializer devirtualization tables.** For a `constant` global, the
+parser walks its initializer and records every `ptr @func` field with its exact
+byte offset (padded struct/array layout, LP64 — matching the executor's gep). The
+lowering keeps the fields whose target is a function defined in the module in
+`Module::global_fn_ptrs`, so an indirect call loaded from an ops-struct/vtable
+global can be devirtualized. The whole table is dropped on any layout-tracking
+uncertainty (an imprecise offset would be unsound; a missed field only lowers
+recall).
 
 ## Supported subset
 `define`d functions; `void`/`iN`/`ptr`/`[N x T]` types (and legacy `T*`);

@@ -8,7 +8,12 @@ It has **no internal dependencies**, so these types are a stable shared
 language and the soundness policy lives in exactly one place. The property
 catalogue includes `WriteCapability` — a write/access must target a region whose
 **provenance** grants the capability (the write-to-a-read-only-page class, driven
-by external contract labels; see `csolver-contracts`).
+by external contract labels; see `csolver-contracts`) — plus `NoInfoLeak`
+(no `copy_to_user` of uninitialized memory), `NoSizeOverflow` (an `n*sizeof(C)`
+allocation size must not wrap), and `DataRace` (currently the AA self-deadlock
+subclass). `NoSizeOverflow` and `DataRace` are **bug-finding-only** obligations
+(the verifier does not enumerate them in sound `verify` mode). The enum is
+`#[non_exhaustive]`, so external matches must carry a wildcard arm.
 
 ## Specification
 - `Verdict::combine` is a commutative, associative monoid with identity `Pass`;
