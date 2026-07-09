@@ -2456,6 +2456,25 @@ impl Explorer<'_> {
                     assumed: false,
                     prov_labels: HashSet::new(),
                 });
+                // Bug-finding: an attacker-controlled `count * sizeof(T)` size that can
+                // wrap the pointer width under-allocates — a heap overflow at the root.
+                // When the size is a variable factor times a constant element size `c`,
+                // overflow is exactly `var > (UINT_MAX / c)` — a constant-bound check the
+                // solver discharges cheaply (no wide multiply). A feasible genuine
+                // overflow is refuted with a witness; a bounded (guarded) count proves.
+                // Only run in bug-finding mode; sound `verify` does not enumerate this
+                // obligation, so allocation sizes stay non-wrapping under `alloc-succeeds`.
+                if self.bug_finding {
+                    match self.size_overflow_goal(size) {
+                        Some(goal) => {
+                            let decision = self.decide(&[goal], state, RefuteMode::Possible, &[]);
+                            self.record_mem(block, idx, SafetyProperty::NoSizeOverflow, decision, "allocation size does not overflow", "the size product may overflow and under-allocate");
+                        }
+                        None => self.record(block, idx, SafetyProperty::NoSizeOverflow, true, "allocation size does not overflow", ""),
+                    }
+                } else {
+                    self.record(block, idx, SafetyProperty::NoSizeOverflow, true, "allocation size does not overflow", "");
+                }
                 // The byte size is non-negative by construction.
                 let zero = self.ctx.int(PTR_WIDTH, 0);
                 let nonneg = self.ctx.cmp(SCmp::Sle, zero, size);
@@ -3500,6 +3519,58 @@ impl Explorer<'_> {
         let lower = self.ctx.cmp(SCmp::Sle, zero, offset);
         let upper = self.ctx.cmp(SCmp::Sle, end, size);
         [lower, upper]
+    }
+
+    /// The goal "the allocation byte size does not overflow the pointer width",
+    /// for a size of the form `var * C` (a variable count times a *constant*
+    /// element/product `C`). Overflow is exactly `var >u (UINT_MAX / C)`, so the
+    /// goal is the constant-bound comparison `var <=u UINT_MAX / C` — no wide
+    /// multiply, so the solver discharges it cheaply and can witness a violation.
+    ///
+    /// Returns `None` (obligation trivially satisfied) when the size is a bare
+    /// constant, has no constant factor `> 1`, or has *two or more* variable
+    /// factors (`n * m` — a wide multiply this path deliberately does not model;
+    /// its overflow, if any, still surfaces downstream as an OOB against the
+    /// wrapped region size). Sound: a `None` only ever *omits* a check.
+    fn size_overflow_goal(&mut self, size: ExprId) -> Option<ExprId> {
+        let factors = self.mul_factors(size);
+        let mut c: u128 = 1;
+        let mut var: Option<ExprId> = None;
+        for f in factors {
+            match self.ctx.node(f) {
+                Node::Const(bv) => c = c.checked_mul(bv.unsigned())?,
+                _ => {
+                    // More than one variable factor: not this path's job.
+                    if var.replace(f).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        let var = var?;
+        if c <= 1 {
+            return None;
+        }
+        let umax = (1u128 << PTR_WIDTH) - 1;
+        let bound = self.ctx.int(PTR_WIDTH, umax / c);
+        Some(self.ctx.cmp(SCmp::Ule, var, bound))
+    }
+
+    /// Flatten a tree of `BvOp::Mul` nodes into its leaf factors (a non-mul is one
+    /// factor). So `(n * size) * stride` yields `[n, size, stride]`.
+    fn mul_factors(&self, e: ExprId) -> Vec<ExprId> {
+        let mut out = Vec::new();
+        let mut stack = vec![e];
+        while let Some(x) = stack.pop() {
+            match self.ctx.node(x) {
+                Node::Bin { op: BvOp::Mul, a, b } => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                _ => out.push(x),
+            }
+        }
+        out
     }
 
     /// The fact `count <=u isize::MAX / stride`, so `count * stride` does not
@@ -4547,6 +4618,84 @@ mod tests {
             blocks: vec![bb0],
             entry: BlockId(0),
         }
+    }
+
+    #[test]
+    fn attacker_controlled_alloc_size_overflow_is_flagged() {
+        // buf = alloc [n x i32]: size = n * 4, n attacker-controlled → can wrap.
+        let n = RegId(0);
+        let buf = RegId(1);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(32),
+            count: Operand::Reg(n),
+            align: 8,
+        });
+        let f = Function {
+            id: FuncId(0),
+            name: "alloc_n_i32".into(),
+            params: vec![(n, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+        let r = discharge_with(&f, limits);
+        let d = r
+            .mem_decision(BlockId(0), 0, SafetyProperty::NoSizeOverflow)
+            .expect("NoSizeOverflow obligation at the alloc");
+        assert!(
+            d.refutation.is_some(),
+            "an unbounded attacker-controlled n*sizeof size must be flagged: {d:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_alloc_size_is_not_flagged_as_overflow() {
+        // A guarded count (n < 1024) cannot overflow n*4 → the size proves safe.
+        let n = RegId(0);
+        let ok = RegId(1);
+        let buf = RegId(2);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::CondBr {
+            cond: Operand::Reg(ok),
+            then_blk: BlockId(1),
+            then_args: vec![],
+            else_blk: BlockId(2),
+            else_args: vec![],
+        });
+        bb0.insts.push(Inst::Assign {
+            dst: ok,
+            ty: Type::Bool,
+            value: RValue::Cmp { op: CmpOp::Ult, lhs: Operand::Reg(n), rhs: Operand::int(64, 1024) },
+        });
+        let mut bb1 = BasicBlock::new(BlockId(1), Terminator::Return(None));
+        bb1.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(32),
+            count: Operand::Reg(n),
+            align: 8,
+        });
+        let bb2 = BasicBlock::new(BlockId(2), Terminator::Return(None));
+        let f = Function {
+            id: FuncId(0),
+            name: "alloc_bounded".into(),
+            params: vec![(n, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2],
+            entry: BlockId(0),
+        };
+        let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+        let r = discharge_with(&f, limits);
+        let d = r
+            .mem_decision(BlockId(1), 0, SafetyProperty::NoSizeOverflow)
+            .expect("NoSizeOverflow obligation");
+        assert!(
+            d.refutation.is_none() && d.proven,
+            "a count guarded < 1024 cannot overflow n*4: {d:?}"
+        );
     }
 
     #[test]

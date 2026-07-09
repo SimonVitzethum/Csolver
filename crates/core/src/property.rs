@@ -47,6 +47,11 @@ pub enum SafetyProperty {
     /// drain must not read source bytes that were never written (a freshly-allocated
     /// kernel buffer copied out before being filled — the classic kernel info-leak).
     NoInfoLeak,
+    /// An **allocation size computation does not overflow**: an `n * sizeof(T)` /
+    /// `kmalloc_array(n, C)` product with an attacker-controlled count and a constant
+    /// element size must not wrap the pointer width to a small value (which
+    /// under-allocates, leading to a heap overflow). A bug-finding-only obligation.
+    NoSizeOverflow,
 }
 
 impl SafetyProperty {
@@ -69,6 +74,7 @@ impl SafetyProperty {
             SafetyProperty::ValidIndirectTarget => "valid_indirect_target",
             SafetyProperty::WriteCapability => "write_capability",
             SafetyProperty::NoInfoLeak => "no_info_leak",
+            SafetyProperty::NoSizeOverflow => "no_size_overflow",
         }
     }
 
@@ -91,6 +97,7 @@ impl SafetyProperty {
             SafetyProperty::ValidIndirectTarget => "indirect branch target is valid",
             SafetyProperty::WriteCapability => "access target's provenance grants the capability",
             SafetyProperty::NoInfoLeak => "no uninitialized memory is disclosed to userspace",
+            SafetyProperty::NoSizeOverflow => "allocation size computation does not overflow",
         }
     }
 
@@ -114,6 +121,7 @@ impl SafetyProperty {
             ValidIndirectTarget,
             WriteCapability,
             NoInfoLeak,
+            NoSizeOverflow,
         ]
     }
 }

@@ -567,6 +567,13 @@ fn verify_function_with(
             // model. Enumerated from the IR so a memory op is never silently
             // treated as safe (when symbolic did not run, it is `Open`).
             for &property in inst.implied_checks() {
+                // Size-overflow is a bug-finding-only obligation: in sound `verify` mode
+                // it is not enumerated, so it never affects PASS/FAIL there (an allocation
+                // size is treated as non-wrapping under `alloc-succeeds`, as before). Only
+                // the kernel bug-finding mode checks it.
+                if property == SafetyProperty::NoSizeOverflow && !config.bug_finding {
+                    continue;
+                }
                 let id = ObligationId(*next_id);
                 *next_id += 1;
                 let location = Location::level_only(config.level)

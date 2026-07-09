@@ -465,6 +465,10 @@ impl Inst {
             Inst::Load { .. } => &[NoNullDeref, NoUseAfterFree, InBounds, Alignment, ValidRead],
             Inst::Store { .. } => &[NoNullDeref, NoUseAfterFree, InBounds, Alignment, ValidWrite],
             Inst::Dealloc { .. } => &[NoDoubleFree],
+            // Bug-finding only (the verifier does not enumerate it in sound mode): an
+            // attacker-controlled `count * sizeof(T)` size must not overflow and
+            // under-allocate.
+            Inst::Alloc { .. } => &[NoSizeOverflow],
             Inst::PtrOffset { .. } => &[ValidPointerArith],
             Inst::MemIntrinsic { kind, .. } => match kind {
                 MemKind::Set | MemKind::UserFill => {
