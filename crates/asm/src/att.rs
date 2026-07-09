@@ -13,7 +13,7 @@
 
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use crate::x86::{cc_cmpop, reg, temp_reg};
-use csolver_core::{Error, Result};
+use csolver_core::{Error, RegionKind, Result};
 use csolver_ir::{BinOp, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
 
 /// Decode a whole AT&T `.s` translation unit into a module (one function per
@@ -162,6 +162,25 @@ fn lower_insn(
         }
         "lea" => lower_lea(&ops, off).map(fall_wrap(off, next)),
         "add" | "sub" | "and" | "or" | "xor" => {
+            // Stack-frame prologue/epilogue (rsp = register 4): `sub $N, %rsp` allocates
+            // the frame — rsp becomes a fresh N-byte stack region so `[rsp+disp]` is
+            // checked against it; `add $N, %rsp` tears it down (a no-op). Mirrors the
+            // byte decoder, so the `.s` path proves stack accesses too.
+            if matches!(base, "add" | "sub") && parse_reg(ops.get(1).copied().unwrap_or("")) == Some(4) {
+                if let Some(n) = ops.first().and_then(|o| parse_imm(o)) {
+                    return Ok(if base == "sub" {
+                        fall(vec![Inst::Alloc {
+                            dst: reg(4),
+                            region: RegionKind::Stack,
+                            elem: Type::int(8),
+                            count: Operand::int(64, n as u128),
+                            align: 16,
+                        }])
+                    } else {
+                        fall(vec![])
+                    });
+                }
+            }
             let bin = match base {
                 "add" => BinOp::Add,
                 "sub" => BinOp::Sub,
@@ -475,6 +494,28 @@ sum:
         assert!(f.blocks.len() >= 3, "loop CFG has multiple blocks");
         // The `addq (%rdi,%rcx,8), %rax` emits a load.
         assert!(f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Load { .. })));
+    }
+
+    #[test]
+    fn sub_rsp_allocates_a_stack_frame() {
+        // subq $16,%rsp allocates the frame; the store/load to (%rsp) are then checked
+        // against it. Assert an Alloc{Stack} is emitted and the frame teardown is a no-op.
+        let src = "\
+f:
+\tsubq\t$16, %rsp
+\tmovl\t$1, (%rsp)
+\tmovl\t(%rsp), %eax
+\taddq\t$16, %rsp
+\tretq
+";
+        let m = decode_att(src);
+        assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
+        let has_frame = m.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. }));
+        assert!(has_frame, "`sub $N,%rsp` must allocate a stack frame");
     }
 
     #[test]
