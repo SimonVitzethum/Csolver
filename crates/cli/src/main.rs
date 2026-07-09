@@ -39,7 +39,7 @@ USAGE:
                                     ABI — opt-in, unsound in general, surfaced as an assumption);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
-    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>] [--cross-file]
+    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>] [--cross-file] [--reachable]
                                     verify EVERY .ll under <dir> without stopping, then
                                     report coverage (% of functions decided) and list
                                     every memory-safety violation found, with a witness
@@ -55,7 +55,14 @@ USAGE:
                                     so a call across a translation-unit boundary resolves
                                     to its definition and a caller's validation flows into
                                     the callee — finds deeper bugs and removes false
-                                    positives a per-file view cannot see.)
+                                    positives a per-file view cannot see.
+                                    --reachable <needs --entries>: link, per attacker
+                                    entry, the transitive set of .ll it can reach through
+                                    the call graph into ONE whole-program module analysed
+                                    closed-world — so a caller's scalar validation flows
+                                    soundly into its callee across files. A bug-finding
+                                    mode: a helper is constrained by the callers reachable
+                                    from that entry.)
     solver demo [--json]            verify a built-in MSIR sample (no frontend)
     solver report <result.json>     re-render a saved JSON report
     solver --help                   show this help
@@ -87,6 +94,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let bug_finding = args.iter().any(|a| a == "--bugs");
     let assume_valid_params = args.iter().any(|a| a == "--assume-valid-params");
     let cross_file = args.iter().any(|a| a == "--cross-file");
+    let reachable = args.iter().any(|a| a == "--reachable");
     // `--pre <file>`: an opt-in parameter-precondition sidecar.
     let pre_file = args
         .iter()
@@ -141,8 +149,14 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--") && entries_file.as_ref().and_then(|p| p.to_str()) != Some(a.as_str()))
                 .ok_or("`scan` needs a directory argument")?;
-            let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns, ..Config::default() };
-            scan_dir(Path::new(dir), &config, cross_file)
+            let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns: entry_patterns.clone(), ..Config::default() };
+            if reachable {
+                let pats = entry_patterns
+                    .ok_or("`--reachable` requires `--entries <file>` (the entry points to link from)")?;
+                scan_reachable(Path::new(dir), &config, &pats)
+            } else {
+                scan_dir(Path::new(dir), &config, cross_file)
+            }
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
@@ -259,6 +273,188 @@ struct FileScan {
     dropped: u64,
     errored: u64,
     findings: Vec<Finding>,
+}
+
+/// The external functions a module DEFINES and the external symbols it CALLS — the edges
+/// of the cross-file call graph. Internal (static) definitions are file-local, so they are
+/// not exported as reachability targets; a `Callee::Symbol(name)` is a cross-file call.
+fn module_call_edges(m: &csolver_ir::Module) -> (Vec<String>, std::collections::HashSet<String>) {
+    use csolver_ir::{Callee, Inst};
+    let defined: Vec<String> = m
+        .functions
+        .iter()
+        .filter(|f| !m.internal.contains(&f.id))
+        .map(|f| f.name.clone())
+        .collect();
+    let mut called = std::collections::HashSet::new();
+    for f in &m.functions {
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Inst::Call { callee: Callee::Symbol(name), .. } = inst {
+                called.insert(name.clone());
+            }
+        }
+    }
+    (defined, called)
+}
+
+/// **Reachability-based** cross-file scan (the (a) step): rather than linking a directory,
+/// link — for each attacker entry — the transitive set of translation units the entry can
+/// reach through the call graph, into one whole-program module analysed closed-world. Then
+/// an internal helper's callers are all present, so a caller's scalar validation soundly
+/// flows into it (closed-world is justified within the reachable set), eliminating the
+/// false positives a per-file or per-directory view cannot. A bug-finding mode: the link is
+/// per-entry, so a helper is constrained by the callers reachable from THAT entry.
+fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Result<ExitCode, String> {
+    use csolver_ir::Frontend;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    let mut files = Vec::new();
+    collect_ll(dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no .ll files found under {}", dir.display()));
+    }
+    eprintln!("reachability scan: lowering {} .ll files under {} …", files.len(), dir.display());
+
+    // Lower every file (parallel), keeping the module + its call-graph edges.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let lowered: std::sync::Mutex<Vec<(usize, String, csolver_ir::Module)>> =
+        std::sync::Mutex::new(Vec::with_capacity(files.len()));
+    std::thread::scope(|s| {
+        for _ in 0..cores.min(files.len()).max(1) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= files.len() {
+                    break;
+                }
+                let rel = files[i].strip_prefix(dir).unwrap_or(&files[i]).display().to_string();
+                if let Ok(src) = std::fs::read_to_string(&files[i]) {
+                    if let Ok(m) = (csolver_llvm::LlvmFrontend).lower(csolver_llvm::LlvmInput { source: src, name: rel.clone() }) {
+                        lowered.lock().unwrap_or_else(|p| p.into_inner()).push((i, rel, m));
+                    }
+                }
+            });
+        }
+    });
+    let mut lowered = lowered.into_inner().unwrap_or_else(|p| p.into_inner());
+    lowered.sort_by_key(|(i, _, _)| *i);
+    let modules: Vec<(String, csolver_ir::Module)> = lowered.into_iter().map(|(_, r, m)| (r, m)).collect();
+
+    // Global index: which module defines each external function, and each module's callees.
+    let mut def_of: HashMap<String, usize> = HashMap::new();
+    let mut calls: Vec<HashSet<String>> = Vec::with_capacity(modules.len());
+    let mut entry_fns: Vec<(usize, String)> = Vec::new();
+    for (mi, (_, m)) in modules.iter().enumerate() {
+        let (defined, called) = module_call_edges(m);
+        // Reachability targets: external definitions only (a `static` name may collide).
+        for name in &defined {
+            def_of.entry(name.clone()).or_insert(mi);
+        }
+        // Entries may be `static` (a proto_ops/file_operations callback is often static),
+        // so match every defined function — the entry's module is the reachability root.
+        for f in &m.functions {
+            if csolver_verifier::matches_entry(&f.name, entry_patterns) {
+                entry_fns.push((mi, f.name.clone()));
+            }
+        }
+        calls.push(called);
+    }
+    eprintln!("  {} modules, {} attacker entries", modules.len(), entry_fns.len());
+
+    // For each entry: BFS the reachable module set (bounded), link, verify closed-world.
+    const MAX_REACH: usize = 600;
+    let cfg = Config { closed_world: true, entry_patterns: Some(entry_patterns.to_vec()), ..config.clone() };
+    let entry_next = std::sync::atomic::AtomicUsize::new(0);
+    let entry_done = std::sync::atomic::AtomicUsize::new(0);
+    let agg: std::sync::Mutex<Vec<FileScan>> = std::sync::Mutex::new(Vec::new());
+    let n_entries = entry_fns.len();
+    std::thread::scope(|s| {
+        for _ in 0..cores.min(n_entries.max(1)) {
+            s.spawn(|| loop {
+                let ei = entry_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if ei >= n_entries {
+                    break;
+                }
+                let (m0, ref ename) = entry_fns[ei];
+                // BFS reachable modules from the entry's module.
+                let mut seen: BTreeSet<usize> = BTreeSet::new();
+                let mut work = vec![m0];
+                seen.insert(m0);
+                while let Some(mi) = work.pop() {
+                    if seen.len() >= MAX_REACH {
+                        break;
+                    }
+                    for callee in &calls[mi] {
+                        if let Some(&tgt) = def_of.get(callee) {
+                            if seen.insert(tgt) {
+                                work.push(tgt);
+                            }
+                        }
+                    }
+                }
+                let group: Vec<&csolver_ir::Module> = seen.iter().map(|&i| &modules[i].1).collect();
+                let linked = csolver_ir::merge_modules(&group.iter().map(|m| (*m).clone()).collect::<Vec<_>>(), ename.as_str());
+                let fs = scan_linked_module(&linked, ename, &cfg);
+                let d = entry_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if d.is_multiple_of(20) {
+                    eprintln!("  … {d}/{n_entries} entries");
+                }
+                agg.lock().unwrap_or_else(|p| p.into_inner()).push(fs);
+            });
+        }
+    });
+
+    // Aggregate + de-duplicate findings (a function reachable from several entries).
+    let all = agg.into_inner().unwrap_or_else(|p| p.into_inner());
+    let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut findings: Vec<Finding> = Vec::new();
+    for fs in all {
+        pass += fs.pass;
+        fail += fs.fail;
+        unknown += fs.unknown;
+        dropped += fs.dropped;
+        errored += fs.errored;
+        findings.extend(fs.findings);
+    }
+    let mut seen_find = HashSet::new();
+    findings.retain(|f| seen_find.insert((f.file.clone(), f.function.clone(), f.property.clone(), f.witness.clone())));
+    report_scan(&findings, pass, fail, unknown, dropped, errored)
+}
+
+/// Verify one already-linked whole-program module, collecting its verdicts + findings.
+fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: &Config) -> FileScan {
+    use csolver_core::ObligationResult;
+    let mut fs = FileScan { dropped: module.unanalyzed.len() as u64, ..Default::default() };
+    let report = verify_module_with_threads(module, cfg, 1);
+    for f in &report.functions {
+        match f.verdict {
+            Verdict::Pass => fs.pass += 1,
+            Verdict::Unknown => fs.unknown += 1,
+            Verdict::Fail => {
+                fs.fail += 1;
+                for o in &f.outcomes {
+                    if let ObligationResult::Refuted(cx) = &o.result {
+                        let witness = cx
+                            .model
+                            .assignments
+                            .iter()
+                            .filter(|a| !a.name.starts_with('?'))
+                            .map(|a| format!("{}={}", a.name, a.value))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        fs.findings.push(Finding {
+                            file: label.to_string(),
+                            function: f.function.clone(),
+                            property: format!("{:?}", o.obligation.property),
+                            witness,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    fs
 }
 
 /// Lower every `.ll` in `unit` (relative to `dir`); in cross-file mode link them into one
@@ -424,13 +620,25 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
         findings.extend(fs.findings);
     }
 
+    report_scan(&findings, pass, fail, unknown, dropped, errored)
+}
+
+/// Render a scan's findings + coverage and pick the exit code.
+fn report_scan(
+    findings: &[Finding],
+    pass: u64,
+    fail: u64,
+    unknown: u64,
+    dropped: u64,
+    errored: u64,
+) -> Result<ExitCode, String> {
     let total = pass + fail + unknown;
     let pct = |x: u64| if total == 0 { 0.0 } else { 100.0 * x as f64 / total as f64 };
     println!("\n== memory-safety violations found ({}) ==", findings.len());
     if findings.is_empty() {
         println!("  (none)");
     } else {
-        for b in &findings {
+        for b in findings {
             println!("  {}::{}  [{}]  witness: {}", b.file, b.function, b.property, b.witness);
         }
     }
