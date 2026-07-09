@@ -100,9 +100,12 @@ const SOLVE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 pub struct Solver {
     num_vars: usize,
     clauses: Vec<Vec<Lit>>,
-    /// `var_clauses[v]` = indices of clauses that mention variable `v` (kept in
-    /// sync as learnt clauses are appended).
-    var_clauses: Vec<Vec<usize>>,
+    /// Two-watched-literal scheme: `watches[lit_code(l)]` holds every clause that
+    /// currently watches literal `l`. A clause is visited only when one of its two
+    /// watched literals becomes false, so propagation touches far fewer clauses
+    /// than a full occurrence list. Each length-≥2 clause watches `lits[0]` and
+    /// `lits[1]`; units and the empty clause are handled directly at seed time.
+    watches: Vec<Vec<usize>>,
     assign: Vec<Option<bool>>,
     /// Decision level at which each variable was assigned (valid while assigned).
     level: Vec<u32>,
@@ -139,20 +142,17 @@ pub struct Solver {
 impl Solver {
     /// Build a solver from a variable count and a clause list.
     pub fn new(num_vars: usize, clauses: Vec<Vec<Lit>>) -> Solver {
-        let mut var_clauses = vec![Vec::new(); num_vars];
+        let mut watches = vec![Vec::new(); 2 * num_vars];
         for (ci, clause) in clauses.iter().enumerate() {
-            for lit in clause {
-                let v = lit.var as usize;
-                // Avoid recording the same clause twice for a repeated variable.
-                if var_clauses[v].last() != Some(&ci) {
-                    var_clauses[v].push(ci);
-                }
+            if clause.len() >= 2 {
+                watches[lit_code(clause[0])].push(ci);
+                watches[lit_code(clause[1])].push(ci);
             }
         }
         Solver {
             num_vars,
             clauses,
-            var_clauses,
+            watches,
             assign: vec![None; num_vars],
             level: vec![0; num_vars],
             reason: vec![None; num_vars],
@@ -197,45 +197,70 @@ impl Solver {
         }
     }
 
-    /// Unit-propagate to a fixpoint. Returns the index of a falsified clause on
-    /// conflict, else `None`.
+    /// Unit-propagate to a fixpoint using two-watched literals. Returns the index
+    /// of a falsified clause on conflict, else `None`.
+    ///
+    /// When a variable is assigned, exactly one literal per polarity becomes
+    /// false; we visit only the clauses watching that false literal. For each such
+    /// clause we try to slide the watch onto any non-false literal; failing that
+    /// the clause is unit (propagate its other watch) or, if that too is false, in
+    /// conflict.
     fn propagate(&mut self) -> Option<usize> {
         while let Some(v) = self.prop_queue.pop() {
-            // Re-examine every clause mentioning `v`. We index by position so we
-            // do not hold a borrow of `self.var_clauses` across `enqueue`.
-            let n = self.var_clauses[v as usize].len();
-            for k in 0..n {
-                let ci = self.var_clauses[v as usize][k];
-                // Scan the clause: is it satisfied, and how many unassigned lits?
-                let mut satisfied = false;
-                let mut unassigned = None;
-                let mut count = 0u32;
-                for &lit in &self.clauses[ci] {
-                    match self.lit_value(lit) {
-                        Some(true) => {
-                            satisfied = true;
-                            break;
-                        }
-                        Some(false) => {}
-                        None => {
-                            count += 1;
-                            unassigned = Some(lit);
-                        }
-                    }
-                }
-                if satisfied {
+            // The literal that just became false for this variable.
+            let false_lit = Lit {
+                var: v,
+                neg: self.assign[v as usize] == Some(true),
+            };
+            let fc = lit_code(false_lit);
+            // Take the watch list out so we can mutate other lists / clauses while
+            // walking it; `keep` is rebuilt as the retained watchers of `false_lit`.
+            let watchers = std::mem::take(&mut self.watches[fc]);
+            let mut keep: Vec<usize> = Vec::with_capacity(watchers.len());
+            let mut conflict: Option<usize> = None;
+            for &ci in &watchers {
+                if conflict.is_some() {
+                    keep.push(ci); // retain the untouched tail unchanged
                     continue;
                 }
-                match (count, unassigned) {
-                    (0, _) => return Some(ci), // all literals false ⇒ conflict
-                    (1, Some(unit)) => {
-                        // Unit clause: the lone unassigned literal is forced, with
-                        // `ci` as its antecedent. It is unassigned, so this never
-                        // conflicts here.
-                        self.enqueue(unit, Some(ci));
-                    }
-                    _ => {}
+                // Normalise so the false watched literal sits at index 1.
+                if self.clauses[ci][0] == false_lit {
+                    self.clauses[ci].swap(0, 1);
                 }
+                // If the other watch is already true, the clause is satisfied.
+                let other = self.clauses[ci][0];
+                if self.lit_value(other) == Some(true) {
+                    keep.push(ci);
+                    continue;
+                }
+                // Look for a non-false literal beyond the two watches to watch next.
+                let mut replacement = None;
+                for k in 2..self.clauses[ci].len() {
+                    if self.lit_value(self.clauses[ci][k]) != Some(false) {
+                        replacement = Some(k);
+                        break;
+                    }
+                }
+                if let Some(k) = replacement {
+                    self.clauses[ci].swap(1, k);
+                    let new_watch = self.clauses[ci][1];
+                    self.watches[lit_code(new_watch)].push(ci);
+                    // dropped from `false_lit`'s list (not pushed to `keep`)
+                    continue;
+                }
+                // No replacement: `other` (at index 0) is the last hope.
+                keep.push(ci);
+                match self.lit_value(other) {
+                    Some(false) => conflict = Some(ci), // all literals false
+                    None => {
+                        self.enqueue(other, Some(ci));
+                    }
+                    Some(true) => {} // handled above; unreachable here
+                }
+            }
+            self.watches[fc] = keep;
+            if let Some(ci) = conflict {
+                return Some(ci);
             }
         }
         None
@@ -302,10 +327,21 @@ impl Solver {
             var: uip,
             neg: self.assign[uip as usize] == Some(true),
         };
-        // Backjump to the second-highest level in the clause (0 for a unit).
+        // Order the clause for watching: put the highest-level literal (among all
+        // but the asserting one) at index 1. After the backjump that literal is the
+        // most recently falsified, so watching `lits[0]` (the asserting literal) and
+        // `lits[1]` keeps the two-watched invariant. Its level is the backjump
+        // target (0 for a learnt unit).
         let mut btlevel = 0u32;
-        for &lit in &learnt[1..] {
-            btlevel = btlevel.max(self.level[lit.var as usize]);
+        if learnt.len() >= 2 {
+            let mut max_i = 1;
+            for i in 2..learnt.len() {
+                if self.level[learnt[i].var as usize] > self.level[learnt[max_i].var as usize] {
+                    max_i = i;
+                }
+            }
+            learnt.swap(1, max_i);
+            btlevel = self.level[learnt[1].var as usize];
         }
         // VSIDS: reward the variables in the learnt clause, then decay globally so
         // recent conflicts weigh more. A pure branch-order heuristic — it changes
@@ -321,15 +357,15 @@ impl Solver {
         (learnt, btlevel)
     }
 
-    /// Append a learnt clause and index it in the occurrence lists. Returns its
-    /// clause index; the asserting literal is at position 0.
+    /// Append a learnt clause and start watching its first two literals (already
+    /// ordered by `analyze`: `lits[0]` asserting, `lits[1]` highest-level). A
+    /// learnt unit has no second watch — it is enqueued at level 0 and never
+    /// falsified again, so it needs none. Returns the new clause index.
     fn add_learnt(&mut self, learnt: Vec<Lit>) -> usize {
         let ci = self.clauses.len();
-        for &lit in &learnt {
-            let v = lit.var as usize;
-            if self.var_clauses[v].last() != Some(&ci) {
-                self.var_clauses[v].push(ci);
-            }
+        if learnt.len() >= 2 {
+            self.watches[lit_code(learnt[0])].push(ci);
+            self.watches[lit_code(learnt[1])].push(ci);
         }
         self.clauses.push(learnt);
         ci
@@ -471,6 +507,11 @@ impl Solver {
             self.luby_v *= 2;
         }
     }
+}
+
+/// A dense index for a literal (`2*var + polarity`), used to key the watch lists.
+fn lit_code(l: Lit) -> usize {
+    ((l.var as usize) << 1) | (l.neg as usize)
 }
 
 /// Wall-clock backstop, checked every 8192 calls so the clock read is negligible.
