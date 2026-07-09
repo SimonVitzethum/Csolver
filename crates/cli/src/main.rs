@@ -803,6 +803,10 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let active = AtomicUsize::new(0);
+    // Live findings counter: each bug is streamed to stderr the moment its unit finishes
+    // (unbuffered, so a long scan surfaces bugs as they are found — visible in `tail -f`).
+    // The final `report_scan` still prints the complete, unit-ordered inventory.
+    let found = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_units));
     // Units whose exploration hit the budget: deferred to a full-effort serial phase
     // instead of being counted as Unknown now (A3 — "pause the file until the others
@@ -828,8 +832,11 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
                     eprintln!("  … {d}/{total_units} units");
                 }
                 if fs.truncated {
+                    // Deferred: its findings are re-produced (and streamed) in phase 2, so
+                    // do not stream the discarded partial result here (avoids duplicates).
                     deferred.lock().unwrap_or_else(|p| p.into_inner()).push(i);
                 } else {
+                    stream_findings(&fs, &found);
                     results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
                 }
             });
@@ -850,6 +857,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
         for i in deferred {
             let (label, unit) = &units[i];
             let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads);
+            stream_findings(&fs, &found);
             results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
         }
     }
@@ -869,6 +877,17 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     }
 
     report_scan(&findings, pass, fail, unknown, dropped, errored)
+}
+
+/// Stream a finished unit's findings to stderr immediately (live feed), tagging each
+/// with a running global index. `found` gives a stable, monotonic count across the
+/// concurrent workers. stderr is unbuffered, so each line reaches the console / log the
+/// moment it is written — a long scan no longer withholds every bug until the end.
+fn stream_findings(fs: &FileScan, found: &std::sync::atomic::AtomicUsize) {
+    for b in &fs.findings {
+        let n = found.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        eprintln!("  [FOUND #{n}] {}::{}  [{}]  witness: {}", b.file, b.function, b.property, b.witness);
+    }
 }
 
 /// Render a scan's findings + coverage and pick the exit code.
