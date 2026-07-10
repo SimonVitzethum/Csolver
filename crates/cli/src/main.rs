@@ -944,28 +944,39 @@ fn stream_program_facts(
     closed_world: bool,
 ) -> (csolver_verifier::ProgramFacts, usize, u64) {
     use csolver_ir::Frontend;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
     let cores = worker_count();
     // Contiguous shards (file order preserved): each worker builds its own facts in
     // parallel — the expensive per-function interval analysis parallelises — then the
     // shards are merged in order, giving ids identical to a single sequential push.
     let chunk = files.len().div_ceil(cores.max(1));
-    let done = AtomicUsize::new(0);
+    let done = Arc::new(AtomicUsize::new(0));
     let lowered = AtomicUsize::new(0);
-    let peak = AtomicU64::new(0);
+    let peak = Arc::new(AtomicU64::new(0));
     let n = files.len();
     let shards: std::sync::Mutex<Vec<(usize, csolver_verifier::WholeProgramFacts)>> =
         std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        // Progress + memory monitor.
-        s.spawn(|| {
-            while done.load(Ordering::Relaxed) < n {
+    // Progress + memory monitor — a **detached** thread, deliberately NOT part of the
+    // worker scope. If it were scoped and looped `while done < n`, a worker that panicked
+    // (leaving `done` short of `n`) would spin the monitor forever, so the scope could
+    // never join and the panic would deadlock instead of surfacing. Detached, the scope
+    // waits only for the workers, so a worker panic propagates (a visible abort) — the
+    // correct outcome: a panic is a bug to fix, never a file to silently drop (which would
+    // void the closed-world completeness the preconditions rest on).
+    let stop = Arc::new(AtomicBool::new(false));
+    let monitor = {
+        let (done, peak, stop) = (done.clone(), peak.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
                 let rss = rss_mb();
                 peak.fetch_max(rss, Ordering::Relaxed);
                 eprintln!("  … {}/{n} files  (RSS {rss} MB)", done.load(Ordering::Relaxed));
                 std::thread::sleep(std::time::Duration::from_secs(3));
             }
-        });
+        })
+    };
+    std::thread::scope(|s| {
         for (si, shard) in files.chunks(chunk.max(1)).enumerate() {
             let (shards, done, lowered) = (&shards, &done, &lowered);
             s.spawn(move || {
@@ -986,6 +997,9 @@ fn stream_program_facts(
             });
         }
     });
+    // Workers joined (a panic would have propagated above); stop the monitor.
+    stop.store(true, Ordering::Relaxed);
+    let _ = monitor.join();
     // Merge shards in file order, then finalize.
     let mut shards = shards.into_inner().unwrap_or_else(|p| p.into_inner());
     shards.sort_by_key(|(i, _)| *i);

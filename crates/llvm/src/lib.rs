@@ -109,6 +109,38 @@ done:
         assert!(has_gep && has_store);
     }
 
+    /// Regression: an integer **wider than 128 bits** (kernel crypto / SIMD
+    /// big-integers, e.g. `i256`) must lower without panicking. The 128-bit concrete
+    /// value domain cannot hold it, so such a constant becomes an opaque `Undef` — a
+    /// sound over-approximation — instead of aborting the whole (whole-program) run.
+    #[test]
+    fn wide_integer_constant_lowers_to_undef_not_panic() {
+        let src = r#"
+define i256 @wide() {
+entry:
+  %x = add i256 5, 1
+  ret i256 %x
+}
+"#;
+        let module = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("a >128-bit integer must lower, not panic");
+        assert_eq!(module.functions.len(), 1);
+        // The add's operands (an `i256` constant) degraded to the opaque unknown.
+        let has_undef = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(
+                i,
+                csolver_ir::Inst::Assign {
+                    value: csolver_ir::RValue::Bin { lhs, rhs, .. }, ..
+                } if matches!(lhs, csolver_ir::Operand::Const(csolver_ir::Const::Undef))
+                    || matches!(rhs, csolver_ir::Operand::Const(csolver_ir::Const::Undef))
+            ));
+        assert!(has_undef, "a >128-bit int constant should lower to Undef");
+    }
+
     /// Regression: `fn(ptr align 4, i64 %i)` where `%i` indexes the pointer is an
     /// *index* argument, not a slice — the pointer must not get a `ParamElements`
     /// contract sized by the index (which refuted every access, a false FAIL that

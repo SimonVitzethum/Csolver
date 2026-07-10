@@ -142,6 +142,12 @@ impl Ctx<'_> {
     fn operand(&self, v: &LValue, width: u32) -> Result<Operand> {
         Ok(match v {
             LValue::Local(name) => Operand::Reg(self.reg(name)?),
+            // A scalar wider than the 128-bit concrete value domain (kernel crypto /
+            // SIMD big-integers such as `i256`/`i512`) cannot be represented as a
+            // `BitVector`; model such a constant as an opaque unknown rather than
+            // crashing. Sound: the analysis then treats it as unconstrained (top), so
+            // it can only lose precision, never yield a false PASS.
+            LValue::Int(_) if width > 128 => Operand::Const(Const::Undef),
             LValue::Int(n) => Operand::int(width.max(1), *n as u128),
             LValue::Null => Operand::Const(Const::Null),
             LValue::Undef => Operand::Const(Const::Undef),
@@ -888,12 +894,16 @@ fn lower_term(ctx: &Ctx, from: &str, term: &LTerm) -> Result<Terminator> {
             // fresh (havoc'd) parameters in the engine — a sound
             // over-approximation, precise for the common discriminant dispatch
             // whose arms have no such phis.
+            // Clamp to the 128-bit concrete domain so a >128-bit discriminant (exotic,
+            // but legal IR) cannot panic the bit-vector constructor. At most an
+            // over-approximation of which arm matches — sound (extra reachable arms).
+            let w = (*width).clamp(1, 128);
             let cases = cases
                 .iter()
-                .map(|(cv, dest)| Ok((BitVector::new(*width, *cv as u128), ctx.block(dest)?)))
+                .map(|(cv, dest)| Ok((BitVector::new(w, *cv as u128), ctx.block(dest)?)))
                 .collect::<Result<Vec<_>>>()?;
             Terminator::Switch {
-                value: ctx.operand(value, *width)?,
+                value: ctx.operand(value, w)?,
                 cases,
                 default: ctx.block(default)?,
             }
