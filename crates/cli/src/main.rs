@@ -194,6 +194,14 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 scan_dir(Path::new(dir), &config, cross_file)
             }
         }
+        "facts" => {
+            let dir = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .ok_or("`facts` needs a directory argument")?;
+            facts_scan(Path::new(dir), closed_world)
+        }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
     }
@@ -887,6 +895,74 @@ fn scan_one_unit(
         }
     }
     fs
+}
+
+/// This process's resident set size in MB (Linux `/proc/self/status`), 0 if
+/// unavailable — used to report the streaming pass's peak memory.
+fn rss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmRSS:").map(str::to_string))
+        })
+        .and_then(|v| v.split_whitespace().next().and_then(|kb| kb.parse::<u64>().ok()))
+        .map_or(0, |kb| kb / 1024)
+}
+
+/// **Whole-program facts (streaming).** Lower every `.ll` under `dir` one at a
+/// time, fold each into the four whole-program precondition builders, then drop it
+/// — so peak memory is bounded by the compact facts, not the resident IR. Finalize
+/// and report coverage + peak RSS. This is the memory foundation for a
+/// whole-kernel scan; it extracts the facts (identical to the linked pipeline)
+/// without ever holding the linked module.
+fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, String> {
+    use csolver_ir::Frontend;
+    let mut files = Vec::new();
+    collect_ll(dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no .ll files found under {}", dir.display()));
+    }
+    eprintln!(
+        "whole-program facts: streaming {} .ll files under {} …",
+        files.len(),
+        dir.display()
+    );
+    let start = std::time::Instant::now();
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    let mut lowered = 0usize;
+    let mut peak_rss = 0u64;
+    for (i, path) in files.iter().enumerate() {
+        let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+        if let Ok(src) = std::fs::read_to_string(path) {
+            if let Ok(m) =
+                (csolver_llvm::LlvmFrontend).lower(csolver_llvm::LlvmInput { source: src, name: rel })
+            {
+                wpf.push_module(&m);
+                lowered += 1;
+            }
+        }
+        if i % 1000 == 0 {
+            peak_rss = peak_rss.max(rss_mb());
+            eprintln!("  … {}/{} files  (RSS {} MB)", i, files.len(), rss_mb());
+        }
+    }
+    peak_rss = peak_rss.max(rss_mb());
+    eprintln!("  finalizing …");
+    let facts = wpf.finalize(closed_world);
+    peak_rss = peak_rss.max(rss_mb());
+
+    println!("== whole-program facts ==");
+    println!("  files                : {} ({lowered} lowered)", files.len());
+    println!("  functions            : {}", facts.n_functions);
+    println!("  effect summaries     : {}", facts.summaries.len());
+    println!("  scalar preconditions : {}", facts.scalars.len());
+    println!("  pointer contracts    : {}", facts.ptr_contracts.len());
+    println!("  field contracts      : {}", facts.field_contracts.len());
+    println!("  peak RSS             : {peak_rss} MB");
+    println!("  wall time            : {:.1}s", start.elapsed().as_secs_f64());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, String> {

@@ -26,8 +26,10 @@ mod contracts;
 mod mem2reg;
 pub mod precond;
 mod report;
+mod wholeprog;
 
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
+pub use wholeprog::{ProgramFacts, WholeProgramFacts};
 
 use csolver_absint::{analyze_intervals, Trivalent};
 use csolver_core::{
