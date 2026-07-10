@@ -304,6 +304,32 @@ impl Module {
     }
 }
 
+/// The id assignment [`merge_modules`] uses, exposed separately so a whole-program
+/// analysis can resolve call edges by name **without linking**, keyed by the same
+/// `FuncId`s the linked module would have. For `mods` in order every function gets
+/// a fresh sequential id; every *external* (non-`internal`) definition contributes
+/// its name → id (first definition wins) so a cross-module `Symbol` call resolves
+/// to its definition exactly as it does after linking. Returns `(name → id map,
+/// per-module old→new id remap)`.
+pub fn merge_id_plan(mods: &[&Module]) -> (HashMap<String, FuncId>, Vec<HashMap<FuncId, FuncId>>) {
+    let mut name_to_id: HashMap<String, FuncId> = HashMap::new();
+    let mut remaps: Vec<HashMap<FuncId, FuncId>> = Vec::with_capacity(mods.len());
+    let mut next: u32 = 0;
+    for m in mods {
+        let mut remap = HashMap::new();
+        for f in &m.functions {
+            let nid = FuncId(next);
+            next += 1;
+            remap.insert(f.id, nid);
+            if !m.internal.contains(&f.id) {
+                name_to_id.entry(f.name.clone()).or_insert(nid);
+            }
+        }
+        remaps.push(remap);
+    }
+    (name_to_id, remaps)
+}
+
 /// **Link** several single-translation-unit modules into one whole-program module
 /// (cross-file analysis). Every function is given a fresh global [`FuncId`]; a call
 /// that was opaque because the callee lived in another file — a `Callee::Symbol(name)`
@@ -319,21 +345,7 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         merged.layout = m.layout;
     }
     // Pass 1: assign fresh ids and, for external definitions, a name → id map (first wins).
-    let mut name_to_id: HashMap<String, FuncId> = HashMap::new();
-    let mut remaps: Vec<HashMap<FuncId, FuncId>> = Vec::with_capacity(mods.len());
-    let mut next: u32 = 0;
-    for m in &mods {
-        let mut remap = HashMap::new();
-        for f in &m.functions {
-            let nid = FuncId(next);
-            next += 1;
-            remap.insert(f.id, nid);
-            if !m.internal.contains(&f.id) {
-                name_to_id.entry(f.name.clone()).or_insert(nid);
-            }
-        }
-        remaps.push(remap);
-    }
+    let (name_to_id, remaps) = merge_id_plan(&mods.iter().collect::<Vec<_>>());
     // Pass 2: **move** functions in with remapped ids and resolved call edges; merge side
     // tables. Taking ownership avoids cloning every function/instruction of the group — the
     // dominant cost when linking large driver TUs for cross-file scanning.

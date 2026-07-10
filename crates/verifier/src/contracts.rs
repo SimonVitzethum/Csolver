@@ -313,6 +313,119 @@ pub(crate) fn synthesize_scalars(
         .collect()
 }
 
+/// Whole-program equivalent of [`synthesize_scalars`] **without linking**: the same
+/// `(FuncId, param) → [lo, hi]` map as `synthesize_scalars(&merge_modules(mods, …),
+/// closed_world)`, computed over the separate modules. Call edges are resolved by
+/// name via [`csolver_ir::merge_id_plan`] (so a cross-module `Symbol` call folds
+/// into its callee's precondition exactly as the linked `Direct` call would), the
+/// escaped set is the union of every module's address-taken names (globally sound —
+/// a function whose address leaks in *any* module is excluded everywhere), and the
+/// per-caller interval analysis is body-local so each call site's argument interval
+/// is identical to the linked one. Callers are visited in the same module-then-
+/// function order the merged module has, and the union fold is order-independent
+/// anyway, so the result is bit-identical.
+// Wired into the verifier by Phase 2 (on-demand whole-program scanning); until
+// then it is exercised only by its equivalence tests, so allow it to be unused.
+#[allow(dead_code)]
+pub(crate) fn synthesize_scalars_program(
+    mods: &[&Module],
+    closed_world: bool,
+) -> HashMap<(FuncId, u32), (i128, i128)> {
+    let (name_to_id, remaps) = csolver_ir::merge_id_plan(mods);
+    let mut global_fn: HashMap<FuncId, &csolver_ir::Function> = HashMap::new();
+    let mut internal: HashSet<FuncId> = HashSet::new();
+    let mut escaped: HashSet<String> = HashSet::new();
+    for (mi, m) in mods.iter().enumerate() {
+        escaped.extend(address_taken_names(m));
+        for f in &m.functions {
+            let gid = remaps[mi][&f.id];
+            global_fn.insert(gid, f);
+            if m.internal.contains(&f.id) {
+                internal.insert(gid);
+            }
+        }
+    }
+
+    let mut candidates: HashSet<(FuncId, u32)> = HashSet::new();
+    let mut candidate_callees: HashSet<FuncId> = HashSet::new();
+    for (&gid, f) in &global_fn {
+        let complete = closed_world || internal.contains(&gid);
+        if !complete || escaped.contains(&f.name) {
+            continue;
+        }
+        for (i, (_, ty)) in f.params.iter().enumerate() {
+            if matches!(ty, Type::Int { .. }) {
+                candidates.insert((gid, i as u32));
+                candidate_callees.insert(gid);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+
+    // Resolve a call to the same global id the linked module would call directly.
+    let resolve = |mi: usize, callee: &Callee| -> Option<FuncId> {
+        match callee {
+            Callee::Direct(old) => remaps[mi].get(old).copied(),
+            Callee::Symbol(nm) => name_to_id.get(nm).copied(),
+            Callee::Indirect(_) => None,
+        }
+    };
+
+    let mut folded: HashMap<(FuncId, u32), Option<(i128, i128)>> = HashMap::new();
+    for (mi, m) in mods.iter().enumerate() {
+        for caller in &m.functions {
+            let calls_candidate = caller.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+                matches!(inst, Inst::Call { callee, .. }
+                    if resolve(mi, callee).is_some_and(|g| candidate_callees.contains(&g)))
+            });
+            if !calls_candidate {
+                continue;
+            }
+            let iv = analyze_intervals(caller);
+            for block in &caller.blocks {
+                for inst in &block.insts {
+                    let Inst::Call { callee, args, .. } = inst else { continue };
+                    let Some(g) = resolve(mi, callee) else { continue };
+                    if !candidate_callees.contains(&g) {
+                        continue;
+                    }
+                    let Some(callee_fn) = global_fn.get(&g) else { continue };
+                    if args.len() != callee_fn.params.len() {
+                        for i in 0..callee_fn.params.len() as u32 {
+                            if candidates.contains(&(g, i)) {
+                                folded.insert((g, i), None);
+                            }
+                        }
+                        continue;
+                    }
+                    for (i, arg) in args.iter().enumerate() {
+                        let key = (g, i as u32);
+                        if !candidates.contains(&key) {
+                            continue;
+                        }
+                        let site = arg_interval(arg, &iv, block.id);
+                        let entry = folded.entry(key).or_insert(site);
+                        *entry = match (*entry, site) {
+                            (Some((la, ha)), Some((lb, hb))) => Some((la.min(lb), ha.max(hb))),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    folded
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let (lo, hi) = v?;
+            (lo > i64::MIN as i128 || hi < i64::MAX as i128).then_some((k, (lo, hi)))
+        })
+        .collect()
+}
+
 /// Interprocedural **member-provenance**: for each contracted pointer parameter,
 /// which of its aggregate fields provably holds a *valid pointer*, folded to the
 /// weakest guarantee across all (visible) call sites.
@@ -729,4 +842,132 @@ fn address_taken_names(module: &Module) -> HashSet<String> {
         }
     }
     names
+}
+
+#[cfg(test)]
+mod program_equiv_tests {
+    use super::*;
+    use csolver_ir::{merge_modules, BasicBlock, Function, RValue};
+
+    fn func(id: u32, name: &str, params: Vec<(RegId, Type)>, insts: Vec<Inst>) -> Function {
+        let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb.insts = insts;
+        Function {
+            id: FuncId(id),
+            name: name.into(),
+            params,
+            ret_ty: Type::Unit,
+            blocks: vec![bb],
+            entry: BlockId(0),
+        }
+    }
+    fn call(callee: Callee, arg: i128) -> Inst {
+        Inst::Call {
+            dst: None,
+            callee,
+            args: vec![Operand::int(32, arg as u128)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        }
+    }
+
+    /// `synthesize_scalars_program` must equal `synthesize_scalars(&merge(...))`
+    /// key-for-key: cross-module `Symbol` folds into the callee's precondition like
+    /// the linked `Direct` call, an in-module `Direct` folds too, and an
+    /// address-taken (escaped) callee is excluded everywhere.
+    #[test]
+    fn scalar_preconditions_match_the_linked_module() {
+        let ip = |r: u32| vec![(RegId(r), Type::int(32))];
+        // Module A: a caller that calls the cross-module `target` (5 and 10), an
+        // in-module `atgt` (7), and an escaped `esc` (3) whose address it also takes.
+        let mut a = Module::new("a");
+        a.functions.push(func(
+            0,
+            "caller_a",
+            vec![],
+            vec![
+                call(Callee::Symbol("target".into()), 5),
+                call(Callee::Symbol("target".into()), 10),
+                call(Callee::Direct(FuncId(1)), 7),
+                Inst::Assign {
+                    dst: RegId(9),
+                    ty: Type::ptr(Type::int(32)),
+                    value: RValue::Use(Operand::Const(Const::Symbol("esc".into()))),
+                },
+                call(Callee::Direct(FuncId(2)), 3),
+            ],
+        ));
+        a.functions.push(func(1, "atgt", ip(0), vec![]));
+        a.functions.push(func(2, "esc", ip(0), vec![]));
+        // Module B: the cross-module target.
+        let mut b = Module::new("b");
+        b.functions.push(func(0, "target", ip(0), vec![]));
+
+        for cw in [true, false] {
+            let linked = merge_modules(vec![a.clone(), b.clone()], "linked");
+            let want = synthesize_scalars(&linked, cw);
+            let got = synthesize_scalars_program(&[&a, &b], cw);
+            assert_eq!(got, want, "link-free scalar preconditions must equal linked (cw={cw})");
+        }
+
+        // Spot-check the intent under closed-world: target=[5,10], atgt=[7,7], esc absent.
+        let got = synthesize_scalars_program(&[&a, &b], true);
+        assert_eq!(got.get(&(FuncId(3), 0)), Some(&(5, 10)), "target folds 5∪10");
+        assert_eq!(got.get(&(FuncId(1), 0)), Some(&(7, 7)), "atgt folds 7");
+        assert!(!got.contains_key(&(FuncId(2), 0)), "escaped esc is excluded");
+    }
+
+    /// Randomised guard: over many random multi-module programs (cross-module and
+    /// in-module constant-argument calls, random address-taking, random closed-world
+    /// flag), the link-free scalar preconditions must always equal the linked ones.
+    #[test]
+    fn scalar_preconditions_match_linked_on_random_programs() {
+        let mut state: u64 = 0x0BEE_F123_4567_89AB;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..300 {
+            let n_mods = 2 + (rng() % 2) as usize; // 2..=3
+            let per = 2 + (rng() % 3) as usize; // 2..=4
+            let total = n_mods * per;
+            let name = |gi: usize| format!("g{gi}");
+            let mut modules = Vec::new();
+            let mut gi = 0usize;
+            for _ in 0..n_mods {
+                let mut m = Module::new("m");
+                for local in 0..per {
+                    let mut insts = Vec::new();
+                    for _ in 0..(rng() % 3) {
+                        let tgt = (rng() as usize) % total;
+                        let v = (rng() % 20) as i128;
+                        insts.push(call(Callee::Symbol(name(tgt)), v));
+                    }
+                    if rng() % 4 == 0 {
+                        let e = (rng() as usize) % total;
+                        insts.push(Inst::Assign {
+                            dst: RegId(50),
+                            ty: Type::ptr(Type::int(32)),
+                            value: RValue::Use(Operand::Const(Const::Symbol(name(e)))),
+                        });
+                    }
+                    m.functions.push(func(
+                        local as u32,
+                        &name(gi),
+                        vec![(RegId(0), Type::int(32))],
+                        insts,
+                    ));
+                    gi += 1;
+                }
+                modules.push(m);
+            }
+            let cw = rng() & 1 == 0;
+            let refs: Vec<&Module> = modules.iter().collect();
+            let got = synthesize_scalars_program(&refs, cw);
+            let want = synthesize_scalars(&merge_modules(modules.clone(), "linked"), cw);
+            assert_eq!(got, want, "link-free != linked scalar preconditions (cw={cw})");
+        }
+    }
 }

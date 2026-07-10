@@ -295,22 +295,9 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
 /// makes it memory-bounded; this function keeps the modules in memory (the
 /// equivalence oracle), a later streaming variant will drop them.
 pub fn summarize_program(mods: &[&Module]) -> HashMap<FuncId, Summary> {
-    // --- Pass 1: merge-compatible id assignment + external name → id (first wins). ---
-    let mut name_to_id: HashMap<String, FuncId> = HashMap::new();
-    let mut remaps: Vec<HashMap<FuncId, FuncId>> = Vec::with_capacity(mods.len());
-    let mut next: u32 = 0;
-    for m in mods {
-        let mut remap = HashMap::new();
-        for f in &m.functions {
-            let nid = FuncId(next);
-            next += 1;
-            remap.insert(f.id, nid);
-            if !m.internal.contains(&f.id) {
-                name_to_id.entry(f.name.clone()).or_insert(nid);
-            }
-        }
-        remaps.push(remap);
-    }
+    // Merge-compatible id assignment + external name → id, shared with the linker
+    // so the ids and cross-module resolution match `merge_modules` exactly.
+    let (name_to_id, remaps) = csolver_ir::merge_id_plan(mods);
 
     // --- Per-function facts (this is the streamable body scan). ---
     let observable =
