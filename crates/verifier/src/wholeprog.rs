@@ -40,6 +40,17 @@ impl WholeProgramFacts {
         self.fields.push_module(m);
     }
 
+    /// Absorb a fact set built in parallel over a *later* range of files, so shards
+    /// extracted concurrently can be merged in file order into ids identical to a
+    /// single sequential push — the finalized results are then bit-identical.
+    pub fn merge(&mut self, other: WholeProgramFacts) {
+        self.n_functions += other.n_functions;
+        self.summaries.merge(other.summaries);
+        self.scalars.merge(other.scalars);
+        self.contracts.merge(other.contracts);
+        self.fields.merge(other.fields);
+    }
+
     /// Finalize all four passes. Pointer contracts feed member-provenance, exactly
     /// as in the linked pipeline (`verify_module`).
     pub fn finalize(self, closed_world: bool) -> ProgramFacts {

@@ -358,6 +358,28 @@ impl SummaryFacts {
         self.next += m.functions.len() as u32;
     }
 
+    /// Absorb another fact set as if its modules had been pushed after `self`'s:
+    /// `other`'s ids are shifted up by `self.next`. This lets shards be built in
+    /// parallel and merged in file order, giving ids identical to a single
+    /// sequential push (so `finalize` still equals the linked result).
+    pub fn merge(&mut self, other: SummaryFacts) {
+        let off = self.next;
+        for (name, id) in other.name_to_id {
+            self.name_to_id.entry(name).or_insert(FuncId(id.0 + off));
+        }
+        self.base.extend(other.base);
+        self.param_of.extend(other.param_of);
+        self.calls.extend(other.calls.into_iter().map(|mut calls| {
+            for (cr, _) in &mut calls {
+                if let CalleeRef::Id(g) = cr {
+                    *g = FuncId(g.0 + off);
+                }
+            }
+            calls
+        }));
+        self.next += other.next;
+    }
+
     /// Resolve cross-module edges by name and run the fixpoints, yielding the same
     /// map as `summarize_module(&merge_modules(mods, …))`.
     pub fn finalize(self) -> HashMap<FuncId, Summary> {

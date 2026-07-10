@@ -924,34 +924,69 @@ fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, String> {
     if files.is_empty() {
         return Err(format!("no .ll files found under {}", dir.display()));
     }
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let cores = worker_count();
     eprintln!(
-        "whole-program facts: streaming {} .ll files under {} …",
+        "whole-program facts: streaming {} .ll files under {} … ({cores} workers)",
         files.len(),
         dir.display()
     );
     let start = std::time::Instant::now();
-    let mut wpf = csolver_verifier::WholeProgramFacts::new();
-    let mut lowered = 0usize;
-    let mut peak_rss = 0u64;
-    for (i, path) in files.iter().enumerate() {
-        let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
-        if let Ok(src) = std::fs::read_to_string(path) {
-            if let Ok(m) =
-                (csolver_llvm::LlvmFrontend).lower(csolver_llvm::LlvmInput { source: src, name: rel })
-            {
-                wpf.push_module(&m);
-                lowered += 1;
+    // Contiguous shards (file order preserved): each worker builds its own facts in
+    // parallel — the expensive per-function interval analysis parallelises — then the
+    // shards are merged in order, giving ids identical to a single sequential push.
+    let chunk = files.len().div_ceil(cores.max(1));
+    let done = AtomicUsize::new(0);
+    let lowered = AtomicUsize::new(0);
+    let peak = AtomicU64::new(0);
+    let n = files.len();
+    let shards: std::sync::Mutex<Vec<(usize, csolver_verifier::WholeProgramFacts)>> =
+        std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        // Progress + memory monitor.
+        s.spawn(|| {
+            while done.load(Ordering::Relaxed) < n {
+                let rss = rss_mb();
+                peak.fetch_max(rss, Ordering::Relaxed);
+                eprintln!("  … {}/{n} files  (RSS {rss} MB)", done.load(Ordering::Relaxed));
+                std::thread::sleep(std::time::Duration::from_secs(3));
             }
+        });
+        for (si, shard) in files.chunks(chunk.max(1)).enumerate() {
+            let (shards, done, lowered) = (&shards, &done, &lowered);
+            s.spawn(move || {
+                let mut wpf = csolver_verifier::WholeProgramFacts::new();
+                for path in shard {
+                    let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+                    if let Ok(src) = std::fs::read_to_string(path) {
+                        if let Ok(m) = (csolver_llvm::LlvmFrontend)
+                            .lower(csolver_llvm::LlvmInput { source: src, name: rel })
+                        {
+                            wpf.push_module(&m);
+                            lowered.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+                shards.lock().unwrap_or_else(|p| p.into_inner()).push((si, wpf));
+            });
         }
-        if i % 1000 == 0 {
-            peak_rss = peak_rss.max(rss_mb());
-            eprintln!("  … {}/{} files  (RSS {} MB)", i, files.len(), rss_mb());
-        }
+    });
+    // Merge shards in file order, then finalize.
+    let mut shards = shards.into_inner().unwrap_or_else(|p| p.into_inner());
+    shards.sort_by_key(|(i, _)| *i);
+    peak.fetch_max(rss_mb(), Ordering::Relaxed);
+    eprintln!("  merging {} shards …", shards.len());
+    let mut merged = csolver_verifier::WholeProgramFacts::new();
+    for (_, wpf) in shards {
+        merged.merge(wpf);
     }
-    peak_rss = peak_rss.max(rss_mb());
+    peak.fetch_max(rss_mb(), Ordering::Relaxed);
     eprintln!("  finalizing …");
-    let facts = wpf.finalize(closed_world);
-    peak_rss = peak_rss.max(rss_mb());
+    let facts = merged.finalize(closed_world);
+    peak.fetch_max(rss_mb(), Ordering::Relaxed);
+    let lowered = lowered.load(Ordering::Relaxed);
+    let peak_rss = peak.load(Ordering::Relaxed);
 
     println!("== whole-program facts ==");
     println!("  files                : {} ({lowered} lowered)", files.len());

@@ -529,6 +529,36 @@ impl ContractFacts {
         self.next += m.functions.len() as u32;
     }
 
+    /// Absorb another fact set built in parallel, shifting its ids up by `self.next`
+    /// so a file-order merge reproduces a single sequential push.
+    pub(crate) fn merge(&mut self, other: ContractFacts) {
+        let off = self.next;
+        if self.layout.is_none() {
+            self.layout = other.layout;
+        }
+        for (name, id) in other.name_to_id {
+            self.name_to_id.entry(name).or_insert(FuncId(id.0 + off));
+        }
+        self.escaped.extend(other.escaped);
+        self.name.extend(other.name);
+        self.internal.extend(other.internal);
+        self.ptr_params.extend(other.ptr_params);
+        self.param_count.extend(other.param_count);
+        self.caller_defs.extend(other.caller_defs);
+        for ((fid, idx), c) in other.declared {
+            self.declared.insert((FuncId(fid.0 + off), idx), c);
+        }
+        self.calls.extend(other.calls.into_iter().map(|mut calls| {
+            for (cr, _) in &mut calls {
+                if let ContractCallee::Id(g) = cr {
+                    *g = FuncId(g.0 + off);
+                }
+            }
+            calls
+        }));
+        self.next += other.next;
+    }
+
     /// Run the pointer-contract fixpoint over the facts — the same result as
     /// `synthesize(&merge_modules(mods, …), closed_world)`.
     pub(crate) fn finalize(self, closed_world: bool) -> HashMap<(FuncId, u32), PtrContract> {
@@ -772,6 +802,37 @@ impl FieldFacts {
             self.blocks.push(fblocks);
         }
         self.next += m.functions.len() as u32;
+    }
+
+    /// Absorb another fact set built in parallel, shifting its ids up by `self.next`.
+    pub(crate) fn merge(&mut self, other: FieldFacts) {
+        let off = self.next;
+        if self.layout.is_none() {
+            self.layout = other.layout;
+        }
+        for (name, id) in other.name_to_id {
+            self.name_to_id.entry(name).or_insert(FuncId(id.0 + off));
+        }
+        self.escaped.extend(other.escaped);
+        self.name.extend(other.name);
+        self.internal.extend(other.internal);
+        self.param_is_ptr.extend(other.param_is_ptr);
+        self.param_count.extend(other.param_count);
+        self.caller_defs.extend(other.caller_defs);
+        for ((fid, idx), c) in other.declared {
+            self.declared.insert((FuncId(fid.0 + off), idx), c);
+        }
+        self.blocks.extend(other.blocks.into_iter().map(|mut fblocks| {
+            for events in &mut fblocks {
+                for ev in events {
+                    if let FieldEvent::Call { callee: Some(ContractCallee::Id(g)), .. } = ev {
+                        *g = FuncId(g.0 + off);
+                    }
+                }
+            }
+            fblocks
+        }));
+        self.next += other.next;
     }
 
     /// Replay the per-block member-provenance analysis over the facts — the same map
@@ -1113,6 +1174,28 @@ impl ScalarFacts {
             self.sites.push(sites);
         }
         self.next += m.functions.len() as u32;
+    }
+
+    /// Absorb another fact set built in parallel, shifting its ids up by `self.next`.
+    pub(crate) fn merge(&mut self, other: ScalarFacts) {
+        let off = self.next;
+        for (name, id) in other.name_to_id {
+            self.name_to_id.entry(name).or_insert(FuncId(id.0 + off));
+        }
+        self.escaped.extend(other.escaped);
+        self.internal.extend(other.internal);
+        self.name.extend(other.name);
+        self.int_params.extend(other.int_params);
+        self.param_count.extend(other.param_count);
+        self.sites.extend(other.sites.into_iter().map(|mut sites| {
+            for site in &mut sites {
+                if let ScalarCallee::Id(g) = &mut site.callee {
+                    *g = FuncId(g.0 + off);
+                }
+            }
+            sites
+        }));
+        self.next += other.next;
     }
 
     /// Resolve callees by name, union each candidate parameter's call-site intervals,
@@ -2295,6 +2378,111 @@ mod program_equiv_tests {
             let want = synthesize_fields(&merged, &params, cw);
             let got = synthesize_fields_program(&refs, &params, cw);
             assert_eq!(got, want, "link-free != linked field contracts (cw={cw})");
+        }
+    }
+
+    /// The parallel-merge property: building the whole-program facts in two shards
+    /// and merging them in order must give the same four result maps as pushing all
+    /// modules sequentially — so shards can be extracted in parallel. Covers all
+    /// four builders' `merge` at once via `WholeProgramFacts`.
+    #[test]
+    fn wholeprog_facts_shard_and_merge_equals_sequential() {
+        let mut state: u64 = 0x00DE_AD57_A11E_D000;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200 {
+            let n_mods = 3 + (rng() % 3) as usize; // 3..=5 modules (so a split is meaningful)
+            let per = 2 + (rng() % 3) as usize;
+            let total = n_mods * per;
+            let name = |gi: usize| format!("w{gi}");
+            let mut modules = Vec::new();
+            let mut gi = 0usize;
+            for _ in 0..n_mods {
+                let mut m = Module::new("m");
+                for local in 0..per {
+                    let mut insts = vec![
+                        Inst::Alloc {
+                            dst: RegId(1),
+                            region: csolver_core::RegionKind::Stack,
+                            elem: Type::int(64),
+                            count: Operand::int(64, 2),
+                            align: 8,
+                        },
+                        Inst::Alloc {
+                            dst: RegId(2),
+                            region: csolver_core::RegionKind::Stack,
+                            elem: Type::int(64),
+                            count: Operand::int(64, 1),
+                            align: 8,
+                        },
+                    ];
+                    if rng() % 2 == 0 {
+                        insts.push(Inst::Store {
+                            ty: Type::ptr(Type::int(64)),
+                            ptr: Operand::Reg(RegId(1)),
+                            value: Operand::Reg(RegId(2)),
+                            align: 8,
+                        });
+                    }
+                    for _ in 0..(1 + rng() % 2) {
+                        let tgt = (rng() as usize) % total;
+                        let arg = if rng() % 2 == 0 { Operand::Reg(RegId(1)) } else { Operand::Reg(RegId(0)) };
+                        insts.push(Inst::Call {
+                            dst: None,
+                            callee: Callee::Symbol(name(tgt)),
+                            args: vec![arg],
+                            ret_ty: Type::Unit,
+                            ret_ref: None,
+                        });
+                    }
+                    if rng() % 5 == 0 {
+                        let e = (rng() as usize) % total;
+                        insts.push(Inst::Assign {
+                            dst: RegId(9),
+                            ty: Type::ptr(Type::int(32)),
+                            value: RValue::Use(Operand::Const(Const::Symbol(name(e)))),
+                        });
+                    }
+                    m.functions.push(func(
+                        local as u32,
+                        &name(gi),
+                        vec![(RegId(0), Type::ptr(Type::int(64)))],
+                        insts,
+                    ));
+                    gi += 1;
+                }
+                modules.push(m);
+            }
+            let cw = rng() & 1 == 0;
+
+            let seq = {
+                let mut w = crate::WholeProgramFacts::new();
+                for m in &modules {
+                    w.push_module(m);
+                }
+                w.finalize(cw)
+            };
+            let k = 1 + (rng() as usize % (n_mods - 1)); // split point in 1..n_mods
+            let sharded = {
+                let mut w1 = crate::WholeProgramFacts::new();
+                for m in &modules[..k] {
+                    w1.push_module(m);
+                }
+                let mut w2 = crate::WholeProgramFacts::new();
+                for m in &modules[k..] {
+                    w2.push_module(m);
+                }
+                w1.merge(w2);
+                w1.finalize(cw)
+            };
+            assert_eq!(seq.summaries, sharded.summaries, "summaries differ");
+            assert_eq!(seq.scalars, sharded.scalars, "scalars differ");
+            assert_eq!(seq.ptr_contracts, sharded.ptr_contracts, "pointer contracts differ");
+            assert_eq!(seq.field_contracts, sharded.field_contracts, "field contracts differ");
         }
     }
 
