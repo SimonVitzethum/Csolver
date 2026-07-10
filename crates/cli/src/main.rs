@@ -1047,7 +1047,16 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let job_cap = std::env::var("CSOLVER_JOBS").ok().and_then(|v| v.parse::<usize>().ok());
     let workers = job_cap.unwrap_or(cores).min(cores).min(total_units).max(1);
-    let threads_per_unit = (cores / workers).max(1);
+    // Symbolic execution and SAT solving are pointer-chasing (memory-latency-bound), so a
+    // running thread stalls on cache misses and yields well under a full core. Modestly
+    // *oversubscribing* threads (more than cores) hides that latency — while one thread waits
+    // on memory another computes. `CSOLVER_THREADS_PER_UNIT=N` sets it explicitly (total
+    // threads ≈ workers×N); the default keeps total ≈ cores.
+    let threads_per_unit = std::env::var("CSOLVER_THREADS_PER_UNIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or((cores / workers).max(1))
+        .max(1);
     eprintln!(
         "scanning {total_files} .ll files under {} … ({total_units} units, {workers} workers × {threads_per_unit} threads{})",
         dir.display(),
