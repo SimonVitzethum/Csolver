@@ -30,7 +30,7 @@ mod wholeprog;
 
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
 pub use csolver_symbolic::Summary;
-pub use wholeprog::{ProgramFacts, WholeProgramFacts};
+pub use wholeprog::{ProgramFacts, WholeProgramContext, WholeProgramFacts};
 
 use csolver_absint::{analyze_intervals, Trivalent};
 use csolver_core::{
@@ -151,33 +151,38 @@ pub fn verify_module(module: &Module, config: &Config) -> ModuleReport {
 /// output. The determinism test (`parallel_matches_serial`) is the oracle for this,
 /// the role Miri plays for the MIR lowering. The count trades only latency.
 pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usize) -> ModuleReport {
-    verify_module_inner(module, config, threads, &HashMap::new())
+    verify_module_inner(module, config, threads, None)
 }
 
-/// As [`verify_module_with_threads`], but resolving cross-file `Callee::Symbol(name)`
-/// calls that have no in-module definition against a whole-program map of callee
-/// **name → effect summary** (the streaming-facts driver supplies it). A call to a
-/// symbol defined in another translation unit is then analysed with that callee's
-/// real summary instead of an opaque havoc — the on-demand whole-program path (2b).
+/// As [`verify_module_with_threads`], but analysing one file with **whole-program
+/// precision, without linking** (2b). A cross-file `Callee::Symbol(name)` call with no
+/// in-module definition resolves to the callee's real effect summary, and an external
+/// function's whole-program preconditions (scalar/pointer/field, derived over the whole
+/// tree) overlay its per-file contracts — everything the streaming-facts driver
+/// extracted, keyed by name (see [`WholeProgramContext`]).
 ///
-/// Sound: `name_summaries` are the same effect summaries the linked pipeline would
-/// compute for those callees; supplying one only ever tightens a call's effect from
-/// "havoc everything" toward the callee's actual writes/frees/provenance. An absent
-/// name falls back to the opaque havoc, exactly as before.
+/// Sound: the effect summaries only ever tighten a call from "havoc everything" toward
+/// the callee's actual effect, and fall back to havoc when absent. The precondition
+/// overlays reproduce exactly what a fully-linked **closed-world** run would synthesize
+/// for those functions (the facts are bit-identical); they are the caller's
+/// responsibility to have extracted closed-world (`ctx` is empty otherwise, so this
+/// degrades to effect-summary-only resolution — still sound in open world). To keep the
+/// per-file synthesis itself sound (one file is not the whole program), it is run
+/// open-world here; the closed-world precision comes solely from the overlay.
 pub fn verify_module_whole_program(
     module: &Module,
     config: &Config,
     threads: usize,
-    name_summaries: &HashMap<String, Summary>,
+    ctx: WholeProgramContext<'_>,
 ) -> ModuleReport {
-    verify_module_inner(module, config, threads, name_summaries)
+    verify_module_inner(module, config, threads, Some(ctx))
 }
 
 fn verify_module_inner(
     module: &Module,
     config: &Config,
     threads: usize,
-    name_summaries: &HashMap<String, Summary>,
+    ctx: Option<WholeProgramContext<'_>>,
 ) -> ModuleReport {
     // Promote non-escaping scalar stack slots to SSA first: unoptimized front-end
     // output spills locals (loop counters, pointer parameters) to allocas, which
@@ -186,20 +191,25 @@ fn verify_module_inner(
     let promoted = mem2reg::promote_module(module);
     let module = &promoted;
     let summaries = config.use_symbolic.then(|| summarize_module(module));
+    // In whole-program mode the per-file synthesis MUST run open-world — a single file
+    // is not the whole program, so its call sites are incomplete — and the closed-world
+    // precision is supplied instead by the name-keyed overlay (`ctx`), which was derived
+    // over the whole tree. Outside whole-program mode, honour the caller's setting.
+    let unit_cw = if ctx.is_some() { false } else { config.closed_world };
     // Interprocedural: contracts synthesized from the (complete) call sites of
     // internal functions overlay the declared ones (declared always wins).
-    let synthesized = contracts::synthesize(module, config.closed_world);
+    let synthesized = contracts::synthesize(module, unit_cw);
     // Interprocedural member-provenance: which fields of a contracted parameter
     // every call site fills with a valid pointer (empty unless internal/closed).
-    let field_synth = contracts::synthesize_fields(module, &synthesized, config.closed_world);
+    let field_synth = contracts::synthesize_fields(module, &synthesized, unit_cw);
     // Interprocedural scalar value-range preconditions: the range each integer parameter
     // is bounded to by the union of its (complete) call sites — so a callee proves an index
     // in bounds using its callers' validation (e.g. a `switch (optname) case A..B:` guard).
-    let scalar_synth = contracts::synthesize_scalars(module, config.closed_world);
+    let scalar_synth = contracts::synthesize_scalars(module, unit_cw);
     let mut functions = verify_functions(
         module,
         summaries.as_ref(),
-        name_summaries,
+        ctx,
         &synthesized,
         &field_synth,
         &scalar_synth,
@@ -274,7 +284,7 @@ fn verify_module_inner(
 fn verify_one_function(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
-    name_summaries: &HashMap<String, Summary>,
+    ctx: Option<WholeProgramContext<'_>>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
     field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
     scalar_synth: &HashMap<(FuncId, u32), (i128, i128)>,
@@ -318,19 +328,54 @@ fn verify_one_function(
         }
     }
     // Per-parameter member-provenance field contracts (empty vec = none).
-    let field_contracts: Vec<Vec<FieldContract>> = (0..f.params.len())
+    let mut field_contracts: Vec<Vec<FieldContract>> = (0..f.params.len())
         .map(|i| field_synth.get(&(f.id, i as u32)).cloned().unwrap_or_default())
         .collect();
     // Per-parameter scalar value-range preconditions (None = unconstrained).
-    let scalar_pre: Vec<Option<(i128, i128)>> = (0..f.params.len())
+    let mut scalar_pre: Vec<Option<(i128, i128)>> = (0..f.params.len())
         .map(|i| scalar_synth.get(&(f.id, i as u32)).copied())
         .collect();
+
+    // Whole-program precondition overlay (2b): for a **linkage-external** function, lay
+    // its whole-tree preconditions (from the streaming facts, keyed by name) over the
+    // per-file (open-world) ones — the cross-file caller→callee validation flow that
+    // linking provided, without linking. Gated on external linkage so a file-local
+    // `static` never picks up an unrelated same-named external's contract. Sound only
+    // because these facts were extracted closed-world (the driver's responsibility); the
+    // maps are empty otherwise, making this a no-op. They reproduce exactly what a linked
+    // closed-world synthesis would assign (the facts are bit-identical), including each
+    // contract's baked-in refutability.
+    if let Some(ctx) = ctx {
+        if !module.internal.contains(&f.id) {
+            for i in 0..f.params.len() as u32 {
+                let key = (f.name.clone(), i);
+                if let Some(&range) = ctx.name_scalars.get(&key) {
+                    scalar_pre[i as usize] = Some(range);
+                }
+                // A declared / `assume_valid_params` contract still wins (as synthesized
+                // never overrides declared); only fill an otherwise-uncontracted pointer.
+                if contracts[i as usize].is_none() {
+                    if let Some(&c) = ctx.name_ptr_contracts.get(&key) {
+                        contracts[i as usize] = Some(c);
+                    }
+                }
+                if let Some(fc) = ctx.name_field_contracts.get(&key) {
+                    if !fc.is_empty() {
+                        field_contracts[i as usize] = fc.clone();
+                    }
+                }
+            }
+        }
+    }
+
     // An entry policy (if given) decides attacker-reachability by name — the sound
     // kernel model, where LLVM external linkage does NOT mean userspace-reachable.
     let exported = match &config.entry_patterns {
         Some(pats) => matches_entry(&f.name, pats),
         None => !module.internal.contains(&f.id),
     };
+    let empty_summaries = HashMap::new();
+    let name_summaries = ctx.map(|c| c.name_summaries).unwrap_or(&empty_summaries);
     let mut local_id = 0u32;
     verify_function_with(
         f,
@@ -356,7 +401,7 @@ fn verify_one_function(
 fn verify_functions(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
-    name_summaries: &HashMap<String, Summary>,
+    ctx: Option<WholeProgramContext<'_>>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
     field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
     scalar_synth: &HashMap<(FuncId, u32), (i128, i128)>,
@@ -368,7 +413,7 @@ fn verify_functions(
     if threads <= 1 || n <= 1 {
         return fns
             .iter()
-            .map(|f| verify_one_function(module, summaries, name_summaries, synthesized, field_synth, scalar_synth, config, f))
+            .map(|f| verify_one_function(module, summaries, ctx, synthesized, field_synth, scalar_synth, config, f))
             .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -381,7 +426,7 @@ fn verify_functions(
                     break;
                 }
                 let r = verify_one_function(
-                    module, summaries, name_summaries, synthesized, field_synth, scalar_synth,
+                    module, summaries, ctx, synthesized, field_synth, scalar_synth,
                     config, &fns[i],
                 );
                 // Recover from a poisoned lock (a worker panicked) rather than

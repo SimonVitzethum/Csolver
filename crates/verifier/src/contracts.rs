@@ -1914,6 +1914,83 @@ mod program_equiv_tests {
         }
     }
 
+    /// End-to-end 2b whole-program equivalence: verifying a callee's file **alone**
+    /// with the streaming-facts overlay (name-keyed preconditions from the whole tree)
+    /// reaches the same verdict as verifying the fully-**linked** closed-world module —
+    /// and strictly more than verifying the file open-world with no overlay. This is the
+    /// proof that the on-demand path (2b) replaces `--cross-file` linking soundly.
+    #[test]
+    fn whole_program_overlay_matches_linked_closed_world() {
+        use csolver_core::SafetyProperty;
+        use csolver_ir::{Condition, CmpOp};
+        let verdict_of = |r: &crate::ModuleReport, name: &str| {
+            r.functions.iter().find(|f| f.function == name).map(|f| f.verdict)
+        };
+        // Module A: a caller passing the constant 2 across a file boundary to `target`.
+        let mut a = Module::new("a");
+        a.functions.push(func(0, "caller_a", vec![], vec![call(Callee::Symbol("target".into()), 2)]));
+        // Module B: `target(i)` does a bounds check `i < 4`. Provable only if the caller's
+        // argument range (i = 2) flows in as a precondition; unconstrained, i could be >= 4.
+        let mut b = Module::new("b");
+        b.functions.push(func(
+            0,
+            "target",
+            vec![(RegId(0), Type::int(32))],
+            vec![Inst::SafetyCheck {
+                property: SafetyProperty::InBounds,
+                condition: Condition::Cmp {
+                    op: CmpOp::Ult,
+                    lhs: Operand::Reg(RegId(0)),
+                    rhs: Operand::int(32, 4),
+                },
+                note: "i < 4".into(),
+            }],
+        ));
+
+        // An empty entry policy: nothing is an attacker entry, so every function's
+        // parameters are taken as caller-validated (the sound kernel model — external
+        // linkage is not userspace-reachability). This is the regime in which a
+        // caller-derived precondition applies to an external, non-entry callee.
+        let cfg = crate::Config {
+            closed_world: true,
+            entry_patterns: Some(vec![]),
+            ..crate::Config::default()
+        };
+
+        // (1) Linked closed-world: the reference verdict for `target`.
+        let linked = merge_modules(vec![a.clone(), b.clone()], "linked");
+        let linked_report = crate::verify_module(&linked, &cfg);
+
+        // (2) 2b: stream the whole-program facts closed-world, then verify B's file ALONE
+        //     with the name-keyed overlay.
+        let mut wpf = crate::WholeProgramFacts::new();
+        wpf.push_module(&a);
+        wpf.push_module(&b);
+        let facts = wpf.finalize(true);
+        let wp_report = crate::verify_module_whole_program(&b, &cfg, 1, facts.context());
+
+        // (3) Control: B's file alone, same entry policy but open-world and no overlay —
+        //     the precondition is absent, so the only difference from (2) is the overlay.
+        let open_cfg = crate::Config { entry_patterns: Some(vec![]), ..crate::Config::default() };
+        let open_report = crate::verify_module(&b, &open_cfg);
+
+        assert_eq!(
+            verdict_of(&wp_report, "target"),
+            verdict_of(&linked_report, "target"),
+            "2b overlay must reach the linked closed-world verdict"
+        );
+        assert_eq!(
+            verdict_of(&wp_report, "target"),
+            Some(csolver_core::Verdict::Pass),
+            "the overlaid precondition (i=2) must prove i<4"
+        );
+        assert_ne!(
+            verdict_of(&open_report, "target"),
+            Some(csolver_core::Verdict::Pass),
+            "without the overlay, i is unconstrained and the check is not proven"
+        );
+    }
+
     /// `synthesize_scalars_program` must equal `synthesize_scalars(&merge(...))`
     /// key-for-key: cross-module `Symbol` folds into the callee's precondition like
     /// the linked `Direct` call, an in-module `Direct` folds too, and an

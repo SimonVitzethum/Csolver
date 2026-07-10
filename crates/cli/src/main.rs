@@ -815,7 +815,7 @@ fn scan_one_unit(
     cross: bool,
     threads: usize,
     content_seen: &std::sync::Mutex<std::collections::HashSet<u64>>,
-    name_summaries: Option<&std::collections::HashMap<String, csolver_verifier::Summary>>,
+    wp_ctx: Option<csolver_verifier::WholeProgramContext<'_>>,
 ) -> FileScan {
     use csolver_core::ObligationResult;
     use csolver_ir::Frontend;
@@ -875,10 +875,11 @@ fn scan_one_unit(
     // caller in another subsystem could violate a synthesized contract → false PASS).
     fs.dropped = module.unanalyzed.len() as u64;
     // Whole-program (2b): a cross-file `Callee::Symbol(name)` with no in-unit definition
-    // resolves to the program-wide callee summary instead of an opaque havoc — sound, and
-    // strictly more precise. Without the map (ordinary scan) behaviour is unchanged.
-    let report = match name_summaries {
-        Some(ns) => csolver_verifier::verify_module_whole_program(&module, config, threads.max(1), ns),
+    // resolves to the program-wide callee summary instead of an opaque havoc, and an
+    // external callee's whole-program preconditions overlay its per-file ones — cross-file
+    // precision without linking. Without the context (ordinary scan) behaviour is unchanged.
+    let report = match wp_ctx {
+        Some(ctx) => csolver_verifier::verify_module_whole_program(&module, config, threads.max(1), ctx),
         None => verify_module_with_threads(&module, config, threads.max(1)),
     };
     fs.truncated = report.any_truncated();
@@ -1042,25 +1043,31 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     let total_files = files.len();
 
     // Whole-program pass 1 (2b): stream the four fact builders over the entire tree in
-    // bounded memory to get every callee's effect summary by name, then verify (pass 2)
-    // with cross-file `Symbol` calls resolved against it. The facts are bit-identical to
-    // linking the whole program, so a call to a symbol defined in another translation unit
-    // is analysed with its real summary — no opaque havoc across the file boundary — while
-    // peak RAM stays bounded by the compact facts, not a giant linked module.
-    let name_summaries = if whole_program {
+    // bounded memory to get every function's effect summary AND preconditions by name,
+    // then verify (pass 2) with cross-file `Symbol` calls resolved and external callees'
+    // preconditions overlaid against them. The facts are bit-identical to linking the
+    // whole program, so cross-TU calls use their real summary and cross-file caller→callee
+    // validation flows in — while peak RAM stays bounded by the compact facts, not a giant
+    // linked module. The precondition overlay is only closed-world-sound, so pass `--closed-world`
+    // to gain it; without it the maps are empty and only effect summaries apply.
+    let facts = if whole_program {
         eprintln!(
-            "whole-program (2b): pass 1 — streaming effect summaries over {total_files} files …"
+            "whole-program (2b): pass 1 — streaming whole-program facts over {total_files} files …"
         );
         let (facts, lowered, peak_rss) = stream_program_facts(dir, &files, config.closed_world);
         eprintln!(
-            "  … {} effect summaries ({lowered} files lowered, peak RSS {peak_rss} MB); pass 2 — verifying",
-            facts.name_summaries.len()
+            "  … {} effect summaries, {} scalar / {} ptr / {} field preconditions \
+             ({lowered} files lowered, peak RSS {peak_rss} MB); pass 2 — verifying",
+            facts.name_summaries.len(),
+            facts.name_scalars.len(),
+            facts.name_ptr_contracts.len(),
+            facts.name_field_contracts.len(),
         );
-        Some(facts.name_summaries)
+        Some(facts)
     } else {
         None
     };
-    let name_summaries = name_summaries.as_ref();
+    let wp_ctx = facts.as_ref().map(|f| f.context());
 
     // A **unit** of work: one file (normal per-TU scan) or one directory group linked into
     // a whole-program module (cross-file). Cross-file groups the .ll by their parent
@@ -1142,7 +1149,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
                 await_memory(&active);
                 active.fetch_add(1, Ordering::Relaxed);
                 let (label, unit) = &units[i];
-                let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit, &content_seen, name_summaries);
+                let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit, &content_seen, wp_ctx);
                 active.fetch_sub(1, Ordering::Relaxed);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d.is_multiple_of(50) {
@@ -1173,7 +1180,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
         let all_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         for i in deferred {
             let (label, unit) = &units[i];
-            let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen, name_summaries);
+            let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen, wp_ctx);
             stream_findings(&fs, &found, &seen_find);
             results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
         }

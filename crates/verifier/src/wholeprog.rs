@@ -55,17 +55,41 @@ impl WholeProgramFacts {
     /// as in the linked pipeline (`verify_module`).
     pub fn finalize(self, closed_world: bool) -> ProgramFacts {
         // Grab the external name → global-id map before `finalize` consumes the
-        // builder, so each finalized summary can be paired back to its callee name
-        // for on-demand cross-file call resolution (2b).
+        // builder, so each finalized fact can be paired back to its function's name
+        // for on-demand cross-file resolution (2b). All four builders assign ids in the
+        // same module-push order, so this one id space keys every fact map below.
         let name_to_id: HashMap<String, FuncId> = self.summaries.name_to_id().clone();
+        // External global-id → name (bijective on externals), for re-keying the
+        // whole-program preconditions by the function's name.
+        let id_to_name: HashMap<FuncId, String> =
+            name_to_id.iter().map(|(n, &id)| (id, n.clone())).collect();
         let summaries = self.summaries.finalize();
         let name_summaries: HashMap<String, Summary> = name_to_id
-            .into_iter()
-            .filter_map(|(name, id)| summaries.get(&id).map(|s| (name, s.clone())))
+            .iter()
+            .filter_map(|(name, id)| summaries.get(id).map(|s| (name.clone(), s.clone())))
             .collect();
         let scalars = self.scalars.finalize(closed_world);
         let ptr_contracts = self.contracts.finalize(closed_world);
         let field_contracts = self.fields.finalize(&ptr_contracts, closed_world);
+        // Re-key each whole-program precondition by the **external name** of its
+        // function, so pass 2 can overlay it onto the matching function in a per-file
+        // module (the on-demand cross-file precondition path). Restricted to external
+        // names: an internal/static's contract is already file-complete and must never
+        // be matched across files (two files may define same-named statics). Only sound
+        // to apply under closed-world — the extraction mode of these very facts.
+        let by_name = |g: &FuncId| id_to_name.get(g).cloned();
+        let name_scalars = scalars
+            .iter()
+            .filter_map(|(&(g, p), v)| by_name(&g).map(|n| ((n, p), *v)))
+            .collect();
+        let name_ptr_contracts = ptr_contracts
+            .iter()
+            .filter_map(|(&(g, p), v)| by_name(&g).map(|n| ((n, p), *v)))
+            .collect();
+        let name_field_contracts = field_contracts
+            .iter()
+            .filter_map(|(&(g, p), v)| by_name(&g).map(|n| ((n, p), v.clone())))
+            .collect();
         ProgramFacts {
             n_functions: self.n_functions,
             summaries,
@@ -73,6 +97,9 @@ impl WholeProgramFacts {
             scalars,
             ptr_contracts,
             field_contracts,
+            name_scalars,
+            name_ptr_contracts,
+            name_field_contracts,
         }
     }
 }
@@ -94,4 +121,45 @@ pub struct ProgramFacts {
     pub ptr_contracts: HashMap<(FuncId, u32), PtrContract>,
     /// Per pointer parameter, the valid-pointer fields of its aggregate.
     pub field_contracts: HashMap<(FuncId, u32), Vec<FieldContract>>,
+    /// [`scalars`](Self::scalars) re-keyed by external function name (pass-2 overlay).
+    pub name_scalars: HashMap<(String, u32), (i128, i128)>,
+    /// [`ptr_contracts`](Self::ptr_contracts) re-keyed by external function name.
+    pub name_ptr_contracts: HashMap<(String, u32), PtrContract>,
+    /// [`field_contracts`](Self::field_contracts) re-keyed by external function name.
+    pub name_field_contracts: HashMap<(String, u32), Vec<FieldContract>>,
+}
+
+impl ProgramFacts {
+    /// A borrowing bundle of the four name-keyed whole-program fact maps, as consumed
+    /// by [`verify_module_whole_program`](crate::verify_module_whole_program) to resolve
+    /// a per-file module's cross-file calls and overlay its callees' whole-program
+    /// preconditions.
+    pub fn context(&self) -> WholeProgramContext<'_> {
+        WholeProgramContext {
+            name_summaries: &self.name_summaries,
+            name_scalars: &self.name_scalars,
+            name_ptr_contracts: &self.name_ptr_contracts,
+            name_field_contracts: &self.name_field_contracts,
+        }
+    }
+}
+
+/// A borrowing view of the whole-program facts keyed by function name — everything
+/// pass 2 needs to analyse one file with whole-program precision without linking:
+/// cross-file `Symbol` calls resolve to `name_summaries`, and an external callee's
+/// whole-program preconditions (`name_*`) overlay its per-file (open-world) contracts.
+///
+/// The precondition overlays are only sound when the facts were extracted
+/// **closed-world** (the union of call sites is then provably complete); the effect
+/// summaries are sound unconditionally (an intrinsic property of each callee).
+#[derive(Clone, Copy)]
+pub struct WholeProgramContext<'a> {
+    /// Cross-file effect summaries, keyed by callee name.
+    pub name_summaries: &'a HashMap<String, Summary>,
+    /// Whole-program scalar preconditions, keyed by function name.
+    pub name_scalars: &'a HashMap<(String, u32), (i128, i128)>,
+    /// Whole-program pointer contracts, keyed by function name.
+    pub name_ptr_contracts: &'a HashMap<(String, u32), PtrContract>,
+    /// Whole-program member-provenance field contracts, keyed by function name.
+    pub name_field_contracts: &'a HashMap<(String, u32), Vec<FieldContract>>,
 }
