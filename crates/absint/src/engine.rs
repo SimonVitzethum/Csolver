@@ -66,6 +66,19 @@ where
     let headers = loops.headers();
 
     let mut in_worklist = vec![false; n];
+    // How many times each node's `in` has been recomputed. Used as a safety net so
+    // that a cyclic region whose header the natural-loop detector missed — an
+    // **irreducible** CFG (a multi-entry loop, common in optimized kernel code with
+    // computed gotos / switch state machines) — still gets a widening point and so
+    // still terminates. Without it, such a cycle has no header, widening is never
+    // applied on it, and an ascending chain (e.g. `x = x + 1` around the cycle) grows
+    // forever. Forcing widen after enough revisits cuts every cycle regardless of
+    // reducibility; it is sound because widening only ever over-approximates the join.
+    let mut updates = vec![0u32; n];
+    // High enough that a well-behaved reducible CFG (where real headers already widen)
+    // never reaches it, so precision there is unchanged; low enough to bound the work
+    // on a pathological cycle to a handful of iterations before it is forced to widen.
+    const FORCE_WIDEN_AFTER: u32 = 64;
     let mut worklist: VecDeque<usize> = VecDeque::new();
     // Seed in reverse postorder so forward information propagates quickly.
     for node in cfg.reverse_postorder() {
@@ -87,14 +100,16 @@ where
             joined = joined.join(&contrib);
         }
 
-        // Accelerate convergence at loop headers.
-        let new_in = if headers.contains(&u) {
+        // Accelerate convergence at loop headers — and, as the termination safety net
+        // above, at any node revisited too many times (an undetected irreducible cycle).
+        let new_in = if headers.contains(&u) || updates[u] >= FORCE_WIDEN_AFTER {
             in_states[u].widen(&joined)
         } else {
             joined
         };
 
         if new_in != in_states[u] {
+            updates[u] = updates[u].saturating_add(1);
             in_states[u] = new_in;
             let new_out = transfer_block(u, &in_states[u]);
             if new_out != out_states[u] {

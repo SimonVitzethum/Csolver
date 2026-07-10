@@ -736,4 +736,91 @@ mod tests {
         // It is NOT bounded above at the header (widening, no narrowing there).
         assert!(!header_i.is_strictly_below(10));
     }
+
+    /// An **irreducible** two-entry cycle whose SCC has no natural-loop header, with a
+    /// counter that grows around it. The natural-loop detector finds no header here, so
+    /// without the engine's revisit-count widening safety net the fixpoint would ascend
+    /// forever (the value grows by a constant each traversal). This test must simply
+    /// *terminate*; it is the regression guard for the kernel functions (`__unmap_range`
+    /// et al.) whose optimized CFGs hung the interval analysis before the fix.
+    ///
+    ///   bb0(sel):            condbr sel -> bb1(0) / bb2(0)   ← two entries into {bb1,bb2}
+    ///   bb1(i):   n1 = i+1 ; br bb2(n1)
+    ///   bb2(j):   c = j<1e9; n2 = j+1 ; condbr c -> bb1(n2) / bb3
+    ///   bb3:                 return
+    #[test]
+    fn irreducible_cycle_terminates_via_fallback_widening() {
+        let sel = RegId(0);
+        let i = RegId(1);
+        let n1 = RegId(2);
+        let j = RegId(3);
+        let n2 = RegId(4);
+        let c = RegId(5);
+
+        let bb0 = BasicBlock::new(
+            BlockId(0),
+            Terminator::CondBr {
+                cond: Operand::Reg(sel),
+                then_blk: BlockId(1),
+                then_args: vec![Operand::int(64, 0)],
+                else_blk: BlockId(2),
+                else_args: vec![Operand::int(64, 0)],
+            },
+        );
+
+        let mut bb1 = BasicBlock::new(
+            BlockId(1),
+            Terminator::Br { target: BlockId(2), args: vec![Operand::Reg(n1)] },
+        );
+        bb1.params = vec![(i, Type::int(64))];
+        bb1.insts.push(Inst::Assign {
+            dst: n1,
+            ty: Type::int(64),
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) },
+        });
+
+        let mut bb2 = BasicBlock::new(
+            BlockId(2),
+            Terminator::CondBr {
+                cond: Operand::Reg(c),
+                then_blk: BlockId(1),
+                then_args: vec![Operand::Reg(n2)],
+                else_blk: BlockId(3),
+                else_args: vec![],
+            },
+        );
+        bb2.params = vec![(j, Type::int(64))];
+        bb2.insts.push(Inst::Assign {
+            dst: c,
+            ty: Type::Bool,
+            value: RValue::Cmp {
+                op: CmpOp::Slt,
+                lhs: Operand::Reg(j),
+                rhs: Operand::int(64, 1_000_000_000),
+            },
+        });
+        bb2.insts.push(Inst::Assign {
+            dst: n2,
+            ty: Type::int(64),
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) },
+        });
+
+        let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
+
+        let f = Function {
+            id: FuncId(0),
+            name: "irreducible".into(),
+            params: vec![(sel, Type::Bool)],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0, bb1, bb2, bb3],
+            entry: BlockId(0),
+        };
+
+        // The assertion is that this returns at all (no hang). The counter is a sound
+        // over-approximation: reachable and non-negative at the cycle entries.
+        let a = analyze_intervals(&f);
+        let iv = a.entry_interval(BlockId(1), RegId(1));
+        assert!(!iv.is_bottom(), "the irreducible cycle head must be reachable");
+        assert!(iv.is_at_least(0), "the counter is >= 0, got {iv}");
+    }
 }
