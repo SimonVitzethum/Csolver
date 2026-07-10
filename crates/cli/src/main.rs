@@ -1036,12 +1036,15 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     // takes a whole core; with few large units (cross-file groups) we also hand each unit
     // function-level threads, so the cores stay busy either way. Deterministic: per-unit
     // results are re-sorted into unit order and each verdict is thread-count independent.
-    let cores = worker_count();
-    // Use ALL cores as workers; the reservation-based memory backpressure (see `await_memory`)
-    // bounds peak RSS by throttling STARTS when several large analyses are in flight, rather
-    // than by permanently capping the worker count — so a tree of small units runs fully
-    // parallel while a cluster of large units is serialised only as much as memory requires.
-    // `CSOLVER_JOBS=N` overrides the worker count.
+    // `cores` is the machine's physical parallelism; `workers` is how many units run
+    // concurrently (capped by `CSOLVER_JOBS` for memory, since each concurrent unit is a
+    // resident module). The remaining cores are handed to each unit as function-level
+    // threads, so a few large cross-file groups still saturate the machine instead of
+    // pinning one core each. `CSOLVER_JOBS=N` therefore trades concurrent-module memory
+    // (N modules resident) for intra-unit parallelism (cores/N threads each), without ever
+    // leaving cores idle. The reservation-based backpressure (`await_memory`) throttles
+    // starts further when several large analyses are in flight.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let job_cap = std::env::var("CSOLVER_JOBS").ok().and_then(|v| v.parse::<usize>().ok());
     let workers = job_cap.unwrap_or(cores).min(cores).min(total_units).max(1);
     let threads_per_unit = (cores / workers).max(1);
