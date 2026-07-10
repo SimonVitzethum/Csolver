@@ -28,7 +28,9 @@ pub use exec::{
     discharge_full, discharge_function, discharge_with, discharge_with_fields,
     discharge_with_scalars, discharge_with_summaries, MemDecision, SymOutcome, SymbolicReport,
 };
-pub use summary::{summarize_module, summarize_program, Affine, RetSummary, Summary};
+pub use summary::{
+    summarize_module, summarize_program, Affine, RetSummary, Summary, SummaryFacts,
+};
 
 /// Resource bounds for symbolic exploration.
 #[derive(Debug, Clone, Copy)]

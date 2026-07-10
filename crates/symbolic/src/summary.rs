@@ -278,140 +278,198 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
     map
 }
 
-/// Whole-program summaries **without linking**: the same result as
-/// `summarize_module(&merge_modules(mods, …))`, computed directly over the
-/// separate modules. Call edges are resolved by name across modules exactly as
-/// [`csolver_ir::merge_modules`] does (external definition wins; a `Symbol` call
-/// to a defined external name becomes a direct edge, an unresolved one stays
-/// opaque; `internal`/static names never resolve cross-module), and the same
-/// write/free and provenance fixpoints run over that resolved global call graph.
+/// Body-free facts for whole-program summaries, built **incrementally**: fold each
+/// module in with [`SummaryFacts::push_module`] — after which it may be dropped —
+/// then [`SummaryFacts::finalize`] resolves cross-module edges by name and runs the
+/// write/free and provenance fixpoints. This is what lets a whole-program summary
+/// pass run in memory bounded by the facts, not the IR: lower a `.ll`, push it,
+/// drop it. Cross-module `Symbol` calls are resolved only at `finalize`, so a
+/// forward reference to a not-yet-pushed module resolves correctly.
 ///
-/// Functions are keyed by the identical `FuncId`s `merge_modules` assigns
-/// (sequential in module-then-function order), so the map equals the linked one
-/// key-for-key. This is the analysis core of whole-program scanning that never
-/// holds a linked module resident: only per-function *facts* (a base summary,
-/// resolved edges, parameter map) are needed past the initial body scan, so the
-/// bodies can be dropped/streamed. Splitting extraction from the fixpoint is what
-/// makes it memory-bounded; this function keeps the modules in memory (the
-/// equivalence oracle), a later streaming variant will drop them.
-pub fn summarize_program(mods: &[&Module]) -> HashMap<FuncId, Summary> {
-    // Merge-compatible id assignment + external name → id, shared with the linker
-    // so the ids and cross-module resolution match `merge_modules` exactly.
-    let (name_to_id, remaps) = csolver_ir::merge_id_plan(mods);
+/// Ids are assigned in push order (module-then-function), identical to
+/// [`csolver_ir::merge_modules`]/[`csolver_ir::merge_id_plan`], so the finalized
+/// map equals `summarize_module(&merge_modules(mods, …))` key-for-key.
+#[derive(Default)]
+pub struct SummaryFacts {
+    /// Functions folded in so far; their ids are `0..next` in push order.
+    next: u32,
+    /// External (non-internal) definition name → id, first definition winning.
+    name_to_id: HashMap<String, FuncId>,
+    /// Per function (by id): the body-local base summary.
+    base: Vec<Summary>,
+    /// Per function: pointer-parameter map (for the provenance fixpoint).
+    param_of: Vec<HashMap<RegId, usize>>,
+    /// Per function: its *observable* calls, callee unresolved until `finalize`.
+    calls: Vec<Vec<(CalleeRef, Vec<Operand>)>>,
+}
 
-    // --- Per-function facts (this is the streamable body scan). ---
-    let observable =
-        |b: &csolver_ir::BasicBlock| !matches!(b.term, csolver_ir::Terminator::Unreachable);
-    let mut map: HashMap<FuncId, Summary> = HashMap::new();
-    let mut edges: HashMap<FuncId, Vec<FuncId>> = HashMap::new();
-    let mut has_opaque: HashMap<FuncId, bool> = HashMap::new();
-    let mut param_of: HashMap<FuncId, HashMap<RegId, usize>> = HashMap::new();
-    let mut prov_calls: HashMap<FuncId, Vec<(FuncId, Vec<Operand>)>> = HashMap::new();
-    for (mi, m) in mods.iter().enumerate() {
-        let remap = &remaps[mi];
+/// A call's callee before cross-module name resolution.
+enum CalleeRef {
+    /// An in-module (`Direct`) edge, already a global id.
+    Id(FuncId),
+    /// A `Symbol` call — resolved to a definition (or opaque) at `finalize`.
+    Name(String),
+    /// An indirect call — always opaque.
+    Indirect,
+}
+
+impl SummaryFacts {
+    /// A fresh, empty fact set.
+    pub fn new() -> SummaryFacts {
+        SummaryFacts::default()
+    }
+
+    /// Fold one module's functions in. The module is only read here; the caller may
+    /// drop it immediately afterwards.
+    pub fn push_module(&mut self, m: &Module) {
+        let base = self.next;
+        let local: HashMap<FuncId, FuncId> = m
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.id, FuncId(base + i as u32)))
+            .collect();
         for f in &m.functions {
-            let gid = remap[&f.id];
-            map.insert(gid, summarize_fn(f));
-            param_of.insert(gid, ptr_param_of(f));
-            let (mut fedges, mut opaque, mut pcalls) = (Vec::new(), false, Vec::new());
-            for b in f.blocks.iter().filter(|b| observable(b)) {
+            let gid = local[&f.id];
+            if !m.internal.contains(&f.id) {
+                self.name_to_id.entry(f.name.clone()).or_insert(gid);
+            }
+            self.base.push(summarize_fn(f));
+            self.param_of.push(ptr_param_of(f));
+            let mut calls = Vec::new();
+            for b in &f.blocks {
+                if matches!(b.term, csolver_ir::Terminator::Unreachable) {
+                    continue; // a diverging block's calls cannot affect a caller
+                }
                 for inst in &b.insts {
                     let Inst::Call { callee, args, .. } = inst else { continue };
-                    // Resolve to a global id and decide opacity exactly as the LINKED
-                    // module would (see `merge_modules` + `summarize_module`'s `opaque`).
-                    let (resolved, is_opaque): (Option<FuncId>, bool) = match callee {
-                        Callee::Direct(old) => (remap.get(old).copied(), false),
-                        Callee::Symbol(nm) if nm == "<inline asm nomem>" => (None, false),
-                        Callee::Symbol(nm) => {
-                            let id = name_to_id.get(nm).copied();
-                            (id, id.is_none())
+                    let cr = match callee {
+                        Callee::Direct(old) => {
+                            local.get(old).map_or(CalleeRef::Indirect, |&g| CalleeRef::Id(g))
                         }
-                        Callee::Indirect(_) => (None, true),
+                        Callee::Symbol(nm) => CalleeRef::Name(nm.clone()),
+                        Callee::Indirect(_) => CalleeRef::Indirect,
                     };
-                    opaque |= is_opaque;
-                    if let Some(g) = resolved {
-                        fedges.push(g);
-                        pcalls.push((g, args.clone()));
-                    }
+                    calls.push((cr, args.clone()));
                 }
             }
-            edges.insert(gid, fedges);
-            has_opaque.insert(gid, opaque);
-            prov_calls.insert(gid, pcalls);
+            self.calls.push(calls);
         }
+        self.next += m.functions.len() as u32;
     }
 
-    // --- The same three steps as `summarize_module`, now over facts only. ---
-    for (gid, &op) in &has_opaque {
-        if op {
-            if let Some(s) = map.get_mut(gid) {
-                s.writes = true;
-                s.frees = true;
-            }
-        }
-    }
-    loop {
-        let mut changed = false;
-        for (gid, callees) in &edges {
-            let (mut writes, mut frees) =
-                map.get(gid).map_or((false, false), |s| (s.writes, s.frees));
-            for g in callees {
-                if let Some(sg) = map.get(g) {
-                    writes |= sg.writes;
-                    frees |= sg.frees;
+    /// Resolve cross-module edges by name and run the fixpoints, yielding the same
+    /// map as `summarize_module(&merge_modules(mods, …))`.
+    pub fn finalize(self) -> HashMap<FuncId, Summary> {
+        let n = self.base.len();
+        let mut summ = self.base;
+        let mut edges: Vec<Vec<FuncId>> = vec![Vec::new(); n];
+        let mut opaque: Vec<bool> = vec![false; n];
+        let mut prov_calls: Vec<Vec<(FuncId, Vec<Operand>)>> = vec![Vec::new(); n];
+        for (gid, calls) in self.calls.into_iter().enumerate() {
+            for (cr, args) in calls {
+                let resolved = match cr {
+                    CalleeRef::Id(g) => Some(g),
+                    CalleeRef::Name(nm) if nm == "<inline asm nomem>" => None,
+                    CalleeRef::Name(nm) => match self.name_to_id.get(&nm) {
+                        Some(&g) => Some(g),
+                        None => {
+                            opaque[gid] = true; // unresolved external ⇒ opaque
+                            None
+                        }
+                    },
+                    CalleeRef::Indirect => {
+                        opaque[gid] = true;
+                        None
+                    }
+                };
+                if let Some(g) = resolved {
+                    edges[gid].push(g);
+                    prov_calls[gid].push((g, args));
                 }
             }
-            if let Some(s) = map.get_mut(gid) {
-                if writes != s.writes || frees != s.frees {
-                    s.writes = writes;
-                    s.frees = frees;
+        }
+        // 1. an opaque (external/indirect) call may do anything.
+        for gid in 0..n {
+            if opaque[gid] {
+                summ[gid].writes = true;
+                summ[gid].frees = true;
+            }
+        }
+        // 2. propagate write/free through direct calls to a fixpoint.
+        loop {
+            let mut changed = false;
+            for gid in 0..n {
+                let (mut writes, mut frees) = (summ[gid].writes, summ[gid].frees);
+                for &g in &edges[gid] {
+                    writes |= summ[g.0 as usize].writes;
+                    frees |= summ[g.0 as usize].frees;
+                }
+                if writes != summ[gid].writes || frees != summ[gid].frees {
+                    summ[gid].writes = writes;
+                    summ[gid].frees = frees;
                     changed = true;
                 }
             }
-        }
-        if !changed {
-            break;
-        }
-    }
-    loop {
-        let mut changed = false;
-        for (gid, pcalls) in &prov_calls {
-            let pof = &param_of[gid];
-            let arg = |op: &Operand| match op {
-                Operand::Reg(r) => pof.get(r).copied(),
-                _ => None,
-            };
-            let mut add = ProvTransfer::default();
-            for (g, args) in pcalls {
-                let Some(sg) = map.get(g) else { continue };
-                for &(d, s) in &sg.prov.transfers {
-                    if let (Some(pd), Some(ps)) =
-                        (args.get(d).and_then(&arg), args.get(s).and_then(&arg))
-                    {
-                        add.transfers.push((pd, ps));
-                    }
-                }
-                for &(a, label) in &sg.prov.labels {
-                    if let Some(pa) = args.get(a).and_then(&arg) {
-                        add.labels.push((pa, label));
-                    }
-                }
+            if !changed {
+                break;
             }
-            if let Some(s) = map.get_mut(gid) {
-                let before = (s.prov.transfers.len(), s.prov.labels.len());
-                s.prov.transfers.extend(add.transfers);
-                s.prov.labels.extend(add.labels);
-                dedup(&mut s.prov);
-                if (s.prov.transfers.len(), s.prov.labels.len()) != before {
+        }
+        // 3. propagate provenance transfers through direct calls to a fixpoint.
+        loop {
+            let mut changed = false;
+            for gid in 0..n {
+                let pof = &self.param_of[gid];
+                let arg = |op: &Operand| match op {
+                    Operand::Reg(r) => pof.get(r).copied(),
+                    _ => None,
+                };
+                let mut add = ProvTransfer::default();
+                for (g, args) in &prov_calls[gid] {
+                    let sg = &summ[g.0 as usize];
+                    for &(d, s) in &sg.prov.transfers {
+                        if let (Some(pd), Some(ps)) =
+                            (args.get(d).and_then(&arg), args.get(s).and_then(&arg))
+                        {
+                            add.transfers.push((pd, ps));
+                        }
+                    }
+                    for &(a, label) in &sg.prov.labels {
+                        if let Some(pa) = args.get(a).and_then(&arg) {
+                            add.labels.push((pa, label));
+                        }
+                    }
+                }
+                let before = (summ[gid].prov.transfers.len(), summ[gid].prov.labels.len());
+                summ[gid].prov.transfers.extend(add.transfers);
+                summ[gid].prov.labels.extend(add.labels);
+                dedup(&mut summ[gid].prov);
+                if (summ[gid].prov.transfers.len(), summ[gid].prov.labels.len()) != before {
                     changed = true;
                 }
             }
+            if !changed {
+                break;
+            }
         }
-        if !changed {
-            break;
-        }
+        summ.into_iter()
+            .enumerate()
+            .map(|(i, s)| (FuncId(i as u32), s))
+            .collect()
     }
-    map
+}
+
+/// Whole-program summaries **without linking**: the same result as
+/// `summarize_module(&merge_modules(mods, …))`, streamed through [`SummaryFacts`]
+/// (each module is scanned once; the bodies need not be held past the scan). Kept
+/// as a convenience over the incremental [`SummaryFacts`] API and as the in-memory
+/// equivalence oracle for it.
+pub fn summarize_program(mods: &[&Module]) -> HashMap<FuncId, Summary> {
+    let mut facts = SummaryFacts::new();
+    for m in mods {
+        facts.push_module(m);
+    }
+    facts.finalize()
 }
 
 fn summarize_fn(f: &Function) -> Summary {
@@ -847,6 +905,60 @@ mod tests {
         assert!(want[&FuncId(1)].writes && want[&FuncId(1)].frees, "a_opaque is fully havoc'd");
         assert!(want[&FuncId(2)].writes, "writer writes");
         assert!(want[&FuncId(3)].writes, "b_wrapper inherits via Direct");
+    }
+
+    /// The streaming property: feeding modules one at a time and **dropping each**
+    /// right after `push_module` yields the same summaries as the linked module —
+    /// so a whole-program pass never needs the IR resident. Uses `atgt`/`writer`
+    /// cross-module resolution to make the drop meaningful (a later module's
+    /// definition still resolves a caller pushed earlier).
+    #[test]
+    fn summary_facts_stream_and_drop_equals_linked() {
+        use csolver_ir::merge_modules;
+        let p = RegId(0);
+        let mk = |name: &str, insts: Vec<Inst>| {
+            let mut m = Module::new("m");
+            let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+            bb.insts = insts;
+            m.functions.push(Function {
+                id: FuncId(0),
+                name: name.into(),
+                params: vec![(p, Type::ptr(Type::int(32)))],
+                ret_ty: Type::Unit,
+                blocks: vec![bb],
+                entry: BlockId(0),
+            });
+            m
+        };
+        let store = Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(p),
+            value: Operand::int(32, 0),
+            align: 4,
+        };
+        let call_writer = Inst::Call {
+            dst: None,
+            callee: Callee::Symbol("writer".into()),
+            args: vec![Operand::Reg(p)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        };
+        // Caller pushed FIRST, its callee's definition SECOND — so resolution must
+        // survive dropping the caller's module before the callee is even seen.
+        let caller = mk("caller", vec![call_writer]);
+        let writer = mk("writer", vec![store]);
+
+        let want = summarize_module(&merge_modules(vec![caller.clone(), writer.clone()], "l"));
+        let mut facts = SummaryFacts::new();
+        {
+            let m0 = caller; // moved in, pushed, then dropped at end of scope
+            facts.push_module(&m0);
+        }
+        {
+            let m1 = writer;
+            facts.push_module(&m1);
+        }
+        assert_eq!(facts.finalize(), want, "streamed+dropped == linked");
     }
 
     /// Randomised losslessness guard: over many random multi-module call graphs
