@@ -145,7 +145,7 @@ fn synthesize_round(
     // site it could not derive — permanently ineligible.
     let mut folded: HashMap<(FuncId, u32), Option<SiteGuarantee>> = HashMap::new();
     for caller in &module.functions {
-        let defs = local_defs(caller, module, prior);
+        let defs = local_defs(caller, caller.id, &module.param_contracts, &module.layout, prior);
         for inst in caller.blocks.iter().flat_map(|b| &b.insts) {
             let Inst::Call { callee: Callee::Direct(g), args, .. } = inst else {
                 continue;
@@ -202,6 +202,148 @@ fn synthesize_round(
                     // A synthesized contract is the *weakest* call-site
                     // guarantee; a witness against it may combine argument
                     // values no single caller produces — prove-only.
+                    refutable: false,
+                    sentinel: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Whole-program pointer-contract synthesis **without linking**: the same map as
+/// `synthesize(&merge_modules(mods, …), closed_world)`, run over the separate
+/// modules. Same fixpoint as [`synthesize`], each round delegating to
+/// [`synthesize_round_program`]. `acc`/`prior` are keyed by merge-compatible global
+/// ids.
+#[allow(dead_code)] // wired into the verifier by Phase 2; until then only tests use it
+pub(crate) fn synthesize_program(
+    mods: &[&Module],
+    closed_world: bool,
+) -> HashMap<(FuncId, u32), PtrContract> {
+    let mut acc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
+    loop {
+        let round = synthesize_round_program(mods, &acc, closed_world);
+        let mut grew = false;
+        for (k, v) in round {
+            grew |= acc.insert(k, v).is_none();
+        }
+        if !grew {
+            return acc;
+        }
+    }
+}
+
+/// One link-free synthesis round — the same as
+/// `synthesize_round(&merge_modules(mods, …), prior, closed_world)` over the
+/// separate modules: global escaped set (union), global declared contracts (each
+/// module's remapped to global ids), each caller's call resolved to the same global
+/// id the linked module would call directly (Direct in-module, Symbol cross-module),
+/// and the weakest (intersection) call-site guarantee folded per candidate parameter.
+fn synthesize_round_program(
+    mods: &[&Module],
+    prior: &HashMap<(FuncId, u32), PtrContract>,
+    closed_world: bool,
+) -> HashMap<(FuncId, u32), PtrContract> {
+    let (name_to_id, remaps) = csolver_ir::merge_id_plan(mods);
+    let layout = mods.first().map_or(csolver_ir::DataLayout::LP64, |m| m.layout);
+    let mut global_fn: HashMap<FuncId, &csolver_ir::Function> = HashMap::new();
+    let mut internal: HashSet<FuncId> = HashSet::new();
+    let mut escaped: HashSet<String> = HashSet::new();
+    let mut global_pc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
+    for (mi, m) in mods.iter().enumerate() {
+        escaped.extend(address_taken_names(m));
+        for f in &m.functions {
+            let gid = remaps[mi][&f.id];
+            global_fn.insert(gid, f);
+            if m.internal.contains(&f.id) {
+                internal.insert(gid);
+            }
+        }
+        for (&(fid, idx), c) in &m.param_contracts {
+            global_pc.insert((remaps[mi][&fid], idx), *c);
+        }
+    }
+
+    let mut candidates: HashSet<(FuncId, u32)> = HashSet::new();
+    for (&gid, f) in &global_fn {
+        let complete = closed_world || internal.contains(&gid);
+        if !complete || escaped.contains(&f.name) {
+            continue;
+        }
+        for (i, (_, ty)) in f.params.iter().enumerate() {
+            let key = (gid, i as u32);
+            if ty.is_ptr() && !global_pc.contains_key(&key) && !prior.contains_key(&key) {
+                candidates.insert(key);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+
+    let resolve = |mi: usize, callee: &Callee| -> Option<FuncId> {
+        match callee {
+            Callee::Direct(old) => remaps[mi].get(old).copied(),
+            Callee::Symbol(nm) => name_to_id.get(nm).copied(),
+            Callee::Indirect(_) => None,
+        }
+    };
+
+    let mut folded: HashMap<(FuncId, u32), Option<SiteGuarantee>> = HashMap::new();
+    for (mi, m) in mods.iter().enumerate() {
+        for caller in &m.functions {
+            let caller_gid = remaps[mi][&caller.id];
+            let defs = local_defs(caller, caller_gid, &global_pc, &layout, prior);
+            for inst in caller.blocks.iter().flat_map(|b| &b.insts) {
+                let Inst::Call { callee, args, .. } = inst else { continue };
+                let Some(g) = resolve(mi, callee) else { continue };
+                let Some(callee_fn) = global_fn.get(&g) else { continue };
+                if args.len() != callee_fn.params.len() {
+                    for i in 0..callee_fn.params.len() as u32 {
+                        if candidates.contains(&(g, i)) {
+                            folded.insert((g, i), None);
+                        }
+                    }
+                    continue;
+                }
+                for (i, arg) in args.iter().enumerate() {
+                    let key = (g, i as u32);
+                    if !candidates.contains(&key) {
+                        continue;
+                    }
+                    let site = derive_site(arg, &defs);
+                    let entry = folded.entry(key).or_insert(site);
+                    *entry = match (*entry, site) {
+                        (Some(a), Some(b)) => Some(SiteGuarantee {
+                            size: a.size.min(b.size),
+                            align: a.align.min(b.align),
+                            readable: a.readable && b.readable,
+                            writable: a.writable && b.writable,
+                        }),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+
+    folded
+        .into_iter()
+        .filter_map(|(key, g)| {
+            let g = g?;
+            let assumption = if internal.contains(&key.0) {
+                INTERNAL_CALL_CONTRACT
+            } else {
+                CLOSED_WORLD_CONTRACT
+            };
+            Some((
+                key,
+                PtrContract {
+                    size: SizeSpec::Bytes(g.size),
+                    align: g.align,
+                    readable: g.readable,
+                    writable: g.writable,
+                    assumption: Some(assumption),
                     refutable: false,
                     sentinel: None,
                 },
@@ -520,7 +662,7 @@ pub(crate) fn synthesize_fields(
     };
 
     for caller in &module.functions {
-        let defs = local_defs(caller, module, params);
+        let defs = local_defs(caller, caller.id, &module.param_contracts, &module.layout, params);
         for block in &caller.blocks {
             // Per-block straight-line state (reset at each block entry, so
             // cross-block field setup is conservatively not credited):
@@ -747,13 +889,15 @@ fn derive_site(
 /// circular.
 fn local_defs(
     f: &csolver_ir::Function,
-    module: &Module,
+    caller_id: FuncId,
+    param_contracts: &HashMap<(FuncId, u32), PtrContract>,
+    layout: &csolver_ir::DataLayout,
     prior: &HashMap<(FuncId, u32), PtrContract>,
 ) -> HashMap<RegId, SiteGuarantee> {
     let mut defs = HashMap::new();
     for (i, (reg, _)) in f.params.iter().enumerate() {
-        let key = (f.id, i as u32);
-        if let Some(c) = module.param_contracts.get(&key).or_else(|| prior.get(&key)) {
+        let key = (caller_id, i as u32);
+        if let Some(c) = param_contracts.get(&key).or_else(|| prior.get(&key)) {
             if let SizeSpec::Bytes(n) = c.size {
                 defs.insert(
                     *reg,
@@ -769,7 +913,7 @@ fn local_defs(
     }
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
         if let Inst::Alloc { dst, elem, count: Operand::Const(Const::Int(bv)), align, .. } = inst {
-            let Some(elem_size) = elem.size_bytes(&module.layout) else { continue };
+            let Some(elem_size) = elem.size_bytes(layout) else { continue };
             let Ok(count) = u64::try_from(bv.unsigned()) else { continue };
             let Some(size) = elem_size.checked_mul(count) else { continue };
             defs.insert(
@@ -799,7 +943,7 @@ fn local_defs(
                 continue;
             }
             let Some(base) = defs.get(b).copied() else { continue };
-            let Some(elem_size) = elem.size_bytes(&module.layout) else { continue };
+            let Some(elem_size) = elem.size_bytes(layout) else { continue };
             let Ok(idx) = u64::try_from(bv.unsigned()) else { continue };
             let Some(off) = idx.checked_mul(elem_size) else { continue };
             let Some(size) = base.size.checked_sub(off) else { continue };
@@ -969,6 +1113,125 @@ mod program_equiv_tests {
         assert_eq!(got.get(&(FuncId(3), 0)), Some(&(5, 10)), "target folds 5∪10");
         assert_eq!(got.get(&(FuncId(1), 0)), Some(&(7, 7)), "atgt folds 7");
         assert!(!got.contains_key(&(FuncId(2), 0)), "escaped esc is excluded");
+    }
+
+    /// `synthesize_program` (pointer contracts, link-free) must equal
+    /// `synthesize(&merge(...))` key-for-key: a cross-module `Symbol` call passing a
+    /// const-sized alloca gives the callee's parameter the same contract the linked
+    /// `Direct` call would, and an address-taken callee is excluded.
+    #[test]
+    fn pointer_contracts_match_the_linked_module() {
+        let pp = || vec![(RegId(0), Type::ptr(Type::int(32)))];
+        let alloc16 = Inst::Alloc {
+            dst: RegId(1),
+            region: csolver_core::RegionKind::Stack,
+            elem: Type::int(32),
+            count: Operand::int(64, 4), // 4 × i32 = 16 bytes
+            align: 4,
+        };
+        let pcall = |callee: Callee, arg: Operand| Inst::Call {
+            dst: None,
+            callee,
+            args: vec![arg],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        };
+        // A: caller allocs 16 bytes and passes it cross-module to `sink`.
+        let mut a = Module::new("a");
+        a.functions.push(func(
+            0,
+            "caller",
+            vec![],
+            vec![alloc16, pcall(Callee::Symbol("sink".into()), Operand::Reg(RegId(1)))],
+        ));
+        // B: the sink (uncontracted ptr param) and an escaped ptr-param function.
+        let mut b = Module::new("b");
+        b.functions.push(func(0, "sink", pp(), vec![]));
+
+        for cw in [true, false] {
+            let want = synthesize(&merge_modules(vec![a.clone(), b.clone()], "l"), cw);
+            let got = synthesize_program(&[&a, &b], cw);
+            assert_eq!(got, want, "link-free pointer contracts must equal linked (cw={cw})");
+        }
+        // Under closed-world, sink (FuncId 1 after merge) gets a 16-byte contract.
+        let got = synthesize_program(&[&a, &b], true);
+        assert_eq!(got.get(&(FuncId(1), 0)).map(|c| c.size), Some(SizeSpec::Bytes(16)));
+    }
+
+    /// Randomised guard for pointer contracts over random multi-module programs:
+    /// const-sized allocas, cross-module and in-module calls that pass an alloca, a
+    /// forwarded parameter (exercising the synthesis fixpoint), or a constant, plus
+    /// random address-taking and closed-world flag.
+    #[test]
+    fn pointer_contracts_match_linked_on_random_programs() {
+        let mut state: u64 = 0x00A5_5A5A_1357_9BDF;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pcall = |callee: Callee, arg: Operand| Inst::Call {
+            dst: None,
+            callee,
+            args: vec![arg],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        };
+        for _ in 0..300 {
+            let n_mods = 2 + (rng() % 2) as usize;
+            let per = 2 + (rng() % 3) as usize;
+            let total = n_mods * per;
+            let name = |gi: usize| format!("h{gi}");
+            let mut modules = Vec::new();
+            let mut gi = 0usize;
+            for _ in 0..n_mods {
+                let mut m = Module::new("m");
+                for local in 0..per {
+                    let mut insts = Vec::new();
+                    let has_alloc = rng() % 2 == 0;
+                    if has_alloc {
+                        insts.push(Inst::Alloc {
+                            dst: RegId(1),
+                            region: csolver_core::RegionKind::Stack,
+                            elem: Type::int(32),
+                            count: Operand::int(64, (1 + rng() % 4) as u128),
+                            align: [1u32, 2, 4, 8][(rng() % 4) as usize],
+                        });
+                    }
+                    for _ in 0..(rng() % 3) {
+                        let tgt = (rng() as usize) % total;
+                        let arg = match rng() % 3 {
+                            0 => Operand::Reg(RegId(0)), // forward own param (fixpoint)
+                            1 => Operand::Reg(RegId(1)), // the alloca (or an undefined reg)
+                            _ => Operand::int(64, 0),    // a non-derivable constant
+                        };
+                        insts.push(pcall(Callee::Symbol(name(tgt)), arg));
+                    }
+                    if rng() % 4 == 0 {
+                        let e = (rng() as usize) % total;
+                        insts.push(Inst::Assign {
+                            dst: RegId(9),
+                            ty: Type::ptr(Type::int(32)),
+                            value: RValue::Use(Operand::Const(Const::Symbol(name(e)))),
+                        });
+                    }
+                    m.functions.push(func(
+                        local as u32,
+                        &name(gi),
+                        vec![(RegId(0), Type::ptr(Type::int(32)))],
+                        insts,
+                    ));
+                    gi += 1;
+                }
+                modules.push(m);
+            }
+            let cw = rng() & 1 == 0;
+            let refs: Vec<&Module> = modules.iter().collect();
+            let got = synthesize_program(&refs, cw);
+            let want = synthesize(&merge_modules(modules.clone(), "linked"), cw);
+            assert_eq!(got, want, "link-free != linked pointer contracts (cw={cw})");
+        }
     }
 
     /// The streaming property: pushing modules one at a time and **dropping each**
