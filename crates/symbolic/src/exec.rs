@@ -132,7 +132,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -141,7 +141,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -154,7 +154,7 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, contracts, &[], &[], globals, &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), contracts, &[], &[], globals, &HashMap::new(), &HashMap::new(), None)
 }
 
 /// As [`discharge_full`], plus interprocedural **member-provenance**:
@@ -176,8 +176,9 @@ pub fn discharge_with_fields(
     assume_valid_params: bool,
 ) -> SymbolicReport {
     discharge_with_scalars(
-        f, summaries, contracts, field_contracts, &[], globals, prov_grants, &HashMap::new(), None,
-        ExecLimits::default().time_budget, bug_finding, exported, assume_valid_params,
+        f, summaries, &HashMap::new(), contracts, field_contracts, &[], globals, prov_grants,
+        &HashMap::new(), None, ExecLimits::default().time_budget, bug_finding, exported,
+        assume_valid_params,
     )
 }
 
@@ -190,6 +191,7 @@ pub fn discharge_with_fields(
 pub fn discharge_with_scalars(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
+    name_summaries: &HashMap<String, Summary>,
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
     scalar_pre: &[Option<(i128, i128)>],
@@ -205,8 +207,8 @@ pub fn discharge_with_scalars(
     let limits =
         ExecLimits { bug_finding, exported, assume_valid_params, time_budget, ..ExecLimits::default() };
     discharge_inner(
-        f, limits, summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
-        global_fn_ptrs, analysis_in,
+        f, limits, summaries, name_summaries, contracts, field_contracts, scalar_pre, globals,
+        prov_grants, global_fn_ptrs, analysis_in,
     )
 }
 
@@ -218,7 +220,7 @@ pub fn discharge_with_scalars(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, limits, &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
 }
 
 /// Every symbol name referenced by an operand of `f` (`Const::Symbol` /
@@ -301,6 +303,7 @@ fn discharge_inner(
     f: &Function,
     limits: ExecLimits,
     summaries: &HashMap<FuncId, Summary>,
+    name_summaries: &HashMap<String, Summary>,
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
     scalar_pre: &[Option<(i128, i128)>],
@@ -384,6 +387,7 @@ fn discharge_inner(
         loop_frees,
         loop_bodies,
         summaries: summaries.clone(),
+        name_summaries: name_summaries.clone(),
         prov_grants: prov_grants.clone(),
         field_offsets: HashMap::new(),
         field_frontier: HashMap::new(),
@@ -1273,6 +1277,11 @@ struct Explorer<'f> {
     loop_bodies: HashMap<BlockId, Vec<BlockId>>,
     /// Interprocedural summaries, by callee id (empty = havoc all calls).
     summaries: HashMap<FuncId, Summary>,
+    /// Whole-program summaries by callee **name**, for resolving a cross-file
+    /// `Callee::Symbol(name)` call that has no in-module id — so a caller sees a
+    /// remote callee's effects (writes/frees/return) instead of an opaque havoc.
+    /// Empty in the ordinary per-module path (every such call stays opaque).
+    name_summaries: HashMap<String, Summary>,
     /// The provenance lattice (label id → granted capability ids), from the module's
     /// contracts. An [`Inst::CapRequire`] checks it; a label absent here grants all
     /// capabilities (sound default). Empty ⇒ the capability mechanism is inert.
@@ -3299,7 +3308,16 @@ impl Explorer<'_> {
             }
             _ => None,
         };
-        let summary = resolved_fid.and_then(|fid| self.summaries.get(&fid).cloned());
+        let summary = resolved_fid
+            .and_then(|fid| self.summaries.get(&fid).cloned())
+            // Whole-program: a cross-file `Symbol(name)` call resolves to the remote
+            // callee's summary by name, so its effects are modelled precisely instead
+            // of havoc'd. Sound: a name with no summary (a true external / unresolved)
+            // still falls through to the opaque havoc below.
+            .or_else(|| match callee {
+                Callee::Symbol(name) => self.name_summaries.get(name).cloned(),
+                _ => None,
+            });
 
         // Double-free through a freeing *wrapper*: a callee that definitely frees its
         // parameter `k` (`Summary.frees_arg`) re-frees a base an earlier freeing call
@@ -6633,8 +6651,8 @@ mod tests {
         let mut table = HashMap::new();
         table.insert("G".to_string(), vec![(0u64, FuncId(1))]);
         let r = discharge_inner(
-            &f, ExecLimits::default(), &summaries, &[], &[], &[], &globals, &empty_grants, &table,
-            None,
+            &f, ExecLimits::default(), &summaries, &HashMap::new(), &[], &[], &[], &globals,
+            &empty_grants, &table, None,
         );
         assert!(
             r.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
@@ -6646,8 +6664,8 @@ mod tests {
         // Control: no table ⇒ opaque indirect call ⇒ default (may write & free)
         // havoc ⇒ the final write is not proven safe.
         let r2 = discharge_inner(
-            &f, ExecLimits::default(), &summaries, &[], &[], &[], &globals, &empty_grants,
-            &HashMap::new(), None,
+            &f, ExecLimits::default(), &summaries, &HashMap::new(), &[], &[], &[], &globals,
+            &empty_grants, &HashMap::new(), None,
         );
         assert!(
             !r2.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
@@ -6655,6 +6673,85 @@ mod tests {
         );
         let uaf2 = r2.mem_decision(BlockId(0), 6, SafetyProperty::NoUseAfterFree).expect("uaf2");
         assert!(!uaf2.proven, "an opaque indirect call must havoc, leaving the write unproven");
+    }
+
+    /// 2b (whole-program on-demand): a cross-file `Callee::Symbol(name)` with no
+    /// in-module id resolves to the program-wide callee summary passed in
+    /// `name_summaries` — so the call is analysed with the callee's real effect
+    /// instead of an opaque havoc. Sound *and* precise: a pure remote callee lets
+    /// the following use prove; a remote callee that frees the argument turns it
+    /// into a caught use-after-free.
+    #[test]
+    fn cross_file_symbol_call_resolves_via_name_summaries() {
+        use std::collections::HashMap;
+        // bb0: buf = alloc[8]; remote(buf); *buf = 0
+        let buf = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 8),
+            align: 1,
+        });
+        bb0.insts.push(Inst::Call {
+            dst: None,
+            callee: Callee::Symbol("remote".into()),
+            args: vec![Operand::Reg(buf)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        });
+        bb0.insts.push(Inst::Store {
+            ty: Type::int(8),
+            ptr: Operand::Reg(buf),
+            value: Operand::int(8, 0),
+            align: 1,
+        });
+        let f = Function {
+            id: FuncId(0),
+            name: "cross_caller".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let empty_grants = HashMap::new();
+
+        // Control: no name map ⇒ opaque `Symbol` havoc ⇒ the call may free `buf`,
+        // so the following store is NOT proven free of use-after-free.
+        let opaque = discharge_inner(
+            &f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[],
+            &HashMap::new(), &empty_grants, &HashMap::new(), None,
+        );
+        let uaf = opaque.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(!uaf.proven, "an unresolved cross-file symbol must havoc (may free)");
+
+        // Resolve `remote` to a PURE summary ⇒ the store is proven live.
+        let mut pure = HashMap::new();
+        pure.insert(
+            "remote".to_string(),
+            Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default() },
+        );
+        let r_pure = discharge_inner(
+            &f, ExecLimits::default(), &HashMap::new(), &pure, &[], &[], &[], &HashMap::new(),
+            &empty_grants, &HashMap::new(), None,
+        );
+        let uaf_pure = r_pure.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(uaf_pure.proven, "a pure remote callee must preserve liveness: {}", uaf_pure.residual);
+
+        // Resolve `remote` to a summary that frees argument 0 ⇒ the store is a
+        // use-after-free and must be refuted (sound: the real effect flows in).
+        let mut frees = HashMap::new();
+        frees.insert(
+            "remote".to_string(),
+            Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default() },
+        );
+        let r_free = discharge_inner(
+            &f, ExecLimits::default(), &HashMap::new(), &frees, &[], &[], &[], &HashMap::new(),
+            &empty_grants, &HashMap::new(), None,
+        );
+        let uaf_free = r_free.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
+        assert!(!uaf_free.proven, "a remote callee that frees the arg makes the store a UAF");
     }
 
     #[test]

@@ -54,13 +54,22 @@ impl WholeProgramFacts {
     /// Finalize all four passes. Pointer contracts feed member-provenance, exactly
     /// as in the linked pipeline (`verify_module`).
     pub fn finalize(self, closed_world: bool) -> ProgramFacts {
+        // Grab the external name → global-id map before `finalize` consumes the
+        // builder, so each finalized summary can be paired back to its callee name
+        // for on-demand cross-file call resolution (2b).
+        let name_to_id: HashMap<String, FuncId> = self.summaries.name_to_id().clone();
         let summaries = self.summaries.finalize();
+        let name_summaries: HashMap<String, Summary> = name_to_id
+            .into_iter()
+            .filter_map(|(name, id)| summaries.get(&id).map(|s| (name, s.clone())))
+            .collect();
         let scalars = self.scalars.finalize(closed_world);
         let ptr_contracts = self.contracts.finalize(closed_world);
         let field_contracts = self.fields.finalize(&ptr_contracts, closed_world);
         ProgramFacts {
             n_functions: self.n_functions,
             summaries,
+            name_summaries,
             scalars,
             ptr_contracts,
             field_contracts,
@@ -75,6 +84,10 @@ pub struct ProgramFacts {
     pub n_functions: usize,
     /// Per-function effect summary.
     pub summaries: HashMap<FuncId, Summary>,
+    /// Effect summary keyed by external callee **name** (first definition winning) —
+    /// the map [`verify_module_whole_program`](crate::verify_module_whole_program)
+    /// consumes to resolve cross-file `Symbol` calls to their real callee effect.
+    pub name_summaries: HashMap<String, Summary>,
     /// Per integer parameter, its synthesized `[lo, hi]` value-range precondition.
     pub scalars: HashMap<(FuncId, u32), (i128, i128)>,
     /// Per pointer parameter, its synthesized region contract.

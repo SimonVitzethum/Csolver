@@ -29,6 +29,7 @@ mod report;
 mod wholeprog;
 
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
+pub use csolver_symbolic::Summary;
 pub use wholeprog::{ProgramFacts, WholeProgramFacts};
 
 use csolver_absint::{analyze_intervals, Trivalent};
@@ -41,8 +42,7 @@ use csolver_ir::{
     Condition, Const, FieldContract, FuncId, Function, Inst, Module, Operand, PtrContract, SizeSpec,
 };
 use csolver_symbolic::{
-    discharge_function, discharge_with_scalars, summarize_module, Summary, SymOutcome,
-    SymbolicReport,
+    discharge_function, discharge_with_scalars, summarize_module, SymOutcome, SymbolicReport,
 };
 use std::collections::HashMap;
 
@@ -151,6 +151,34 @@ pub fn verify_module(module: &Module, config: &Config) -> ModuleReport {
 /// output. The determinism test (`parallel_matches_serial`) is the oracle for this,
 /// the role Miri plays for the MIR lowering. The count trades only latency.
 pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usize) -> ModuleReport {
+    verify_module_inner(module, config, threads, &HashMap::new())
+}
+
+/// As [`verify_module_with_threads`], but resolving cross-file `Callee::Symbol(name)`
+/// calls that have no in-module definition against a whole-program map of callee
+/// **name → effect summary** (the streaming-facts driver supplies it). A call to a
+/// symbol defined in another translation unit is then analysed with that callee's
+/// real summary instead of an opaque havoc — the on-demand whole-program path (2b).
+///
+/// Sound: `name_summaries` are the same effect summaries the linked pipeline would
+/// compute for those callees; supplying one only ever tightens a call's effect from
+/// "havoc everything" toward the callee's actual writes/frees/provenance. An absent
+/// name falls back to the opaque havoc, exactly as before.
+pub fn verify_module_whole_program(
+    module: &Module,
+    config: &Config,
+    threads: usize,
+    name_summaries: &HashMap<String, Summary>,
+) -> ModuleReport {
+    verify_module_inner(module, config, threads, name_summaries)
+}
+
+fn verify_module_inner(
+    module: &Module,
+    config: &Config,
+    threads: usize,
+    name_summaries: &HashMap<String, Summary>,
+) -> ModuleReport {
     // Promote non-escaping scalar stack slots to SSA first: unoptimized front-end
     // output spills locals (loop counters, pointer parameters) to allocas, which
     // defeats induction bounds and store-load provenance. Semantics-preserving, so
@@ -171,6 +199,7 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
     let mut functions = verify_functions(
         module,
         summaries.as_ref(),
+        name_summaries,
         &synthesized,
         &field_synth,
         &scalar_synth,
@@ -245,6 +274,7 @@ pub fn verify_module_with_threads(module: &Module, config: &Config, threads: usi
 fn verify_one_function(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
+    name_summaries: &HashMap<String, Summary>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
     field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
     scalar_synth: &HashMap<(FuncId, u32), (i128, i128)>,
@@ -305,6 +335,7 @@ fn verify_one_function(
     verify_function_with(
         f,
         summaries,
+        name_summaries,
         &contracts,
         &field_contracts,
         &scalar_pre,
@@ -321,9 +352,11 @@ fn verify_one_function(
 /// from a shared atomic index (not fixed chunks), so a few slow functions do not
 /// stall a whole worker — scalable to the machine's cores. Results are returned in
 /// function order (sorted by index), so the caller's renumbering is deterministic.
+#[allow(clippy::too_many_arguments)]
 fn verify_functions(
     module: &Module,
     summaries: Option<&HashMap<FuncId, Summary>>,
+    name_summaries: &HashMap<String, Summary>,
     synthesized: &HashMap<(FuncId, u32), PtrContract>,
     field_synth: &HashMap<(FuncId, u32), Vec<FieldContract>>,
     scalar_synth: &HashMap<(FuncId, u32), (i128, i128)>,
@@ -335,7 +368,7 @@ fn verify_functions(
     if threads <= 1 || n <= 1 {
         return fns
             .iter()
-            .map(|f| verify_one_function(module, summaries, synthesized, field_synth, scalar_synth, config, f))
+            .map(|f| verify_one_function(module, summaries, name_summaries, synthesized, field_synth, scalar_synth, config, f))
             .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -348,7 +381,8 @@ fn verify_functions(
                     break;
                 }
                 let r = verify_one_function(
-                    module, summaries, synthesized, field_synth, scalar_synth, config, &fns[i],
+                    module, summaries, name_summaries, synthesized, field_synth, scalar_synth,
+                    config, &fns[i],
                 );
                 // Recover from a poisoned lock (a worker panicked) rather than
                 // cascading the panic — the collected data is still valid.
@@ -505,8 +539,8 @@ fn assumption_record(id: String) -> Assumption {
 /// parameter contracts), drawing obligation ids from `next_id`.
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
     verify_function_with(
-        f, None, &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), config, true,
-        next_id,
+        f, None, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(),
+        &HashMap::new(), config, true, next_id,
     )
 }
 
@@ -516,6 +550,7 @@ pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> Func
 fn verify_function_with(
     f: &Function,
     summaries: Option<&HashMap<FuncId, Summary>>,
+    name_summaries: &HashMap<String, Summary>,
     contracts: &[Option<PtrContract>],
     field_contracts: &[Vec<FieldContract>],
     scalar_pre: &[Option<(i128, i128)>],
@@ -531,8 +566,8 @@ fn verify_function_with(
         // Hand the interval analysis (already computed for interval discharge) to
         // the executor so it is not recomputed — a clone instead of a 2nd fixpoint.
         Some(s) => discharge_with_scalars(
-            f, s, contracts, field_contracts, scalar_pre, globals, prov_grants, global_fn_ptrs,
-            analysis.as_ref(), config.time_budget, config.bug_finding, exported,
+            f, s, name_summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
+            global_fn_ptrs, analysis.as_ref(), config.time_budget, config.bug_finding, exported,
             config.assume_valid_params,
         ),
         None => discharge_function(f),

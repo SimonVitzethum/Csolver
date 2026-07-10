@@ -319,6 +319,13 @@ impl SummaryFacts {
         SummaryFacts::default()
     }
 
+    /// The external (non-internal) definition name → global `FuncId` map (first
+    /// definition winning), as used to resolve cross-module `Symbol` call edges.
+    /// Lets a whole-program driver pair a finalized summary back to its callee name.
+    pub fn name_to_id(&self) -> &HashMap<String, FuncId> {
+        &self.name_to_id
+    }
+
     /// Fold one module's functions in. The module is only read here; the caller may
     /// drop it immediately afterwards.
     pub fn push_module(&mut self, m: &Module) {

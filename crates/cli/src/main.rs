@@ -39,7 +39,7 @@ USAGE:
                                     ABI — opt-in, unsound in general, surfaced as an assumption);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
-    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>] [--cross-file] [--reachable]
+    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>] [--cross-file] [--whole-program] [--reachable]
                                     verify EVERY .ll under <dir> without stopping, then
                                     report coverage (% of functions decided) and list
                                     every memory-safety violation found, with a witness
@@ -56,6 +56,13 @@ USAGE:
                                     to its definition and a caller's validation flows into
                                     the callee — finds deeper bugs and removes false
                                     positives a per-file view cannot see.
+                                    --whole-program: pass 1 streams every callee's effect
+                                    summary over the WHOLE tree in bounded memory, then
+                                    verifies (pass 2) with each cross-file `Symbol` call
+                                    resolved to its real callee summary instead of an
+                                    opaque havoc — cross-module precision at a few GB, no
+                                    giant linked module. Combine with --cross-file to also
+                                    link within each directory.
                                     --reachable <needs --entries>: link, per attacker
                                     entry, the transitive set of .ll it can reach through
                                     the call graph into ONE whole-program module analysed
@@ -113,6 +120,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let bug_finding = args.iter().any(|a| a == "--bugs");
     let assume_valid_params = args.iter().any(|a| a == "--assume-valid-params");
     let cross_file = args.iter().any(|a| a == "--cross-file");
+    let whole_program = args.iter().any(|a| a == "--whole-program");
     let reachable = args.iter().any(|a| a == "--reachable");
     let auto_entries = args.iter().any(|a| a == "--auto-entries");
     // `--pre <file>`: an opt-in parameter-precondition sidecar.
@@ -191,7 +199,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or("`--reachable` requires `--entries <file>` (the entry points to link from)")?;
                 scan_reachable(Path::new(dir), &config, &pats)
             } else {
-                scan_dir(Path::new(dir), &config, cross_file)
+                scan_dir(Path::new(dir), &config, cross_file, whole_program)
             }
         }
         "facts" => {
@@ -807,6 +815,7 @@ fn scan_one_unit(
     cross: bool,
     threads: usize,
     content_seen: &std::sync::Mutex<std::collections::HashSet<u64>>,
+    name_summaries: Option<&std::collections::HashMap<String, csolver_verifier::Summary>>,
 ) -> FileScan {
     use csolver_core::ObligationResult;
     use csolver_ir::Frontend;
@@ -865,7 +874,13 @@ fn scan_one_unit(
     // the group holds ALL callers (closed-world) would be unsound on a partial merge (a
     // caller in another subsystem could violate a synthesized contract → false PASS).
     fs.dropped = module.unanalyzed.len() as u64;
-    let report = verify_module_with_threads(&module, config, threads.max(1));
+    // Whole-program (2b): a cross-file `Callee::Symbol(name)` with no in-unit definition
+    // resolves to the program-wide callee summary instead of an opaque havoc — sound, and
+    // strictly more precise. Without the map (ordinary scan) behaviour is unchanged.
+    let report = match name_summaries {
+        Some(ns) => csolver_verifier::verify_module_whole_program(&module, config, threads.max(1), ns),
+        None => verify_module_with_threads(&module, config, threads.max(1)),
+    };
     fs.truncated = report.any_truncated();
     for f in &report.functions {
         match f.verdict {
@@ -916,22 +931,20 @@ fn rss_mb() -> u64 {
 /// and report coverage + peak RSS. This is the memory foundation for a
 /// whole-kernel scan; it extracts the facts (identical to the linked pipeline)
 /// without ever holding the linked module.
-fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, String> {
+/// Stream every file in `files` (relative to `dir`) through the four whole-program
+/// fact builders in parallel contiguous shards, merge in file order, and finalize —
+/// the memory-bounded extraction shared by `solver facts` and the whole-program
+/// scan's first pass. Returns the finalized facts, the count of lowered files, and
+/// the observed peak RSS (MB). Bit-identical to the linked pipeline (see
+/// `WholeProgramFacts`).
+fn stream_program_facts(
+    dir: &Path,
+    files: &[std::path::PathBuf],
+    closed_world: bool,
+) -> (csolver_verifier::ProgramFacts, usize, u64) {
     use csolver_ir::Frontend;
-    let mut files = Vec::new();
-    collect_ll(dir, &mut files);
-    files.sort();
-    if files.is_empty() {
-        return Err(format!("no .ll files found under {}", dir.display()));
-    }
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let cores = worker_count();
-    eprintln!(
-        "whole-program facts: streaming {} .ll files under {} … ({cores} workers)",
-        files.len(),
-        dir.display()
-    );
-    let start = std::time::Instant::now();
     // Contiguous shards (file order preserved): each worker builds its own facts in
     // parallel — the expensive per-function interval analysis parallelises — then the
     // shards are merged in order, giving ids identical to a single sequential push.
@@ -985,8 +998,24 @@ fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, String> {
     eprintln!("  finalizing …");
     let facts = merged.finalize(closed_world);
     peak.fetch_max(rss_mb(), Ordering::Relaxed);
-    let lowered = lowered.load(Ordering::Relaxed);
-    let peak_rss = peak.load(Ordering::Relaxed);
+    (facts, lowered.load(Ordering::Relaxed), peak.load(Ordering::Relaxed))
+}
+
+fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, String> {
+    let mut files = Vec::new();
+    collect_ll(dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no .ll files found under {}", dir.display()));
+    }
+    let cores = worker_count();
+    eprintln!(
+        "whole-program facts: streaming {} .ll files under {} … ({cores} workers)",
+        files.len(),
+        dir.display()
+    );
+    let start = std::time::Instant::now();
+    let (facts, lowered, peak_rss) = stream_program_facts(dir, &files, closed_world);
 
     println!("== whole-program facts ==");
     println!("  files                : {} ({lowered} lowered)", files.len());
@@ -1000,7 +1029,7 @@ fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, String> {
+fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) -> Result<ExitCode, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1011,6 +1040,27 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
         return Err(format!("no .ll files found under {}", dir.display()));
     }
     let total_files = files.len();
+
+    // Whole-program pass 1 (2b): stream the four fact builders over the entire tree in
+    // bounded memory to get every callee's effect summary by name, then verify (pass 2)
+    // with cross-file `Symbol` calls resolved against it. The facts are bit-identical to
+    // linking the whole program, so a call to a symbol defined in another translation unit
+    // is analysed with its real summary — no opaque havoc across the file boundary — while
+    // peak RAM stays bounded by the compact facts, not a giant linked module.
+    let name_summaries = if whole_program {
+        eprintln!(
+            "whole-program (2b): pass 1 — streaming effect summaries over {total_files} files …"
+        );
+        let (facts, lowered, peak_rss) = stream_program_facts(dir, &files, config.closed_world);
+        eprintln!(
+            "  … {} effect summaries ({lowered} files lowered, peak RSS {peak_rss} MB); pass 2 — verifying",
+            facts.name_summaries.len()
+        );
+        Some(facts.name_summaries)
+    } else {
+        None
+    };
+    let name_summaries = name_summaries.as_ref();
 
     // A **unit** of work: one file (normal per-TU scan) or one directory group linked into
     // a whole-program module (cross-file). Cross-file groups the .ll by their parent
@@ -1092,7 +1142,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
                 await_memory(&active);
                 active.fetch_add(1, Ordering::Relaxed);
                 let (label, unit) = &units[i];
-                let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit, &content_seen);
+                let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit, &content_seen, name_summaries);
                 active.fetch_sub(1, Ordering::Relaxed);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d.is_multiple_of(50) {
@@ -1123,7 +1173,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
         let all_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         for i in deferred {
             let (label, unit) = &units[i];
-            let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen);
+            let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen, name_summaries);
             stream_findings(&fs, &found, &seen_find);
             results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
         }
