@@ -494,7 +494,7 @@ fn discover_ops_handlers(dir: &Path) -> std::collections::HashSet<String> {
     if files.is_empty() {
         return std::collections::HashSet::new();
     }
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = worker_count();
     let next = AtomicUsize::new(0);
     // Per worker: local defined-set and ref-set, merged at the end (cheap, no lock churn).
     let acc: Mutex<(std::collections::HashSet<String>, std::collections::HashSet<String>)> =
@@ -557,21 +557,47 @@ fn available_mb() -> u64 {
 /// several large units are in flight the reserve blocks further starts, bounding peak RSS
 /// without ever capping the worker count or aborting an analysis.
 const MEM_FLOOR_MB: u64 = 1024;
-const MEM_RESERVE_PER_INFLIGHT_MB: u64 = 2560;
 fn await_memory(active: &std::sync::atomic::AtomicUsize) {
     use std::sync::atomic::Ordering;
+    let reserve = mem_reserve_per_inflight_mb();
     loop {
         let inflight = active.load(Ordering::Relaxed) as u64;
         // At least one analysis must always be allowed to run (progress guarantee).
         if inflight == 0 {
             return;
         }
-        let need = MEM_FLOOR_MB + inflight * MEM_RESERVE_PER_INFLIGHT_MB;
+        let need = MEM_FLOOR_MB + inflight * reserve;
         if available_mb() >= need {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// Worker count for the parallel scan/lowering loops. `CSOLVER_JOBS`, when set,
+/// caps it — a soundness-neutral RAM lever: fewer concurrent units means fewer
+/// large modules resident at once (lower peak memory), while every unit is still
+/// analysed identically, so no coverage and no soundness is lost, only wall-clock
+/// time. Defaults to the machine's available parallelism.
+fn worker_count() -> usize {
+    std::env::var("CSOLVER_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// Memory a single in-flight analysis is assumed to need, reserved by the
+/// backpressure (`await_memory`). Overridable via `CSOLVER_MEM_RESERVE_MB`: raise
+/// it for cross-file / whole-program runs whose linked modules dwarf a single
+/// translation unit, so fewer start concurrently. Soundness-neutral (throttles
+/// only — it never changes what is analysed).
+fn mem_reserve_per_inflight_mb() -> u64 {
+    std::env::var("CSOLVER_MEM_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2560)
 }
 
 /// The external functions a module DEFINES and the external symbols it CALLS — the edges
@@ -616,7 +642,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
     eprintln!("reachability scan: lowering {} .ll files under {} …", files.len(), dir.display());
 
     // Lower every file (parallel), keeping the module + its call-graph edges.
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = worker_count();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let lowered: std::sync::Mutex<Vec<(usize, String, csolver_ir::Module)>> =
         std::sync::Mutex::new(Vec::with_capacity(files.len()));
@@ -899,7 +925,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool) -> Result<ExitCode, S
     // takes a whole core; with few large units (cross-file groups) we also hand each unit
     // function-level threads, so the cores stay busy either way. Deterministic: per-unit
     // results are re-sorted into unit order and each verdict is thread-count independent.
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cores = worker_count();
     // Use ALL cores as workers; the reservation-based memory backpressure (see `await_memory`)
     // bounds peak RSS by throttling STARTS when several large analyses are in flight, rather
     // than by permanently capping the worker count — so a tree of small units runs fully
