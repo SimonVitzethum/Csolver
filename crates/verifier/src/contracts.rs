@@ -313,117 +313,171 @@ pub(crate) fn synthesize_scalars(
         .collect()
 }
 
-/// Whole-program equivalent of [`synthesize_scalars`] **without linking**: the same
-/// `(FuncId, param) → [lo, hi]` map as `synthesize_scalars(&merge_modules(mods, …),
-/// closed_world)`, computed over the separate modules. Call edges are resolved by
-/// name via [`csolver_ir::merge_id_plan`] (so a cross-module `Symbol` call folds
-/// into its callee's precondition exactly as the linked `Direct` call would), the
-/// escaped set is the union of every module's address-taken names (globally sound —
-/// a function whose address leaks in *any* module is excluded everywhere), and the
-/// per-caller interval analysis is body-local so each call site's argument interval
-/// is identical to the linked one. Callers are visited in the same module-then-
-/// function order the merged module has, and the union fold is order-independent
-/// anyway, so the result is bit-identical.
-// Wired into the verifier by Phase 2 (on-demand whole-program scanning); until
-// then it is exercised only by its equivalence tests, so allow it to be unused.
+/// Body-free, incrementally-built facts for whole-program scalar preconditions —
+/// the `SummaryFacts` analogue for [`synthesize_scalars`]. Each module is folded in
+/// with `push_module` (which runs its body-local interval analysis and records every
+/// call site's per-argument interval) and may then be dropped; `finalize` resolves
+/// callees by name, unions each candidate parameter's intervals across all call
+/// sites, and drops full-width ranges. The escaped set is the **global union** of
+/// every module's address-taken names — a function whose address leaks in ANY module
+/// is excluded everywhere. That globality is the one soundness-critical point: a
+/// per-file escaped check would let a cross-module address-taken function receive an
+/// unsound precondition, i.e. a false PASS. Ids match `merge_modules`.
+#[allow(dead_code)] // wired into the verifier by Phase 2; until then only tests use it
+#[derive(Default)]
+pub(crate) struct ScalarFacts {
+    next: u32,
+    name_to_id: HashMap<String, FuncId>,
+    escaped: HashSet<String>,
+    internal: Vec<bool>,
+    name: Vec<String>,
+    int_params: Vec<Vec<u32>>,
+    param_count: Vec<usize>,
+    sites: Vec<Vec<ScalarCall>>,
+}
+
+/// A call site's callee, unresolved until `finalize` (indirect calls are dropped).
+#[allow(dead_code)]
+enum ScalarCallee {
+    Id(FuncId),
+    Name(String),
+}
+
+/// One call site: its callee and the interval each argument held there.
+#[allow(dead_code)]
+struct ScalarCall {
+    callee: ScalarCallee,
+    arg_intervals: Vec<Option<(i128, i128)>>,
+}
+
+#[allow(dead_code)]
+impl ScalarFacts {
+    /// Fold one module in (droppable afterwards): record each function's linkage,
+    /// integer parameters and arity, extend the global escaped set with its
+    /// address-taken names, and extract every call site's per-argument interval.
+    pub(crate) fn push_module(&mut self, m: &Module) {
+        let base = self.next;
+        let local: HashMap<FuncId, FuncId> = m
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.id, FuncId(base + i as u32)))
+            .collect();
+        self.escaped.extend(address_taken_names(m));
+        for f in &m.functions {
+            if !m.internal.contains(&f.id) {
+                self.name_to_id.entry(f.name.clone()).or_insert(local[&f.id]);
+            }
+            self.internal.push(m.internal.contains(&f.id));
+            self.name.push(f.name.clone());
+            self.int_params.push(
+                f.params
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, ty))| matches!(ty, Type::Int { .. }))
+                    .map(|(i, _)| i as u32)
+                    .collect(),
+            );
+            self.param_count.push(f.params.len());
+            let iv = analyze_intervals(f);
+            let mut sites = Vec::new();
+            for block in &f.blocks {
+                for inst in &block.insts {
+                    let Inst::Call { callee, args, .. } = inst else { continue };
+                    let callee = match callee {
+                        Callee::Direct(old) => match local.get(old) {
+                            Some(&g) => ScalarCallee::Id(g),
+                            None => continue,
+                        },
+                        Callee::Symbol(nm) => ScalarCallee::Name(nm.clone()),
+                        Callee::Indirect(_) => continue,
+                    };
+                    let arg_intervals =
+                        args.iter().map(|a| arg_interval(a, &iv, block.id)).collect();
+                    sites.push(ScalarCall { callee, arg_intervals });
+                }
+            }
+            self.sites.push(sites);
+        }
+        self.next += m.functions.len() as u32;
+    }
+
+    /// Resolve callees by name, union each candidate parameter's call-site intervals,
+    /// and drop full-width ranges — the same map as `synthesize_scalars`.
+    pub(crate) fn finalize(self, closed_world: bool) -> HashMap<(FuncId, u32), (i128, i128)> {
+        let n = self.name.len();
+        let mut candidates: HashSet<(FuncId, u32)> = HashSet::new();
+        let mut candidate_callees: HashSet<FuncId> = HashSet::new();
+        for gid in 0..n {
+            let complete = closed_world || self.internal[gid];
+            if !complete || self.escaped.contains(&self.name[gid]) {
+                continue;
+            }
+            for &i in &self.int_params[gid] {
+                candidates.insert((FuncId(gid as u32), i));
+                candidate_callees.insert(FuncId(gid as u32));
+            }
+        }
+        if candidates.is_empty() {
+            return HashMap::new();
+        }
+        let resolve = |c: &ScalarCallee| match c {
+            ScalarCallee::Id(g) => Some(*g),
+            ScalarCallee::Name(nm) => self.name_to_id.get(nm).copied(),
+        };
+        let mut folded: HashMap<(FuncId, u32), Option<(i128, i128)>> = HashMap::new();
+        for gid in 0..n {
+            for site in &self.sites[gid] {
+                let Some(g) = resolve(&site.callee) else { continue };
+                if !candidate_callees.contains(&g) {
+                    continue;
+                }
+                let params = self.param_count[g.0 as usize];
+                if site.arg_intervals.len() != params {
+                    for i in 0..params as u32 {
+                        if candidates.contains(&(g, i)) {
+                            folded.insert((g, i), None);
+                        }
+                    }
+                    continue;
+                }
+                for (i, site_iv) in site.arg_intervals.iter().enumerate() {
+                    let key = (g, i as u32);
+                    if !candidates.contains(&key) {
+                        continue;
+                    }
+                    let entry = folded.entry(key).or_insert(*site_iv);
+                    *entry = match (*entry, *site_iv) {
+                        (Some((la, ha)), Some((lb, hb))) => Some((la.min(lb), ha.max(hb))),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        folded
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let (lo, hi) = v?;
+                (lo > i64::MIN as i128 || hi < i64::MAX as i128).then_some((k, (lo, hi)))
+            })
+            .collect()
+    }
+}
+
+/// Whole-program scalar preconditions **without linking**: the same map as
+/// `synthesize_scalars(&merge_modules(mods, …), closed_world)`, streamed through
+/// [`ScalarFacts`] (each module scanned once, its body then droppable). Kept as a
+/// convenience wrapper and the in-memory equivalence oracle for the streaming path.
 #[allow(dead_code)]
 pub(crate) fn synthesize_scalars_program(
     mods: &[&Module],
     closed_world: bool,
 ) -> HashMap<(FuncId, u32), (i128, i128)> {
-    let (name_to_id, remaps) = csolver_ir::merge_id_plan(mods);
-    let mut global_fn: HashMap<FuncId, &csolver_ir::Function> = HashMap::new();
-    let mut internal: HashSet<FuncId> = HashSet::new();
-    let mut escaped: HashSet<String> = HashSet::new();
-    for (mi, m) in mods.iter().enumerate() {
-        escaped.extend(address_taken_names(m));
-        for f in &m.functions {
-            let gid = remaps[mi][&f.id];
-            global_fn.insert(gid, f);
-            if m.internal.contains(&f.id) {
-                internal.insert(gid);
-            }
-        }
+    let mut facts = ScalarFacts::default();
+    for m in mods {
+        facts.push_module(m);
     }
-
-    let mut candidates: HashSet<(FuncId, u32)> = HashSet::new();
-    let mut candidate_callees: HashSet<FuncId> = HashSet::new();
-    for (&gid, f) in &global_fn {
-        let complete = closed_world || internal.contains(&gid);
-        if !complete || escaped.contains(&f.name) {
-            continue;
-        }
-        for (i, (_, ty)) in f.params.iter().enumerate() {
-            if matches!(ty, Type::Int { .. }) {
-                candidates.insert((gid, i as u32));
-                candidate_callees.insert(gid);
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return HashMap::new();
-    }
-
-    // Resolve a call to the same global id the linked module would call directly.
-    let resolve = |mi: usize, callee: &Callee| -> Option<FuncId> {
-        match callee {
-            Callee::Direct(old) => remaps[mi].get(old).copied(),
-            Callee::Symbol(nm) => name_to_id.get(nm).copied(),
-            Callee::Indirect(_) => None,
-        }
-    };
-
-    let mut folded: HashMap<(FuncId, u32), Option<(i128, i128)>> = HashMap::new();
-    for (mi, m) in mods.iter().enumerate() {
-        for caller in &m.functions {
-            let calls_candidate = caller.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
-                matches!(inst, Inst::Call { callee, .. }
-                    if resolve(mi, callee).is_some_and(|g| candidate_callees.contains(&g)))
-            });
-            if !calls_candidate {
-                continue;
-            }
-            let iv = analyze_intervals(caller);
-            for block in &caller.blocks {
-                for inst in &block.insts {
-                    let Inst::Call { callee, args, .. } = inst else { continue };
-                    let Some(g) = resolve(mi, callee) else { continue };
-                    if !candidate_callees.contains(&g) {
-                        continue;
-                    }
-                    let Some(callee_fn) = global_fn.get(&g) else { continue };
-                    if args.len() != callee_fn.params.len() {
-                        for i in 0..callee_fn.params.len() as u32 {
-                            if candidates.contains(&(g, i)) {
-                                folded.insert((g, i), None);
-                            }
-                        }
-                        continue;
-                    }
-                    for (i, arg) in args.iter().enumerate() {
-                        let key = (g, i as u32);
-                        if !candidates.contains(&key) {
-                            continue;
-                        }
-                        let site = arg_interval(arg, &iv, block.id);
-                        let entry = folded.entry(key).or_insert(site);
-                        *entry = match (*entry, site) {
-                            (Some((la, ha)), Some((lb, hb))) => Some((la.min(lb), ha.max(hb))),
-                            _ => None,
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    folded
-        .into_iter()
-        .filter_map(|(k, v)| {
-            let (lo, hi) = v?;
-            (lo > i64::MIN as i128 || hi < i64::MAX as i128).then_some((k, (lo, hi)))
-        })
-        .collect()
+    facts.finalize(closed_world)
 }
 
 /// Interprocedural **member-provenance**: for each contracted pointer parameter,
@@ -915,6 +969,36 @@ mod program_equiv_tests {
         assert_eq!(got.get(&(FuncId(3), 0)), Some(&(5, 10)), "target folds 5∪10");
         assert_eq!(got.get(&(FuncId(1), 0)), Some(&(7, 7)), "atgt folds 7");
         assert!(!got.contains_key(&(FuncId(2), 0)), "escaped esc is excluded");
+    }
+
+    /// The streaming property: pushing modules one at a time and **dropping each**
+    /// right after `push_module` yields the same scalar preconditions as the linked
+    /// module — the caller is pushed and dropped before its callee's module is even
+    /// seen, so a whole-program pass needs no IR resident.
+    #[test]
+    fn scalar_facts_stream_and_drop_equals_linked() {
+        let ip = |r: u32| vec![(RegId(r), Type::int(32))];
+        let caller = {
+            let mut m = Module::new("a");
+            m.functions.push(func(0, "caller", vec![], vec![call(Callee::Symbol("t".into()), 9)]));
+            m
+        };
+        let callee = {
+            let mut m = Module::new("b");
+            m.functions.push(func(0, "t", ip(0), vec![]));
+            m
+        };
+        let want = synthesize_scalars(&merge_modules(vec![caller.clone(), callee.clone()], "l"), true);
+        let mut facts = ScalarFacts::default();
+        {
+            let m0 = caller;
+            facts.push_module(&m0);
+        }
+        {
+            let m1 = callee;
+            facts.push_module(&m1);
+        }
+        assert_eq!(facts.finalize(true), want, "streamed+dropped == linked");
     }
 
     /// Randomised guard: over many random multi-module programs (cross-module and
