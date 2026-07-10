@@ -29,6 +29,22 @@ solver — are implemented and audited for soundness. The **Rust (MIR)** and
 recovery, C/kernel allocators, `copy_from_user`, and inline assembly, and runs on
 real Linux-kernel IR. **C++** goes through the same LLVM path.
 
+The internal SAT core is a full **CDCL** solver (1-UIP clause learning,
+non-chronological backjumping, VSIDS, Luby restarts, two-watched literals, LBD
+clause deletion) — pure Rust, `unsafe`-free, no external solver. Only `Unsat` is
+ever trusted; every soundness-neutral heuristic is guarded by a randomized
+brute-force oracle cross-check.
+
+**Whole-program analysis scales without linking.** Cross-module verification
+(a caller's validation flowing into a callee) is available two ways: by *linking*
+a directory/reachable set into one module (`--cross-file` / `--reachable`), or —
+the memory-bounded path — by **streaming**: each `.ll` is lowered, its
+interprocedural facts (effect summaries, pointer/scalar preconditions,
+member-provenance) folded into compact per-function facts, and the IR dropped.
+The four fact passes are each proven *bit-identical* to running them on the fully
+linked module, so the whole kernel is analysed in a few GB instead of the tens of
+GB the link-everything path needs. See `solver facts` below.
+
 Recognized library/kernel APIs are described by **external, file-driven contracts**
 (`crates/contracts/data/*.contract`) — one block per API family, so a new API is
 covered by writing a contract, not editing the frontend. The contract language also
@@ -95,7 +111,20 @@ solver verify <path> --json                # machine-readable report
 solver scan <dir> [--bugs] [--assume-valid-params]   # sweep EVERY .ll under a tree:
                                             # list every violation + report coverage
                                             # (PASS/FAIL/UNKNOWN %, decided, dropped)
+solver scan <dir> --cross-file --auto-entries --bugs # cross-module (link each dir),
+                                            # attacker entries derived automatically
+solver scan <dir> --reachable --entries <f> --bugs   # per-entry whole-program slice
+solver facts <dir> [--closed-world]         # streaming whole-program facts (no linking):
+                                            # extract summaries + pointer/scalar/field
+                                            # contracts for a whole tree in bounded RAM,
+                                            # report coverage + peak RSS
 ```
+
+**Memory / parallelism knobs** (soundness-neutral — they only throttle; every unit
+is still analysed identically): `CSOLVER_JOBS=<n>` caps the worker count (fewer
+concurrent modules ⇒ lower peak RSS), `CSOLVER_MEM_RESERVE_MB=<n>` raises the
+per-in-flight memory reserve so fewer large modules start together. Use them to fit
+a whole-kernel `--cross-file` scan under a memory ceiling.
 
 Exit codes: `verify` — `0` PASS · `1` FAIL · `2` UNKNOWN · `3` tool error.
 `scan` exits `1` iff any bug was found (it is an inventory, not one verdict).

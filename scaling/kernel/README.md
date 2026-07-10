@@ -58,6 +58,28 @@ parallelism. Results land in `scaling/kernel/out/` (`fails.txt`, `errors.txt`,
 - **timeouts** — raise `TIMEOUT` to reach them, or leave them; a slow TU is usually a
   huge generated file.
 
+## Whole-kernel cross-module scan
+
+`run.sh` sweeps files independently (each `.ll` in isolation). For **cross-module**
+analysis — a caller's argument validation flowing into a callee, which removes the
+false positives a per-file view produces — use the `solver` CLI directly:
+
+```sh
+# link each directory into one module, derive attacker entries automatically,
+# bug-finding mode; cap workers so a whole-kernel run stays under a RAM ceiling:
+CSOLVER_JOBS=4 solver scan /tmp/kll --cross-file --auto-entries --bugs
+```
+
+`--cross-file` links each directory; `--auto-entries` treats every registered
+ops-struct handler (plus syscall wrappers) as an attacker entry, so no hand-written
+entry list is needed. `CSOLVER_JOBS` / `CSOLVER_MEM_RESERVE_MB` bound peak RSS without
+changing any verdict (they only throttle concurrency).
+
+To extract the whole-program interprocedural facts (summaries + pointer/scalar/field
+contracts) for the entire tree in **bounded memory, without linking** — the streaming
+path — use `solver facts /tmp/kll --closed-world`. It reports coverage and peak RSS;
+the facts are bit-identical to the linked pipeline (proven by equivalence tests).
+
 ## What is and isn't modeled
 
 CSolver proves/refutes **spatial and temporal** memory safety. It models the kernel
