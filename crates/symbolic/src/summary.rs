@@ -118,7 +118,7 @@ pub struct ProvTransfer {
 }
 
 /// A function's interprocedural summary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
     /// The return-value characterization.
     pub ret: RetSummary,
@@ -275,6 +275,155 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
         }
     }
 
+    map
+}
+
+/// Whole-program summaries **without linking**: the same result as
+/// `summarize_module(&merge_modules(mods, …))`, computed directly over the
+/// separate modules. Call edges are resolved by name across modules exactly as
+/// [`csolver_ir::merge_modules`] does (external definition wins; a `Symbol` call
+/// to a defined external name becomes a direct edge, an unresolved one stays
+/// opaque; `internal`/static names never resolve cross-module), and the same
+/// write/free and provenance fixpoints run over that resolved global call graph.
+///
+/// Functions are keyed by the identical `FuncId`s `merge_modules` assigns
+/// (sequential in module-then-function order), so the map equals the linked one
+/// key-for-key. This is the analysis core of whole-program scanning that never
+/// holds a linked module resident: only per-function *facts* (a base summary,
+/// resolved edges, parameter map) are needed past the initial body scan, so the
+/// bodies can be dropped/streamed. Splitting extraction from the fixpoint is what
+/// makes it memory-bounded; this function keeps the modules in memory (the
+/// equivalence oracle), a later streaming variant will drop them.
+pub fn summarize_program(mods: &[&Module]) -> HashMap<FuncId, Summary> {
+    // --- Pass 1: merge-compatible id assignment + external name → id (first wins). ---
+    let mut name_to_id: HashMap<String, FuncId> = HashMap::new();
+    let mut remaps: Vec<HashMap<FuncId, FuncId>> = Vec::with_capacity(mods.len());
+    let mut next: u32 = 0;
+    for m in mods {
+        let mut remap = HashMap::new();
+        for f in &m.functions {
+            let nid = FuncId(next);
+            next += 1;
+            remap.insert(f.id, nid);
+            if !m.internal.contains(&f.id) {
+                name_to_id.entry(f.name.clone()).or_insert(nid);
+            }
+        }
+        remaps.push(remap);
+    }
+
+    // --- Per-function facts (this is the streamable body scan). ---
+    let observable =
+        |b: &csolver_ir::BasicBlock| !matches!(b.term, csolver_ir::Terminator::Unreachable);
+    let mut map: HashMap<FuncId, Summary> = HashMap::new();
+    let mut edges: HashMap<FuncId, Vec<FuncId>> = HashMap::new();
+    let mut has_opaque: HashMap<FuncId, bool> = HashMap::new();
+    let mut param_of: HashMap<FuncId, HashMap<RegId, usize>> = HashMap::new();
+    let mut prov_calls: HashMap<FuncId, Vec<(FuncId, Vec<Operand>)>> = HashMap::new();
+    for (mi, m) in mods.iter().enumerate() {
+        let remap = &remaps[mi];
+        for f in &m.functions {
+            let gid = remap[&f.id];
+            map.insert(gid, summarize_fn(f));
+            param_of.insert(gid, ptr_param_of(f));
+            let (mut fedges, mut opaque, mut pcalls) = (Vec::new(), false, Vec::new());
+            for b in f.blocks.iter().filter(|b| observable(b)) {
+                for inst in &b.insts {
+                    let Inst::Call { callee, args, .. } = inst else { continue };
+                    // Resolve to a global id and decide opacity exactly as the LINKED
+                    // module would (see `merge_modules` + `summarize_module`'s `opaque`).
+                    let (resolved, is_opaque): (Option<FuncId>, bool) = match callee {
+                        Callee::Direct(old) => (remap.get(old).copied(), false),
+                        Callee::Symbol(nm) if nm == "<inline asm nomem>" => (None, false),
+                        Callee::Symbol(nm) => {
+                            let id = name_to_id.get(nm).copied();
+                            (id, id.is_none())
+                        }
+                        Callee::Indirect(_) => (None, true),
+                    };
+                    opaque |= is_opaque;
+                    if let Some(g) = resolved {
+                        fedges.push(g);
+                        pcalls.push((g, args.clone()));
+                    }
+                }
+            }
+            edges.insert(gid, fedges);
+            has_opaque.insert(gid, opaque);
+            prov_calls.insert(gid, pcalls);
+        }
+    }
+
+    // --- The same three steps as `summarize_module`, now over facts only. ---
+    for (gid, &op) in &has_opaque {
+        if op {
+            if let Some(s) = map.get_mut(gid) {
+                s.writes = true;
+                s.frees = true;
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (gid, callees) in &edges {
+            let (mut writes, mut frees) =
+                map.get(gid).map_or((false, false), |s| (s.writes, s.frees));
+            for g in callees {
+                if let Some(sg) = map.get(g) {
+                    writes |= sg.writes;
+                    frees |= sg.frees;
+                }
+            }
+            if let Some(s) = map.get_mut(gid) {
+                if writes != s.writes || frees != s.frees {
+                    s.writes = writes;
+                    s.frees = frees;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (gid, pcalls) in &prov_calls {
+            let pof = &param_of[gid];
+            let arg = |op: &Operand| match op {
+                Operand::Reg(r) => pof.get(r).copied(),
+                _ => None,
+            };
+            let mut add = ProvTransfer::default();
+            for (g, args) in pcalls {
+                let Some(sg) = map.get(g) else { continue };
+                for &(d, s) in &sg.prov.transfers {
+                    if let (Some(pd), Some(ps)) =
+                        (args.get(d).and_then(&arg), args.get(s).and_then(&arg))
+                    {
+                        add.transfers.push((pd, ps));
+                    }
+                }
+                for &(a, label) in &sg.prov.labels {
+                    if let Some(pa) = args.get(a).and_then(&arg) {
+                        add.labels.push((pa, label));
+                    }
+                }
+            }
+            if let Some(s) = map.get_mut(gid) {
+                let before = (s.prov.transfers.len(), s.prov.labels.len());
+                s.prov.transfers.extend(add.transfers);
+                s.prov.labels.extend(add.labels);
+                dedup(&mut s.prov);
+                if (s.prov.transfers.len(), s.prov.labels.len()) != before {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     map
 }
 
@@ -636,6 +785,160 @@ mod tests {
         };
         assert!(summarize_fn(&make(p)).writes, "memset to a parameter is a visible write");
         assert!(!summarize_fn(&make(buf)).writes, "memset to an own alloca is not");
+    }
+
+    /// The load-bearing losslessness oracle for whole-program-without-linking:
+    /// `summarize_program(&[&a, &b])` must equal `summarize_module(&merge(a, b))`
+    /// key-for-key — proving that resolving call edges by name across separate
+    /// modules and running the fixpoints on facts reproduces the linked result
+    /// exactly (cross-module `Symbol` resolve, in-module `Direct` remap, and an
+    /// unresolved external staying opaque).
+    #[test]
+    fn summarize_program_equals_summarize_of_the_linked_module() {
+        use csolver_ir::merge_modules;
+        let p = RegId(0);
+        let one_block = |insts: Vec<Inst>| {
+            let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+            bb.insts = insts;
+            vec![bb]
+        };
+        let func = |id: u32, name: &str, params: Vec<(RegId, Type)>, insts: Vec<Inst>| Function {
+            id: FuncId(id),
+            name: name.into(),
+            params,
+            ret_ty: Type::Unit,
+            blocks: one_block(insts),
+            entry: BlockId(0),
+        };
+        let store_p = || Inst::Store {
+            ty: Type::int(32),
+            ptr: Operand::Reg(p),
+            value: Operand::int(32, 0),
+            align: 4,
+        };
+        let call = |callee: Callee, args: Vec<Operand>| Inst::Call {
+            dst: None,
+            callee,
+            args,
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        };
+        let pp = || vec![(p, Type::ptr(Type::int(32)))];
+
+        // Module B: a real writer, and an in-module Direct wrapper around it.
+        let mut b = Module::new("b");
+        b.functions.push(func(0, "writer", pp(), vec![store_p()]));
+        b.functions.push(func(
+            1,
+            "b_wrapper",
+            pp(),
+            vec![call(Callee::Direct(FuncId(0)), vec![Operand::Reg(p)])],
+        ));
+        // Module A: a cross-module Symbol wrapper (resolves to B::writer → writes),
+        // and a call to an unresolved external (stays opaque → writes+frees).
+        let mut a = Module::new("a");
+        a.functions.push(func(
+            0,
+            "a_wrapper",
+            pp(),
+            vec![call(Callee::Symbol("writer".into()), vec![Operand::Reg(p)])],
+        ));
+        a.functions.push(func(
+            1,
+            "a_opaque",
+            vec![],
+            vec![call(Callee::Symbol("some_undefined_ext".into()), vec![])],
+        ));
+
+        let linked = merge_modules(vec![a.clone(), b.clone()], "linked");
+        let want = summarize_module(&linked);
+        let got = summarize_program(&[&a, &b]);
+        assert_eq!(got, want, "link-free summaries must equal the linked summaries");
+
+        // Spot-check the intended effects survived (guards against both being wrong).
+        assert!(want[&FuncId(0)].writes, "a_wrapper inherits B::writer's write");
+        assert!(want[&FuncId(1)].writes && want[&FuncId(1)].frees, "a_opaque is fully havoc'd");
+        assert!(want[&FuncId(2)].writes, "writer writes");
+        assert!(want[&FuncId(3)].writes, "b_wrapper inherits via Direct");
+    }
+
+    /// Randomised losslessness guard: over many random multi-module call graphs
+    /// (stores, frees, and cross-module `Symbol` calls — some to defined names,
+    /// some unresolved/opaque), the link-free summaries must always equal the
+    /// linked ones. Exercises the transitive write/free fixpoint on arbitrary
+    /// graphs, which hand-built cases cannot cover exhaustively.
+    #[test]
+    fn summarize_program_matches_linked_on_random_programs() {
+        use csolver_ir::merge_modules;
+        let p = RegId(0);
+        let mut state: u64 = 0x00C0_FFEE_1234_5678;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let call = |callee: Callee| Inst::Call {
+            dst: None,
+            callee,
+            args: vec![Operand::Reg(p)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        };
+        for _ in 0..400 {
+            let n_mods = 2 + (rng() % 3) as usize; // 2..=4 modules
+            let per = 2 + (rng() % 4) as usize; // 2..=5 functions each
+            let total = n_mods * per;
+            let name = |gi: usize| format!("f{gi}");
+            let mut modules = Vec::new();
+            let mut gi = 0usize;
+            for _ in 0..n_mods {
+                let mut m = Module::new("m");
+                for local in 0..per {
+                    let mut insts = Vec::new();
+                    if rng() & 1 == 0 {
+                        insts.push(Inst::Store {
+                            ty: Type::int(32),
+                            ptr: Operand::Reg(p),
+                            value: Operand::int(32, 0),
+                            align: 4,
+                        });
+                    }
+                    if rng() % 4 == 0 {
+                        insts.push(Inst::Dealloc {
+                            region: csolver_core::RegionKind::Heap,
+                            ptr: Operand::Reg(p),
+                        });
+                    }
+                    for _ in 0..(rng() % 3) {
+                        let callee = if rng() % 5 == 0 {
+                            Callee::Symbol("undefined_ext".into()) // opaque
+                        } else {
+                            Callee::Symbol(name((rng() as usize) % total))
+                        };
+                        insts.push(call(callee));
+                    }
+                    m.functions.push(Function {
+                        id: FuncId(local as u32),
+                        name: name(gi),
+                        params: vec![(p, Type::ptr(Type::int(32)))],
+                        ret_ty: Type::Unit,
+                        blocks: {
+                            let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+                            bb.insts = insts;
+                            vec![bb]
+                        },
+                        entry: BlockId(0),
+                    });
+                    gi += 1;
+                }
+                modules.push(m);
+            }
+            let refs: Vec<&Module> = modules.iter().collect();
+            let got = summarize_program(&refs);
+            let want = summarize_module(&merge_modules(modules.clone(), "linked"));
+            assert_eq!(got, want, "link-free != linked on a random program");
+        }
     }
 
     /// A call in an `Unreachable`-terminated block (rustc's `call @panic…;
