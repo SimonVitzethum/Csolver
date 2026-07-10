@@ -844,6 +844,197 @@ pub(crate) fn synthesize_fields(
         .collect()
 }
 
+/// Whole-program member-provenance **without linking**: the same map as
+/// `synthesize_fields(&merge_modules(mods, …), params, closed_world)`, over the
+/// separate modules. Global escaped set / declared contracts / callee resolution
+/// as in [`synthesize_program`]; the per-caller field-slot analysis is body-local,
+/// hence identical to the linked one. `params` (the whole-program pointer contracts)
+/// and the result are keyed by merge-compatible global ids.
+#[allow(dead_code)] // wired into the verifier by Phase 2; until then only tests use it
+pub(crate) fn synthesize_fields_program(
+    mods: &[&Module],
+    params: &HashMap<(FuncId, u32), PtrContract>,
+    closed_world: bool,
+) -> HashMap<(FuncId, u32), Vec<FieldContract>> {
+    let (name_to_id, remaps) = csolver_ir::merge_id_plan(mods);
+    let layout = mods.first().map_or(csolver_ir::DataLayout::LP64, |m| m.layout);
+    let mut global_fn: HashMap<FuncId, &csolver_ir::Function> = HashMap::new();
+    let mut internal: HashSet<FuncId> = HashSet::new();
+    let mut escaped_names: HashSet<String> = HashSet::new();
+    let mut global_pc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
+    for (mi, m) in mods.iter().enumerate() {
+        escaped_names.extend(address_taken_names(m));
+        for f in &m.functions {
+            let gid = remaps[mi][&f.id];
+            global_fn.insert(gid, f);
+            if m.internal.contains(&f.id) {
+                internal.insert(gid);
+            }
+        }
+        for (&(fid, idx), c) in &m.param_contracts {
+            global_pc.insert((remaps[mi][&fid], idx), *c);
+        }
+    }
+
+    let eligible = |g: FuncId, i: u32| -> bool {
+        let Some(f) = global_fn.get(&g) else { return false };
+        let complete = closed_world || internal.contains(&g);
+        complete
+            && !escaped_names.contains(&f.name)
+            && f.params.get(i as usize).is_some_and(|(_, t)| t.is_ptr())
+            && (params.contains_key(&(g, i)) || global_pc.contains_key(&(g, i)))
+    };
+
+    let mut folded: HashMap<(FuncId, u32), Option<HashMap<u64, SiteGuarantee>>> = HashMap::new();
+    for (mi, m) in mods.iter().enumerate() {
+        let resolve = |callee: &Callee| -> Option<FuncId> {
+            match callee {
+                Callee::Direct(old) => remaps[mi].get(old).copied(),
+                Callee::Symbol(nm) => name_to_id.get(nm).copied(),
+                Callee::Indirect(_) => None,
+            }
+        };
+        for caller in &m.functions {
+            let caller_gid = remaps[mi][&caller.id];
+            let defs = local_defs(caller, caller_gid, &global_pc, &layout, params);
+            for block in &caller.blocks {
+                let mut field_of: HashMap<RegId, (RegId, u64)> = HashMap::new();
+                let mut slot: HashMap<(RegId, u64), SiteGuarantee> = HashMap::new();
+                let mut escaped: HashSet<RegId> = HashSet::new();
+                let root_of = |field_of: &HashMap<RegId, (RegId, u64)>, r: &RegId| -> Option<RegId> {
+                    if defs.contains_key(r) {
+                        Some(*r)
+                    } else {
+                        field_of.get(r).map(|(root, _)| *root)
+                    }
+                };
+                for inst in &block.insts {
+                    match inst {
+                        Inst::PtrOffset { dst, base: Operand::Reg(base), index, elem } => {
+                            let delta = match index {
+                                Operand::Const(Const::Int(bv)) => u64::try_from(bv.unsigned())
+                                    .ok()
+                                    .and_then(|n| n.checked_mul(elem.size_bytes(&layout)?)),
+                                _ => None,
+                            };
+                            match (delta, field_of.get(base).copied(), defs.contains_key(base)) {
+                                (Some(d), Some((root, d0)), _) => {
+                                    if let Some(total) = d0.checked_add(d) {
+                                        field_of.insert(*dst, (root, total));
+                                    }
+                                }
+                                (Some(d), None, true) => {
+                                    field_of.insert(*dst, (*base, d));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Inst::Store { ptr: Operand::Reg(pr), value, .. } => {
+                            if let Operand::Reg(vr) = value {
+                                if let Some(r) = root_of(&field_of, vr) {
+                                    escaped.insert(r);
+                                    slot.retain(|(root, _), _| *root != r);
+                                }
+                            }
+                            let target = field_of
+                                .get(pr)
+                                .copied()
+                                .or_else(|| defs.contains_key(pr).then_some((*pr, 0)));
+                            match target {
+                                Some(slotkey) => match value {
+                                    Operand::Reg(vr) if defs.contains_key(vr) => {
+                                        slot.insert(slotkey, defs[vr]);
+                                    }
+                                    _ => {
+                                        slot.remove(&slotkey);
+                                    }
+                                },
+                                None => slot.clear(),
+                            }
+                        }
+                        Inst::Store { .. } => slot.clear(),
+                        Inst::Call { callee, args, .. } => {
+                            if let Some(g) = resolve(callee) {
+                                if args.len()
+                                    == global_fn.get(&g).map_or(usize::MAX, |c| c.params.len())
+                                {
+                                    for (i, arg) in args.iter().enumerate() {
+                                        let key = (g, i as u32);
+                                        if !eligible(g, i as u32) {
+                                            continue;
+                                        }
+                                        let site: HashMap<u64, SiteGuarantee> = match arg {
+                                            Operand::Reg(root) if defs.contains_key(root) => slot
+                                                .iter()
+                                                .filter(|((r, _), _)| r == root)
+                                                .map(|((_, off), g)| (*off, *g))
+                                                .collect(),
+                                            _ => HashMap::new(),
+                                        };
+                                        intersect_site(folded.entry(key).or_insert(None), site);
+                                    }
+                                }
+                            }
+                            for arg in args {
+                                if let Operand::Reg(a) = arg {
+                                    if let Some(r) = root_of(&field_of, a) {
+                                        escaped.insert(r);
+                                    }
+                                }
+                            }
+                            slot.retain(|(root, _), _| !escaped.contains(root));
+                        }
+                        Inst::MemIntrinsic { dst: Operand::Reg(d), .. } => {
+                            match root_of(&field_of, d) {
+                                Some(r) => {
+                                    escaped.insert(r);
+                                    slot.retain(|(root, _), _| !escaped.contains(root));
+                                }
+                                None => slot.clear(),
+                            }
+                        }
+                        Inst::Intrinsic { .. } | Inst::MemIntrinsic { .. } | Inst::Dealloc { .. } => {
+                            slot.clear()
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    folded
+        .into_iter()
+        .filter_map(|(key, fields)| {
+            let fields = fields?;
+            if fields.is_empty() {
+                return None;
+            }
+            let mut v: Vec<FieldContract> = fields
+                .into_iter()
+                .map(|(offset, g)| FieldContract {
+                    offset,
+                    pointee: PtrContract {
+                        size: SizeSpec::Bytes(g.size),
+                        align: g.align,
+                        readable: g.readable,
+                        writable: g.writable,
+                        assumption: Some(if internal.contains(&key.0) {
+                            INTERNAL_CALL_CONTRACT
+                        } else {
+                            CLOSED_WORLD_CONTRACT
+                        }),
+                        refutable: false,
+                        sentinel: None,
+                    },
+                })
+                .collect();
+            v.sort_by_key(|fc| fc.offset);
+            Some((key, v))
+        })
+        .collect()
+}
+
 /// Fold one call site's field guarantees into the running intersection: keep only
 /// byte offsets present at *every* site so far, each at the weakest guarantee.
 fn intersect_site(
@@ -1231,6 +1422,169 @@ mod program_equiv_tests {
             let got = synthesize_program(&refs, cw);
             let want = synthesize(&merge_modules(modules.clone(), "linked"), cw);
             assert_eq!(got, want, "link-free != linked pointer contracts (cw={cw})");
+        }
+    }
+
+    /// `synthesize_fields_program` (member-provenance, link-free) must equal
+    /// `synthesize_fields(&merge(...), params, …)`: a valid pointer stored into a
+    /// field of a region that is then passed cross-module to a contracted-parameter
+    /// callee gives that parameter's field the same contract as when linked.
+    #[test]
+    fn field_contracts_match_the_linked_module() {
+        // caller: R = alloc 16B; B = alloc 8B; store B into R@0; sink(R).
+        let mut a = Module::new("a");
+        a.functions.push(func(
+            0,
+            "caller",
+            vec![],
+            vec![
+                Inst::Alloc {
+                    dst: RegId(1),
+                    region: csolver_core::RegionKind::Stack,
+                    elem: Type::int(64),
+                    count: Operand::int(64, 2),
+                    align: 8,
+                },
+                Inst::Alloc {
+                    dst: RegId(2),
+                    region: csolver_core::RegionKind::Stack,
+                    elem: Type::int(64),
+                    count: Operand::int(64, 1),
+                    align: 8,
+                },
+                Inst::Store {
+                    ty: Type::ptr(Type::int(64)),
+                    ptr: Operand::Reg(RegId(1)),
+                    value: Operand::Reg(RegId(2)),
+                    align: 8,
+                },
+                Inst::Call {
+                    dst: None,
+                    callee: Callee::Symbol("sink".into()),
+                    args: vec![Operand::Reg(RegId(1))],
+                    ret_ty: Type::Unit,
+                    ret_ref: None,
+                },
+            ],
+        ));
+        let mut b = Module::new("b");
+        b.functions.push(func(0, "sink", vec![(RegId(0), Type::ptr(Type::int(64)))], vec![]));
+
+        for cw in [true, false] {
+            let merged = merge_modules(vec![a.clone(), b.clone()], "l");
+            let params = synthesize(&merged, cw);
+            let want = synthesize_fields(&merged, &params, cw);
+            let got = synthesize_fields_program(&[&a, &b], &params, cw);
+            assert_eq!(got, want, "link-free field contracts must equal linked (cw={cw})");
+        }
+        // Under closed-world, sink (FuncId 1) gets a field at offset 0.
+        let merged = merge_modules(vec![a.clone(), b.clone()], "l");
+        let params = synthesize(&merged, true);
+        let got = synthesize_fields_program(&[&a, &b], &params, true);
+        assert_eq!(got.get(&(FuncId(1), 0)).map(|v| v.len()), Some(1), "sink gets one field");
+    }
+
+    /// Randomised guard for member-provenance over random multi-module programs
+    /// that build regions, store valid pointers into fields (at offset 0 and via a
+    /// constant `PtrOffset`), pass the region cross-module and in-module, and clobber
+    /// via extra calls / stores — with `params` taken from `synthesize` so callees
+    /// carry the contracts fields attach to.
+    #[test]
+    fn field_contracts_match_linked_on_random_programs() {
+        let mut state: u64 = 0x0F1E_2D3C_4B5A_6978;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..300 {
+            let n_mods = 2 + (rng() % 2) as usize;
+            let per = 2 + (rng() % 3) as usize;
+            let total = n_mods * per;
+            let name = |gi: usize| format!("k{gi}");
+            let mut modules = Vec::new();
+            let mut gi = 0usize;
+            for _ in 0..n_mods {
+                let mut m = Module::new("m");
+                for local in 0..per {
+                    let mut insts = vec![
+                        // R = region (16B, holds two 8B slots), B = a valid 8B buffer.
+                        Inst::Alloc {
+                            dst: RegId(1),
+                            region: csolver_core::RegionKind::Stack,
+                            elem: Type::int(64),
+                            count: Operand::int(64, 2),
+                            align: 8,
+                        },
+                        Inst::Alloc {
+                            dst: RegId(2),
+                            region: csolver_core::RegionKind::Stack,
+                            elem: Type::int(64),
+                            count: Operand::int(64, 1),
+                            align: 8,
+                        },
+                    ];
+                    // Maybe a field pointer R + k*8.
+                    if rng() % 2 == 0 {
+                        insts.push(Inst::PtrOffset {
+                            dst: RegId(3),
+                            base: Operand::Reg(RegId(1)),
+                            index: Operand::int(64, (rng() % 2) as u128),
+                            elem: Type::int(64),
+                        });
+                    }
+                    // Maybe store B (a valid ptr) or an unknown value into R@0 or the field.
+                    if rng() % 3 != 0 {
+                        let target = if rng() % 2 == 0 { RegId(1) } else { RegId(3) };
+                        let value = if rng() % 3 == 0 {
+                            Operand::int(64, 0) // unknown value clears the slot
+                        } else {
+                            Operand::Reg(RegId(2))
+                        };
+                        insts.push(Inst::Store {
+                            ty: Type::ptr(Type::int(64)),
+                            ptr: Operand::Reg(target),
+                            value,
+                            align: 8,
+                        });
+                    }
+                    // Pass R to some targets (and maybe escape it via an extra call).
+                    for _ in 0..(1 + rng() % 2) {
+                        let tgt = (rng() as usize) % total;
+                        insts.push(Inst::Call {
+                            dst: None,
+                            callee: Callee::Symbol(name(tgt)),
+                            args: vec![Operand::Reg(RegId(1))],
+                            ret_ty: Type::Unit,
+                            ret_ref: None,
+                        });
+                    }
+                    if rng() % 5 == 0 {
+                        let e = (rng() as usize) % total;
+                        insts.push(Inst::Assign {
+                            dst: RegId(9),
+                            ty: Type::ptr(Type::int(32)),
+                            value: RValue::Use(Operand::Const(Const::Symbol(name(e)))),
+                        });
+                    }
+                    m.functions.push(func(
+                        local as u32,
+                        &name(gi),
+                        vec![(RegId(0), Type::ptr(Type::int(64)))],
+                        insts,
+                    ));
+                    gi += 1;
+                }
+                modules.push(m);
+            }
+            let cw = rng() & 1 == 0;
+            let refs: Vec<&Module> = modules.iter().collect();
+            let merged = merge_modules(modules.clone(), "linked");
+            let params = synthesize(&merged, cw);
+            let want = synthesize_fields(&merged, &params, cw);
+            let got = synthesize_fields_program(&refs, &params, cw);
+            assert_eq!(got, want, "link-free != linked field contracts (cw={cw})");
         }
     }
 
