@@ -148,6 +148,35 @@ slots + heap load-consistency + region-level label persistence — each soundnes
 single "page-granular aliasing" feature, and was not built as a rushed risky chain; this
 note records the precise, ordered work so it can be done properly and oracle-guarded.
 
+## Update 2026-07-12 (2) — value-flow gap CLOSED; the CVE sink is the AAD copy
+
+**Opaque read-consistency landed (`6a9493b`)** — read-after-read consistency, which
+existed only for region bases, now covers **opaque object ids** too. Two loads of the
+same `(opaque-base, concrete offset)` return the same value, so `req->src`/`req->dst`
+read off an opaque request (alloca round-trip + interior-field loads — the real crypto
+worker's shape) are now recognised as aliasing. Proven by a regression test on that exact
+shape (in-place refused, out-of-place not). Sound and general (differential-SOUND). This
+was the object-granular value-flow gap — **not** "page-granular aliasing," which the gate
+never needed.
+
+**Why the real CVE still does not fire — definitively traced.** In the vulnerable v6.12
+`-O1` IR, `aead_request_set_crypt(req, src, dst)` is called with
+`src = areq->tsgl` (field 5, the **TX** scatterlist) and `dst = areq->first_rsgl`
+(field 2, the **RX** scatterlist) — two *different* fields, i.e. the main crypto is
+legitimately **out-of-place** (TX→RX). Read-consistency correctly does NOT alias them
+(no false FAIL). Matching the fix commit exactly — *"mostly reverts … except for the
+copying of the associated data"* — CVE-2026-31431 is the in-place copy of the
+**associated data (AAD)**, a *different* operation from the main src/dst crypto that the
+contract's `require-if-alias` gates. The contract targets the wrong sink.
+
+**The remaining, correctly-scoped step** is therefore a **contract change** (data, no scan
+code): put a capability gate on the AAD-copy sink — `crypto_aead_copy_sgl` /
+the NULL-cipher AAD copy — that fires when its destination is a `foreign` page, gated so
+the patched out-of-place AAD copy does not fire. This needs the AAD-copy semantics modelled
+and validated on a positive/negative pair, but it is the right level: no aliasing/value-flow
+feature closes it, because the main-crypto aliasing the previous gate checked is genuinely
+absent here.
+
 ## Validation (soundness-first, mandatory)
 
 Extend the **C differential oracle** with positive controls for the write-capability
