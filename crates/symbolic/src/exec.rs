@@ -3586,6 +3586,7 @@ impl Explorer<'_> {
         let region = &state.regions[rid];
         let rstate = region.state;
         let rperms = region.perms;
+        let rkind = region.kind;
         let rsize = region.size;
         let contract = region.contract;
         let size_nowrap = region.size_nowrap;
@@ -3622,13 +3623,29 @@ impl Explorer<'_> {
         let aligned = aalign <= 1 || p.align.is_multiple_of(aalign);
         self.record(block, idx, Alignment, aligned, "address meets the required alignment", "could not prove the required alignment");
 
-        // Permission.
-        let granted = match perm_prop {
-            ValidRead => rperms.read,
-            ValidWrite => rperms.write,
-            _ => true,
-        };
-        self.record(block, idx, perm_prop, granted, "region grants the access permission", "region does not grant the access permission");
+        // Permission. A write into a region that provably lacks write permission is a
+        // real violation. When that region is a definitely read-only GLOBAL — a store
+        // into `.rodata` / a `constant` object, which faults at runtime — it is refuted
+        // (a FAIL with a witness) like any other definite memory violation. Any other
+        // non-writable region (a contract-derived `const`/`readonly` parameter, which C
+        // legitimately casts away) stays a prove-only UNKNOWN, so this adds no false FAIL.
+        if matches!(perm_prop, ValidWrite) && !rperms.write && matches!(rkind, RegionKind::Global) {
+            self.record_temporal(
+                (block, idx),
+                ValidWrite,
+                true,
+                state,
+                "region grants the write permission",
+                "write into a read-only (constant/.rodata) region",
+            );
+        } else {
+            let granted = match perm_prop {
+                ValidRead => rperms.read,
+                ValidWrite => rperms.write,
+                _ => true,
+            };
+            self.record(block, idx, perm_prop, granted, "region grants the access permission", "region does not grant the access permission");
+        }
 
         if non_null && live {
             self.assumptions.insert(contract.unwrap_or(ALLOC_SUCCEEDS));
@@ -6690,6 +6707,48 @@ mod tests {
         );
         let uaf2 = r2.mem_decision(BlockId(0), 6, SafetyProperty::NoUseAfterFree).expect("uaf2");
         assert!(!uaf2.proven, "an opaque indirect call must havoc, leaving the write unproven");
+    }
+
+    /// A1 (IR-intrinsic read-only): a store into a `constant` global — a `.rodata`
+    /// write that faults at runtime — is a refutable violation (FAIL), while a store
+    /// into a writable global proves. General and sound: it rests only on the module's
+    /// own `constant` vs `global` linkage, and a runtime `.rodata` write is always a bug.
+    #[test]
+    fn write_to_constant_global_is_refuted() {
+        use std::collections::HashMap;
+        let mk = |name: &str| {
+            let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+            bb0.insts.push(Inst::Store {
+                ty: Type::int(32),
+                ptr: Operand::Const(Const::Symbol(name.into())),
+                value: Operand::int(32, 7),
+                align: 4,
+            });
+            Function {
+                id: FuncId(0),
+                name: "w".into(),
+                params: vec![],
+                ret_ty: Type::Unit,
+                blocks: vec![bb0],
+                entry: BlockId(0),
+            }
+        };
+        let mut globals = HashMap::new();
+        globals.insert("ro".to_string(), csolver_ir::GlobalDef { size: 4, align: 4, writable: false });
+        globals.insert("rw".to_string(), csolver_ir::GlobalDef { size: 4, align: 4, writable: true });
+        let empty = HashMap::new();
+        let run = |f: &Function| {
+            discharge_inner(
+                f, ExecLimits { bug_finding: true, ..ExecLimits::default() }, &HashMap::new(),
+                &HashMap::new(), &[], &[], &[], &globals, &empty, &HashMap::new(), None,
+            )
+        };
+        let ro = run(&mk("ro"));
+        let vw = ro.mem_decision(BlockId(0), 0, SafetyProperty::ValidWrite).expect("valid_write");
+        assert!(!vw.proven && vw.refutation.is_some(), "a write into a constant global must be refuted: {}", vw.residual);
+        let rw = run(&mk("rw"));
+        let vw2 = rw.mem_decision(BlockId(0), 0, SafetyProperty::ValidWrite).expect("valid_write");
+        assert!(vw2.proven, "a write into a writable global must prove: {}", vw2.residual);
     }
 
     /// 2b (whole-program on-demand): a cross-file `Callee::Symbol(name)` with no
