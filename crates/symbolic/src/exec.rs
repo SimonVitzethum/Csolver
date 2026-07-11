@@ -4364,6 +4364,23 @@ impl Explorer<'_> {
     fn eval_value(&mut self, op: &Operand, state: &PathState) -> SymValue {
         match op {
             Operand::Reg(r) => match state.env.get(r) {
+                // A pointer into a region that a control-flow merge dropped keeps its old
+                // region id, which now points past the end of this path's `regions`.
+                // `merge_core` rewrites such pointers held in the environment, but one can
+                // still reach a register via the heap/store list, a block argument, or a
+                // summary return. Sanitize it to Unknown provenance on read, so every
+                // downstream region access (bounds, liveness, dealloc, provenance) sees a
+                // valid id or an opaque pointer — never an out-of-range index. Sound: an
+                // unknown-provenance pointer is only ever treated conservatively.
+                Some(SymValue::Ptr(p))
+                    if matches!(p.prov, Prov::Region(rid) if rid >= state.regions.len()) =>
+                {
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Unknown(POrigin::RegionDrop, None),
+                        offset: p.offset,
+                        align: p.align,
+                    })
+                }
                 Some(v) => v.clone(),
                 None => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
             },
