@@ -65,9 +65,22 @@ label arg3 foreign
 [_aead_recvmsg aead_recvmsg]
 seed arg0 foreign
 
-# NOTE: on REAL algif_aead the scatterlist regions are built by opaque helpers
-# (`af_alg_get_rsgl`) and reached through struct-field loads (`areq->first_rsgl.sgl.sg`), whose
-# region identity the per-TU analysis does not yet recover — so the provenance does not yet
-# connect end-to-end on the unmodified kernel .ll. The contract chain and the enforcement are
-# complete (proven on a faithful synthetic reproduction); closing it on real IR needs the
-# opaque-region / member-provenance recovery for these crypto-API structs.
+# NOTE (diagnosis refined 2026-07-11, on vulnerable v6.12 `crypto/algif_aead.ll`):
+# the `foreign` label now DOES reach the AEAD request at the sink — the cross-syscall
+# `seed arg0 foreign` + taint-on-read propagate it to `crypto_aead_{en,de}crypt`'s arg0
+# (verified: the request object carries the label). What still does not connect is the
+# **in-place aliasing** of `req->src` (off 64) and `req->dst` (off 72): they are read back
+# as two DISTINCT opaque values, so the `require-if-alias-fields` gate cannot see `src==dst`
+# and (soundly) does not fire.
+#
+# Root cause: an intervening opaque call between the request setup and the crypto op
+# (`af_alg_get_rsgl` and the request-build helpers) HAVOCs the analyzer's store-forwarding,
+# so the same-SSA-value stores to src/dst are forgotten by the time the op reads them. The
+# enforcement + this contract chain are complete and proven on a faithful synthetic
+# reproduction *and* on an opaque (heap) request with no intervening havoc; forcing the gate
+# to fire once the aliasing is unknown would be UNSOUND (the intervening call may legitimately
+# set an out-of-place dst → a false FAIL on the patched path). Closing it on real optimized IR
+# therefore needs PRECISE INTERPROCEDURAL EFFECT SUMMARIES for the request-build helpers (that
+# they do not clobber `req->src`/`req->dst`), so store-forwarding survives the call — a general,
+# contract-expressible feature, not a copy-fail special case. See
+# `Kerneltests/scanrun/logs/copyfail-detection-design.md`.
