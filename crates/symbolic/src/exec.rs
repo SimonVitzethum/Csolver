@@ -2619,7 +2619,9 @@ impl Explorer<'_> {
             Inst::FieldPtr { dst, base, field, size, align } => {
                 let base_ptr = self.eval_pointer(base, state);
                 let result = match &base_ptr.prov {
-                    Prov::Region(r) => {
+                    // Guard against a stale (dropped-region) id — fall through to the
+                    // unknown-provenance arm below rather than indexing out of bounds.
+                    Prov::Region(r) if state.regions.get(*r).is_some() => {
                         // A typed field of a valid aggregate lies within it. Place
                         // it at its synthetic offset (concrete, so distinct fields
                         // are disjoint and the same field round-trips), assert
@@ -3092,7 +3094,8 @@ impl Explorer<'_> {
         }
         for &(d, s) in &prov.transfers {
             let Some(src) = region(s) else { continue };
-            let src_labels = state.regions[src].prov_labels.clone();
+            let Some(src_region) = state.regions.get(src) else { continue };
+            let src_labels = src_region.prov_labels.clone();
             if src_labels.is_empty() {
                 continue;
             }
@@ -3109,7 +3112,7 @@ impl Explorer<'_> {
     /// (`Prov::Unknown`'s id, which flows through `gep`/copy). Unifies both channels.
     fn ptr_labels(&mut self, ptr: &Operand, state: &PathState) -> HashSet<u32> {
         match self.eval_pointer(ptr, state).prov {
-            Prov::Region(rid) => state.regions[rid].prov_labels.clone(),
+            Prov::Region(rid) => state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default(),
             Prov::Unknown(_, Some(id)) => state.opaque_labels.get(&id).cloned().unwrap_or_default(),
             _ => HashSet::new(),
         }
@@ -3583,7 +3586,17 @@ impl Explorer<'_> {
             }
             return;
         };
-        let region = &state.regions[rid];
+        // A stale region id (a dropped-region pointer that reached here via a heap
+        // reload / block arg / select branch, past `eval_value`'s sanitization) is
+        // treated as unknown provenance instead of indexing out of bounds — sound (the
+        // access is left unproven, never a false PASS).
+        let Some(region) = state.regions.get(rid) else {
+            let residual = Prov::Unknown(POrigin::RegionDrop, None).provenance_residual();
+            for prop in [NoUseAfterFree, InBounds, Alignment, perm_prop] {
+                self.record(block, idx, prop, false, "requires known provenance", residual);
+            }
+            return;
+        };
         let rstate = region.state;
         let rperms = region.perms;
         let rkind = region.kind;
@@ -3679,8 +3692,18 @@ impl Explorer<'_> {
             self.record(block, idx, ValidPointerArith, false, "requires known provenance", p.prov.provenance_residual());
             return;
         };
-        let rsize = state.regions[rid].size;
-        let contract = state.regions[rid].contract;
+        // A stale region id — a pointer into a region a control-flow merge dropped —
+        // whose id now points past this path's `regions`. `eval_value` rewrites such
+        // pointers on a register read, but one can still reach here via a heap reload, a
+        // block argument, or a `select` branch; treat it as unknown provenance rather
+        // than indexing out of bounds. Sound: the arithmetic is left unproven, never a
+        // false PASS.
+        let Some(region) = state.regions.get(rid) else {
+            self.record(block, idx, ValidPointerArith, false, "requires known provenance", Prov::Unknown(POrigin::RegionDrop, None).provenance_residual());
+            return;
+        };
+        let rsize = region.size;
+        let contract = region.contract;
         // In-object or one-past-end: 0 <= offset <= size. Refutation off here:
         // the *access* in-bounds check (in `check_access`) is the one that
         // carries the OOB counterexample; the intermediate pointer arithmetic is
@@ -3700,6 +3723,11 @@ impl Explorer<'_> {
             self.record(block, idx, NoDoubleFree, false, "requires known provenance", "freed pointer provenance is not tracked");
             return;
         };
+        // A stale (dropped-region) id is treated as unknown provenance, not an OOB index.
+        if state.regions.get(rid).is_none() {
+            self.record(block, idx, NoDoubleFree, false, "requires known provenance", "freed pointer provenance is not tracked (region dropped at path merge)");
+            return;
+        }
         if state.regions[rid].contract.is_some() {
             // Freeing caller-owned (borrowed) memory is not ours to prove safe.
             self.record(block, idx, NoDoubleFree, false, "caller-owned region", "freeing a borrowed (caller-owned) region is not provably valid");
