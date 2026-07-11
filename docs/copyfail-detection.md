@@ -116,6 +116,38 @@ store-effect contracts) combined with page-level reasoning. This is a substantia
 analysis feature — deliberately *not* faked with a heuristic that would false-FAIL the
 patched out-of-place path.
 
+## Update 2026-07-12 — "page-granular aliasing" is NOT the binding constraint
+
+Traced the vulnerable module at `-O1` (readable IR) to the exact `require-if-alias`
+site: `aead_request_set_crypt(req, src=%144, dst=%146)` is a *visible call*, and
+
+- `src = load %rsgl_src` (a local pointer slot),
+- `dst = load (areq->first_rsgl.sgl.sgt.sgl)` (a heap field of the RX request).
+
+At the gate, `alias_lacks_cap(pa, pb)` sees `pa = Unknown(Load 36)`, `pb =
+Unknown(Load 45)` — **distinct opaque ids, both unlabelled** (`labA = labB = 0`), so
+`lacks = false`. Two independent facts, both upstream of aliasing:
+
+1. **The gate is already object-granular.** `alias_lacks_cap` treats two pointers as
+   aliasing when they share the same region *or* the same opaque base id (any offset,
+   offset-satisfiable for opaque) — a strictly stronger test than pointer identity.
+   Adding "page granularity" changes nothing here: `src` and `dst` have *different*
+   bases, not the same base at a different offset.
+2. **The real gap is value-flow, not aliasing.** `src` and `dst` are the *same* sgl in
+   the in-place case, but the analysis cannot see it because (a) the intermediate pointer
+   slot `%rsgl_src` is not promoted to SSA, so `src` stays an opaque load; (b) even
+   promoted, `src` and `dst` become two loads of the same heap field, which need
+   **heap load-consistency** (same `(base, offset)` load ⇒ same value) to be recognised
+   as equal; and (c) the `foreign` label is applied to one SSA load of the request and
+   lost across the alloca round-trip, so it never reaches `dst` (**label persistence on
+   the region**, not on a value).
+
+So closing this needs a **value-flow chain** — mem2reg promotion of multi-store pointer
+slots + heap load-consistency + region-level label persistence — each soundness-critical
+(a rushed version false-FAILs the patched out-of-place path). It is deliberately NOT the
+single "page-granular aliasing" feature, and was not built as a rushed risky chain; this
+note records the precise, ordered work so it can be done properly and oracle-guarded.
+
 ## Validation (soundness-first, mandatory)
 
 Extend the **C differential oracle** with positive controls for the write-capability

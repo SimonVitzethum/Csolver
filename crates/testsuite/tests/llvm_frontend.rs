@@ -3118,6 +3118,52 @@ entry:
         "a distinct dst (patched out-of-place) does not fire — no false FAIL");
 }
 
+/// **Read-consistency on an opaque object's fields.** The real crypto worker reads
+/// `req->src` and `req->dst` off an *opaque* request (a call result reached through an
+/// alloca round-trip), not a stack `alloca` whose stores forward. Two reads of the same
+/// `(opaque-base, offset)` with no intervening write must return the SAME value, so an
+/// in-place op (src and dst both that field) is recognised and refused. Sound: the value
+/// is a fresh unknown either way — read-consistency only adds an equality between two
+/// reads of one location, never a false PASS, and the out-of-place case (distinct field)
+/// still does not fire.
+#[test]
+fn opaque_field_read_consistency_recognises_in_place() {
+    let base = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare void @aead_request_set_crypt(ptr, ptr, ptr, i32, ptr)
+declare ptr @alloc_req()
+define void @f(ptr %sk) {
+entry:
+  %slot = alloca ptr, align 8
+  %areq = call ptr @alloc_req()
+  store ptr %areq, ptr %slot, align 8
+  call void @af_alg_sendpage(ptr %sk, ptr %areq)
+  %r1 = load ptr, ptr %slot, align 8
+  %f1 = getelementptr inbounds i8, ptr %r1, i64 16
+  %src = load ptr, ptr %f1, align 8
+  %r2 = load ptr, ptr %slot, align 8
+  %f2 = getelementptr inbounds i8, ptr %r2, i64 SRCOFF
+  %dst = load ptr, ptr %f2, align 8
+  call void @aead_request_set_crypt(ptr %areq, ptr %src, ptr %dst, i32 0, ptr null)
+  ret void
+}
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // In-place: src and dst read the SAME opaque field (offset 16) → the two reads agree
+    // (read-consistency) → recognised as an in-place write of a foreign field → refused.
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: base.replace("SRCOFF", "16"), name: "ip".into() })
+        .expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "two reads of the same opaque field must alias → in-place foreign write refused");
+    // Out-of-place: src and dst read DIFFERENT fields (16 vs 24) → distinct values → no fire.
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: base.replace("SRCOFF", "24"), name: "oop".into() })
+        .expect("lower");
+    assert_ne!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "distinct opaque fields do not alias — no false FAIL");
+}
+
 /// **Taint-on-read chains through plain field loads**: the seeded socket's `foreign` provenance
 /// flows `sk → ctx → child` across two levels of ordinary pointer-field loads (not just DWARF
 /// raw-pointer/RefWitness fields), and the in-place write of the twice-loaded `child` is refused.

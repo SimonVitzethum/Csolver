@@ -4167,20 +4167,32 @@ impl Explorer<'_> {
             return (SymValue::Scalar(self.fresh_genuine_scalar(type_width(ty))), LoadOrigin::Stored);
         }
         // Read-consistency: no store aliases this location, so it is unwritten. Two reads of
-        // the same never-written `(region, concrete offset, width)` must agree (unwritten
-        // memory holds one fixed unknown value). Reuse the value first materialized here;
-        // materialize (and cache) it otherwise. Only for a concrete offset — a symbolic
-        // offset stays a fresh over-approximation. The cache is dropped on every heap havoc.
-        if let Prov::Region(rid) = p.prov {
-            if let Some(off) = self.ctx.as_const(p.offset).map(|bv| bv.unsigned()) {
-                let key = (rid, off, ty.size_bytes(&LAYOUT).unwrap_or(0) as u32);
-                if let Some(v) = state.unwritten_reads.get(&key) {
-                    return (v.clone(), LoadOrigin::Unwritten);
-                }
-                let v = self.fresh_value(ty, POrigin::Load);
-                state.unwritten_reads.insert(key, v.clone());
-                return (v, LoadOrigin::Unwritten);
+        // the same never-written `(base, concrete offset, width)` must agree (unwritten memory
+        // holds one fixed unknown value). Reuse the value first materialized here; materialize
+        // (and cache) it otherwise. Only for a concrete offset — a symbolic offset stays a
+        // fresh over-approximation. The cache is dropped on every heap havoc.
+        //
+        // The base is a region id OR an **opaque object id** (an interior field of a call
+        // result / parameter, e.g. `areq->src` and `areq->dst` read twice off the same opaque
+        // request) placed in a disjoint id namespace so the two spaces never collide. This is
+        // what lets two loads of the same opaque field alias — sound: the returned value is a
+        // fresh unknown either way, so read-consistency can only ADD an equality between two
+        // reads of one location, never a false PASS (it makes nothing wrongly provable) nor a
+        // false FAIL (the two reads genuinely are the same location, hence the same value).
+        const OPAQUE_NS: usize = 1 << 48;
+        let base = match p.prov {
+            Prov::Region(rid) => Some(rid),
+            Prov::Unknown(_, Some(id)) => Some((id as usize) | OPAQUE_NS),
+            _ => None,
+        };
+        if let (Some(base), Some(off)) = (base, self.ctx.as_const(p.offset).map(|bv| bv.unsigned())) {
+            let key = (base, off, ty.size_bytes(&LAYOUT).unwrap_or(0) as u32);
+            if let Some(v) = state.unwritten_reads.get(&key) {
+                return (v.clone(), LoadOrigin::Unwritten);
             }
+            let v = self.fresh_value(ty, POrigin::Load);
+            state.unwritten_reads.insert(key, v.clone());
+            return (v, LoadOrigin::Unwritten);
         }
         (self.fresh_value(ty, POrigin::Load), LoadOrigin::Unwritten)
     }
