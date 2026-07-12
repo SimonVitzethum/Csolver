@@ -1356,6 +1356,8 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             Read(x) => format!("read {x}"),
             Write(x) => format!("write {x}"),
             Fence => "barrier".to_string(),
+            WFence => "write-barrier".to_string(),
+            RFence => "read-barrier".to_string(),
         }
     };
     if !violations.is_empty() {
@@ -1368,13 +1370,17 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             }
         }
     }
-    // Store-buffer / missing-barrier weak-memory bugs (subsystem 4, weak memory).
-    let sb = csolver_verifier::store_buffer_violations(&threads);
-    if !sb.is_empty() {
-        println!("\n== store-buffer / missing-barrier bugs (weak memory) ({}) [bug-finding] ==", sb.len());
-        for w in &sb {
-            println!("  {} writes {} then reads {}; {} writes {} then reads {} — no barrier between",
-                w.threads.0, w.locations.0, w.locations.1, w.threads.1, w.locations.1, w.locations.0);
+    // Weak-memory (SC-robustness) bugs via the operational PSO model (subsystem 4) — subsumes
+    // the store-buffer and message-passing litmus, with a concrete non-SC schedule as witness.
+    let wm = csolver_verifier::find_weak_memory_bugs(&threads);
+    if !wm.is_empty() {
+        println!("\n== weak-memory (SC-robustness) bugs ({}) [bug-finding] ==", wm.len());
+        for w in &wm {
+            println!("  threads {}: {}", w.threads.join(", "), w.description);
+            println!("    non-SC schedule:");
+            for (thread, step) in &w.schedule {
+                println!("      {thread}: {step}");
+            }
         }
     }
 }

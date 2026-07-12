@@ -547,10 +547,13 @@ pub enum Inst {
         /// The returned value (if any), whose resource escapes and is not a leak.
         escaping: Option<Operand>,
     },
-    /// **Memory barrier** (weak-memory, subsystem 4): a full fence (`smp_mb`/…) recorded in
-    /// the interleaving trace so the store-buffer check knows a store cannot be reordered past
-    /// it. No memory-safety effect of its own.
-    Barrier,
+    /// **Memory barrier** (weak-memory, subsystem 4): recorded in the interleaving trace so the
+    /// operational weak-memory model orders accesses accordingly. `kind` 0 = full (`smp_mb`),
+    /// 1 = write (`smp_wmb`), 2 = read (`smp_rmb`). No memory-safety effect of its own.
+    Barrier {
+        /// 0 = full, 1 = write, 2 = read.
+        kind: u8,
+    },
     /// **Secret-dependence check** (constant-time L): `val` (a branch condition or a `gep`
     /// index) must not carry the `secret` taint label. Implies
     /// [`SafetyProperty::SecretDependent`]. Injected by the frontend at every branch and
@@ -645,7 +648,7 @@ impl Inst {
             | Inst::Refcount { .. }
             | Inst::TypestateLeakCheck { .. }
             | Inst::SecretCheck { .. }
-            | Inst::Barrier
+            | Inst::Barrier { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }

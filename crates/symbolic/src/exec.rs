@@ -338,7 +338,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                         op(e);
                     }
                 }
-                Inst::TypestateYield { .. } | Inst::Barrier => {}
+                Inst::TypestateYield { .. } | Inst::Barrier { .. } => {}
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -3214,11 +3214,11 @@ impl Explorer<'_> {
                     "a resource acquired on this path is neither released nor returned (leak)",
                 );
             }
-            // A memory barrier: record a fence in the interleaving trace (weak-memory store-
-            // buffer check). No memory-safety effect.
-            Inst::Barrier => {
+            // A memory barrier: record a fence in the interleaving trace (weak-memory model).
+            // Trace kind 4 = full (`smp_mb`), 5 = write (`smp_wmb`), 6 = read (`smp_rmb`).
+            Inst::Barrier { kind } => {
                 if self.race_trace.len() < RACE_TRACE_CAP {
-                    self.race_trace.push((4, String::new()));
+                    self.race_trace.push((4 + *kind, String::new()));
                 }
             }
             // Constant-time: a secret-tainted value must not decide a branch or index memory.

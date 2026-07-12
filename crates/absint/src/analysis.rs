@@ -487,7 +487,7 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::Refcount { .. }
         | Inst::TypestateLeakCheck { .. }
         | Inst::SecretCheck { .. }
-        | Inst::Barrier
+        | Inst::Barrier { .. }
         | Inst::SafetyCheck { .. } => {}
     }
 }

@@ -266,10 +266,14 @@ pub enum Effect {
         /// `true` for a decrement (`put`), `false` for an increment (`get`).
         dec: bool,
     },
-    /// **Memory barrier** (weak-memory, subsystem 4): the call is a full memory barrier
-    /// (`smp_mb`/`mb`/…) — it orders the thread's prior writes before its later reads, so a
-    /// store cannot be reordered past it. Recorded in the interleaving trace as a fence.
-    Barrier,
+    /// **Memory barrier** (weak-memory, subsystem 4): the call is a memory barrier —
+    /// `kind` 0 = full (`smp_mb`, orders W→R), 1 = write (`smp_wmb`, orders W→W), 2 = read
+    /// (`smp_rmb`, orders R→R). Recorded in the interleaving trace so the operational
+    /// weak-memory model drains the store buffers accordingly.
+    Barrier {
+        /// 0 = full (`smp_mb`), 1 = write (`smp_wmb`), 2 = read (`smp_rmb`).
+        kind: u8,
+    },
     /// **Leak-state declaration** (K): a resource left in `state` of `protocol` at a function
     /// **return** (without being released or escaping via the return value) is a resource
     /// leak. Not applied at a call — it registers `(protocol, state)` as a leak state checked
@@ -567,8 +571,16 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let protocol = rest.get(1).copied().ok_or("`refcount` needs a protocol")?.to_string();
             Ok(Effect::Refcount { arg, protocol, dec: kind == "refcount-dec" })
         }
-        // `barrier` (a full memory barrier; no arguments).
-        "barrier" => Ok(Effect::Barrier),
+        // `barrier [write|read]` — a full (default), write, or read memory barrier.
+        "barrier" => {
+            let kind = match rest.first().copied() {
+                None | Some("full") => 0,
+                Some("write") => 1,
+                Some("read") => 2,
+                Some(other) => return Err(format!("unknown barrier kind `{other}`")),
+            };
+            Ok(Effect::Barrier { kind })
+        }
         // `typestate-leak <protocol> <state>` (registers a leak state; checked at returns).
         "typestate-leak" => {
             let protocol = rest.first().copied().ok_or("`typestate-leak` needs a protocol")?.to_string();
@@ -795,10 +807,12 @@ mod tests {
             c.lookup("own").unwrap().effects,
             vec![Effect::TypestateLeak { protocol: "file".into(), state: "open".into() }]
         );
-        // A barrier effect (no arguments).
+        // Barrier effects: full (default), write, read.
         let mut c2 = Contracts::default();
-        c2.parse_str("[smp_mb]\nbarrier\n", "t").unwrap();
-        assert_eq!(c2.lookup("smp_mb").unwrap().effects, vec![Effect::Barrier]);
+        c2.parse_str("[smp_mb]\nbarrier\n[smp_wmb]\nbarrier write\n[smp_rmb]\nbarrier read\n", "t").unwrap();
+        assert_eq!(c2.lookup("smp_mb").unwrap().effects, vec![Effect::Barrier { kind: 0 }]);
+        assert_eq!(c2.lookup("smp_wmb").unwrap().effects, vec![Effect::Barrier { kind: 1 }]);
+        assert_eq!(c2.lookup("smp_rmb").unwrap().effects, vec![Effect::Barrier { kind: 2 }]);
     }
 
     #[test]

@@ -3323,6 +3323,37 @@ fn store_buffer_without_barrier_is_a_weak_memory_bug() {
     assert!(good.store_buffer_bugs().is_empty(), "an smp_mb barrier fixes the store-buffer bug");
 }
 
+/// **Message-passing / publish (operational weak-memory model, subsystem 4 — full semantics).**
+/// A producer writes `data` then `flag`; a consumer reads `flag` then `data`. Under the PSO
+/// store-buffer model the producer's two writes can become visible out of order, so the consumer
+/// can observe `flag=set` but `data=stale` — an outcome no sequentially-consistent execution
+/// allows (non-robust). The **write barrier** `smp_wmb` between the two publishes fixes it. This
+/// is the case the syntactic store-buffer (W→R) check does not catch — it needs the operational
+/// model.
+#[test]
+fn message_passing_without_wmb_is_a_weak_memory_bug() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |mid: &str| {
+        let src = format!(
+            "@data = global i32 0, align 4\n@flag = global i32 0, align 4\ndeclare void @smp_wmb()\n\
+             define void @producer() {{\n  store i32 42, ptr @data, align 4\n{mid}  \
+               store i32 1, ptr @flag, align 4\n  ret void\n}}\n\
+             define i32 @consumer() {{\n  %f = load i32, ptr @flag, align 4\n  \
+               %d = load i32, ptr @data, align 4\n  ret i32 %d\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "mp".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // No write barrier → the publish can be observed out of order (non-SC-robust).
+    let bad = module("");
+    assert_eq!(bad.weak_memory_bugs().len(), 1, "message passing without smp_wmb is not SC-robust");
+    // The syntactic store-buffer (W→R) check does NOT catch this (it is a W→W reorder).
+    assert!(bad.store_buffer_bugs().is_empty(), "MP is not a store-buffer (W->R) shape");
+    // A write barrier between the two producer writes restores robustness.
+    let good = module("  call void @smp_wmb()\n");
+    assert!(good.weak_memory_bugs().is_empty(), "smp_wmb between the publishes fixes it");
+}
+
 /// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and
 /// accessed without that lock in another is a candidate race (inconsistent lockset, a write,
 /// two functions). Consistent locking on every access is not flagged (no false positive).

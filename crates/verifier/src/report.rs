@@ -145,4 +145,18 @@ impl ModuleReport {
             .collect();
         crate::interleave::store_buffer_violations(&threads)
     }
+
+    /// Candidate **weak-memory (SC-robustness) bugs** among this module's functions (subsystem
+    /// 4, full operational model): a pair of functions whose concurrent execution under the PSO
+    /// store-buffer model can observe a read outcome no sequentially-consistent execution allows
+    /// — a missing barrier. Subsumes the store-buffer *and* message-passing (`smp_wmb`) litmus.
+    pub fn weak_memory_bugs(&self) -> Vec<crate::interleave::WeakMemoryWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::interleave::find_weak_memory_bugs(&threads)
+    }
 }
