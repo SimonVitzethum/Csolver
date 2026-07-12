@@ -199,6 +199,32 @@ chain via taint-on-read). That is a general SSA-promotion improvement, soundness
 by the existing determinism oracle — the last piece to make Copy-Fail fire end-to-end on
 real optimized kernel IR.
 
+## Update 2026-07-12 (4) — label propagation SOLVED via switch edge-splitting
+
+The reloaded-`%areq`-slot gap is **closed** (`f925be8`). Root cause: MSIR `Switch`
+carries no per-target arguments, so mem2reg could not place a PHI on a switch edge and
+**dropped** any slot needing one (27 in `algif_aead`) — including the request-pointer
+slot, whose reloads then became distinct opaque objects and broke the `foreign` label.
+Fix: a mem2reg pre-pass **splits critical switch edges** (inserts a single-predecessor
+`Br` block, which does carry args). A pure CFG normalization, differential-SOUND and
+guarded by the `parallel_matches_serial` determinism oracle.
+
+**Result:** the `foreign` label now flows end-to-end through the reloaded request pointer
+to the AAD-copy destination — the `crypto_aead_copy_sgl` write-capability obligation on
+the real `-O1` module now *sees a `foreign` dst* (`lacks = true`). Proven end-to-end by
+`provenance_flows_through_a_switch` (a foreign pointer survives a switch and fires the
+gate → FAIL). This was the hard, session-long blocker.
+
+**One remaining barrier (separate, smaller):** on the real deep `_aead_recvmsg` the fired
+obligation is recorded **UNKNOWN, not FAIL**, because `record_temporal`'s
+`feasibility_witness` cannot produce a model for the copy-site path (the function is full
+of UNKNOWNs from uncontracted pointer parameters, and the deep path's condition is not
+cleanly witnessable). The violation IS detected (`lacks = true`); surfacing it as a FAIL
+needs either contracts on the recvmsg pointer parameters (a cleaner path condition) or a
+capability-specific refutation that does not require a full input model (a capability
+violation is input-independent). That is a distinct precision task, not the
+label-propagation problem — which is now solved.
+
 ## Validation (soundness-first, mandatory)
 
 Extend the **C differential oracle** with positive controls for the write-capability

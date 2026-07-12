@@ -3118,6 +3118,42 @@ entry:
         "a distinct dst (patched out-of-place) does not fire — no false FAIL");
 }
 
+/// **Provenance flows through a `switch` (mem2reg critical-edge splitting).** A `foreign`
+/// pointer is stored to a stack slot, the CFG passes through a `switch` whose default edge
+/// targets a multi-predecessor block, and the slot is reloaded past it and written via the
+/// AAD-copy sink. Only if mem2reg promotes the slot — which needs a PHI on the critical
+/// switch edge, enabled by edge-splitting — does the `foreign` label survive the switch and
+/// reach the destination, so the write-capability gate fires. This is the real crypto
+/// worker's shape (a request pointer reloaded across a switch) in miniature.
+#[test]
+fn provenance_flows_through_a_switch() {
+    let src = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare i32 @crypto_aead_copy_sgl(ptr, ptr, ptr, i32)
+declare i32 @pick()
+define void @f(ptr %sk, ptr %tfm, ptr %src, ptr %foreign) {
+entry:
+  %slot = alloca ptr, align 8
+  call void @af_alg_sendpage(ptr %sk, ptr %foreign)
+  store ptr %foreign, ptr %slot, align 8
+  %sel = call i32 @pick()
+  switch i32 %sel, label %merge [i32 0, label %c0]
+c0:
+  store ptr %foreign, ptr %slot, align 8
+  br label %merge
+merge:
+  %q = load ptr, ptr %slot, align 8
+  %r = call i32 @crypto_aead_copy_sgl(ptr %tfm, ptr %src, ptr %q, i32 16)
+  ret void
+}
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "s".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "the foreign label must survive the switch (slot promoted via edge-splitting) and \
+         fire the AAD-copy write-capability gate");
+}
+
 /// **The AAD-copy sink (CVE-2026-31431).** The Copy-Fail bug is the in-place copy of the
 /// *associated data*: `crypto_aead_copy_sgl(null_tfm, src, dst, len)` writes `dst`, which
 /// in the vulnerable build is the socket's RX scatterlist and may hold a `foreign`
