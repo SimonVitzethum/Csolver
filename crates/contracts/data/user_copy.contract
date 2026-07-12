@@ -5,7 +5,7 @@
 # copy_from_user(to, from, n): writes the kernel buffer `to` (arg0) with untrusted USER
 # data, so a value later read back from it is a genuine adversarial input (fill=user).
 [copy_from_user _copy_from_user __copy_from_user __copy_from_user_inatomic copy_from_user_nofault]
-write arg0 len=arg2 fill=user
+write arg0 len=arg2 fill=user from=arg1
 
 # copy_to_user(to, from, n): reads the kernel buffer `from` (arg1) and discloses it to
 # userspace — so copying never-written source bytes is an information leak (sink=user).

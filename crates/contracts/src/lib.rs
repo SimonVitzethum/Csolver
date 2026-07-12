@@ -95,6 +95,10 @@ pub enum Effect {
         len: SizeExpr,
         /// How the written bytes are initialized (ordinary vs. untrusted user data).
         fill: Fill,
+        /// For a `fill=user` copy, the 0-based argument index of the USER source pointer
+        /// (`from=arg<k>`), so the executor can detect a **double-fetch** (two reads of the
+        /// same user address). `None` for a plain fill or when unspecified.
+        from: Option<usize>,
     },
     /// Bulk-reads `len` bytes from the region pointed to by argument `ptr`.
     Read {
@@ -368,7 +372,11 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
                 Some("user") => Fill::User,
                 Some(other) => return Err(format!("unknown fill `{other}`")),
             };
-            Ok(Effect::Write { ptr, len, fill })
+            let from = match kv(&rest, "from") {
+                Some(s) => Some(parse_arg(s)?),
+                None => None,
+            };
+            Ok(Effect::Write { ptr, len, fill, from })
         }
         "read" => {
             let ptr = parse_arg(rest.first().copied().unwrap_or(""))?;
@@ -489,7 +497,7 @@ mod tests {
         // User-copies (formerly `user_copy_kernel_arg`).
         assert_eq!(
             c.lookup("copy_from_user").unwrap().effects,
-            vec![Effect::Write { ptr: 0, len: SizeExpr::Arg(2), fill: Fill::User }]
+            vec![Effect::Write { ptr: 0, len: SizeExpr::Arg(2), fill: Fill::User, from: Some(1) }]
         );
         assert_eq!(
             c.lookup("copy_to_user").unwrap().effects,
@@ -508,7 +516,7 @@ mod tests {
         assert_eq!(c.lookup("b").and_then(|c| c.alloc()), Some((&SizeExpr::Product(0, 1), 8)));
         assert_eq!(
             c.lookup("d").unwrap().effects,
-            vec![Effect::Write { ptr: 0, len: SizeExpr::Const(64), fill: Fill::User }]
+            vec![Effect::Write { ptr: 0, len: SizeExpr::Const(64), fill: Fill::User, from: None }]
         );
         // An effect before any header is an error.
         assert!(Contracts::default().parse_str("free arg0\n", "t").is_err());

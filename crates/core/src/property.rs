@@ -57,6 +57,14 @@ pub enum SafetyProperty {
     /// is already held on the same path, which deadlocks. A bug-finding-only obligation.
     /// (Inter-thread data races proper need a concurrency model and are future work.)
     DataRace,
+    /// No **double-fetch** of user memory: a syscall must not read the same user-space
+    /// address twice (two `copy_from_user`/`get_user` from a provably-aliasing user
+    /// source on one path). User memory is adversary-controlled, so a value validated on
+    /// the first read can differ on the second — a time-of-check-to-time-of-use race whose
+    /// second timeline is implicit (the user mutates concurrently). A bug-finding-only
+    /// obligation, refuted only for a **must-aliasing** re-fetch (no false FAIL on a
+    /// re-fetch of a different address).
+    DoubleFetch,
 }
 
 impl SafetyProperty {
@@ -81,6 +89,7 @@ impl SafetyProperty {
             SafetyProperty::NoInfoLeak => "no_info_leak",
             SafetyProperty::NoSizeOverflow => "no_size_overflow",
             SafetyProperty::DataRace => "data_race",
+            SafetyProperty::DoubleFetch => "double_fetch",
         }
     }
 
@@ -105,6 +114,7 @@ impl SafetyProperty {
             SafetyProperty::NoInfoLeak => "no uninitialized memory is disclosed to userspace",
             SafetyProperty::NoSizeOverflow => "allocation size computation does not overflow",
             SafetyProperty::DataRace => "no concurrency-safety violation (AA self-deadlock)",
+            SafetyProperty::DoubleFetch => "no double-fetch of user memory",
         }
     }
 
@@ -130,6 +140,7 @@ impl SafetyProperty {
             NoInfoLeak,
             NoSizeOverflow,
             DataRace,
+            DoubleFetch,
         ]
     }
 }

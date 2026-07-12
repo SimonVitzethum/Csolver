@@ -1310,14 +1310,20 @@ fn emit_contract(
             // A bulk write of `len` bytes to the argument buffer — carries the in-bounds
             // obligation (refutable via `check_mem_intrinsic`). `fill=user` taints the
             // region so a value read back is a genuine adversarial input.
-            Effect::Write { ptr, len, fill } => {
+            Effect::Write { ptr, len, fill, from } => {
                 if let Some(a) = args.get(*ptr) {
                     let Some(len) = size_operand(ctx, insts, len, args)? else { continue };
                     let kind = match fill {
                         Fill::User => MemKind::UserFill,
                         Fill::Undef => MemKind::Set,
                     };
-                    insts.push(Inst::MemIntrinsic { kind, dst: ctx.operand(a, 64)?, src: None, len });
+                    // For a `fill=user` copy, carry the USER source pointer (`from=arg<k>`)
+                    // as the intrinsic's `src` so the executor can detect a double-fetch.
+                    let src = match from.and_then(|k| args.get(k)) {
+                        Some(s) => Some(ctx.operand(s, 64)?),
+                        None => None,
+                    };
+                    insts.push(Inst::MemIntrinsic { kind, dst: ctx.operand(a, 64)?, src, len });
                     handled = true;
                 }
             }

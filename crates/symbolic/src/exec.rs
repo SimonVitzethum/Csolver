@@ -589,6 +589,7 @@ fn discharge_inner(
             opaque_labels: HashMap::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
+        user_fetches: HashSet::new(),
         freed_bases: HashSet::new(),
         exact: true,
     };
@@ -1169,6 +1170,13 @@ struct PathState {
     /// already here is an AA self-deadlock. Structural per-path state (not memory), so
     /// not cleared on a heap havoc; joined by meet at control-flow merges.
     locks_held: HashSet<RefBase>,
+    /// **User-memory addresses fetched** on this path, by `(source base, concrete byte
+    /// offset)` — one entry per `copy_from_user`/`get_user` from a concrete user address.
+    /// Re-fetching an address already here is a **double-fetch** (a TOCTOU on adversary-
+    /// controlled user memory). Structural per-path state (not cleared on a heap havoc);
+    /// joined by meet at merges, so a re-fetch is flagged only when the first fetch is
+    /// definite on every incoming path — sound (a partial fetch never fabricates one).
+    user_fetches: HashSet<(RefBase, u128)>,
     /// **Bases freed by an attributed freeing call** (`Summary.frees_arg`) on this path —
     /// so a second freeing-wrapper call on the same pointer is a definite double-free
     /// (which the coarse `frees` region havoc cannot attribute). Joined by meet at merges
@@ -1759,6 +1767,15 @@ impl Explorer<'_> {
             .copied()
             .filter(|b| edges.iter().all(|e| e.pred_state.freed_bases.contains(b)))
             .collect();
+        // Same meet for fetched user addresses: an address counts as fetched after the
+        // join only if fetched on every incoming path, so a re-fetch is flagged as a
+        // double-fetch only when it is definite on all paths.
+        let user_fetches: HashSet<(RefBase, u128)> = first
+            .user_fetches
+            .iter()
+            .copied()
+            .filter(|k| edges.iter().all(|e| e.pred_state.user_fetches.contains(k)))
+            .collect();
 
         // The heap is computed by `merge_multi` (it needs the edge discriminators
         // to *join* differing stores); leave it empty here.
@@ -1773,6 +1790,7 @@ impl Explorer<'_> {
             opaque_labels,
             fn_ptrs,
             locks_held,
+            user_fetches,
             freed_bases,
             exact: false,
         }
@@ -2899,6 +2917,39 @@ impl Explorer<'_> {
                         if let Some(r) = state.regions.get_mut(rid) {
                             r.user_controlled = true;
                         }
+                    }
+                    // Double-fetch (TOCTOU): key the USER source address by `(base, concrete
+                    // offset)`; a re-fetch of an address already read on this path is a
+                    // definite double-fetch — refuted (a value validated on the first read
+                    // can differ on the second, since user memory is adversary-controlled).
+                    // A symbolic source (no concrete key) cannot be proven must-aliasing, so
+                    // no re-fetch is established there — sound (proved, no false FAIL).
+                    let dfkey = src.as_ref().and_then(|s| {
+                        let sp = self.eval_pointer(s, state);
+                        let base = Self::ptr_base_key(&SymValue::Ptr(sp.clone()))?;
+                        self.ctx.as_const(sp.offset).map(|o| (base, o.unsigned()))
+                    });
+                    match dfkey {
+                        Some(key) => {
+                            let dup = state.user_fetches.contains(&key);
+                            self.record_temporal(
+                                (block, idx),
+                                SafetyProperty::DoubleFetch,
+                                dup,
+                                state,
+                                "no user address is fetched twice on this path",
+                                "re-fetches a user address already read on this path (double-fetch TOCTOU)",
+                            );
+                            state.user_fetches.insert(key);
+                        }
+                        None => self.record(
+                            block,
+                            idx,
+                            SafetyProperty::DoubleFetch,
+                            true,
+                            "no user address is fetched twice on this path",
+                            "",
+                        ),
                     }
                     // The written bytes are untrusted user data; a load from the
                     // now-user-controlled region yields a genuine symbol (see

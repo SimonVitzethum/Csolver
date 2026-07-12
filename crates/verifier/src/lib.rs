@@ -662,8 +662,12 @@ fn verify_function_with(
                 // it is not enumerated, so it never affects PASS/FAIL there (an allocation
                 // size is treated as non-wrapping under `alloc-succeeds`, as before). Only
                 // the kernel bug-finding mode checks it.
-                if matches!(property, SafetyProperty::NoSizeOverflow | SafetyProperty::DataRace)
-                    && !config.bug_finding
+                if matches!(
+                    property,
+                    SafetyProperty::NoSizeOverflow
+                        | SafetyProperty::DataRace
+                        | SafetyProperty::DoubleFetch
+                ) && !config.bug_finding
                 {
                     continue;
                 }

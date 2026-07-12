@@ -483,9 +483,10 @@ impl Inst {
             Inst::Alloc { .. } => &[NoSizeOverflow],
             Inst::PtrOffset { .. } => &[ValidPointerArith],
             Inst::MemIntrinsic { kind, .. } => match kind {
-                MemKind::Set | MemKind::UserFill => {
-                    &[NoNullDeref, NoUseAfterFree, InBounds, ValidWrite]
-                }
+                MemKind::Set => &[NoNullDeref, NoUseAfterFree, InBounds, ValidWrite],
+                // A `copy_from_user` also carries the double-fetch obligation (bug-finding
+                // only): re-reading the same user address on one path is a TOCTOU race.
+                MemKind::UserFill => &[NoNullDeref, NoUseAfterFree, InBounds, ValidWrite, DoubleFetch],
                 MemKind::Copy | MemKind::Move => {
                     &[NoNullDeref, NoUseAfterFree, InBounds, ValidRead, ValidWrite]
                 }

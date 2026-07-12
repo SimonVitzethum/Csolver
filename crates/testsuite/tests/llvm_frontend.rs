@@ -3118,6 +3118,36 @@ entry:
         "a distinct dst (patched out-of-place) does not fire — no false FAIL");
 }
 
+/// **Double-fetch of user memory (TOCTOU, G3).** Two `copy_from_user` reads from a
+/// provably-aliasing user source on one path are a double-fetch: user memory is
+/// adversary-controlled, so a value validated on the first read can differ on the second.
+/// Refuted only for a **must-aliasing** re-fetch — a re-fetch of a *different* user
+/// address (or a single fetch) does not fire, so there is no false FAIL.
+#[test]
+fn double_fetch_of_user_memory_is_refused() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let df = |name: &str, body: &str| -> Verdict {
+        let src = format!(
+            "declare i64 @copy_from_user(ptr, ptr, i64)\n\
+             define void @{name}(ptr %u1, ptr %u2, ptr %k) {{\nentry:\n{body}  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: name.into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // Same user address fetched twice → double-fetch → FAIL.
+    assert_eq!(
+        df("dbl", "  %a = call i64 @copy_from_user(ptr %k, ptr %u1, i64 8)\n  \
+                    %b = call i64 @copy_from_user(ptr %k, ptr %u1, i64 8)\n"),
+        Verdict::Fail, "two copy_from_user from the same user address is a double-fetch"
+    );
+    // Distinct user addresses → not a double-fetch (no false FAIL).
+    assert_ne!(
+        df("dist", "  %a = call i64 @copy_from_user(ptr %k, ptr %u1, i64 8)\n  \
+                     %b = call i64 @copy_from_user(ptr %k, ptr %u2, i64 8)\n"),
+        Verdict::Fail, "distinct user addresses are not a double-fetch"
+    );
+}
+
 /// **A loop-guarded foreign write is refused, not left spurious-UNKNOWN.** The AAD copy
 /// in the real crypto worker sits behind a `br` whose condition is loop-carried; such a
 /// condition can reach the executor wider than `i1`, and using it directly as a boolean
