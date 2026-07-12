@@ -1386,6 +1386,19 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
                 w.location, w.threads.0, w.threads.1, if w.double_free { "free" } else { "use" });
         }
     }
+    // Cross-entry (cross-syscall) use-after-free: a free of a global-rooted object in one entry and
+    // a dereference/free of it in another, sequentially composable entry (no common caller). Runs
+    // over every trace; the global-root restriction keeps it to persistent shared state.
+    let cross_entry = csolver_verifier::find_cross_entry_uaf(&threads);
+    if !cross_entry.is_empty() {
+        println!("\n== cross-entry (cross-syscall) use-after-free / double-free ({}) [bug-finding] ==",
+            cross_entry.len());
+        for w in &cross_entry {
+            let kind = if w.double_free { "double-free" } else { "use-after-free" };
+            println!("  {kind} of {} : entry {} frees it (root left dangling), entry {} later {}s it",
+                w.location, w.entries.0, w.entries.1, if w.double_free { "free" } else { "use" });
+        }
+    }
     // ABA: a compare-and-swap concurrent with a modification of the same location.
     let aba = csolver_verifier::find_aba(&threads);
     if !aba.is_empty() {

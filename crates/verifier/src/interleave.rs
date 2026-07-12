@@ -365,6 +365,116 @@ pub fn find_cross_thread_uaf(threads: &[Thread]) -> Vec<FreeUseWitness> {
     out
 }
 
+/// A witnessed **cross-entry (cross-syscall) use-after-free / double-free**: one attacker-reachable
+/// entry frees an object reachable from a shared *persistent* root (a global — an fd table, a
+/// device pointer, …) without clearing that root, and a *separate* entry, with no common caller,
+/// later dereferences (or frees) the same root. Unlike the cross-*thread* search this is a
+/// **sequential** composition — the entries need not overlap in time (locks between them do not
+/// order them); the attacker simply invokes the freeing syscall (`close`) and then the using one
+/// (`read`/`ioctl`). The dangling shared root is what carries the freed pointer between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossEntryWitness {
+    /// The dangling global-rooted object's class.
+    pub location: String,
+    /// The entries: the one that frees, and the one that later uses (or the second free).
+    pub entries: (String, String),
+    /// `true` if the second entry also frees it (cross-entry double-free), else a use-after-free.
+    pub double_free: bool,
+}
+
+/// Whether a class is rooted at a **global** — the only state that persists between independent
+/// syscall entries. A parameter-derived object does not survive to another entry (no common
+/// caller passes it), so it is excluded. Matches `g:name@off` and any `deref:` chased from one.
+fn is_global_rooted(class: &str) -> bool {
+    let mut core = class;
+    while let Some(rest) = core.strip_prefix("deref:") {
+        core = rest;
+    }
+    core.starts_with("g:")
+}
+
+/// The **root slot** of a dereferenced global class: `deref:g:obj@0` → `g:obj@0`. A write to this
+/// slot in the freeing entry means it reassigned/cleared the global (no dangling) — we then skip.
+fn root_slot(class: &str) -> &str {
+    class.strip_prefix("deref:").unwrap_or(class)
+}
+
+/// Whole-program **cross-entry use-after-free / double-free** search: a free of a global-rooted
+/// object in one entry (that does not clear the global root) and a later dereference (UAF) or free
+/// (double-free) of the same object in a *different* entry. `entries` should be the attacker-
+/// reachable entry functions' traces; the global-root restriction means only *persistent* shared
+/// state is considered, so a param-passed object (which cannot survive to an unrelated entry) never
+/// fires. Bounded by [`MAX_PAIRS`]. A bug-finding heuristic — it does not model an intervening
+/// re-validation the two syscalls might both perform, so it reports candidates.
+pub fn find_cross_entry_uaf(entries: &[Thread]) -> Vec<CrossEntryWitness> {
+    use std::collections::BTreeSet;
+    struct EntryEff {
+        /// Global-rooted classes this entry frees.
+        frees: Vec<String>,
+        /// Global slots this entry writes (a reassign/clear of the root — removes the dangling).
+        writes_slot: BTreeSet<String>,
+        /// Global-rooted classes this entry dereferences (read/write through the root).
+        uses: BTreeSet<String>,
+    }
+    let eff: Vec<EntryEff> = entries
+        .iter()
+        .map(|t| {
+            let mut frees = Vec::new();
+            let mut writes_slot = BTreeSet::new();
+            let mut uses = BTreeSet::new();
+            for e in &t.events {
+                match e {
+                    Event::Free(x) if is_global_rooted(x) => frees.push(x.clone()),
+                    Event::Write(x) if is_global_rooted(x) => {
+                        writes_slot.insert(x.clone());
+                        uses.insert(x.clone());
+                    }
+                    Event::Read(x) | Event::DepRead(x) if is_global_rooted(x) => {
+                        uses.insert(x.clone());
+                    }
+                    _ => {}
+                }
+            }
+            EntryEff { frees, writes_slot, uses }
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
+    let mut checked = 0usize;
+    for i in 0..entries.len() {
+        for j in 0..entries.len() {
+            if i == j || checked >= MAX_PAIRS {
+                continue;
+            }
+            checked += 1;
+            for fx in &eff[i].frees {
+                // The freeing entry reassigned/cleared the global root → not left dangling, skip.
+                if eff[i].writes_slot.contains(root_slot(fx)) {
+                    continue;
+                }
+                // A later dereference of the same object in a different entry → cross-entry UAF.
+                if eff[j].uses.contains(fx) && seen.insert((fx.clone(), false)) {
+                    out.push(CrossEntryWitness {
+                        location: fx.clone(),
+                        entries: (entries[i].name.clone(), entries[j].name.clone()),
+                        double_free: false,
+                    });
+                }
+                // A second free of the same object in a different entry → cross-entry double-free.
+                if i < j && eff[j].frees.contains(fx) && seen.insert((fx.clone(), true)) {
+                    out.push(CrossEntryWitness {
+                        location: fx.clone(),
+                        entries: (entries[i].name.clone(), entries[j].name.clone()),
+                        double_free: true,
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.location.cmp(&b.location));
+    out
+}
+
 /// A witnessed **ABA problem**: one thread compare-and-swaps a location while another thread
 /// concurrently modifies it (write or free — the value can go A→B→A), with disjoint locksets so
 /// nothing orders them. The CAS can then succeed on a stale premise.

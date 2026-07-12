@@ -171,6 +171,25 @@ impl ModuleReport {
         crate::find_aba(&threads)
     }
 
+    /// Candidate **cross-entry (cross-syscall) use-after-free / double-free**: an object freed via
+    /// a shared global root in one entry and dereferenced (or freed again) in another, independently
+    /// reachable entry — the `ioctl`→`close`→`read` pattern across *separate* syscall entries with
+    /// no common caller. `is_entry` selects the attacker-reachable entries (e.g. `matches_entry`
+    /// against the configured patterns); pass `|_| true` to consider every function. The search
+    /// only ever fires on global-rooted (persistent) state, so a parameter-passed object never does.
+    pub fn cross_entry_uaf(
+        &self,
+        is_entry: impl Fn(&str) -> bool,
+    ) -> Vec<crate::interleave::CrossEntryWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| is_entry(&f.function) && !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::interleave::find_cross_entry_uaf(&threads)
+    }
+
     /// Candidate **weak-memory (SC-robustness) bugs** among this module's functions (subsystem
     /// 4, full operational model): a pair of functions whose concurrent execution under the PSO
     /// store-buffer model can observe a read outcome no sequentially-consistent execution allows

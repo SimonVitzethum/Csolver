@@ -3567,6 +3567,48 @@ fn rcu_grace_period_violation_is_refused() {
     );
 }
 
+/// **Cross-syscall (cross-entry) use-after-free.** Two entry points with *no common caller* — a
+/// `close` that frees the object held by a global and a `read` that dereferences that same global —
+/// compose into a use-after-free: the attacker invokes `close` then `read`, and the global still
+/// points at freed memory (the freeing entry never cleared it). This is sequential, not concurrent
+/// (no lock orders them), and is invisible to the interprocedural summary (there is no call edge).
+#[test]
+fn cross_entry_syscall_use_after_free_is_detected() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // `sys_close` frees the object reachable from @dev without nulling @dev (dangling);
+    // `sys_read` loads @dev and dereferences it → cross-entry UAF on `deref:g:dev@0`.
+    let src = "\
+        @dev = global ptr null, align 8\n\
+        declare void @kfree(ptr)\n\
+        define void @sys_close() {\n\
+          %p = load ptr, ptr @dev, align 8\n  call void @kfree(ptr %p)\n  ret void\n}\n\
+        define i32 @sys_read() {\n\
+          %p = load ptr, ptr @dev, align 8\n  %v = load i32, ptr %p, align 4\n  ret i32 %v\n}\n";
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "ce".into() }).expect("lower");
+    let report = verify_module(&m, &cfg);
+    let uaf = report.cross_entry_uaf(|n| n.starts_with("sys_"));
+    assert!(
+        uaf.iter().any(|w| !w.double_free && w.location.contains("g:dev")),
+        "close-then-read across entries on a shared global is a cross-entry UAF: {uaf:?}"
+    );
+
+    // If `sys_close` nulls @dev after the free (clears the dangling root), there is no UAF.
+    let safe_src = "\
+        @dev = global ptr null, align 8\n\
+        declare void @kfree(ptr)\n\
+        define void @sys_close() {\n\
+          %p = load ptr, ptr @dev, align 8\n  call void @kfree(ptr %p)\n  \
+          store ptr null, ptr @dev, align 8\n  ret void\n}\n\
+        define i32 @sys_read() {\n\
+          %p = load ptr, ptr @dev, align 8\n  %v = load i32, ptr %p, align 4\n  ret i32 %v\n}\n";
+    let m2 = LlvmFrontend.lower(LlvmInput { source: safe_src.into(), name: "ce".into() }).expect("lower");
+    let uaf2 = verify_module(&m2, &cfg).cross_entry_uaf(|n| n.starts_with("sys_"));
+    assert!(
+        !uaf2.iter().any(|w| w.location.contains("g:dev")),
+        "clearing the global root after the free removes the cross-entry UAF: {uaf2:?}"
+    );
+}
+
 /// **Deferred reclamation beyond RCU.** Hazard pointers and epoch-based reclamation share RCU's
 /// shape: an object retired/protected for lock-free readers must not be plain-`kfree`d until the
 /// safe point (a hazard scan / epoch advance). The same `reclaim` typestate that guards RCU guards
