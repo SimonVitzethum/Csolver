@@ -320,7 +320,15 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                 | Inst::TaintCheck { val, .. }
                 | Inst::TaintClear { val, .. }
                 | Inst::TypestateSet { val, .. }
-                | Inst::TypestateRequire { val, .. } => op(val),
+                | Inst::TypestateRequire { val, .. }
+                | Inst::Refcount { val, .. }
+                | Inst::SecretCheck { val, .. } => op(val),
+                Inst::TypestateLeakCheck { escaping, .. } => {
+                    if let Some(e) = escaping {
+                        op(e);
+                    }
+                }
+                Inst::TypestateYield { .. } => {}
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -632,6 +640,7 @@ fn discharge_inner(
             opaque_labels: HashMap::new(),
         tainted: HashMap::new(),
         typestates: HashMap::new(),
+        refcounts: HashMap::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
         spin_held: HashSet::new(),
@@ -1234,6 +1243,11 @@ struct PathState {
     /// on every incoming path — so a require refutes with no false FAIL under a partial state).
     /// A fact about the resource, not memory (not cleared on havoc).
     typestates: HashMap<(ResKey, u32), u32>,
+    /// **Reference counts per resource per protocol** (G8): `(resource, protocol) → count`.
+    /// Raised by an `inc` and lowered by a `dec` (`Inst::Refcount`); a `dec` below zero is an
+    /// underflow (premature free → UAF). Meet-joined at merges (kept only if all incoming
+    /// paths agree on the count — so an underflow refutes only when definite; no false FAIL).
+    refcounts: HashMap<(ResKey, u32), i64>,
     /// **Resolved function-pointer values**: a register holding a function address
     /// devirtualised from a constant ops-struct load (see `global_fnptrs`) maps to
     /// its target `FuncId`, so an indirect call through that register is analysed
@@ -1863,6 +1877,14 @@ impl Explorer<'_> {
             .filter(|(k, st)| edges.iter().all(|e| e.pred_state.typestates.get(k) == Some(*st)))
             .map(|(k, st)| (*k, *st))
             .collect();
+        // Refcounts survive the join by the same meet: keep a count only if every incoming
+        // edge agrees, so an underflow refutes only when the count is definite.
+        let refcounts: HashMap<(ResKey, u32), i64> = first
+            .refcounts
+            .iter()
+            .filter(|(k, c)| edges.iter().all(|e| e.pred_state.refcounts.get(k) == Some(*c)))
+            .map(|(k, c)| (*k, *c))
+            .collect();
 
         // Resolved function-pointer identities survive the join by the same meet:
         // a register keeps its target only if every incoming edge resolved it to
@@ -1930,6 +1952,7 @@ impl Explorer<'_> {
             opaque_labels,
             tainted,
             typestates,
+            refcounts,
             fn_ptrs,
             locks_held,
             spin_held,
@@ -2694,8 +2717,18 @@ impl Explorer<'_> {
 
     fn step(&mut self, block: BlockId, idx: usize, inst: &Inst, state: &mut PathState) {
         match inst {
-            Inst::Assign { dst, value, .. } => {
-                let v = self.eval_rvalue(value, state);
+            Inst::Assign { dst, ty, value } => {
+                // A generically-bound **pointer** call result (`Assign(dst, Undef)` for a
+                // modelled call with no return summary — e.g. `fopen`'s handle) must get a
+                // *stable opaque pointer identity*, not a scalar `undef`: otherwise the same
+                // SSA value is a scalar here and an opaque pointer once used as one, so a
+                // `ret`-typestate/taint target and a later use disagree on the resource key.
+                let v = match value {
+                    RValue::Use(Operand::Const(Const::Undef)) if ty.is_ptr() => {
+                        self.fresh_value(ty, POrigin::Call)
+                    }
+                    _ => self.eval_rvalue(value, state),
+                };
                 state.env.insert(*dst, v);
                 // Taint propagation: the result carries the union of its operands' taint.
                 let t = self.rvalue_taint(value, state);
@@ -3087,6 +3120,71 @@ impl Explorer<'_> {
                     state,
                     "the resource is in a protocol state this operation allows",
                     "the resource is used in a state its protocol forbids (use-after-close / missing-check)",
+                );
+            }
+            // Protocol-wide yield (TOCTOU): every resource of `protocol` in state `from`
+            // moves to `to` — a `check` invalidated by an intervening yield.
+            Inst::TypestateYield { protocol, from, to } => {
+                let hits: Vec<(ResKey, u32)> = state
+                    .typestates
+                    .iter()
+                    .filter(|((_, p), s)| p == protocol && *s == from)
+                    .map(|((k, p), _)| (*k, *p))
+                    .collect();
+                for key in hits {
+                    state.typestates.insert(key, *to);
+                }
+            }
+            // Reference-count change: inc/dec the resource's count; a `dec` below zero is an
+            // underflow (premature free → UAF), refuted on a definite path.
+            Inst::Refcount { val, protocol, dec } => {
+                if let Some(key) = self.res_key(val, state) {
+                    let entry = state.refcounts.entry((key, *protocol)).or_insert(0);
+                    if *dec {
+                        let underflow = *entry <= 0;
+                        *entry -= 1;
+                        self.record_temporal(
+                            (block, idx),
+                            SafetyProperty::TypestateViolation,
+                            underflow,
+                            state,
+                            "the reference count stays non-negative",
+                            "a reference-count decrement underflows (premature free / use-after-free)",
+                        );
+                    } else {
+                        *entry += 1;
+                        self.record(block, idx, SafetyProperty::TypestateViolation, true, "the reference count stays non-negative", "");
+                    }
+                }
+            }
+            // Leak check at return: a resource still in the leak `state` that did not escape
+            // via the returned value is a resource leak.
+            Inst::TypestateLeakCheck { protocol, state: st, escaping } => {
+                let escapes = escaping
+                    .as_ref()
+                    .and_then(|op| self.res_key(op, state));
+                let leaked = state.typestates.iter().any(|((k, p), s)| {
+                    p == protocol && s == st && Some(*k) != escapes
+                });
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::TypestateViolation,
+                    leaked,
+                    state,
+                    "every acquired resource is released or returned",
+                    "a resource acquired on this path is neither released nor returned (leak)",
+                );
+            }
+            // Constant-time: a secret-tainted value must not decide a branch or index memory.
+            Inst::SecretCheck { val, taint } => {
+                let secret = self.taint_has(val, *taint, state);
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::SecretDependent,
+                    secret,
+                    state,
+                    "no secret-dependent branch or memory index",
+                    "a secret-tainted value decides a branch or memory index (timing/cache side channel)",
                 );
             }
             Inst::RefWitness { dst, size, align, writable, assumed, src } => {

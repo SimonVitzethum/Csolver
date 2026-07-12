@@ -85,6 +85,13 @@ pub enum SafetyProperty {
     /// obligation, refuted only when the resource is **definitely** in the forbidden state on
     /// the path (state meet-joined at merges — no false FAIL under a partial state).
     TypestateViolation,
+    /// No **secret-dependent control flow or memory index** (constant-time / side-channel, L):
+    /// a value carrying a `secret` taint label must not decide a **branch** (a timing side
+    /// channel — the taken path is observable) or index memory (a cache side channel). Rides
+    /// the taint lattice: `secret` sources (`taint-source … secret`) flow to a branch
+    /// condition or a `gep` index. A bug-finding-only obligation, refuted only when the
+    /// deciding value is definitely secret-tainted on the path.
+    SecretDependent,
     /// No **blocking/sleeping call in atomic context**: a call that may sleep
     /// (`mutex_lock`/`kmalloc(GFP_KERNEL)`/`schedule`/`msleep`/`down`/…) must not run while a
     /// **spinlock is held** (or IRQs/preemption are disabled) — it deadlocks or corrupts the
@@ -120,6 +127,7 @@ impl SafetyProperty {
             SafetyProperty::SleepInAtomic => "sleep_in_atomic",
             SafetyProperty::TaintedSink => "tainted_sink",
             SafetyProperty::TypestateViolation => "typestate_violation",
+            SafetyProperty::SecretDependent => "secret_dependent",
         }
     }
 
@@ -148,6 +156,7 @@ impl SafetyProperty {
             SafetyProperty::SleepInAtomic => "no sleeping call in atomic (spinlock-held) context",
             SafetyProperty::TaintedSink => "no tainted value reaches an unsafe sink",
             SafetyProperty::TypestateViolation => "no resource is used in a forbidden protocol state",
+            SafetyProperty::SecretDependent => "no secret-dependent branch or memory index",
         }
     }
 
@@ -177,6 +186,7 @@ impl SafetyProperty {
             SleepInAtomic,
             TaintedSink,
             TypestateViolation,
+            SecretDependent,
         ]
     }
 }

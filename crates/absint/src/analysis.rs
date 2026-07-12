@@ -483,6 +483,10 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::TaintClear { .. }
         | Inst::TypestateSet { .. }
         | Inst::TypestateRequire { .. }
+        | Inst::TypestateYield { .. }
+        | Inst::Refcount { .. }
+        | Inst::TypestateLeakCheck { .. }
+        | Inst::SecretCheck { .. }
         | Inst::SafetyCheck { .. } => {}
     }
 }

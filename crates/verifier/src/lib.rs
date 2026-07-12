@@ -673,6 +673,7 @@ fn verify_function_with(
                         | SafetyProperty::SleepInAtomic
                         | SafetyProperty::TaintedSink
                         | SafetyProperty::TypestateViolation
+                        | SafetyProperty::SecretDependent
                 ) && !config.bug_finding
                 {
                     continue;

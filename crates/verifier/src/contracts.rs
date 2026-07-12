@@ -1871,7 +1871,15 @@ fn address_taken_names(module: &Module) -> HashSet<String> {
                     | Inst::TaintCheck { val, .. }
                     | Inst::TaintClear { val, .. }
                     | Inst::TypestateSet { val, .. }
-                    | Inst::TypestateRequire { val, .. } => op(val),
+                    | Inst::TypestateRequire { val, .. }
+                    | Inst::Refcount { val, .. }
+                    | Inst::SecretCheck { val, .. } => op(val),
+                    Inst::TypestateLeakCheck { escaping, .. } => {
+                        if let Some(e) = escaping {
+                            op(e);
+                        }
+                    }
+                    Inst::TypestateYield { .. } => {}
                     Inst::SafetyCheck { condition, .. } => condition_operands(condition, &mut op),
                     Inst::Asm { .. } => {}
                 }

@@ -7,9 +7,11 @@
 # the forbidden state on the path (states are meet-joined at merges — no false FAIL).
 
 # --- stdio handle: use-after-close and double-close (FILE* is a pointer handle) -----------
-# fopen returns an OPEN handle.
+# fopen returns an OPEN handle. A handle still `open` at return (see typestate-leak) — not
+# closed and not returned — is a resource leak (K).
 [fopen fdopen freopen tmpfile]
 typestate-set ret file open
+typestate-leak file open
 
 # fclose closes it — and refuses to close an already-closed handle (double-close).
 [fclose]
@@ -32,3 +34,35 @@ typestate-set arg0 perm checked
 # The privileged operation requires the object to have been checked first.
 [privileged_write]
 typestate-require arg0 perm checked
+
+# --- TOCTOU (G2): a check invalidated by an intervening yield ------------------------------
+# access()/stat() validate a path — it becomes `checked`.
+[access stat lstat faccessat]
+typestate-set arg0 toctou checked
+
+# A yield (blocking call, reschedule, sleep) lets an adversary act: every `checked` path
+# becomes `stale`.
+[schedule msleep ssleep mutex_lock down cond_resched]
+typestate-yield toctou checked stale
+
+# Using (open) a path whose check went stale across a yield is a TOCTOU race.
+[open openat fopen_path]
+typestate-require-not arg0 toctou stale
+
+# --- Reference counts (G8): a decrement below zero is a premature free / UAF ---------------
+[kref_get refcount_inc kobject_get get_task_struct atomic_inc_not_zero]
+refcount-inc arg0 kref
+
+[kref_put refcount_dec kobject_put put_task_struct refcount_dec_and_test]
+refcount-dec arg0 kref
+
+# --- Type confusion (H): a per-object type tag, checked at a typed operation ---------------
+# An allocator/initialiser stamps the object's type; a typed op requires the matching tag.
+[init_as_request]
+typestate-set arg0 objtype request
+
+[init_as_reply]
+typestate-set arg0 objtype reply
+
+[handle_request]
+typestate-require arg0 objtype request

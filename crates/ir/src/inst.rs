@@ -506,6 +506,50 @@ pub enum Inst {
         /// When `true`, `val` must **not** be in `state`; when `false`, it must be.
         negate: bool,
     },
+    /// **Protocol-wide yield** (TOCTOU G2, a contract's `typestate-yield`): transition every
+    /// resource of `protocol` in state `from` to state `to` — a yield (blocking call / second
+    /// syscall) that invalidates a prior check. Not tied to a value.
+    TypestateYield {
+        /// The interned protocol id.
+        protocol: u32,
+        /// The interned state a resource must be in to be affected.
+        from: u32,
+        /// The interned state such resources move to.
+        to: u32,
+    },
+    /// **Reference-count change** (G8, a contract's `refcount-inc`/`refcount-dec`): raise or
+    /// lower the refcount of resource `val` within `protocol`. A `dec` below zero is an
+    /// underflow (premature free) — implies [`SafetyProperty::TypestateViolation`].
+    Refcount {
+        /// The value naming the counted resource.
+        val: Operand,
+        /// The interned protocol id.
+        protocol: u32,
+        /// `true` for a decrement (`put`), `false` for an increment (`get`).
+        dec: bool,
+    },
+    /// **Leak check at return** (K, from a contract's `typestate-leak`): a resource still in
+    /// `state` of `protocol` on this path — and not escaping via `escaping` (the return
+    /// value) — is a resource leak. Implies [`SafetyProperty::TypestateViolation`]. Injected
+    /// before each `Return` by the frontend.
+    TypestateLeakCheck {
+        /// The interned protocol id.
+        protocol: u32,
+        /// The interned leak state id.
+        state: u32,
+        /// The returned value (if any), whose resource escapes and is not a leak.
+        escaping: Option<Operand>,
+    },
+    /// **Secret-dependence check** (constant-time L): `val` (a branch condition or a `gep`
+    /// index) must not carry the `secret` taint label. Implies
+    /// [`SafetyProperty::SecretDependent`]. Injected by the frontend at every branch and
+    /// memory index **only when** a `secret` taint label is defined by the contracts.
+    SecretCheck {
+        /// The deciding value (branch condition or memory index).
+        val: Operand,
+        /// The interned `secret` taint-label id.
+        taint: u32,
+    },
 }
 
 /// The reference-validity facts a call's `&T`/`&mut T` result carries.
@@ -551,6 +595,9 @@ impl Inst {
             Inst::CapRequireIfAliasFields { .. } => &[WriteCapability],
             Inst::TaintCheck { .. } => &[TaintedSink],
             Inst::TypestateRequire { .. } => &[TypestateViolation],
+            Inst::Refcount { .. } => &[TypestateViolation],
+            Inst::TypestateLeakCheck { .. } => &[TypestateViolation],
+            Inst::SecretCheck { .. } => &[SecretDependent],
             // A freeing-wrapper call must not re-free a pointer an earlier freeing call
             // already freed (`NoDoubleFree`); a lock-acquiring call must not re-acquire a
             // held lock (`DataRace`, bug-finding only).
@@ -583,6 +630,10 @@ impl Inst {
             | Inst::TaintClear { .. }
             | Inst::TypestateSet { .. }
             | Inst::TypestateRequire { .. }
+            | Inst::TypestateYield { .. }
+            | Inst::Refcount { .. }
+            | Inst::TypestateLeakCheck { .. }
+            | Inst::SecretCheck { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }

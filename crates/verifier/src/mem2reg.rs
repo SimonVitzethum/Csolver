@@ -449,7 +449,16 @@ fn visit_operands(inst: &Inst, op: &mut impl FnMut(&Operand)) {
         Inst::TaintSource { val, .. } | Inst::TaintCheck { val, .. } | Inst::TaintClear { val, .. } => {
             op(val)
         }
-        Inst::TypestateSet { val, .. } | Inst::TypestateRequire { val, .. } => op(val),
+        Inst::TypestateSet { val, .. }
+        | Inst::TypestateRequire { val, .. }
+        | Inst::Refcount { val, .. }
+        | Inst::SecretCheck { val, .. } => op(val),
+        Inst::TypestateLeakCheck { escaping, .. } => {
+            if let Some(e) = escaping {
+                op(e);
+            }
+        }
+        Inst::TypestateYield { .. } => {}
         Inst::SafetyCheck { condition, .. } => condition_operands(condition, op),
         Inst::Asm { .. } => {}
     }

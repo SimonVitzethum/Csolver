@@ -3247,6 +3247,53 @@ define void @f(ptr %kbuf) {
         "an untainted pointer to system() is not a tainted sink");
 }
 
+/// **The remaining typestate/taint classes (TOCTOU G2, refcount G8, leak K, type-confusion H,
+/// secret side-channel L).** All contract-driven on the general typestate + taint engines.
+#[test]
+fn toctou_refcount_leak_typeconfusion_and_secret_are_refused() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let decls = "declare i32 @access(ptr, i32)\ndeclare void @schedule()\ndeclare i32 @open(ptr, i32)\n\
+                 declare void @kref_get(ptr)\ndeclare void @kref_put(ptr)\n\
+                 declare ptr @fopen(ptr, ptr)\ndeclare i32 @fclose(ptr)\n\
+                 declare void @init_as_request(ptr)\ndeclare void @handle_request(ptr)\n\
+                 declare i64 @load_secret_key(ptr)\n";
+    let v = |sig: &str, body: &str| -> Verdict {
+        let src = format!("{decls}define {sig} {{\n{body}}}\n");
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "t".into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // G2 TOCTOU: check → yield (schedule) → use is a race; no yield is fine.
+    assert_eq!(v("void @f(ptr %p)",
+        "  %c = call i32 @access(ptr %p, i32 0)\n  call void @schedule()\n  \
+           %o = call i32 @open(ptr %p, i32 0)\n  ret void\n"),
+        Verdict::Fail, "check→yield→use is a TOCTOU race");
+    assert_ne!(v("void @f(ptr %p)",
+        "  %c = call i32 @access(ptr %p, i32 0)\n  %o = call i32 @open(ptr %p, i32 0)\n  ret void\n"),
+        Verdict::Fail, "check→use with no yield is fine");
+    // G8 refcount underflow: a put with no matching get.
+    assert_eq!(v("void @f(ptr %o)", "  call void @kref_put(ptr %o)\n  ret void\n"),
+        Verdict::Fail, "a refcount decrement below zero underflows");
+    assert_ne!(v("void @f(ptr %o)", "  call void @kref_get(ptr %o)\n  call void @kref_put(ptr %o)\n  ret void\n"),
+        Verdict::Fail, "a balanced get/put is fine");
+    // K leak: an open handle neither closed nor returned.
+    assert_eq!(v("void @f(ptr %p, ptr %m)", "  %h = call ptr @fopen(ptr %p, ptr %m)\n  ret void\n"),
+        Verdict::Fail, "an unclosed, unreturned FILE* is a leak");
+    assert_ne!(v("void @f(ptr %p, ptr %m)",
+        "  %h = call ptr @fopen(ptr %p, ptr %m)\n  %r = call i32 @fclose(ptr %h)\n  ret void\n"),
+        Verdict::Fail, "a closed handle is not a leak");
+    // H type confusion: a typed op on an object of the wrong (unset) type.
+    assert_eq!(v("void @f(ptr %o)", "  call void @handle_request(ptr %o)\n  ret void\n"),
+        Verdict::Fail, "a typed op on a mis-typed object is type confusion");
+    assert_ne!(v("void @f(ptr %o)", "  call void @init_as_request(ptr %o)\n  call void @handle_request(ptr %o)\n  ret void\n"),
+        Verdict::Fail, "a correctly-typed object passes");
+    // L secret side-channel: a branch on a secret-derived value.
+    assert_eq!(v("i32 @f(ptr %k)",
+        "  %r = call i64 @load_secret_key(ptr %k)\n  %b = load i8, ptr %k, align 1\n  \
+           %c = icmp ne i8 %b, 0\n  br i1 %c, label %t, label %e\n\
+         t:\n  ret i32 1\ne:\n  ret i32 0\n"),
+        Verdict::Fail, "branching on a secret-derived value is a timing side channel");
+}
+
 /// **Generalised typestate tracker (use-after-close B / missing-check E, roadmap #4).** A
 /// contract-driven per-resource protocol: `fopen`→`file.open`, `fclose`→`file.closed` and
 /// refuses a closed handle; a `fread`/second `fclose` on a closed handle is refused

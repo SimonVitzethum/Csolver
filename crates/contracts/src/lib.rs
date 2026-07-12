@@ -241,6 +241,41 @@ pub enum Effect {
         /// When `true`, the resource must **not** be in `state`; when `false`, it must be.
         negate: bool,
     },
+    /// **Protocol-wide yield** (TOCTOU G2): a call that yields (a blocking call, a second
+    /// syscall entry, dropping a lock) transitions *every* resource of `protocol` currently
+    /// in state `from` to state `to` — e.g. `schedule()` moves every `file.checked` to
+    /// `file.stale`, so a subsequent use of a stale check is a time-of-check-to-time-of-use
+    /// race. Not tied to an argument (it affects all resources of the protocol).
+    TypestateYield {
+        /// The protocol whose resources are transitioned.
+        protocol: String,
+        /// The state a resource must be in to be affected.
+        from: String,
+        /// The state such resources move to.
+        to: String,
+    },
+    /// **Reference-count increment / decrement** (G8): the call raises (`inc`) or lowers
+    /// (`dec`) the refcount of the resource at argument `arg` within `protocol`. A `dec`
+    /// that takes the count **below zero** is an underflow (a premature free → UAF). `inc`
+    /// is `false`, `dec` is `true` in [`Effect::Refcount::dec`].
+    Refcount {
+        /// The 0-based argument index naming the counted resource.
+        arg: usize,
+        /// The refcount protocol name (e.g. `kref`).
+        protocol: String,
+        /// `true` for a decrement (`put`), `false` for an increment (`get`).
+        dec: bool,
+    },
+    /// **Leak-state declaration** (K): a resource left in `state` of `protocol` at a function
+    /// **return** (without being released or escaping via the return value) is a resource
+    /// leak. Not applied at a call — it registers `(protocol, state)` as a leak state checked
+    /// at every return.
+    TypestateLeak {
+        /// The protocol whose lingering state is a leak.
+        protocol: String,
+        /// The state that, if still held at return, is a leak.
+        state: String,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -515,6 +550,25 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let state = rest.get(2).copied().ok_or("`typestate-require` needs a state")?.to_string();
             Ok(Effect::TypestateRequire { arg, protocol, state, negate: kind == "typestate-require-not" })
         }
+        // `typestate-yield <protocol> <from> <to>` (protocol-wide, no argument).
+        "typestate-yield" => {
+            let protocol = rest.first().copied().ok_or("`typestate-yield` needs a protocol")?.to_string();
+            let from = rest.get(1).copied().ok_or("`typestate-yield` needs a from-state")?.to_string();
+            let to = rest.get(2).copied().ok_or("`typestate-yield` needs a to-state")?.to_string();
+            Ok(Effect::TypestateYield { protocol, from, to })
+        }
+        // `refcount-inc arg<k> <protocol>` / `refcount-dec arg<k> <protocol>`.
+        "refcount-inc" | "refcount-dec" => {
+            let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let protocol = rest.get(1).copied().ok_or("`refcount` needs a protocol")?.to_string();
+            Ok(Effect::Refcount { arg, protocol, dec: kind == "refcount-dec" })
+        }
+        // `typestate-leak <protocol> <state>` (registers a leak state; checked at returns).
+        "typestate-leak" => {
+            let protocol = rest.first().copied().ok_or("`typestate-leak` needs a protocol")?.to_string();
+            let state = rest.get(1).copied().ok_or("`typestate-leak` needs a state")?.to_string();
+            Ok(Effect::TypestateLeak { protocol, state })
+        }
         other => Err(format!("unknown effect `{other}`")),
     }
 }
@@ -704,6 +758,35 @@ mod tests {
         assert_eq!(
             c.lookup("use_h").unwrap().effects,
             vec![Effect::TypestateRequire { arg: 0, protocol: "perm".into(), state: "checked".into(), negate: false }]
+        );
+    }
+
+    #[test]
+    fn yield_refcount_and_leak_effects_parse() {
+        let mut c = Contracts::default();
+        c.parse_str(
+            "[yld]\ntypestate-yield toctou checked stale\n\
+             [get]\nrefcount-inc arg0 kref\n\
+             [put]\nrefcount-dec arg0 kref\n\
+             [own]\ntypestate-leak file open\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            c.lookup("yld").unwrap().effects,
+            vec![Effect::TypestateYield { protocol: "toctou".into(), from: "checked".into(), to: "stale".into() }]
+        );
+        assert_eq!(
+            c.lookup("get").unwrap().effects,
+            vec![Effect::Refcount { arg: 0, protocol: "kref".into(), dec: false }]
+        );
+        assert_eq!(
+            c.lookup("put").unwrap().effects,
+            vec![Effect::Refcount { arg: 0, protocol: "kref".into(), dec: true }]
+        );
+        assert_eq!(
+            c.lookup("own").unwrap().effects,
+            vec![Effect::TypestateLeak { protocol: "file".into(), state: "open".into() }]
         );
     }
 

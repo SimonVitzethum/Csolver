@@ -319,7 +319,7 @@ fn lower_function(
         }
     }
 
-    let function = Function {
+    let mut function = Function {
         id,
         name: f.name.clone(),
         params,
@@ -327,7 +327,71 @@ fn lower_function(
         blocks,
         entry: BlockId(0),
     };
+    inject_leak_and_secret_checks(&mut function);
     Ok((function, contracts, raw_ptr_hints))
+}
+
+/// Post-pass: inject the two obligation checks that are not tied to a specific call —
+/// **resource-leak** checks (K) before every `Return`, and **secret-dependence** checks (L)
+/// at every branch condition and memory index. Both are gated on the contracts actually
+/// declaring the relevant labels (a leak state, a `secret` taint label), so a codebase that
+/// names neither pays nothing.
+fn inject_leak_and_secret_checks(f: &mut Function) {
+    let leaks = leak_states();
+    let secret = prov_interner().id("secret");
+    if leaks.is_empty() && secret.is_none() {
+        return;
+    }
+    for b in &mut f.blocks {
+        // Secret-dependence at each memory index: inject a `SecretCheck` on the index
+        // operand just before each `PtrOffset` (rebuild the inst list to keep order).
+        if let Some(taint) = secret {
+            let mut out = Vec::with_capacity(b.insts.len());
+            for inst in b.insts.drain(..) {
+                if let Inst::PtrOffset { index: Operand::Reg(r), .. } = &inst {
+                    out.push(Inst::SecretCheck { val: Operand::Reg(*r), taint });
+                }
+                out.push(inst);
+            }
+            b.insts = out;
+        }
+        // Resource-leak checks + secret-dependent branch: appended after the body, before
+        // the terminator is evaluated (the executor runs them in the step loop).
+        match &b.term {
+            Terminator::Return(ret) => {
+                for &(protocol, state) in leaks {
+                    b.insts.push(Inst::TypestateLeakCheck { protocol, state, escaping: ret.clone() });
+                }
+            }
+            Terminator::CondBr { cond: Operand::Reg(r), .. } => {
+                if let Some(taint) = secret {
+                    b.insts.push(Inst::SecretCheck { val: Operand::Reg(*r), taint });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The `(protocol, state)` leak-state declarations from all contracts (a `typestate-leak`
+/// effect), interned to ids — a resource still in one of these states at a return is a leak.
+fn leak_states() -> &'static [(u32, u32)] {
+    static LEAKS: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    LEAKS.get_or_init(|| {
+        let mut v = Vec::new();
+        for c in contracts().iter() {
+            for effect in &c.effects {
+                if let Effect::TypestateLeak { protocol, state } = effect {
+                    if let (Some(p), Some(s)) = (prov_interner().id(protocol), prov_interner().id(state)) {
+                        v.push((p, s));
+                    }
+                }
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    })
 }
 
 /// A per-function pre-pass over debug info: the *result* locals of `load ptr`
@@ -666,6 +730,12 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 if emit_contract(ctx, &mut insts, contract, dst.as_deref(), args, ret)? {
                     continue;
                 }
+                // An annotation-only contract (taint/typestate, no memory model): the
+                // pre-call effects are already emitted; now emit the *real* call (which binds
+                // the result), then the `ret`-targeted effects on the bound result.
+                insts.push(lower_inst(ctx, inst)?);
+                emit_ret_effects(ctx, &mut insts, contract, dst.as_deref())?;
+                continue;
             }
         }
         insts.push(lower_inst(ctx, inst)?);
@@ -1255,10 +1325,17 @@ fn prov_interner() -> &'static ProvInterner {
                     | Effect::TaintSink { label, .. }
                     | Effect::TaintSanitize { label, .. } => names.push(label),
                     Effect::TypestateSet { protocol, state, .. }
-                    | Effect::TypestateRequire { protocol, state, .. } => {
+                    | Effect::TypestateRequire { protocol, state, .. }
+                    | Effect::TypestateLeak { protocol, state } => {
                         names.push(protocol);
                         names.push(state);
                     }
+                    Effect::TypestateYield { protocol, from, to } => {
+                        names.push(protocol);
+                        names.push(from);
+                        names.push(to);
+                    }
+                    Effect::Refcount { protocol, .. } => names.push(protocol),
                     _ => {}
                 }
             }
@@ -1447,6 +1524,25 @@ fn emit_contract(
             }
             // `ret`-targeted typestate-set: handled after result binding.
             Effect::TypestateSet { .. } => {}
+            // Protocol-wide yield (TOCTOU): not tied to an argument.
+            Effect::TypestateYield { protocol, from, to } => {
+                if let (Some(p), Some(fr), Some(t)) = (
+                    prov_interner().id(protocol),
+                    prov_interner().id(from),
+                    prov_interner().id(to),
+                ) {
+                    insts.push(Inst::TypestateYield { protocol: p, from: fr, to: t });
+                }
+            }
+            // Reference-count inc/dec.
+            Effect::Refcount { arg, protocol, dec } => {
+                if let (Some(a), Some(p)) = (args.get(*arg), prov_interner().id(protocol)) {
+                    insts.push(Inst::Refcount { val: ctx.operand(a, 64)?, protocol: p, dec: *dec });
+                }
+            }
+            // Leak-state declarations are collected globally and injected before returns
+            // (see `inject_leak_and_secret_checks`), not emitted at a call.
+            Effect::TypestateLeak { .. } => {}
         }
     }
     // A recognized non-allocating call still yields a result the caller may use
@@ -1460,38 +1556,53 @@ fn emit_contract(
             });
         }
     }
-    // `ret`-targeted taint source/sanitiser: the result register now exists (bound above or
-    // by the allocation/model), so mark or clear its taint. A `recv`-style API whose *return*
-    // is an untrusted length is the archetype.
-    if let Some(dst) = dst {
-        for effect in &contract.effects {
-            match effect {
-                Effect::TaintSource { arg, label } if *arg == RET_ARG => {
-                    if let Some(id) = prov_interner().id(label) {
-                        insts.push(Inst::TaintSource { val: Operand::Reg(ctx.reg(dst)?), taint: id });
-                    }
-                }
-                Effect::TaintSanitize { arg, label } if *arg == RET_ARG => {
-                    if let Some(id) = prov_interner().id(label) {
-                        insts.push(Inst::TaintClear { val: Operand::Reg(ctx.reg(dst)?), taint: id });
-                    }
-                }
-                // A `ret`-targeted typestate transition (`fopen` → the returned handle is
-                // `file.open`).
-                Effect::TypestateSet { arg, protocol, state } if *arg == RET_ARG => {
-                    if let (Some(p), Some(s)) = (prov_interner().id(protocol), prov_interner().id(state)) {
-                        insts.push(Inst::TypestateSet {
-                            val: Operand::Reg(ctx.reg(dst)?),
-                            protocol: p,
-                            state: s,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
+    // `ret`-targeted effects need the result register bound *first*. When this contract fully
+    // models the call (`handled`), the result is bound above, so emit them now; otherwise the
+    // real `Inst::Call` (emitted by the caller after this returns) binds the result, so the
+    // caller emits the ret-effects afterwards (see `emit_ret_effects`).
+    if handled {
+        emit_ret_effects(ctx, insts, contract, dst)?;
     }
     Ok(handled)
+}
+
+/// Emit the `ret`-targeted contract effects (taint source/sanitiser, typestate transition) —
+/// which mark or clear the **result** value's provenance/taint/state. Called once the result
+/// register is bound (by a memory model inside `emit_contract`, or by the real call the caller
+/// emits for an annotation-only contract). A `recv`-style tainted return, or `fopen`'s returned
+/// `file.open` handle, is the archetype.
+fn emit_ret_effects(
+    ctx: &mut Ctx,
+    insts: &mut Vec<Inst>,
+    contract: &ApiContract,
+    dst: Option<&str>,
+) -> Result<()> {
+    let Some(dst) = dst else { return Ok(()) };
+    for effect in &contract.effects {
+        match effect {
+            Effect::TaintSource { arg, label } if *arg == RET_ARG => {
+                if let Some(id) = prov_interner().id(label) {
+                    insts.push(Inst::TaintSource { val: Operand::Reg(ctx.reg(dst)?), taint: id });
+                }
+            }
+            Effect::TaintSanitize { arg, label } if *arg == RET_ARG => {
+                if let Some(id) = prov_interner().id(label) {
+                    insts.push(Inst::TaintClear { val: Operand::Reg(ctx.reg(dst)?), taint: id });
+                }
+            }
+            Effect::TypestateSet { arg, protocol, state } if *arg == RET_ARG => {
+                if let (Some(p), Some(s)) = (prov_interner().id(protocol), prov_interner().id(state)) {
+                    insts.push(Inst::TypestateSet {
+                        val: Operand::Reg(ctx.reg(dst)?),
+                        protocol: p,
+                        state: s,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate a contract [`SizeExpr`] to a byte-length operand, or `None` if it references

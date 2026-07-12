@@ -28,3 +28,10 @@ taint-sink arg1 user
 # A recognised validation/escape returns a sanitised copy (its result is untainted).
 [taint_sanitize escape_shell realpath]
 taint-sanitize ret user
+
+# --- Secret sources (constant-time L) ------------------------------------------------------
+# A secret key / random material fills a buffer; a value derived from it must not decide a
+# branch or index memory (a timing / cache side channel). Injected `SecretCheck`s at every
+# branch condition and gep index enforce this — only active because `secret` is defined here.
+[load_secret_key crypto_get_key get_random_bytes read_mac]
+taint-source arg0 secret
