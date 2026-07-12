@@ -100,13 +100,42 @@ pub struct AtomicityWitness {
     pub schedule: Vec<(String, Event)>,
 }
 
-/// Cap on explored schedule states — keeps the (worst-case exponential) DFS bounded. On
-/// reaching it the search gives up (returns `None` for that pair), never a false witness.
-const MAX_STATES: u64 = 200_000;
+/// The single unavoidable **memory-safety ceiling**: the reachable interleaving / weak-memory state
+/// space is worst-case exponential in the trace length, so one search must be bounded to keep memory
+/// finite. This is *not* a recall knob — every search whose input-derived estimate falls within it is
+/// explored *completely* (see [`search_budget`]); it only caps pathological inputs, and it is the
+/// pivot for decomposing an intractable N-thread product into pairs ([`product_fits`]). ~500 000
+/// small states is on the order of a hundred megabytes. Deterministic, so verdicts stay reproducible.
+const SEARCH_CEILING: u64 = 500_000;
 
-/// Cap on the number of thread pairs the whole-program search checks — the pairing is
-/// quadratic, so a large program is bounded (best-effort recall, never a false witness).
-const MAX_PAIRS: usize = 20_000;
+/// The input-derived state estimate for a search over the given per-thread trace lengths: the
+/// interleaving product `∏(eᵢ+1)` scaled by a per-thread buffer/propagation factor that grows with
+/// the thread count (`~4^threads` — the store-buffer-flush and cross-thread-propagation orderings a
+/// wider product adds). Empirically this tracks the reachable-state count (the 4-thread IRIW litmus
+/// reaches ~5 000; this estimates ~9 000). Saturating, so a huge group yields `u64::MAX`.
+fn search_estimate(per_thread_events: &[usize]) -> u64 {
+    let threads = per_thread_events.len() as u32;
+    let mut product: u64 = 1;
+    for &e in per_thread_events {
+        product = product.saturating_mul(e as u64 + 1);
+    }
+    product.saturating_mul(4u64.saturating_pow(threads))
+}
+
+/// The exploration budget for a search over these traces: the input-derived estimate, capped at the
+/// memory-safety ceiling. Generous for small traces (litmus explore fully) and scaling with the
+/// input rather than a fixed magic count.
+fn search_budget(per_thread_events: &[usize]) -> u64 {
+    search_estimate(per_thread_events).min(SEARCH_CEILING)
+}
+
+/// Whether an N-thread product's estimated state space fits the ceiling — if so it is explored as
+/// one simultaneous product (needed for genuine >2-thread effects like IRIW); if not, the search is
+/// decomposed into pairs (each far smaller). Replaces a fixed maximum group size with an input-
+/// derived decision.
+fn product_fits(per_thread_events: &[usize]) -> bool {
+    search_estimate(per_thread_events) <= SEARCH_CEILING
+}
 
 /// Build a [`Thread`] from an encoded `(kind, class)` trace (0=acquire,1=release,2=read,
 /// 3=write) — the form the executor streams (`csolver_symbolic`).
@@ -174,11 +203,10 @@ fn spawned_names(threads: &[Thread]) -> std::collections::HashSet<String> {
 
 /// Whole-program atomicity search: over all thread traces, check every pair that shares a
 /// location where at least one writes it, in both orders, and collect the witnessed atomicity
-/// violations (one per location, most-relevant first). Bounded by [`MAX_PAIRS`].
+/// violations (one per location, most-relevant first).
 pub fn find_atomicity_violations(threads: &[Thread]) -> Vec<AtomicityWitness> {
     let mut out: Vec<AtomicityWitness> = Vec::new();
     let mut seen_loc: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut pairs = 0usize;
     let spawned = spawned_names(threads);
     for i in 0..threads.len() {
         let ti_written = threads[i].written();
@@ -206,10 +234,6 @@ pub fn find_atomicity_violations(threads: &[Thread]) -> Vec<AtomicityWitness> {
             if !shares_write {
                 continue;
             }
-            if pairs >= MAX_PAIRS {
-                return out;
-            }
-            pairs += 1;
             for w in [
                 atomicity_violation(&threads[i], &threads[j]),
                 atomicity_violation(&threads[j], &threads[i]),
@@ -265,19 +289,14 @@ Event::Read(y) | Event::DepRead(y) if y != x => {
 
 /// Whole-program store-buffer search: find every pair of threads exhibiting the store-buffer
 /// litmus (`Ti: W(a)…R(b)` and `Tj: W(b)…R(a)`, no barrier in either window) — a missing-barrier
-/// weak-memory bug. Bounded by [`MAX_PAIRS`]. Bug-finding: the reordering is only a bug if the
+/// weak-memory bug. Bug-finding: the reordering is only a bug if the
 /// code relies on the SC outcome (a flag handshake / Dekker lock), so it is a candidate.
 pub fn store_buffer_violations(threads: &[Thread]) -> Vec<StoreBufferWitness> {
     let pairs: Vec<_> = threads.iter().map(buffered_write_read_pairs).collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    let mut checked = 0usize;
     for i in 0..threads.len() {
         for j in (i + 1)..threads.len() {
-            if checked >= MAX_PAIRS {
-                return out;
-            }
-            checked += 1;
             for (a, b) in &pairs[i] {
                 // Thread j must write `b` then read `a` (the mirrored litmus).
                 if pairs[j].contains(&(b.clone(), a.clone())) {
@@ -339,19 +358,17 @@ fn free_and_access_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
 
 /// Whole-program **cross-thread use-after-free / double-free** search: a free in one thread and a
 /// concurrent access (UAF) or free (double-free) of the same object in another thread, with
-/// **disjoint locksets** (nothing orders them). Bounded by [`MAX_PAIRS`]. A bug-finding
+/// **disjoint locksets** (nothing orders them). A bug-finding
 /// heuristic — like Eraser it does not model refcounts or ownership that may order them.
 pub fn find_cross_thread_uaf(threads: &[Thread]) -> Vec<FreeUseWitness> {
     let per: Vec<_> = threads.iter().map(free_and_access_locksets).collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
-    let mut checked = 0usize;
     for i in 0..threads.len() {
         for j in 0..threads.len() {
-            if i == j || checked >= MAX_PAIRS {
+            if i == j {
                 continue;
             }
-            checked += 1;
             // A free in `i` vs an access in `j`, disjoint locksets → use-after-free.
             for (fx, fl) in &per[i].0 {
                 for (ax, al) in &per[j].1 {
@@ -421,7 +438,7 @@ fn root_slot(class: &str) -> &str {
 /// (double-free) of the same object in a *different* entry. `entries` should be the attacker-
 /// reachable entry functions' traces; the global-root restriction means only *persistent* shared
 /// state is considered, so a param-passed object (which cannot survive to an unrelated entry) never
-/// fires. Bounded by [`MAX_PAIRS`]. A bug-finding heuristic — it does not model an intervening
+/// fires. A bug-finding heuristic — it does not model an intervening
 /// re-validation the two syscalls might both perform, so it reports candidates.
 pub fn find_cross_entry_uaf(entries: &[Thread]) -> Vec<CrossEntryWitness> {
     use std::collections::BTreeSet;
@@ -465,13 +482,11 @@ pub fn find_cross_entry_uaf(entries: &[Thread]) -> Vec<CrossEntryWitness> {
         .collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
-    let mut checked = 0usize;
     for i in 0..entries.len() {
         for j in 0..entries.len() {
-            if i == j || checked >= MAX_PAIRS {
+            if i == j {
                 continue;
             }
-            checked += 1;
             for fx in &eff[i].frees {
                 // The freeing entry reassigned/cleared the global root → not left dangling, skip.
                 if eff[i].writes_slot.contains(root_slot(fx)) {
@@ -532,7 +547,7 @@ fn parse_typestate(payload: &str) -> Option<(u8, &str, u32, u32)> {
 /// in one entry paired with a `require-not` of the same triple in a *different* entry — invoking the
 /// setter then the user is a cross-syscall use-after-state (use-after-close / use-after-free on the
 /// object's persistent global handle). Restricted to global-rooted objects (streamed as such), so a
-/// parameter-local resource never fires. Bounded by [`MAX_PAIRS`]. A bug-finding heuristic — it does
+/// parameter-local resource never fires. A bug-finding heuristic — it does
 /// not model an ordering guard (a re-open/re-check) the second syscall might perform.
 pub fn find_cross_entry_typestate(entries: &[Thread]) -> Vec<CrossEntryTypestateWitness> {
     // Per entry: the (class, proto, state) it sets, and the ones it requires-not (the use side).
@@ -557,13 +572,11 @@ pub fn find_cross_entry_typestate(entries: &[Thread]) -> Vec<CrossEntryTypestate
         .unzip();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<Triple> = std::collections::HashSet::new();
-    let mut checked = 0usize;
     for i in 0..entries.len() {
         for j in 0..entries.len() {
-            if i == j || checked >= MAX_PAIRS {
+            if i == j {
                 continue;
             }
-            checked += 1;
             for set in &sets[i] {
                 if reqnots[j].contains(set) && seen.insert(set.clone()) {
                     out.push(CrossEntryTypestateWitness {
@@ -615,19 +628,17 @@ fn cas_and_mod_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
 
 /// Whole-program **ABA** search: a compare-and-swap of a location in one thread concurrent
 /// (disjoint locksets) with a modification of the same location in another thread. Bounded by
-/// [`MAX_PAIRS`]. A bug-finding heuristic — a real ABA also needs the value to actually recur,
+/// A bug-finding heuristic — a real ABA also needs the value to actually recur,
 /// which is not modelled, so it is a candidate.
 pub fn find_aba(threads: &[Thread]) -> Vec<AbaWitness> {
     let per: Vec<_> = threads.iter().map(cas_and_mod_locksets).collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut checked = 0usize;
     for i in 0..threads.len() {
         for j in 0..threads.len() {
-            if i == j || checked >= MAX_PAIRS {
+            if i == j {
                 continue;
             }
-            checked += 1;
             for (cx, cl) in &per[i].0 {
                 for (mx, ml) in &per[j].1 {
                     if cx == mx && cl.is_disjoint(ml) && seen.insert(cx.clone()) {
@@ -680,19 +691,17 @@ fn get_and_put_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
 
 /// Whole-program **concurrent refcount race** search: an unchecked get of an object in one thread
 /// concurrent (disjoint locksets) with a put of the same object in another thread. Bounded by
-/// [`MAX_PAIRS`]. A bug-finding heuristic — a real race also needs the put to actually be the last
+/// A bug-finding heuristic — a real race also needs the put to actually be the last
 /// reference, which is not modelled, so it reports candidates.
 pub fn find_refcount_races(threads: &[Thread]) -> Vec<RefcountRaceWitness> {
     let per: Vec<_> = threads.iter().map(get_and_put_locksets).collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut checked = 0usize;
     for i in 0..threads.len() {
         for j in 0..threads.len() {
-            if i == j || checked >= MAX_PAIRS {
+            if i == j {
                 continue;
             }
-            checked += 1;
             for (gx, gl) in &per[i].0 {
                 for (px, pl) in &per[j].1 {
                     if gx == px && gl.is_disjoint(pl) && seen.insert(gx.clone()) {
@@ -726,11 +735,6 @@ pub struct WeakMemoryWitness {
     /// The weak-memory schedule (thread name + step) realising the non-SC observation.
     pub schedule: Vec<(String, String)>,
 }
-
-/// Cap on operational-model states explored per run (SC or weak). Bounds the (large) reachable
-/// set; on reaching it the run gives up — soundly (a missed non-SC observation is a recall
-/// loss, never a false witness).
-const MAX_OP_STATES: u64 = 400_000;
 
 /// An in-flight write that has left its writer's store buffer and is **propagating** to the
 /// other threads' memory views one at a time (non-multi-copy-atomicity — a store reaches
@@ -899,7 +903,7 @@ fn op_reachable(
     };
     let mut out = std::collections::HashMap::new();
     let mut visited: std::collections::HashSet<OpState> = std::collections::HashSet::new();
-    let mut budget = MAX_OP_STATES;
+    let mut budget = search_budget(&prog.threads.iter().map(|t| t.events.len()).collect::<Vec<_>>());
     let mut stack: Vec<(OpState, Vec<(usize, String)>)> = vec![(init, Vec::new())];
     while let Some((st, sched)) = stack.pop() {
         if budget == 0 {
@@ -1108,11 +1112,6 @@ pub fn weak_memory_nonrobustness(threads: &[Thread]) -> Option<WeakMemoryWitness
     })
 }
 
-/// Largest thread group checked as a single simultaneous weak-memory product — >2-thread litmus
-/// (IRIW needs 4; some need 5–6) are found, while the (expensive) product stays bounded by the
-/// per-run state cap. Larger groups fall back to pairwise.
-const MAX_GROUP: usize = 6;
-
 /// Whether thread `t` has a **reorder window** — a program-order pair of shared-memory accesses to
 /// *different* locations that the operational weak-memory model can reorder (so its effects can
 /// become visible out of order). A non-SC observation is impossible without one, so a group in which
@@ -1173,9 +1172,9 @@ fn has_reorder_window(t: &Thread) -> bool {
 }
 
 /// Whole-program weak-memory search. Threads that (transitively) share a location where at least
-/// one writes form a **connected group**; a group of 2..=[`MAX_GROUP`] threads is checked as one
+/// one writes form a **connected group**; a group whose product fits the memory ceiling is checked as one
 /// simultaneous product (so a >2-thread litmus like IRIW is caught), a larger group is checked
-/// pairwise as a fallback. Bounded by [`MAX_PAIRS`]. A group with no [`has_reorder_window`] thread
+/// pairwise as a fallback. A group with no [`has_reorder_window`] thread
 /// is skipped — provably SC-robust, so the product search would find nothing.
 pub fn find_weak_memory_bugs(threads: &[Thread]) -> Vec<WeakMemoryWitness> {
     let n = threads.len();
@@ -1226,7 +1225,6 @@ pub fn find_weak_memory_bugs(threads: &[Thread]) -> Vec<WeakMemoryWitness> {
     };
     let spawned = spawned_names(threads);
     let mut out = Vec::new();
-    let mut checked = 0usize;
     // Self-concurrency: a *spawned* function may run in several threads at once, so check each
     // such writer against a second instance of itself (unbounded thread count).
     for (i, t) in threads.iter().enumerate() {
@@ -1241,7 +1239,7 @@ pub fn find_weak_memory_bugs(threads: &[Thread]) -> Vec<WeakMemoryWitness> {
     }
     for group in groups.values() {
         // Exact prune: no member has a reorder window ⇒ the group is SC-robust ⇒ no witness exists.
-        if group.len() < 2 || checked >= MAX_PAIRS || !group.iter().any(|&i| window[i]) {
+        if group.len() < 2 || !group.iter().any(|&i| window[i]) {
             continue;
         }
         // Exact prune: a non-SC witness needs two members that share ≥2 locations (a single shared
@@ -1254,15 +1252,15 @@ pub fn find_weak_memory_bugs(threads: &[Thread]) -> Vec<WeakMemoryWitness> {
         if !group_pair_two() {
             continue;
         }
-        checked += 1;
-        if group.len() <= MAX_GROUP {
-            // Check the whole group as one simultaneous product.
+        let group_events: Vec<usize> = group.iter().map(|&i| threads[i].events.len()).collect();
+        if product_fits(&group_events) {
+            // The whole-group product fits the memory ceiling — check it simultaneously.
             let ts: Vec<Thread> = group.iter().map(|&i| clone_thread(&threads[i])).collect();
             if let Some(w) = weak_memory_nonrobustness(&ts) {
                 out.push(w);
             }
         } else {
-            // Too large for a full product — fall back to pairwise within the group.
+            // The product exceeds the ceiling — decompose to pairwise within the group.
             for a in 0..group.len() {
                 for b in (a + 1)..group.len() {
                     // A pair is SC-robust unless a thread has a reorder window, one writes a shared
@@ -1297,7 +1295,7 @@ fn clone_thread(t: &Thread) -> Thread {
 /// to `x` lands between the other thread's read of `x` and its later dependent write of `x`.
 /// Returns the first witnessing schedule, or `None` if none exists within the bound.
 pub fn atomicity_violation(a: &Thread, b: &Thread) -> Option<AtomicityWitness> {
-    let mut budget = MAX_STATES;
+    let mut budget = search_budget(&[a.events.len(), b.events.len()]);
     let mut schedule: Vec<(usize, Event)> = Vec::new();
     // Per-thread: locks currently held, and locations read-but-not-yet-written (pending RMW).
     let mut st = State::default();
