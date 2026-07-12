@@ -739,6 +739,22 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 emit_ret_effects(ctx, &mut insts, contract, dst.as_deref())?;
                 continue;
             }
+            // Inline asm with structured memory operands (`<inline asm[...]|w0|r1>`): emit a
+            // precise access obligation on each pointer operand — so a UAF/OOB/null through the
+            // asm's memory operand is caught — then the base call (clean name) for its clobber.
+            if callee.starts_with("<inline asm") && callee.contains('|') {
+                emit_inline_asm_mem_ops(ctx, &mut insts, callee, args)?;
+                let base: String = callee.split('|').next().unwrap_or(callee).to_string();
+                let call_args = args.iter().map(|a| ctx.operand(a, 64)).collect::<Result<Vec<_>>>()?;
+                insts.push(Inst::Call {
+                    dst: dst.as_deref().map(|d| ctx.reg(d)).transpose()?,
+                    callee: Callee::Symbol(base),
+                    args: call_args,
+                    ret_ty: lower_type(ret),
+                    ret_ref: None,
+                });
+                continue;
+            }
         }
         insts.push(lower_inst(ctx, inst)?);
     }
@@ -1637,6 +1653,45 @@ fn resolve_callee(ctx: &Ctx, callee: &str) -> Callee {
         Some(id) => Callee::Direct(*id),
         None => Callee::Symbol(callee.to_string()),
     }
+}
+
+/// Emit a precise access obligation for each inline-asm memory operand encoded in the callee
+/// name (`|w<i>` = written, `|r<i>` = read). A byte Load/Store through the pointer argument
+/// checks it is non-null, live, in-bounds and (for a write) writable — catching a UAF / OOB /
+/// null-deref committed *through* the asm's declared memory operand.
+fn emit_inline_asm_mem_ops(
+    ctx: &mut Ctx,
+    insts: &mut Vec<Inst>,
+    callee: &str,
+    args: &[LValue],
+) -> Result<()> {
+    for spec in callee.split('|').skip(1) {
+        let (write, idx_str) = match spec.split_at(1) {
+            ("w", n) => (true, n),
+            ("r", n) => (false, n),
+            _ => continue,
+        };
+        let Ok(i) = idx_str.parse::<usize>() else { continue };
+        let Some(a) = args.get(i) else { continue };
+        // Only a pointer operand can be accessed (a register/global/null); an integer immediate
+        // is not a memory operand and is skipped.
+        if !matches!(a, LValue::Local(_) | LValue::Global(_) | LValue::GlobalOff { .. } | LValue::Null) {
+            continue;
+        }
+        let ptr = ctx.operand(a, 64)?;
+        if write {
+            insts.push(Inst::Store {
+                ty: Type::int(8),
+                ptr,
+                value: Operand::Const(Const::Undef),
+                align: 1,
+                volatile: true,
+            });
+        } else {
+            insts.push(Inst::Load { dst: ctx.fresh(), ty: Type::int(8), ptr, align: 1, volatile: true });
+        }
+    }
+    Ok(())
 }
 
 fn size_operand(

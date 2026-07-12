@@ -1958,11 +1958,19 @@ impl Parser {
             // register-only and touches no tracked memory (`<inline asm nomem>`), which
             // the executor treats as a non-clobbering call — preserving the heap and
             // provenance that a havoc would destroy (kernel C is saturated with such asm).
-            if asm_may_write_memory(&constraints) {
+            // Precise memory operands (`=*m`/`m`/…): appended as `|w<i>` (written) / `|r<i>`
+            // (read) so the lowering emits a real access obligation on the pointer argument —
+            // catching a UAF/OOB/null through an asm memory operand — on top of the sound
+            // clobber/nomem classification.
+            let mut name = if asm_may_write_memory(&constraints) {
                 "<inline asm>".to_string()
             } else {
                 "<inline asm nomem>".to_string()
+            };
+            for (arg, is_write) in asm_memory_operands(&constraints) {
+                name.push_str(&format!("|{}{arg}", if is_write { 'w' } else { 'r' }));
             }
+            name
         } else {
             self.callee_name()?
         };
@@ -2083,6 +2091,34 @@ fn is_int_type(w: &str) -> bool {
 /// memory *input* (`m` with no `=`/`+`), touches no tracked memory. Conservative
 /// by direction: any doubt about an output resolves to "may write" (a false havoc,
 /// never a missed write), so an unrecognised shape can only lose precision.
+/// The **memory operands** of an inline-asm constraint string: `(arg_index, is_write)` for each
+/// operand that is a pointer the asm accesses (`=*m`/`+*m`/`*m`/`=m`/`m`). LLVM passes indirect
+/// memory operands and inputs as call arguments in constraint order; a plain register output
+/// (`=r`, no `*`/`m`) consumes no argument (it maps to the return). Best-effort: used only to
+/// *add* precise access obligations on the pointer, so a mis-count can never cause a false PASS.
+fn asm_memory_operands(constraints: &str) -> Vec<(usize, bool)> {
+    let mut ops = Vec::new();
+    let mut arg = 0usize;
+    for tok in constraints.split(',') {
+        let t = tok.trim();
+        if t.is_empty() || t.starts_with('~') {
+            continue; // a clobber (`~{memory}`, `~{cc}`, `~{reg}`) consumes no argument
+        }
+        let is_output = t.starts_with('=') || t.starts_with('+');
+        let is_reg_output = is_output && !t.contains('*') && !t.contains('m');
+        if is_reg_output {
+            continue; // register output → the return value, not an argument
+        }
+        // This operand consumes an argument (an input, or an indirect/memory operand).
+        let is_mem = t.contains('m') || t.contains('*');
+        if is_mem {
+            ops.push((arg, is_output));
+        }
+        arg += 1;
+    }
+    ops
+}
+
 fn asm_may_write_memory(constraints: &str) -> bool {
     // A `~{memory}` clobber, or an indirect operand (`*` — the asm is handed a pointer
     // and may write through it, in any direction), or an OUTPUT memory operand

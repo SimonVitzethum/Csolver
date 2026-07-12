@@ -3465,6 +3465,44 @@ fn iriw_is_a_weak_memory_bug() {
     assert!(good.weak_memory_bugs().is_empty(), "full barriers between the reads fix IRIW");
 }
 
+/// **Inline-asm memory operand (safety through asm).** An inline asm with a memory operand
+/// (`=*m`) writes through its pointer argument — a use-after-free / OOB / null committed *through*
+/// the asm is now caught (a precise access obligation on the pointer), and a `~{memory}`-clobber
+/// asm no longer false-flags a later free as a double-free (a clobber writes, it does not free).
+#[test]
+fn inline_asm_memory_operand_is_checked() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let verdict = |name: &str, body: &str| -> Verdict {
+        let src = format!(
+            "declare ptr @kmalloc(i64, i32)\ndeclare void @kfree(ptr)\n\
+             define void @{name}() {{\n{body}  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: name.into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // asm writes *p AFTER free → use-after-free through the asm memory operand.
+    assert_eq!(
+        verdict("uaf", "  %p = call ptr @kmalloc(i64 8, i32 0)\n  call void @kfree(ptr %p)\n  \
+                         call void asm sideeffect \"movb $1, $0\", \"=*m,r\"(ptr %p, i8 0)\n"),
+        Verdict::Fail, "a write through a freed inline-asm memory operand is a UAF"
+    );
+    // asm writes *p while live, then free → safe. (Also: the memclobber asm must not be
+    // treated as a free, else the kfree would be a spurious double-free.)
+    assert_ne!(
+        verdict("ok", "  %p = call ptr @kmalloc(i64 8, i32 0)\n  \
+                        call void asm sideeffect \"movb $1, $0\", \"=*m,r\"(ptr %p, i8 0)\n  \
+                        call void @kfree(ptr %p)\n"),
+        Verdict::Fail, "a write through a live operand then free is safe"
+    );
+    // A memory-clobber asm before a free is not a double-free (a clobber writes, not frees).
+    assert_ne!(
+        verdict("clob", "  %p = call ptr @kmalloc(i64 8, i32 0)\n  \
+                          call void asm sideeffect \"mfence\", \"~{memory}\"()\n  \
+                          call void @kfree(ptr %p)\n"),
+        Verdict::Fail, "a memory-clobber asm does not free — no double-free"
+    );
+}
+
 /// **Cross-thread use-after-free.** One function frees an object (`kfree`) while another
 /// concurrently dereferences it, under *disjoint* locks — nothing orders the free before the
 /// use, so it is a cross-thread UAF. A common lock orders them (no finding).

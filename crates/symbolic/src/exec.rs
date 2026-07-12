@@ -4187,9 +4187,15 @@ impl Explorer<'_> {
         // frees no tracked memory — so it does NOT havoc the heap/provenance, unlike an
         // unknown call. Sound: a memory-clobbering asm keeps the `<inline asm>` marker and
         // the full havoc below.
+        let asm = matches!(callee, Callee::Symbol(n) if n.starts_with("<inline asm"));
         let nomem_asm = matches!(callee, Callee::Symbol(n) if n == "<inline asm nomem>");
         let (writes, frees) = if nomem_asm {
             (false, false)
+        } else if asm {
+            // A memory-clobbering inline asm (`~{memory}`) may WRITE memory but does not free —
+            // so it havocs the heap yet must not be treated as a freeing call (which would
+            // false-flag a later `kfree` of the same object as a double-free).
+            (true, false)
         } else {
             summary.as_ref().map_or((true, true), |s| (s.writes, s.frees))
         };
