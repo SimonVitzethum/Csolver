@@ -3333,25 +3333,30 @@ fn store_buffer_without_barrier_is_a_weak_memory_bug() {
 #[test]
 fn message_passing_without_wmb_is_a_weak_memory_bug() {
     let cfg = Config { bug_finding: true, ..Config::default() };
-    let module = |mid: &str| {
+    // `pbar` goes between the producer's two writes, `cbar` between the consumer's two reads.
+    let module = |pbar: &str, cbar: &str| {
         let src = format!(
-            "@data = global i32 0, align 4\n@flag = global i32 0, align 4\ndeclare void @smp_wmb()\n\
-             define void @producer() {{\n  store i32 42, ptr @data, align 4\n{mid}  \
+            "@data = global i32 0, align 4\n@flag = global i32 0, align 4\n\
+             declare void @smp_wmb()\ndeclare void @smp_rmb()\n\
+             define void @producer() {{\n  store i32 42, ptr @data, align 4\n{pbar}  \
                store i32 1, ptr @flag, align 4\n  ret void\n}}\n\
-             define i32 @consumer() {{\n  %f = load i32, ptr @flag, align 4\n  \
+             define i32 @consumer() {{\n  %f = load i32, ptr @flag, align 4\n{cbar}  \
                %d = load i32, ptr @data, align 4\n  ret i32 %d\n}}\n"
         );
         let m = LlvmFrontend.lower(LlvmInput { source: src, name: "mp".into() }).expect("lower");
         verify_module(&m, &cfg)
     };
-    // No write barrier → the publish can be observed out of order (non-SC-robust).
-    let bad = module("");
-    assert_eq!(bad.weak_memory_bugs().len(), 1, "message passing without smp_wmb is not SC-robust");
-    // The syntactic store-buffer (W→R) check does NOT catch this (it is a W→W reorder).
+    // No barriers → the publish can be observed out of order (non-SC-robust).
+    let bad = module("", "");
+    assert_eq!(bad.weak_memory_bugs().len(), 1, "message passing with no barriers is not SC-robust");
+    // The syntactic store-buffer (W→R) check does NOT catch this (it is a W→W / R→R reorder).
     assert!(bad.store_buffer_bugs().is_empty(), "MP is not a store-buffer (W->R) shape");
-    // A write barrier between the two producer writes restores robustness.
-    let good = module("  call void @smp_wmb()\n");
-    assert!(good.weak_memory_bugs().is_empty(), "smp_wmb between the publishes fixes it");
+    // A write barrier alone is not enough — the consumer's reads still reorder (ARM R→R).
+    let wmb_only = module("  call void @smp_wmb()\n", "");
+    assert_eq!(wmb_only.weak_memory_bugs().len(), 1, "smp_wmb alone leaves the consumer R->R reorder");
+    // Both a write barrier (producer) and a read barrier (consumer) restore robustness.
+    let good = module("  call void @smp_wmb()\n", "  call void @smp_rmb()\n");
+    assert!(good.weak_memory_bugs().is_empty(), "smp_wmb + smp_rmb fix the publish protocol");
 }
 
 /// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and

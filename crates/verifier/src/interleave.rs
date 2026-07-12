@@ -255,19 +255,44 @@ pub struct WeakMemoryWitness {
 /// loss, never a false witness).
 const MAX_OP_STATES: u64 = 400_000;
 
-/// The operational state: per-thread instruction pointers, per-thread **per-location** FIFO
-/// store buffers (PSO — each location's buffer drains independently, so writes to *different*
-/// locations may become visible out of order), shared memory (location → value tag), locks
-/// held, and the read observations so far (read-event id → value tag observed).
+/// The operational state: per-thread **per-event consumed** flags (so reads can be taken out of
+/// program order — ARM-style read reordering — while non-reads and barriers stay ordered),
+/// per-thread **per-location** FIFO store buffers (PSO — each location's buffer drains
+/// independently, so writes to *different* locations may become visible out of order), shared
+/// memory (location → value tag), locks held, and the read observations so far.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct OpState {
-    ip: Vec<usize>,
+    // consumed[thread][event_index] = whether that event has executed.
+    consumed: Vec<Vec<bool>>,
     // buffer[thread][location] = FIFO of value tags not yet flushed to memory.
     bufs: Vec<std::collections::BTreeMap<String, Vec<u32>>>,
     mem: std::collections::BTreeMap<String, u32>,
     held: Vec<Vec<String>>,
     // read-event global id -> observed value tag.
     obs: std::collections::BTreeMap<u32, u32>,
+}
+
+/// Whether thread `t`'s event `i` may execute now. Every earlier **non-read** (a write, barrier
+/// or lock op) must already be consumed — those stay in program order. A **read** may addition-
+/// ally execute *before* earlier reads when `reorder` (weak memory, ARM R→R reordering), so a
+/// consumer's `R(flag);R(data)` can be observed out of order — a read barrier (`smp_rmb`, a
+/// non-read) between them re-imposes order. A non-read requires *all* earlier events consumed.
+fn takeable(events: &[Event], consumed: &[bool], i: usize, reorder: bool) -> bool {
+    if consumed[i] {
+        return false;
+    }
+    let is_read = matches!(events[i], Event::Read(_));
+    for (j, e) in events.iter().enumerate().take(i) {
+        if consumed[j] {
+            continue;
+        }
+        // An earlier unconsumed non-read always blocks; an earlier unconsumed read blocks unless
+        // this event is a read taken under reordering.
+        if !(matches!(e, Event::Read(_)) && is_read && reorder) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Precomputed static data for a set of threads: each write's value tag and each read's global
@@ -336,7 +361,7 @@ fn op_reachable(
 ) -> std::collections::HashMap<std::collections::BTreeMap<u32, u32>, Vec<(usize, String)>> {
     let n = prog.threads.len();
     let init = OpState {
-        ip: vec![0; n],
+        consumed: prog.threads.iter().map(|t| vec![false; t.events.len()]).collect(),
         bufs: vec![std::collections::BTreeMap::new(); n],
         mem: std::collections::BTreeMap::new(),
         held: vec![Vec::new(); n],
@@ -354,8 +379,8 @@ fn op_reachable(
         if !visited.insert(st.clone()) {
             continue;
         }
-        // Terminal: every thread finished and all buffers drained.
-        let done = (0..n).all(|t| st.ip[t] >= prog.threads[t].events.len() && bufs_empty(&st, t));
+        // Terminal: every event executed and all buffers drained.
+        let done = (0..n).all(|t| st.consumed[t].iter().all(|&c| c) && bufs_empty(&st, t));
         if done {
             out.entry(st.obs.clone()).or_insert_with(|| sched.clone());
             continue;
@@ -379,56 +404,61 @@ fn op_reachable(
                 }
             }
         }
-        // Thread steps.
+        // Thread steps: any takeable event (reads may reorder under weak memory).
         for t in 0..n {
-            let ip = st.ip[t];
-            let Some(ev) = prog.threads[t].events.get(ip) else { continue };
-            let mut ns = st.clone();
-            let step: String = match ev {
-                Event::Write(x) => {
-                    let tag = prog.write_tag[t][ip];
-                    if weak {
-                        ns.bufs[t].entry(x.clone()).or_default().push(tag);
-                    } else {
-                        ns.mem.insert(x.clone(), tag);
+            let events = &prog.threads[t].events;
+            for i in 0..events.len() {
+                if !takeable(events, &st.consumed[t], i, weak) {
+                    continue;
+                }
+                let ev = &events[i];
+                let mut ns = st.clone();
+                let step: String = match ev {
+                    Event::Write(x) => {
+                        let tag = prog.write_tag[t][i];
+                        if weak {
+                            ns.bufs[t].entry(x.clone()).or_default().push(tag);
+                        } else {
+                            ns.mem.insert(x.clone(), tag);
+                        }
+                        format!("write {x}")
                     }
-                    format!("write {x}")
-                }
-                Event::Read(x) => {
-                    let v = op_read(&st, t, x);
-                    ns.obs.insert(prog.read_id[t][ip], v);
-                    format!("read {x} -> {v}")
-                }
-                // A full or write barrier drains this thread's store buffers: it may only fire
-                // once they are empty (the flush steps above do the draining).
-                Event::Fence | Event::WFence => {
-                    if !bufs_empty(&st, t) {
-                        continue;
+                    Event::Read(x) => {
+                        let v = op_read(&st, t, x);
+                        ns.obs.insert(prog.read_id[t][i], v);
+                        format!("read {x} -> {v}")
                     }
-                    "barrier".into()
-                }
-                // Read barrier: a no-op under PSO (reads are in program order).
-                Event::RFence => "read-barrier".into(),
-                // A lock op is a full barrier and enforces mutual exclusion.
-                Event::Acquire(l) => {
-                    if (0..n).any(|o| o != t && st.held[o].contains(l)) || !bufs_empty(&st, t) {
-                        continue;
+                    // A full or write barrier drains this thread's store buffers: it may only
+                    // fire once they are empty (the flush steps above do the draining). A read
+                    // barrier carries no buffer effect but (as a non-read) orders reads across it.
+                    Event::Fence | Event::WFence => {
+                        if !bufs_empty(&st, t) {
+                            continue;
+                        }
+                        "barrier".into()
                     }
-                    ns.held[t].push(l.clone());
-                    format!("acquire {l}")
-                }
-                Event::Release(l) => {
-                    if !bufs_empty(&st, t) {
-                        continue;
+                    Event::RFence => "read-barrier".into(),
+                    // A lock op is a full barrier and enforces mutual exclusion.
+                    Event::Acquire(l) => {
+                        if (0..n).any(|o| o != t && st.held[o].contains(l)) || !bufs_empty(&st, t) {
+                            continue;
+                        }
+                        ns.held[t].push(l.clone());
+                        format!("acquire {l}")
                     }
-                    ns.held[t].retain(|h| h != l);
-                    format!("release {l}")
-                }
-            };
-            ns.ip[t] += 1;
-            let mut nsched = sched.clone();
-            nsched.push((t, step));
-            stack.push((ns, nsched));
+                    Event::Release(l) => {
+                        if !bufs_empty(&st, t) {
+                            continue;
+                        }
+                        ns.held[t].retain(|h| h != l);
+                        format!("release {l}")
+                    }
+                };
+                ns.consumed[t][i] = true;
+                let mut nsched = sched.clone();
+                nsched.push((t, step));
+                stack.push((ns, nsched));
+            }
         }
     }
     out
@@ -720,13 +750,22 @@ mod tests {
             "message passing without smp_wmb is not SC-robust");
     }
 
-    // A write barrier between the two producer writes orders them → the consumer that sees
-    // flag=set also sees data=new. Robust.
+    // ARM-style: with a write barrier on the producer but NO read barrier on the consumer, the
+    // consumer's two reads can still reorder (R→R), so it can see flag=set, data=stale.
     #[test]
-    fn operational_message_passing_with_wmb_is_robust() {
+    fn operational_message_passing_needs_read_barrier_too() {
         let producer = thread("producer", vec![Write("data".into()), WFence, Write("flag".into())]);
         let consumer = thread("consumer", vec![Read("flag".into()), Read("data".into())]);
+        assert!(weak_memory_nonrobustness(&[producer, consumer]).is_some(),
+            "wmb alone is not enough — the consumer's reads can still reorder (ARM R->R)");
+    }
+
+    // Both barriers: smp_wmb orders the publishes, smp_rmb orders the consumer's reads → robust.
+    #[test]
+    fn operational_message_passing_with_both_barriers_is_robust() {
+        let producer = thread("producer", vec![Write("data".into()), WFence, Write("flag".into())]);
+        let consumer = thread("consumer", vec![Read("flag".into()), RFence, Read("data".into())]);
         assert!(weak_memory_nonrobustness(&[producer, consumer]).is_none(),
-            "smp_wmb between the publishes restores robustness");
+            "smp_wmb + smp_rmb restore robustness");
     }
 }
