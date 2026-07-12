@@ -1333,7 +1333,8 @@ fn report_data_races(accesses: &[(String, String, bool, Vec<String>)]) {
     }
     println!("\n== data races (lockset / Eraser) ({}) [bug-finding] ==", races.len());
     for r in &races {
-        println!("  location: {}", r.location);
+        let tag = if r.irq_unsafe { "  [IRQ-unsafe: plain lock on IRQ-shared data]" } else { "" };
+        println!("  location: {}{tag}", r.location);
         println!("    accessed under inconsistent locking in: {}", r.functions.join(", "));
     }
 }

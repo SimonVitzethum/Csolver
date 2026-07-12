@@ -101,6 +101,24 @@ const RCU_READ_UNLOCK: &[&str] = &[
     "rcu_read_unlock_trace",
 ];
 
+/// Calls that **disable IRQs** (or soft-IRQs) — an access made while IRQs are off is protected
+/// against an interrupt handler on the same CPU, modelled as holding a synthetic `@irqoff` lock.
+/// A location accessed *irqsave* in one place and under a plain `spin_lock` in another is an
+/// IRQ-context race (G9) the data-race pass then flags via the missing `@irqoff`.
+const IRQ_DISABLE: &[&str] = &[
+    "spin_lock_irqsave", "spin_lock_irq", "_raw_spin_lock_irqsave", "_raw_spin_lock_irq",
+    "raw_spin_lock_irqsave", "raw_spin_lock_irq", "read_lock_irqsave", "write_lock_irqsave",
+    "read_lock_irq", "write_lock_irq", "local_irq_save", "local_irq_disable",
+    "local_bh_disable", "spin_lock_bh", "_raw_spin_lock_bh", "raw_spin_lock_bh",
+];
+const IRQ_ENABLE: &[&str] = &[
+    "spin_unlock_irqrestore", "spin_unlock_irq", "_raw_spin_unlock_irqrestore",
+    "_raw_spin_unlock_irq", "raw_spin_unlock_irqrestore", "raw_spin_unlock_irq",
+    "read_unlock_irqrestore", "write_unlock_irqrestore", "read_unlock_irq", "write_unlock_irq",
+    "local_irq_restore", "local_irq_enable", "local_bh_enable", "spin_unlock_bh",
+    "_raw_spin_unlock_bh", "raw_spin_unlock_bh",
+];
+
 /// Accessors returning a pointer to **per-CPU** data — thread-local by construction (each CPU
 /// has its own instance, accessed with preemption disabled), so accesses through the result are
 /// not shared races. The data-race pass excludes them.
@@ -675,6 +693,7 @@ fn discharge_inner(
         typestates: HashMap::new(),
         refcounts: HashMap::new(),
         rcu_depth: 0,
+        irq_off: 0,
         percpu: HashSet::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
@@ -1344,6 +1363,11 @@ struct PathState {
     /// so excluded from the data-race pass. Meet-joined (min) at merges — an access counts as
     /// RCU-protected only if it is on every incoming path.
     rcu_depth: u32,
+    /// **IRQ-disabled nesting depth** on this path (G9): raised by `spin_lock_irqsave`/
+    /// `local_irq_disable`/`local_bh_disable`, lowered by the matching restore. An access made
+    /// while this is > 0 holds a synthetic `@irqoff` lock, so a location protected against IRQs
+    /// in one place but not another is flagged by the data-race pass. Meet-joined (min).
+    irq_off: u32,
     /// **Per-CPU pointer identities** on this path (data-race hardening): opaque-pointer ids
     /// returned by a per-CPU accessor (`this_cpu_ptr`/…). Accesses through them are thread-local
     /// (not shared), so excluded from the data-race pass. Meet-joined at merges.
@@ -2004,6 +2028,7 @@ impl Explorer<'_> {
         // RCU depth after the join is the min over edges (an access is RCU-protected only if in
         // a read-side section on every path); per-CPU ids survive by intersection (meet).
         let rcu_depth = edges.iter().map(|e| e.pred_state.rcu_depth).min().unwrap_or(0);
+        let irq_off = edges.iter().map(|e| e.pred_state.irq_off).min().unwrap_or(0);
         let percpu: HashSet<u32> = first
             .percpu
             .iter()
@@ -2079,6 +2104,7 @@ impl Explorer<'_> {
             typestates,
             refcounts,
             rcu_depth,
+            irq_off,
             percpu,
             fn_ptrs,
             locks_held,
@@ -3801,6 +3827,12 @@ impl Explorer<'_> {
             return;
         };
         let mut lockset: Vec<String> = state.held_classes.values().cloned().collect();
+        // An IRQ-disabled access holds a synthetic `@irqoff` lock (G9): consistent irqsave
+        // protection then intersects to `@irqoff`; a plain-locked access to the same location
+        // lacks it → the data-race pass flags the IRQ-unsafe access.
+        if state.irq_off > 0 {
+            lockset.push("@irqoff".to_string());
+        }
         lockset.sort();
         lockset.dedup();
         // Ordered trace for the interleaving check (read=2, dependent-read=9, write=3), bounded
@@ -3966,6 +3998,13 @@ impl Explorer<'_> {
             state.rcu_depth += 1;
         } else if RCU_READ_UNLOCK.contains(&name) {
             state.rcu_depth = state.rcu_depth.saturating_sub(1);
+        }
+        // IRQ-disabled section (G9): an access here holds the synthetic `@irqoff` lock, so a
+        // location protected against IRQs inconsistently (irqsave here, plain lock there) races.
+        if IRQ_DISABLE.contains(&name) {
+            state.irq_off += 1;
+        } else if IRQ_ENABLE.contains(&name) {
+            state.irq_off = state.irq_off.saturating_sub(1);
         }
         let base = args.first().map(|a| self.eval_value(a, state)).and_then(|v| Self::ptr_base_key(&v));
         // Sleep-in-atomic: a blocking/sleeping call while a spinlock is *definitely* held is a
