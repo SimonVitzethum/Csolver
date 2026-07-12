@@ -159,6 +159,18 @@ impl ModuleReport {
         crate::find_cross_thread_uaf(&threads)
     }
 
+    /// Candidate **ABA problems** among this module's functions: a compare-and-swap of a location
+    /// concurrent (disjoint lockset) with a modification of the same location in another thread.
+    pub fn aba_bugs(&self) -> Vec<crate::AbaWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::find_aba(&threads)
+    }
+
     /// Candidate **weak-memory (SC-robustness) bugs** among this module's functions (subsystem
     /// 4, full operational model): a pair of functions whose concurrent execution under the PSO
     /// store-buffer model can observe a read outcome no sequentially-consistent execution allows

@@ -1363,6 +1363,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             Spawn(c) => format!("spawn {c}"),
             Join => "join".to_string(),
             Free(x) => format!("free {x}"),
+            Cas(x) => format!("cas {x}"),
         }
     };
     if !violations.is_empty() {
@@ -1383,6 +1384,15 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             let kind = if w.double_free { "double-free" } else { "use-after-free" };
             println!("  {kind} of {} : {} frees it, {} concurrently {}s it (disjoint locks)",
                 w.location, w.threads.0, w.threads.1, if w.double_free { "free" } else { "use" });
+        }
+    }
+    // ABA: a compare-and-swap concurrent with a modification of the same location.
+    let aba = csolver_verifier::find_aba(&threads);
+    if !aba.is_empty() {
+        println!("\n== ABA problems ({}) [bug-finding] ==", aba.len());
+        for w in &aba {
+            println!("  location: {} — {} CAS-es it while {} concurrently modifies it (disjoint locks)",
+                w.location, w.threads.0, w.threads.1);
         }
     }
     // Weak-memory (SC-robustness) bugs via the operational PSO model (subsystem 4) — subsumes

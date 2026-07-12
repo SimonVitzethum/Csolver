@@ -1879,7 +1879,7 @@ fn address_taken_names(module: &Module) -> HashSet<String> {
                             op(e);
                         }
                     }
-                    Inst::TypestateYield { .. } | Inst::Barrier { .. } | Inst::Spawn { .. } | Inst::Join => {}
+                    Inst::TypestateYield { .. } | Inst::Barrier { .. } | Inst::Spawn { .. } | Inst::Join | Inst::Cas { .. } => {}
                     Inst::SafetyCheck { condition, .. } => condition_operands(condition, &mut op),
                     Inst::Asm { .. } => {}
                 }

@@ -376,7 +376,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                         op(e);
                     }
                 }
-                Inst::TypestateYield { .. } | Inst::Barrier { .. } | Inst::Spawn { .. } | Inst::Join => {}
+                Inst::TypestateYield { .. } | Inst::Barrier { .. } | Inst::Spawn { .. } | Inst::Join | Inst::Cas { .. } => {}
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -3377,6 +3377,14 @@ impl Explorer<'_> {
             Inst::Join => {
                 if self.race_trace.len() < RACE_TRACE_CAP {
                     self.race_trace.push((8, String::new()));
+                }
+            }
+            // Compare-and-swap (ABA): record a CAS event on the location's class.
+            Inst::Cas { val } => {
+                if let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, val) {
+                    if self.race_trace.len() < RACE_TRACE_CAP {
+                        self.race_trace.push((11, class));
+                    }
                 }
             }
             // Constant-time: a secret-tainted value must not decide a branch or index memory.

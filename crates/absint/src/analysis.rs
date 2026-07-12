@@ -490,6 +490,7 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::Barrier { .. }
         | Inst::Spawn { .. }
         | Inst::Join
+        | Inst::Cas { .. }
         | Inst::SafetyCheck { .. } => {}
     }
 }

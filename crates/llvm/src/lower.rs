@@ -1573,6 +1573,11 @@ fn emit_contract(
                 }
             }
             Effect::Join => insts.push(Inst::Join),
+            Effect::Cas { arg } => {
+                if let Some(a) = args.get(*arg) {
+                    insts.push(Inst::Cas { val: ctx.operand(a, 64)? });
+                }
+            }
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

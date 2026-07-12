@@ -458,7 +458,7 @@ fn visit_operands(inst: &Inst, op: &mut impl FnMut(&Operand)) {
                 op(e);
             }
         }
-        Inst::TypestateYield { .. } | Inst::Barrier { .. } | Inst::Spawn { .. } | Inst::Join => {}
+        Inst::TypestateYield { .. } | Inst::Barrier { .. } | Inst::Spawn { .. } | Inst::Join | Inst::Cas { .. } => {}
         Inst::SafetyCheck { condition, .. } => condition_operands(condition, op),
         Inst::Asm { .. } => {}
     }

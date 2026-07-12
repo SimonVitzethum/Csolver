@@ -62,6 +62,10 @@ pub enum Event {
     /// free-vs-free of the same object (disjoint locksets → not ordered) is a cross-thread
     /// use-after-free / double-free.
     Free(String),
+    /// **Compare-and-swap** on the location of the given class. A concurrent modification (write
+    /// or free) of the same location by another thread means the value can change A→B→A under the
+    /// CAS — the ABA problem.
+    Cas(String),
 }
 
 /// A thread: a name and its ordered event trace.
@@ -106,6 +110,7 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             8 => Event::Join,
             9 => Event::DepRead(c.clone()),
             10 => Event::Free(c.clone()),
+            11 => Event::Cas(c.clone()),
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -351,6 +356,70 @@ pub fn find_cross_thread_uaf(threads: &[Thread]) -> Vec<FreeUseWitness> {
                                 double_free: true,
                             });
                         }
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.location.cmp(&b.location));
+    out
+}
+
+/// A witnessed **ABA problem**: one thread compare-and-swaps a location while another thread
+/// concurrently modifies it (write or free — the value can go A→B→A), with disjoint locksets so
+/// nothing orders them. The CAS can then succeed on a stale premise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbaWitness {
+    /// The compare-and-swapped location's class.
+    pub location: String,
+    /// The threads: the one that CAS-es, and the one that concurrently modifies.
+    pub threads: (String, String),
+}
+
+/// Per-thread, the `(class, lockset)` of every compare-and-swap and every modification (a write
+/// or free) — used to match a CAS against a concurrent A→B→A modification.
+fn cas_and_mod_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
+    let mut held: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cas = Vec::new();
+    let mut modif = Vec::new();
+    for e in &t.events {
+        match e {
+            Event::Acquire(l) => {
+                held.insert(l.clone());
+            }
+            Event::Release(l) => {
+                held.remove(l);
+            }
+            Event::Cas(x) => cas.push((x.clone(), held.clone())),
+            Event::Write(x) | Event::Free(x) => modif.push((x.clone(), held.clone())),
+            _ => {}
+        }
+    }
+    (cas, modif)
+}
+
+/// Whole-program **ABA** search: a compare-and-swap of a location in one thread concurrent
+/// (disjoint locksets) with a modification of the same location in another thread. Bounded by
+/// [`MAX_PAIRS`]. A bug-finding heuristic — a real ABA also needs the value to actually recur,
+/// which is not modelled, so it is a candidate.
+pub fn find_aba(threads: &[Thread]) -> Vec<AbaWitness> {
+    let per: Vec<_> = threads.iter().map(cas_and_mod_locksets).collect();
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut checked = 0usize;
+    for i in 0..threads.len() {
+        for j in 0..threads.len() {
+            if i == j || checked >= MAX_PAIRS {
+                continue;
+            }
+            checked += 1;
+            for (cx, cl) in &per[i].0 {
+                for (mx, ml) in &per[j].1 {
+                    if cx == mx && cl.is_disjoint(ml) && seen.insert(cx.clone()) {
+                        out.push(AbaWitness {
+                            location: cx.clone(),
+                            threads: (threads[i].name.clone(), threads[j].name.clone()),
+                        });
                     }
                 }
             }
@@ -663,6 +732,7 @@ fn op_reachable(
                     // A free carries no value effect for the SC-robustness check (cross-thread
                     // UAF has its own detector, `find_cross_thread_uaf`).
                     Event::Free(x) => format!("free {x}"),
+                    Event::Cas(x) => format!("cas {x}"),
                     // Spawn the named child: a happens-before edge (it may now run) with release
                     // semantics — the parent's prior writes are made globally visible first, so
                     // the child observes everything the parent did before the spawn.
@@ -752,8 +822,9 @@ pub fn weak_memory_nonrobustness(threads: &[Thread]) -> Option<WeakMemoryWitness
 }
 
 /// Largest thread group checked as a single simultaneous weak-memory product — >2-thread litmus
-/// (IRIW needs 4) are found, while the (expensive) product stays bounded.
-const MAX_GROUP: usize = 4;
+/// (IRIW needs 4; some need 5–6) are found, while the (expensive) product stays bounded by the
+/// per-run state cap. Larger groups fall back to pairwise.
+const MAX_GROUP: usize = 6;
 
 /// Whole-program weak-memory search. Threads that (transitively) share a location where at least
 /// one writes form a **connected group**; a group of 2..=[`MAX_GROUP`] threads is checked as one
@@ -904,7 +975,7 @@ fn dfs(
             // interleaving is already a total order); it matters only for weak memory. Spawn/join
             // are likewise treated as plain steps here (the SC lost-update pattern is unaffected).
             Event::Fence | Event::WFence | Event::RFence | Event::Spawn(_) | Event::Join
-            | Event::Free(_) => {}
+| Event::Free(_) | Event::Cas(_) => {}
             Event::Acquire(l) => child.held[t].push(l.clone()),
             Event::Release(l) => child.held[t].retain(|h| h != l),
             Event::Read(x) | Event::DepRead(x) => {
@@ -1036,6 +1107,18 @@ mod tests {
         let f2 = thread("freer", vec![Acquire("L".into()), Free("obj".into()), Release("L".into())]);
         let u2 = thread("user", vec![Acquire("L".into()), Read("obj".into()), Release("L".into())]);
         assert!(find_cross_thread_uaf(&[f2, u2]).is_empty(), "a common lock orders free vs use");
+    }
+
+    // ABA: one thread CAS-es a location while another concurrently modifies it (disjoint locks).
+    #[test]
+    fn aba_cas_with_concurrent_modification() {
+        let cas = thread("popper", vec![Cas("head".into())]);
+        let modif = thread("pusher", vec![Write("head".into())]);
+        assert_eq!(find_aba(&[cas, modif]).len(), 1, "a CAS concurrent with a modification is ABA-susceptible");
+        // Under a common lock the CAS and the modification are ordered → no candidate.
+        let c2 = thread("popper", vec![Acquire("L".into()), Cas("head".into()), Release("L".into())]);
+        let m2 = thread("pusher", vec![Acquire("L".into()), Write("head".into()), Release("L".into())]);
+        assert!(find_aba(&[c2, m2]).is_empty(), "a common lock orders the CAS and the modification");
     }
 
     // Cross-thread double-free: two threads free the same object with disjoint locksets.

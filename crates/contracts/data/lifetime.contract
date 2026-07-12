@@ -44,3 +44,8 @@ refcount-dec arg0 lifetime
 refcount-inc arg0 lifetime
 [put_device put_task_struct mmdrop mmput]
 refcount-dec arg0 lifetime
+
+# --- Compare-and-swap (ABA detection) ------------------------------------------------------
+# A lock-free CAS on the location; a concurrent modification (A->B->A) is the ABA problem.
+[atomic_cmpxchg cmpxchg try_cmpxchg atomic_try_cmpxchg atomic64_cmpxchg atomic_cmpxchg_relaxed cmpxchg_relaxed cmpxchg_acquire cmpxchg_release]
+cas arg0

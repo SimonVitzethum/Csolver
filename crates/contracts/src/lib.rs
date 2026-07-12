@@ -285,6 +285,13 @@ pub enum Effect {
     /// **Thread join** (happens-before): the call waits for the threads this thread spawned to
     /// finish (`pthread_join`/`kthread_stop`), so the parent's later accesses happen after them.
     Join,
+    /// **Compare-and-swap** on argument `arg` (`cmpxchg`/`atomic_cmpxchg`/`try_cmpxchg`) — a
+    /// lock-free update whose success only checks the value. If another thread modifies the same
+    /// location concurrently (A→B→A), the CAS can succeed on a stale premise: the **ABA problem**.
+    Cas {
+        /// The 0-based argument index of the CAS location pointer.
+        arg: usize,
+    },
     /// **Leak-state declaration** (K): a resource left in `state` of `protocol` at a function
     /// **return** (without being released or escaping via the return value) is a resource
     /// leak. Not applied at a call — it registers `(protocol, state)` as a leak state checked
@@ -585,6 +592,8 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
         // `spawn arg<k>` (child function pointer) and `join` (no arguments).
         "spawn" => Ok(Effect::Spawn { arg: parse_arg(rest.first().copied().unwrap_or(""))? }),
         "join" => Ok(Effect::Join),
+        // `cas arg<k>` — a compare-and-swap on the location pointed to by arg k.
+        "cas" => Ok(Effect::Cas { arg: parse_arg(rest.first().copied().unwrap_or(""))? }),
         // `barrier [write|read]` — a full (default), write, or read memory barrier.
         "barrier" => {
             let kind = match rest.first().copied() {

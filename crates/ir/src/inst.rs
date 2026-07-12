@@ -563,6 +563,12 @@ pub enum Inst {
     /// **Thread join** (weak-memory happens-before): recorded in the interleaving trace so the
     /// model orders the joined children before the parent's later events. No memory-safety effect.
     Join,
+    /// **Compare-and-swap** on `val` (ABA detection): recorded in the interleaving trace so a
+    /// concurrent modification of the same location (A→B→A) is flagged. No memory-safety effect.
+    Cas {
+        /// The CAS location pointer.
+        val: Operand,
+    },
     /// **Secret-dependence check** (constant-time L): `val` (a branch condition or a `gep`
     /// index) must not carry the `secret` taint label. Implies
     /// [`SafetyProperty::SecretDependent`]. Injected by the frontend at every branch and
@@ -660,6 +666,7 @@ impl Inst {
             | Inst::Barrier { .. }
             | Inst::Spawn { .. }
             | Inst::Join
+            | Inst::Cas { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }
