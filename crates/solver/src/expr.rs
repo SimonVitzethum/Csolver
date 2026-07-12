@@ -185,6 +185,39 @@ impl ExprCtx {
         self.widths[id.index()]
     }
 
+    /// The set of symbolic input variables (`Node::Sym`) reachable from `root`, as sorted, unique
+    /// `ExprId`s (each `Sym` is interned once, so its id identifies the variable). Used as a cheap,
+    /// exact relevance test — whether two expressions share any variable — so the decision procedure
+    /// can drop path-condition assumptions that cannot affect an entailment.
+    pub fn symbols_of(&self, root: ExprId) -> Vec<ExprId> {
+        let mut set = Vec::new();
+        let mut stack = vec![root];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            match self.node(x) {
+                Node::Sym { .. } => set.push(x),
+                Node::Const(_) | Node::Bool(_) => {}
+                Node::Not(a) | Node::Zext(a) => stack.push(*a),
+                Node::Bin { a, b, .. } | Node::Cmp { a, b, .. } => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Node::And(v) | Node::Or(v) => stack.extend(v.iter().copied()),
+                Node::Ite { c, t, e } => {
+                    stack.push(*c);
+                    stack.push(*t);
+                    stack.push(*e);
+                }
+            }
+        }
+        set.sort_unstable();
+        set.dedup();
+        set
+    }
+
     /// The constant value of an expression, if it is a literal.
     pub fn as_const(&self, id: ExprId) -> Option<BitVector> {
         match self.node(id) {
@@ -465,6 +498,26 @@ mod tests {
         let before = c.len();
         let _ = c.bin(BvOp::Add, x, x);
         assert_eq!(c.len(), before, "no new node for a repeated expression");
+    }
+
+    #[test]
+    fn symbols_of_collects_variables() {
+        let mut c = ExprCtx::new();
+        let x = c.symbol("x", 64);
+        let y = c.symbol("y", 64);
+        let five = c.int(64, 5);
+        // (x + 5) < y  — variables {x, y}, sorted & deduplicated.
+        let sum = c.bin(BvOp::Add, x, five);
+        let cmp = c.cmp(CmpOp::Ult, sum, y);
+        let mut want = vec![x, y];
+        want.sort_unstable();
+        assert_eq!(c.symbols_of(cmp), want, "collects each distinct variable once");
+        // A constant expression has no variables.
+        let konst = c.bin(BvOp::Add, five, five);
+        assert!(c.symbols_of(konst).is_empty(), "a constant has no variables");
+        // A shared variable used twice appears once.
+        let xx = c.bin(BvOp::Xor, x, x);
+        assert_eq!(c.symbols_of(xx), vec![x], "a repeated variable is deduplicated");
     }
 
     #[test]

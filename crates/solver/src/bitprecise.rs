@@ -125,6 +125,43 @@ mod tests {
         assert!(prove_implies(&c, &[lt], lt));
     }
 
+    /// Exactness anchor for the executor's `branch_infeasible` relevance pre-filter: when a branch
+    /// condition shares no variable with the path condition, the entailment `assumptions ⊨ ¬cond`
+    /// equals `⊨ ¬cond` (deciding it with an *empty* assumption set is the same boolean). In
+    /// particular a *self-contradictory* disjoint condition is still detected as infeasible by the
+    /// empty-assumption query — so the fast path never wrongly treats a dead branch as live.
+    #[test]
+    fn disjoint_condition_entailment_matches_empty_assumptions() {
+        let mut c = ExprCtx::new();
+        let a = c.symbol("a", 32); // appears only in the "path condition"
+        let b = c.symbol("b", 32); // appears only in the branch condition
+        let five = c.int(32, 5);
+        let ten = c.int(32, 10);
+        // Path condition over `a` only.
+        let pc = c.cmp(CmpOp::Ult, a, five);
+        // A satisfiable branch condition over `b` only: `b <u 10`. Not infeasible either way.
+        let feasible = c.cmp(CmpOp::Ult, b, ten);
+        let nf = c.not(feasible);
+        assert_eq!(
+            prove_implies(&c, &[pc], nf),
+            prove_implies(&c, &[], nf),
+            "a disjoint feasible condition: full and empty-assumption queries agree (both false)"
+        );
+        assert!(!prove_implies(&c, &[], nf), "and it is feasible");
+        // A self-contradictory branch condition over `b` only: `b <u 5 ∧ b >u 10`. Infeasible — the
+        // empty-assumption query must still detect it (soundness of the fast path).
+        let lo = c.cmp(CmpOp::Ult, b, five);
+        let hi = c.cmp(CmpOp::Ugt, b, ten);
+        let contra = c.and(vec![lo, hi]);
+        let ncontra = c.not(contra);
+        assert!(prove_implies(&c, &[], ncontra), "a self-contradictory condition is infeasible");
+        assert_eq!(
+            prove_implies(&c, &[pc], ncontra),
+            prove_implies(&c, &[], ncontra),
+            "full and empty-assumption queries agree for the contradictory disjoint condition"
+        );
+    }
+
     #[test]
     fn proves_guarded_index_without_overflow_assumption() {
         // {0 <=u i, i <u len} ⟹ i <u len  — purely bit-precise.

@@ -501,6 +501,7 @@ fn discharge_inner(
         global_rids: HashMap::new(),
         global_fnptrs: HashMap::new(),
         prove_cache: HashMap::new(),
+        sym_memo: HashMap::new(),
         lock_classes: crate::lockclass::resolve_lock_classes(f),
         lock_edges: HashSet::new(),
         race_accesses: HashSet::new(),
@@ -1016,6 +1017,20 @@ fn load_derived_regs(f: &Function) -> HashSet<RegId> {
 }
 
 /// The register operands of an r-value.
+/// Whether two **sorted, deduplicated** `ExprId` slices share at least one element — a linear
+/// merge walk (used by the `branch_infeasible` relevance pre-filter to test variable overlap).
+fn sorted_share(a: &[ExprId], b: &[ExprId]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    false
+}
+
 fn rvalue_regs(v: &RValue) -> Vec<RegId> {
     let ops: Vec<&Operand> = match v {
         RValue::Use(o) => vec![o],
@@ -1555,6 +1570,10 @@ struct Explorer<'f> {
     /// path condition) then skip re-bit-blasting. The `linear-no-overflow` side
     /// effect is re-applied on a hit.
     prove_cache: HashMap<(Box<[ExprId]>, ExprId), Option<ProofMethod>>,
+    /// Memoized **variable set** (sorted `Sym` ids) of an expression, keyed by its interned id
+    /// (immutable, so the cache is stable). Powers the relevance pre-filter in `branch_infeasible`,
+    /// which skips the full path-condition query when a branch condition shares no variable with it.
+    sym_memo: HashMap<ExprId, std::rc::Rc<[ExprId]>>,
     /// Static **lock-class map** for this function: register → the cross-function name
     /// of the lock it designates (see `lockclass`). Consulted at each lock-acquire to
     /// name the acquired lock for ABBA lock-order edges.
@@ -2188,9 +2207,42 @@ impl Explorer<'_> {
     /// just keeps a redundant path — never unsound.
     fn branch_infeasible(&mut self, cond: ExprId, state: &PathState) -> bool {
         let not_cond = self.ctx.not(cond);
+        // **Relevance pre-filter (exact).** Only a path-condition assumption that shares a variable
+        // with `cond` can make `cond` unsatisfiable; if none do, whether the branch is infeasible
+        // depends on `cond` alone. So when `cond`'s variables are disjoint from the whole path
+        // condition, decide it with an *empty* assumption set — a tiny query — instead of one
+        // carrying the full (on large functions, hundreds-deep) path condition. This is the same
+        // boolean result (irrelevant assumptions cannot change the entailment), so verdicts are
+        // unchanged; it only removes the dominant solver cost on big CFGs. (If the path condition is
+        // itself contradictory we may then not prune a dead branch, but a refutation there re-solves
+        // the full path condition and finds no model — so no false FAIL; see `try_refute`.)
+        let cvars = self.syms(cond);
+        if !cvars.is_empty() {
+            let mut shares = false;
+            for a in state.pathcond.iter().chain(state.facts.iter()) {
+                let av = self.syms(*a);
+                if sorted_share(&av, &cvars) {
+                    shares = true;
+                    break;
+                }
+            }
+            if !shares {
+                return bitprecise::prove_implies(&self.ctx, &[], not_cond);
+            }
+        }
         let mut assumptions = state.pathcond.clone();
         assumptions.extend_from_slice(&state.facts);
         bitprecise::prove_implies(&self.ctx, &assumptions, not_cond)
+    }
+
+    /// The memoized variable set (sorted `Sym` ids) of an expression — see `sym_memo`.
+    fn syms(&mut self, e: ExprId) -> std::rc::Rc<[ExprId]> {
+        if let Some(v) = self.sym_memo.get(&e) {
+            return v.clone();
+        }
+        let v: std::rc::Rc<[ExprId]> = self.ctx.symbols_of(e).into();
+        self.sym_memo.insert(e, v.clone());
+        v
     }
 
     /// Whether the edge `from -> to` is a loop back-edge (cut during
