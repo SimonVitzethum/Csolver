@@ -225,6 +225,31 @@ capability-specific refutation that does not require a full input model (a capab
 violation is input-independent). That is a distinct precision task, not the
 label-propagation problem — which is now solved.
 
+## Update 2026-07-12 (5) — Copy-Fail DETECTED end-to-end on real kernel IR ✅
+
+The last barrier is closed. Root cause of the UNKNOWN-not-FAIL: a `CondBr` condition
+reached the executor wider than `i1` (a widened / loop-carried condition), and using it
+directly as a boolean guard is unencodable → the path condition was spuriously UNSAT →
+the feasibility witness failed → the fired capability violation was recorded UNKNOWN.
+Fix (`5031029`): coerce a non-`i1` branch condition to `c != 0` (LLVM truthiness).
+
+**Result:** on the vulnerable v6.12 `algif_aead` module the scan now reports
+`[WriteCapability] algif_aead.ll::_aead_recvmsg` — **CVE-2026-31431 detected**. This is
+the full chain working end-to-end on real optimized (`-O1`) kernel IR:
+
+1. `seed arg0 foreign` / `af_alg_get_rsgl label arg3 foreign` — the socket/request is foreign;
+2. **opaque read-consistency** (`6a9493b`) — two reads of the same opaque field agree;
+3. **switch critical-edge splitting** (`f925be8`) — mem2reg promotes the reloaded request
+   pointer so the label survives the switch;
+4. **non-boolean condition coercion** (`5031029`) — the copy-site path condition is no
+   longer spuriously UNSAT, so the violation is refuted;
+5. the `[crypto_aead_copy_sgl] require arg2 write` contract (`2987e96`) is the sink.
+
+Sound throughout: all differentials SOUND, out-of-place control (non-foreign dst) does not
+fire, `dereferenceable`/`A1`/region-index fixes independently gated. The remaining
+`--auto-entries` open-world index/pointer false-positive classes are unrelated precision
+work.
+
 ## Validation (soundness-first, mandatory)
 
 Extend the **C differential oracle** with positive controls for the write-capability
