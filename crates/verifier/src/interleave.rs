@@ -45,9 +45,14 @@ pub enum Event {
     /// message-passing producer-side W→W reordering, but *not* the store-buffer W→R one.
     WFence,
     /// A **read barrier** (`smp_rmb`): orders this thread's prior reads before its later reads.
-    /// Under the store-buffer / PSO model (reads are in program order) it is a no-op; kept so a
-    /// full ARM-style read-reordering model can use it later.
     RFence,
+    /// **Spawn** the thread whose function is named — a happens-before edge: the child's events
+    /// cannot execute before this point (`pthread_create`/`kthread_run`).
+    Spawn(String),
+    /// **Join** the threads this thread spawned — a happens-before edge: the parent's subsequent
+    /// events execute after the joined children finish (`pthread_join`/`kthread_stop`). Also a
+    /// full barrier.
+    Join,
 }
 
 /// A thread: a name and its ordered event trace.
@@ -88,6 +93,8 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             4 => Event::Fence,
             5 => Event::WFence,
             6 => Event::RFence,
+            7 => Event::Spawn(c.clone()),
+            8 => Event::Join,
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -186,8 +193,8 @@ fn buffered_write_read_pairs(t: &Thread) -> std::collections::BTreeSet<(String, 
         let Event::Write(x) = ev else { continue };
         for later in &t.events[i + 1..] {
             match later {
-                // Any barrier stops the reordering window for this write.
-                Event::Fence | Event::Acquire(_) | Event::Release(_) => break,
+                // Any barrier or thread-sync stops the reordering window for this write.
+                Event::Fence | Event::Acquire(_) | Event::Release(_) | Event::Spawn(_) | Event::Join => break,
                 Event::Read(y) if y != x => {
                     pairs.insert((x.clone(), y.clone()));
                 }
@@ -280,6 +287,9 @@ struct OpState {
     // Writes still propagating to other threads' views (weak only).
     pending: Vec<Pending>,
     held: Vec<Vec<String>>,
+    // spawned[thread] = whether the thread may run yet (a child starts false until its parent
+    // executes the corresponding Spawn — a happens-before edge).
+    spawned: Vec<bool>,
     obs: std::collections::BTreeMap<u32, u32>,
 }
 
@@ -307,24 +317,33 @@ fn takeable(events: &[Event], consumed: &[bool], i: usize, reorder: bool) -> boo
 }
 
 /// Precomputed static data for a set of threads: each write's value tag and each read's global
-/// id, so an observation is comparable across the SC and weak runs.
+/// id (so an observation is comparable across the SC and weak runs), plus the thread-spawn
+/// relation (`Spawn(name)` in one thread makes the thread named `name` its child).
 struct OpProgram<'a> {
     threads: &'a [Thread],
     // write_tag[thread][event_index] = the unique value tag a Write event stores (else 0).
     write_tag: Vec<Vec<u32>>,
     // read_id[thread][event_index] = the global read id a Read event has (else u32::MAX).
     read_id: Vec<Vec<u32>>,
+    // parent_of[thread] = the thread that spawns it (if any); such a thread starts unspawned.
+    parent_of: Vec<Option<usize>>,
+    // spawn_target[thread][event_index] = the child thread index a Spawn event targets (else None).
+    spawn_target: Vec<Vec<Option<usize>>>,
 }
 
 impl<'a> OpProgram<'a> {
     fn new(threads: &'a [Thread]) -> OpProgram<'a> {
         let mut write_tag = Vec::with_capacity(threads.len());
         let mut read_id = Vec::with_capacity(threads.len());
+        let mut spawn_target: Vec<Vec<Option<usize>>> = Vec::with_capacity(threads.len());
+        let mut parent_of = vec![None; threads.len()];
+        let index_of = |name: &str| threads.iter().position(|t| t.name == name);
         let mut next_tag = 1u32; // 0 = the initial value of every location
         let mut next_read = 0u32;
-        for t in threads {
+        for (ti, t) in threads.iter().enumerate() {
             let mut wt = vec![0u32; t.events.len()];
             let mut rd = vec![u32::MAX; t.events.len()];
+            let mut sp = vec![None; t.events.len()];
             for (i, e) in t.events.iter().enumerate() {
                 match e {
                     Event::Write(_) => {
@@ -335,13 +354,22 @@ impl<'a> OpProgram<'a> {
                         rd[i] = next_read;
                         next_read += 1;
                     }
+                    Event::Spawn(name) => {
+                        if let Some(c) = index_of(name) {
+                            if c != ti {
+                                sp[i] = Some(c);
+                                parent_of[c] = Some(ti);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
             write_tag.push(wt);
             read_id.push(rd);
+            spawn_target.push(sp);
         }
-        OpProgram { threads, write_tag, read_id }
+        OpProgram { threads, write_tag, read_id, parent_of, spawn_target }
     }
 }
 
@@ -391,6 +419,8 @@ fn op_reachable(
         views: vec![std::collections::BTreeMap::new(); n],
         pending: Vec::new(),
         held: vec![Vec::new(); n],
+        // A child thread only becomes runnable when its parent spawns it (happens-before).
+        spawned: (0..n).map(|t| prog.parent_of[t].is_none()).collect(),
         obs: std::collections::BTreeMap::new(),
     };
     let mut out = std::collections::HashMap::new();
@@ -459,6 +489,10 @@ fn op_reachable(
         }
         // Thread steps: any takeable event (reads may reorder under weak memory).
         for t in 0..n {
+            // Happens-before: a child thread runs only after its parent has spawned it.
+            if !st.spawned[t] {
+                continue;
+            }
             let events = &prog.threads[t].events;
             for i in 0..events.len() {
                 if !takeable(events, &st.consumed[t], i, weak) {
@@ -501,6 +535,34 @@ fn op_reachable(
                         "barrier".into()
                     }
                     Event::RFence => "read-barrier".into(),
+                    // Spawn the named child: a happens-before edge (it may now run) with release
+                    // semantics — the parent's prior writes are made globally visible first, so
+                    // the child observes everything the parent did before the spawn.
+                    Event::Spawn(name) => {
+                        if !bufs_empty(&st, t) || !no_pending_from(&st, t) {
+                            continue;
+                        }
+                        if let Some(c) = prog.spawn_target[t][i] {
+                            ns.spawned[c] = true;
+                        }
+                        format!("spawn {name}")
+                    }
+                    // Join: a full barrier that blocks until every child this thread spawned has
+                    // finished (all its events consumed) — the parent's later events happen after.
+                    Event::Join => {
+                        // Acquire semantics: every joined child must have finished *and* have its
+                        // buffers drained and writes fully propagated, so the parent's later reads
+                        // observe them.
+                        let children_ok = (0..n).filter(|&c| prog.parent_of[c] == Some(t)).all(|c| {
+                            st.consumed[c].iter().all(|&d| d)
+                                && bufs_empty(&st, c)
+                                && no_pending_from(&st, c)
+                        });
+                        if !children_ok || !bufs_empty(&st, t) || !no_pending_from(&st, t) {
+                            continue;
+                        }
+                        "join".into()
+                    }
                     // A lock op is a full barrier and enforces mutual exclusion.
                     Event::Acquire(l) => {
                         if (0..n).any(|o| o != t && st.held[o].contains(l))
@@ -700,8 +762,9 @@ fn dfs(
         child.ip[t] += 1;
         match ev {
             // A fence is a no-op for the sequentially-consistent lost-update search (the
-            // interleaving is already a total order); it matters only for weak memory.
-            Event::Fence | Event::WFence | Event::RFence => {}
+            // interleaving is already a total order); it matters only for weak memory. Spawn/join
+            // are likewise treated as plain steps here (the SC lost-update pattern is unaffected).
+            Event::Fence | Event::WFence | Event::RFence | Event::Spawn(_) | Event::Join => {}
             Event::Acquire(l) => child.held[t].push(l.clone()),
             Event::Release(l) => child.held[t].retain(|h| h != l),
             Event::Read(x) => {
@@ -900,5 +963,35 @@ mod tests {
         let r2 = thread("r2", vec![Read("y".into()), Fence, Read("x".into())]);
         assert!(weak_memory_nonrobustness(&[w1, w2, r1, r2]).is_none(),
             "IRIW with full barriers between the reads is robust");
+    }
+
+    // Happens-before via spawn/join: the store-buffer shape is a bug when the two threads run
+    // concurrently, but NOT when one is spawned and joined by the other — the join orders the
+    // child's write before the parent's read.
+    #[test]
+    fn spawn_join_happens_before_removes_the_race() {
+        // Concurrent: classic store buffer → non-robust.
+        let a = thread("A", vec![Write("x".into()), Read("y".into())]);
+        let b = thread("B", vec![Write("y".into()), Read("x".into())]);
+        assert!(weak_memory_nonrobustness(&[a, b]).is_some(), "concurrent SB is a bug");
+        // Spawned + joined: the parent spawns B, joins it, then does its own accesses — the
+        // child is entirely ordered before the parent's read (no concurrency).
+        let parent = thread("A", vec![
+            Write("x".into()), Spawn("B".into()), Join, Read("y".into()),
+        ]);
+        let child = thread("B", vec![Write("y".into()), Read("x".into())]);
+        assert!(weak_memory_nonrobustness(&[parent, child]).is_none(),
+            "a spawned-then-joined child is ordered by happens-before — no race");
+    }
+
+    // The child observes the parent's pre-spawn writes (release/acquire of thread creation).
+    #[test]
+    fn spawned_child_sees_parent_prior_writes() {
+        let parent = thread("A", vec![Write("x".into()), Spawn("B".into()), Join]);
+        let child = thread("B", vec![Read("x".into())]);
+        // The only observation is child reads x = the parent's write (never the initial 0),
+        // matching SC → robust (no anomaly).
+        assert!(weak_memory_nonrobustness(&[parent, child]).is_none(),
+            "the child sees the parent's pre-spawn write (thread-create HB)");
     }
 }

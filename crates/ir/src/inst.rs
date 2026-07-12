@@ -554,6 +554,15 @@ pub enum Inst {
         /// 0 = full, 1 = write, 2 = read.
         kind: u8,
     },
+    /// **Thread spawn** (weak-memory happens-before): recorded in the interleaving trace so the
+    /// model gates the child thread (`child` is its function name). No memory-safety effect.
+    Spawn {
+        /// The spawned child's function name.
+        child: String,
+    },
+    /// **Thread join** (weak-memory happens-before): recorded in the interleaving trace so the
+    /// model orders the joined children before the parent's later events. No memory-safety effect.
+    Join,
     /// **Secret-dependence check** (constant-time L): `val` (a branch condition or a `gep`
     /// index) must not carry the `secret` taint label. Implies
     /// [`SafetyProperty::SecretDependent`]. Injected by the frontend at every branch and
@@ -649,6 +658,8 @@ impl Inst {
             | Inst::TypestateLeakCheck { .. }
             | Inst::SecretCheck { .. }
             | Inst::Barrier { .. }
+            | Inst::Spawn { .. }
+            | Inst::Join
             | Inst::MemIntrinsic { .. } => None,
         }
     }

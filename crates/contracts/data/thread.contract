@@ -1,0 +1,15 @@
+# Thread creation / join — happens-before edges for the weak-memory model (subsystem 4).
+# A spawn's child sees the parent's prior writes and runs no earlier than the spawn; a join
+# orders the spawned children before the parent's later accesses.
+
+# pthread_create(thread, attr, start_routine, arg): the child function is arg2.
+[pthread_create]
+spawn arg2
+
+# kthread_run/kthread_create(threadfn, data, ...): the child function is arg0.
+[kthread_run kthread_create kthread_create_on_node kthread_run_on_cpu]
+spawn arg0
+
+# Joins wait for the spawned children.
+[pthread_join kthread_stop]
+join

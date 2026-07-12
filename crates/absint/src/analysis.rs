@@ -488,6 +488,8 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::TypestateLeakCheck { .. }
         | Inst::SecretCheck { .. }
         | Inst::Barrier { .. }
+        | Inst::Spawn { .. }
+        | Inst::Join
         | Inst::SafetyCheck { .. } => {}
     }
 }

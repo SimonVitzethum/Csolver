@@ -358,7 +358,7 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                         op(e);
                     }
                 }
-                Inst::TypestateYield { .. } | Inst::Barrier { .. } => {}
+                Inst::TypestateYield { .. } | Inst::Barrier { .. } | Inst::Spawn { .. } | Inst::Join => {}
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -3272,6 +3272,18 @@ impl Explorer<'_> {
             Inst::Barrier { kind } => {
                 if self.race_trace.len() < RACE_TRACE_CAP {
                     self.race_trace.push((4 + *kind, String::new()));
+                }
+            }
+            // Thread spawn/join: record a happens-before event (kind 7 = spawn with the child's
+            // function name, 8 = join) for the weak-memory model.
+            Inst::Spawn { child } => {
+                if self.race_trace.len() < RACE_TRACE_CAP {
+                    self.race_trace.push((7, child.clone()));
+                }
+            }
+            Inst::Join => {
+                if self.race_trace.len() < RACE_TRACE_CAP {
+                    self.race_trace.push((8, String::new()));
                 }
             }
             // Constant-time: a secret-tainted value must not decide a branch or index memory.

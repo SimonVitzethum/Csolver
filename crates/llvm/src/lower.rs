@@ -1549,6 +1549,14 @@ fn emit_contract(
             Effect::TypestateLeak { .. } => {}
             // A memory barrier: recorded in the interleaving trace as a fence.
             Effect::Barrier { kind } => insts.push(Inst::Barrier { kind: *kind }),
+            // Thread spawn/join (happens-before). The child function name comes from the
+            // function-pointer argument (a global symbol); skip if it is not a direct symbol.
+            Effect::Spawn { arg } => {
+                if let Some(LValue::Global(child)) = args.get(*arg) {
+                    insts.push(Inst::Spawn { child: child.clone() });
+                }
+            }
+            Effect::Join => insts.push(Inst::Join),
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

@@ -274,6 +274,17 @@ pub enum Effect {
         /// 0 = full (`smp_mb`), 1 = write (`smp_wmb`), 2 = read (`smp_rmb`).
         kind: u8,
     },
+    /// **Thread spawn** (weak-memory / happens-before, subsystem 4): the call creates a thread
+    /// running the function named by argument `arg` (a function pointer — `pthread_create`'s
+    /// start routine, `kthread_run`'s threadfn). A happens-before edge: the child sees the
+    /// parent's prior writes and cannot run before this point.
+    Spawn {
+        /// The 0-based argument index holding the child's function pointer.
+        arg: usize,
+    },
+    /// **Thread join** (happens-before): the call waits for the threads this thread spawned to
+    /// finish (`pthread_join`/`kthread_stop`), so the parent's later accesses happen after them.
+    Join,
     /// **Leak-state declaration** (K): a resource left in `state` of `protocol` at a function
     /// **return** (without being released or escaping via the return value) is a resource
     /// leak. Not applied at a call — it registers `(protocol, state)` as a leak state checked
@@ -571,6 +582,9 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let protocol = rest.get(1).copied().ok_or("`refcount` needs a protocol")?.to_string();
             Ok(Effect::Refcount { arg, protocol, dec: kind == "refcount-dec" })
         }
+        // `spawn arg<k>` (child function pointer) and `join` (no arguments).
+        "spawn" => Ok(Effect::Spawn { arg: parse_arg(rest.first().copied().unwrap_or(""))? }),
+        "join" => Ok(Effect::Join),
         // `barrier [write|read]` — a full (default), write, or read memory barrier.
         "barrier" => {
             let kind = match rest.first().copied() {
@@ -649,6 +663,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("taint.contract", include_str!("../data/taint.contract")),
     ("typestate.contract", include_str!("../data/typestate.contract")),
     ("barrier.contract", include_str!("../data/barrier.contract")),
+    ("thread.contract", include_str!("../data/thread.contract")),
 ];
 
 #[cfg(test)]
@@ -807,6 +822,11 @@ mod tests {
             c.lookup("own").unwrap().effects,
             vec![Effect::TypestateLeak { protocol: "file".into(), state: "open".into() }]
         );
+        // Spawn/join effects.
+        let mut c3 = Contracts::default();
+        c3.parse_str("[pthread_create]\nspawn arg2\n[pthread_join]\njoin\n", "t").unwrap();
+        assert_eq!(c3.lookup("pthread_create").unwrap().effects, vec![Effect::Spawn { arg: 2 }]);
+        assert_eq!(c3.lookup("pthread_join").unwrap().effects, vec![Effect::Join]);
         // Barrier effects: full (default), write, read.
         let mut c2 = Contracts::default();
         c2.parse_str("[smp_mb]\nbarrier\n[smp_wmb]\nbarrier write\n[smp_rmb]\nbarrier read\n", "t").unwrap();

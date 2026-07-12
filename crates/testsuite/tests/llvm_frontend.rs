@@ -3359,6 +3359,53 @@ fn message_passing_without_wmb_is_a_weak_memory_bug() {
     assert!(good.weak_memory_bugs().is_empty(), "smp_wmb + smp_rmb fix the publish protocol");
 }
 
+/// **Happens-before via thread create/join (operational weak memory).** A store-buffer shape is
+/// a weak-memory bug when the two functions run concurrently — but not when one is `pthread_create`d
+/// and `pthread_join`ed by the other: the join orders the child before the parent's later read.
+#[test]
+fn spawn_join_happens_before_removes_the_weak_memory_bug() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // Concurrent store-buffer: a weak-memory bug.
+    let concurrent = r#"
+@x = global i32 0, align 4
+@y = global i32 0, align 4
+define i32 @child() {
+  store i32 1, ptr @y, align 4
+  %v = load i32, ptr @x, align 4
+  ret i32 %v
+}
+define i32 @a() {
+  store i32 1, ptr @x, align 4
+  %v = load i32, ptr @y, align 4
+  ret i32 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: concurrent.into(), name: "c".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &cfg).weak_memory_bugs().len(), 1, "concurrent SB is a weak-memory bug");
+    // The parent spawns and joins the child → happens-before orders them → no bug.
+    let ordered = r#"
+@x = global i32 0, align 4
+@y = global i32 0, align 4
+declare i32 @pthread_create(ptr, ptr, ptr, ptr)
+declare i32 @pthread_join(ptr, ptr)
+define i32 @child() {
+  store i32 1, ptr @y, align 4
+  %v = load i32, ptr @x, align 4
+  ret i32 %v
+}
+define i32 @a(ptr %t, ptr %attr, ptr %arg) {
+  store i32 1, ptr @x, align 4
+  %r = call i32 @pthread_create(ptr %t, ptr %attr, ptr @child, ptr %arg)
+  %j = call i32 @pthread_join(ptr %t, ptr null)
+  %v = load i32, ptr @y, align 4
+  ret i32 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ordered.into(), name: "o".into() }).expect("lower");
+    assert!(verify_module(&m, &cfg).weak_memory_bugs().is_empty(),
+        "a spawned-then-joined child is ordered by happens-before — no weak-memory bug");
+}
+
 /// **IRIW — Independent Reads of Independent Writes (operational weak memory, >2 threads).** A
 /// **four-thread** litmus needing non-multi-copy-atomicity: two writers to `x` and `y`, two
 /// readers observing them in opposite orders. No pair exhibits it — the whole-program group

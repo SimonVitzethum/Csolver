@@ -1358,6 +1358,8 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             Fence => "barrier".to_string(),
             WFence => "write-barrier".to_string(),
             RFence => "read-barrier".to_string(),
+            Spawn(c) => format!("spawn {c}"),
+            Join => "join".to_string(),
         }
     };
     if !violations.is_empty() {
