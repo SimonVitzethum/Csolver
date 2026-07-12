@@ -73,6 +73,38 @@ const LOCK_ACQUIRE: &[&str] = &[
     "down_interruptible", "down_killable", "down_write_killable",
 ];
 
+/// **Spinning** lock acquisitions — those that enter **atomic context** (preemption off),
+/// so a subsequent sleeping call deadlocks. Spinlocks and rwlocks spin; `mutex`/`down`
+/// (semaphore) may themselves sleep and are NOT atomic context (they are blocking calls).
+const SPIN_ACQUIRE: &[&str] = &[
+    "spin_lock", "_raw_spin_lock", "spin_lock_irq", "spin_lock_bh", "spin_lock_irqsave",
+    "_raw_spin_lock_irq", "_raw_spin_lock_bh", "_raw_spin_lock_irqsave",
+    "raw_spin_lock", "raw_spin_lock_irq", "raw_spin_lock_irqsave", "raw_spin_lock_bh",
+    "read_lock", "write_lock", "read_lock_irq", "write_lock_irq",
+    "read_lock_irqsave", "write_lock_irqsave", "read_lock_bh", "write_lock_bh",
+    "_raw_read_lock", "_raw_write_lock",
+];
+
+// A spinning-lock **release** (`spin_unlock`/…) leaves atomic context. It is not a named
+// set here: like any other call it is handed the lock base as a pointer argument, and the
+// general call arm below already drops every passed base from `spin_held` (and `locks_held`).
+
+/// Calls that **may sleep** (block): illegal while a spinlock is held (atomic context).
+/// The unambiguous always-may-sleep primitives — a `mutex`/semaphore acquire, an explicit
+/// yield/sleep, a completion/RCU wait, or the kernel's own `might_sleep` marker. (GFP-flag-
+/// conditional allocators like `kmalloc(GFP_KERNEL)` need flag analysis and are not here.)
+const BLOCKING: &[&str] = &[
+    "mutex_lock", "mutex_lock_nested", "mutex_lock_interruptible", "mutex_lock_killable",
+    "down", "down_write", "down_read", "down_interruptible", "down_killable",
+    "down_write_killable", "down_timeout", "schedule", "schedule_timeout",
+    "schedule_timeout_interruptible", "schedule_timeout_uninterruptible", "io_schedule",
+    "msleep", "msleep_interruptible", "ssleep", "usleep_range", "might_sleep",
+    "___might_sleep", "__might_sleep", "wait_for_completion", "wait_for_completion_interruptible",
+    "wait_for_completion_killable", "wait_for_completion_timeout", "synchronize_rcu",
+    "synchronize_srcu", "synchronize_net", "synchronize_irq", "flush_work",
+    "flush_workqueue", "cond_resched",
+];
+
 /// Whether a scalar `SafetyCheck` was discharged symbolically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymOutcome {
@@ -589,6 +621,7 @@ fn discharge_inner(
             opaque_labels: HashMap::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
+        spin_held: HashSet::new(),
         user_fetches: HashSet::new(),
         freed_bases: HashSet::new(),
         exact: true,
@@ -1170,6 +1203,11 @@ struct PathState {
     /// already here is an AA self-deadlock. Structural per-path state (not memory), so
     /// not cleared on a heap havoc; joined by meet at control-flow merges.
     locks_held: HashSet<RefBase>,
+    /// **Spinning locks held** on this path (the atomic-context subset of `locks_held`:
+    /// `spin_lock`/`read_lock`/`write_lock` families, not sleepable `mutex`/`down`). A
+    /// blocking call while this is non-empty is a sleep-in-atomic bug. Meet-joined at merges
+    /// like `locks_held`, and conservatively dropped when the lock base is passed to any call.
+    spin_held: HashSet<RefBase>,
     /// **User-memory addresses fetched** on this path, by `(source base, concrete byte
     /// offset)` — one entry per `copy_from_user`/`get_user` from a concrete user address.
     /// Re-fetching an address already here is a **double-fetch** (a TOCTOU on adversary-
@@ -1758,6 +1796,12 @@ impl Explorer<'_> {
             .copied()
             .filter(|b| edges.iter().all(|e| e.pred_state.locks_held.contains(b)))
             .collect();
+        let spin_held: HashSet<RefBase> = first
+            .spin_held
+            .iter()
+            .copied()
+            .filter(|b| edges.iter().all(|e| e.pred_state.spin_held.contains(b)))
+            .collect();
         // Same meet for freed bases: a base counts as freed after the join only if it was
         // freed on every incoming path, so a re-free is flagged only when it is a definite
         // double-free on all paths.
@@ -1790,6 +1834,7 @@ impl Explorer<'_> {
             opaque_labels,
             fn_ptrs,
             locks_held,
+            spin_held,
             user_fetches,
             freed_bases,
             exact: false,
@@ -3296,10 +3341,26 @@ impl Explorer<'_> {
             Callee::Symbol(n) => n.as_str(),
             _ => {
                 self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", "");
+                self.record(block, idx, SafetyProperty::SleepInAtomic, true, "no sleeping call while a spinlock is held", "");
                 return;
             }
         };
         let base = args.first().map(|a| self.eval_value(a, state)).and_then(|v| Self::ptr_base_key(&v));
+        // Sleep-in-atomic: a blocking/sleeping call while a spinlock is *definitely* held is a
+        // deadlock/scheduler-corruption bug — refuted with a reachability witness. Every other
+        // call records the obligation proven, so it is never left Open.
+        if BLOCKING.contains(&name) && !state.spin_held.is_empty() {
+            self.record_temporal(
+                (block, idx),
+                SafetyProperty::SleepInAtomic,
+                true,
+                state,
+                "no sleeping call while a spinlock is held",
+                "a call that may sleep runs while a spinlock is held (sleep-in-atomic)",
+            );
+        } else {
+            self.record(block, idx, SafetyProperty::SleepInAtomic, true, "no sleeping call while a spinlock is held", "");
+        }
         if LOCK_ACQUIRE.contains(&name) {
             match base {
                 // Re-acquiring a lock already held on this path: a definite AA deadlock.
@@ -3325,6 +3386,13 @@ impl Explorer<'_> {
                 // never fabricates a deadlock; it only omits the check). Sound.
                 None => self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", ""),
             }
+            // A **spinning** lock also enters atomic context — track it separately, so a
+            // later blocking call is caught (a sleepable `mutex`/`down` is not tracked here).
+            if SPIN_ACQUIRE.contains(&name) {
+                if let Some(b) = base {
+                    state.spin_held.insert(b);
+                }
+            }
         } else {
             // Any other call: a call handed a held lock's base MAY release it — a matched
             // unlock (`spin_unlock`/`spin_unlock_irqrestore`/…), an unlock wrapper, or a
@@ -3336,6 +3404,7 @@ impl Explorer<'_> {
             for a in args {
                 if let Some(b) = Self::ptr_base_key(&self.eval_value(a, state)) {
                     state.locks_held.remove(&b);
+                    state.spin_held.remove(&b);
                 }
             }
             self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", "");

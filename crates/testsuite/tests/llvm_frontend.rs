@@ -3148,6 +3148,48 @@ fn double_fetch_of_user_memory_is_refused() {
     );
 }
 
+/// **Sleep-in-atomic (G7).** A call that may sleep (`mutex_lock`/`schedule`/…) must not run
+/// while a **spinlock is held** — it deadlocks or corrupts the scheduler. A per-path
+/// structural typestate: a spinlock enters atomic context; a matched unlock (or any call
+/// handed the lock base) leaves it; a *sleepable* mutex never enters it. Refuted only when a
+/// spinlock is definitely held at the sleeping call (no false FAIL under a mutex-only hold).
+#[test]
+fn sleep_in_atomic_context_is_refused() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let sia = |name: &str, body: &str| -> Verdict {
+        let src = format!(
+            "declare void @spin_lock(ptr)\n\
+             declare void @spin_unlock(ptr)\n\
+             declare void @mutex_lock(ptr)\n\
+             declare void @schedule()\n\
+             define void @{name}(ptr %l, ptr %m) {{\nentry:\n{body}  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: name.into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // Blocking mutex_lock while a spinlock is held → sleep-in-atomic → FAIL.
+    assert_eq!(
+        sia("sleep_spin", "  call void @spin_lock(ptr %l)\n  call void @mutex_lock(ptr %m)\n"),
+        Verdict::Fail, "a blocking mutex_lock while a spinlock is held is sleep-in-atomic"
+    );
+    // schedule() while a spinlock is held → FAIL.
+    assert_eq!(
+        sia("sched_spin", "  call void @spin_lock(ptr %l)\n  call void @schedule()\n"),
+        Verdict::Fail, "schedule() while a spinlock is held is sleep-in-atomic"
+    );
+    // Spinlock released before the sleeping call → no atomic context → no fire.
+    assert_ne!(
+        sia("released", "  call void @spin_lock(ptr %l)\n  call void @spin_unlock(ptr %l)\n  \
+                          call void @mutex_lock(ptr %m)\n"),
+        Verdict::Fail, "a sleeping call after the spinlock is released is not sleep-in-atomic"
+    );
+    // Only a (sleepable) mutex held → sleeping is legal, not atomic context (no false FAIL).
+    assert_ne!(
+        sia("mutex_only", "  call void @mutex_lock(ptr %l)\n  call void @schedule()\n"),
+        Verdict::Fail, "a sleeping call under a mutex-only hold is not sleep-in-atomic"
+    );
+}
+
 /// **A loop-guarded foreign write is refused, not left spurious-UNKNOWN.** The AAD copy
 /// in the real crypto worker sits behind a `br` whose condition is loop-carried; such a
 /// condition can reach the executor wider than `i1`, and using it directly as a boolean

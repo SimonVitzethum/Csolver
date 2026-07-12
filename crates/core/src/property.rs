@@ -65,6 +65,13 @@ pub enum SafetyProperty {
     /// obligation, refuted only for a **must-aliasing** re-fetch (no false FAIL on a
     /// re-fetch of a different address).
     DoubleFetch,
+    /// No **blocking/sleeping call in atomic context**: a call that may sleep
+    /// (`mutex_lock`/`kmalloc(GFP_KERNEL)`/`schedule`/`msleep`/`down`/…) must not run while a
+    /// **spinlock is held** (or IRQs/preemption are disabled) — it deadlocks or corrupts the
+    /// scheduler. A per-path structural typestate (spinlock held vs. sleepable context); a
+    /// bug-finding-only obligation. Refuted only when a spinlock is *definitely* held on
+    /// every path reaching the sleeping call (no false FAIL under a partial hold).
+    SleepInAtomic,
 }
 
 impl SafetyProperty {
@@ -90,6 +97,7 @@ impl SafetyProperty {
             SafetyProperty::NoSizeOverflow => "no_size_overflow",
             SafetyProperty::DataRace => "data_race",
             SafetyProperty::DoubleFetch => "double_fetch",
+            SafetyProperty::SleepInAtomic => "sleep_in_atomic",
         }
     }
 
@@ -115,6 +123,7 @@ impl SafetyProperty {
             SafetyProperty::NoSizeOverflow => "allocation size computation does not overflow",
             SafetyProperty::DataRace => "no concurrency-safety violation (AA self-deadlock)",
             SafetyProperty::DoubleFetch => "no double-fetch of user memory",
+            SafetyProperty::SleepInAtomic => "no sleeping call in atomic (spinlock-held) context",
         }
     }
 
@@ -141,6 +150,7 @@ impl SafetyProperty {
             NoSizeOverflow,
             DataRace,
             DoubleFetch,
+            SleepInAtomic,
         ]
     }
 }

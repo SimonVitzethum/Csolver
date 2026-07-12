@@ -667,6 +667,7 @@ fn verify_function_with(
                     SafetyProperty::NoSizeOverflow
                         | SafetyProperty::DataRace
                         | SafetyProperty::DoubleFetch
+                        | SafetyProperty::SleepInAtomic
                 ) && !config.bug_finding
                 {
                     continue;
