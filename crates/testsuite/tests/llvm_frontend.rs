@@ -3190,6 +3190,63 @@ fn sleep_in_atomic_context_is_refused() {
     );
 }
 
+/// **Directional taint lattice (injection J / info-flow, roadmap #3).** A value derived from
+/// an untrusted source (`recv`/`copy_from_user`) must not reach an unsafe sink (`system`)
+/// without a sanitiser. Exercises the whole pipeline: region taint-on-read → **scalar** taint
+/// through arithmetic → store propagates taint back to a region → sink refutes; a recognised
+/// sanitiser (`realpath`, result untainted) clears it; an untainted kernel buffer passes.
+#[test]
+fn tainted_value_reaching_an_unsafe_sink_is_refused() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let verdict = |name: &str, src: &str| -> Verdict {
+        let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: name.into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // Full scalar flow: recv taints buf; a byte is loaded (scalar taint-on-read), +1
+    // (propagation), stored into kb2 (region taint), then system(kb2) — a tainted sink.
+    let flow = r#"
+declare i64 @recv(i32, ptr, i64, i32)
+declare i32 @system(ptr)
+define void @f(i32 %fd) {
+  %buf = alloca [64 x i8], align 1
+  %kb2 = alloca [64 x i8], align 1
+  %r = call i64 @recv(i32 %fd, ptr %buf, i64 64, i32 0)
+  %b = load i8, ptr %buf, align 1
+  %b1 = add i8 %b, 1
+  store i8 %b1, ptr %kb2, align 1
+  %rc = call i32 @system(ptr %kb2)
+  ret void
+}
+"#;
+    assert_eq!(verdict("flow", flow), Verdict::Fail,
+        "a user-tainted value flowing through arithmetic + memory into system() is refused");
+    // A sanitiser (realpath → untainted result) clears the taint before the sink.
+    let sanitized = r#"
+declare i64 @recv(i32, ptr, i64, i32)
+declare i32 @system(ptr)
+declare ptr @realpath(ptr, ptr)
+define void @f(i32 %fd, ptr %out) {
+  %buf = alloca [64 x i8], align 1
+  %r = call i64 @recv(i32 %fd, ptr %buf, i64 64, i32 0)
+  %clean = call ptr @realpath(ptr %buf, ptr %out)
+  %rc = call i32 @system(ptr %clean)
+  ret void
+}
+"#;
+    assert_ne!(verdict("san", sanitized), Verdict::Fail,
+        "a sanitised value does not fire the tainted-sink check");
+    // An untainted kernel pointer to a sink is fine (no source, no false FAIL).
+    let clean = r#"
+declare i32 @system(ptr)
+define void @f(ptr %kbuf) {
+  %rc = call i32 @system(ptr %kbuf)
+  ret void
+}
+"#;
+    assert_ne!(verdict("clean", clean), Verdict::Fail,
+        "an untainted pointer to system() is not a tainted sink");
+}
+
 /// **ABBA lock-order cycle (G6).** Two functions acquire two locks (two fields of the
 /// same struct type, so two stable cross-function *classes*) in the **opposite order**:
 /// `f` takes field-0 then field-1, `g` takes field-1 then field-0. The whole-program

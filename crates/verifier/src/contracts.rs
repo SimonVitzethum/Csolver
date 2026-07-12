@@ -1867,6 +1867,9 @@ fn address_taken_names(module: &Module) -> HashSet<String> {
                     Inst::ProvPropagate { dst, src } => { op(dst); op(src); }
                     Inst::CapRequireIfAlias { a, b, .. } => { op(a); op(b); }
                     Inst::CapRequireIfAliasFields { obj, .. } => op(obj),
+                    Inst::TaintSource { val, .. }
+                    | Inst::TaintCheck { val, .. }
+                    | Inst::TaintClear { val, .. } => op(val),
                     Inst::SafetyCheck { condition, .. } => condition_operands(condition, &mut op),
                     Inst::Asm { .. } => {}
                 }

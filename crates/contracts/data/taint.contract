@@ -1,0 +1,30 @@
+# Directional taint lattice (injection J / tainted-length F / info-flow D).
+#
+# A value derived from an untrusted SOURCE (user data, network input, argv) must not reach
+# an unsafe SINK without passing a sanitiser. Taint flows through arithmetic, loads, stores
+# and calls; a `taint-sink` argument that is definitely tainted is refused (bug-finding).
+# The `user` label is shared with `copy_from_user` (see user_copy.contract), so a buffer
+# filled from userspace is a taint source for these sinks too.
+
+# --- Sources (untrusted input) -------------------------------------------------------------
+# recv/recvfrom/read fill a caller buffer (arg1) with adversary-controlled bytes.
+[recv recvfrom read recvmsg]
+taint-source arg1 user
+
+# --- Sinks (must not receive tainted input) ------------------------------------------------
+# Command injection: the command string (arg0) must not be attacker-controlled.
+[system popen execl execlp execv execvp]
+taint-sink arg0 user
+
+# Format-string injection: the format string (arg0) must not be attacker-controlled.
+[printf vprintf puts]
+taint-sink arg0 user
+
+# `printf`-family with a leading stream/buffer: the FORMAT is arg1.
+[fprintf vfprintf dprintf]
+taint-sink arg1 user
+
+# --- Sanitisers (clear the taint) ----------------------------------------------------------
+# A recognised validation/escape returns a sanitised copy (its result is untainted).
+[taint_sanitize escape_shell realpath]
+taint-sanitize ret user

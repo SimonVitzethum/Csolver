@@ -186,6 +186,34 @@ pub enum Effect {
         /// The provenance label name.
         label: String,
     },
+    /// **Taint source**: argument `arg` (and its result value) becomes tainted with `label`
+    /// — an untrusted input (`recv`/`argv`/a syscall scalar). Taint then flows through
+    /// arithmetic, loads and calls to a [`Effect::TaintSink`]. (A bulk `copy_from_user`
+    /// buffer is already a taint source via its `fill=user` region — this is for a scalar or
+    /// return-value source the bulk-write effect does not cover.)
+    TaintSource {
+        /// The 0-based argument index whose value becomes tainted (`ret` for the result).
+        arg: usize,
+        /// The taint label name.
+        label: String,
+    },
+    /// **Taint sink**: argument `arg` must **not** be tainted with `label`. A tainted value
+    /// reaching it (a `user`-tainted `printf` format string, `memcpy` length, loop bound,
+    /// `exec` arg) is refuted (`TaintedSink`). An untainted / sanitised value passes.
+    TaintSink {
+        /// The 0-based argument index that must be free of the taint label.
+        arg: usize,
+        /// The taint label the argument must not carry.
+        label: String,
+    },
+    /// **Taint sanitiser**: clears `label` from argument `arg` (and its result) — a
+    /// recognised validation/escape/clamp (`snprintf`-bounded, `min()`, a bounds check).
+    TaintSanitize {
+        /// The 0-based argument index whose taint is cleared (`ret` for the result).
+        arg: usize,
+        /// The taint label cleared.
+        label: String,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -429,6 +457,23 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let cap = rest.get(3).copied().ok_or("needs a capability")?.to_string();
             Ok(Effect::RequireIfAliasFields { arg, off_a, off_b, cap })
         }
+        // `taint-source arg<k>|ret <label>`, `taint-sink arg<k> <label>`,
+        // `taint-sanitize arg<k>|ret <label>`.
+        "taint-source" => {
+            let arg = parse_arg_or_ret(rest.first().copied().unwrap_or(""))?;
+            let label = rest.get(1).copied().ok_or("`taint-source` needs a label name")?.to_string();
+            Ok(Effect::TaintSource { arg, label })
+        }
+        "taint-sink" => {
+            let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let label = rest.get(1).copied().ok_or("`taint-sink` needs a label name")?.to_string();
+            Ok(Effect::TaintSink { arg, label })
+        }
+        "taint-sanitize" => {
+            let arg = parse_arg_or_ret(rest.first().copied().unwrap_or(""))?;
+            let label = rest.get(1).copied().ok_or("`taint-sanitize` needs a label name")?.to_string();
+            Ok(Effect::TaintSanitize { arg, label })
+        }
         other => Err(format!("unknown effect `{other}`")),
     }
 }
@@ -456,6 +501,19 @@ fn parse_arg(tok: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("expected `arg<k>`, got `{tok}`"))
 }
 
+/// The taint-target sentinel for a call's **return value** (`ret`), used by
+/// `taint-source`/`taint-sanitize` in place of an `arg<k>` index.
+pub const RET_ARG: usize = usize::MAX;
+
+/// Parse a taint target: `arg<k>` or the literal `ret` (the call's result value).
+fn parse_arg_or_ret(tok: &str) -> Result<usize, String> {
+    if tok == "ret" {
+        Ok(RET_ARG)
+    } else {
+        parse_arg(tok)
+    }
+}
+
 /// `arg0`, `arg0*arg1`, or a decimal integer.
 fn parse_size(tok: &str) -> Result<SizeExpr, String> {
     if let Some((a, b)) = tok.split_once('*') {
@@ -475,6 +533,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("free.contract", include_str!("../data/free.contract")),
     ("user_copy.contract", include_str!("../data/user_copy.contract")),
     ("provenance.contract", include_str!("../data/provenance.contract")),
+    ("taint.contract", include_str!("../data/taint.contract")),
 ];
 
 #[cfg(test)]
@@ -497,7 +556,10 @@ mod tests {
         // User-copies (formerly `user_copy_kernel_arg`).
         assert_eq!(
             c.lookup("copy_from_user").unwrap().effects,
-            vec![Effect::Write { ptr: 0, len: SizeExpr::Arg(2), fill: Fill::User, from: Some(1) }]
+            vec![
+                Effect::Write { ptr: 0, len: SizeExpr::Arg(2), fill: Fill::User, from: Some(1) },
+                Effect::TaintSource { arg: 0, label: "user".into() },
+            ]
         );
         assert_eq!(
             c.lookup("copy_to_user").unwrap().effects,
@@ -548,6 +610,31 @@ mod tests {
         assert_eq!(
             c.lookup("needs_writable").unwrap().effects,
             vec![Effect::Require { ptr: 0, cap: "write".into() }]
+        );
+    }
+
+    #[test]
+    fn taint_effects_parse() {
+        let mut c = Contracts::default();
+        c.parse_str(
+            "[src]\ntaint-source arg1 user\n\
+             [snk]\ntaint-sink arg0 user\n\
+             [san]\ntaint-sanitize ret user\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            c.lookup("src").unwrap().effects,
+            vec![Effect::TaintSource { arg: 1, label: "user".into() }]
+        );
+        assert_eq!(
+            c.lookup("snk").unwrap().effects,
+            vec![Effect::TaintSink { arg: 0, label: "user".into() }]
+        );
+        // `ret` maps to the return-value sentinel.
+        assert_eq!(
+            c.lookup("san").unwrap().effects,
+            vec![Effect::TaintSanitize { arg: RET_ARG, label: "user".into() }]
         );
     }
 

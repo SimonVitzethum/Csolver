@@ -454,6 +454,34 @@ pub enum Inst {
         /// The interned capability the aliased region must grant.
         cap: u32,
     },
+    /// **Taint source** (a contract's `taint-source`): mark `val`'s register — and, when it
+    /// is a pointer, its region — as tainted with label `taint`. An untrusted input that then
+    /// flows to a [`Inst::TaintCheck`] sink.
+    TaintSource {
+        /// The value (or pointer) that becomes tainted.
+        val: Operand,
+        /// The interned taint-label id.
+        taint: u32,
+    },
+    /// **Taint sink** (a contract's `taint-sink`): require `val` to be free of taint label
+    /// `taint`. Implies [`SafetyProperty::TaintedSink`]: refuted when the value reaching the
+    /// sink is definitely tainted with `taint` (a `user`-tainted format string / length /
+    /// exec arg). An untainted or sanitised value passes.
+    TaintCheck {
+        /// The value that must not carry the taint label.
+        val: Operand,
+        /// The interned taint-label id the value must not carry.
+        taint: u32,
+    },
+    /// **Taint sanitiser** (a contract's `taint-sanitize`): clear taint label `taint` from
+    /// `val`'s register (a recognised validation/clamp/escape). A sanitised value passes a
+    /// later [`Inst::TaintCheck`].
+    TaintClear {
+        /// The value whose taint label is cleared.
+        val: Operand,
+        /// The interned taint-label id cleared.
+        taint: u32,
+    },
 }
 
 /// The reference-validity facts a call's `&T`/`&mut T` result carries.
@@ -497,6 +525,7 @@ impl Inst {
             Inst::CapRequire { .. } => &[WriteCapability],
             Inst::CapRequireIfAlias { .. } => &[WriteCapability],
             Inst::CapRequireIfAliasFields { .. } => &[WriteCapability],
+            Inst::TaintCheck { .. } => &[TaintedSink],
             // A freeing-wrapper call must not re-free a pointer an earlier freeing call
             // already freed (`NoDoubleFree`); a lock-acquiring call must not re-acquire a
             // held lock (`DataRace`, bug-finding only).
@@ -524,6 +553,9 @@ impl Inst {
             | Inst::ProvPropagate { .. }
             | Inst::CapRequireIfAlias { .. }
             | Inst::CapRequireIfAliasFields { .. }
+            | Inst::TaintSource { .. }
+            | Inst::TaintCheck { .. }
+            | Inst::TaintClear { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }

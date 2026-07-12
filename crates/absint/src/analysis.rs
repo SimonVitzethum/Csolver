@@ -478,6 +478,9 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::ProvPropagate { .. }
         | Inst::CapRequireIfAlias { .. }
         | Inst::CapRequireIfAliasFields { .. }
+        | Inst::TaintSource { .. }
+        | Inst::TaintCheck { .. }
+        | Inst::TaintClear { .. }
         | Inst::SafetyCheck { .. } => {}
     }
 }

@@ -65,6 +65,16 @@ pub enum SafetyProperty {
     /// obligation, refuted only for a **must-aliasing** re-fetch (no false FAIL on a
     /// re-fetch of a different address).
     DoubleFetch,
+    /// No **tainted value reaches an unsafe sink**: a value derived from an untrusted
+    /// **source** (`copy_from_user`/`recv`/argv, a `taint-source` contract) must not flow —
+    /// through arithmetic, loads and calls — into a **sink** that a `taint-sink` contract
+    /// marks as requiring untrusted-free input (a `printf` format string, a `memcpy`/loop
+    /// length, an `exec` argument). A recognised **sanitiser** (`taint-sanitize`) clears the
+    /// taint. A directional generalisation of the provenance labels; the one mechanism covers
+    /// injection (J), tainted-length→OOB (F), and information-flow (D). A bug-finding-only
+    /// obligation, refuted only when the value is **definitely tainted** on the path reaching
+    /// the sink (taint meet-joined at merges — no false FAIL under a partly-tainted phi).
+    TaintedSink,
     /// No **blocking/sleeping call in atomic context**: a call that may sleep
     /// (`mutex_lock`/`kmalloc(GFP_KERNEL)`/`schedule`/`msleep`/`down`/…) must not run while a
     /// **spinlock is held** (or IRQs/preemption are disabled) — it deadlocks or corrupts the
@@ -98,6 +108,7 @@ impl SafetyProperty {
             SafetyProperty::DataRace => "data_race",
             SafetyProperty::DoubleFetch => "double_fetch",
             SafetyProperty::SleepInAtomic => "sleep_in_atomic",
+            SafetyProperty::TaintedSink => "tainted_sink",
         }
     }
 
@@ -124,6 +135,7 @@ impl SafetyProperty {
             SafetyProperty::DataRace => "no concurrency-safety violation (AA self-deadlock)",
             SafetyProperty::DoubleFetch => "no double-fetch of user memory",
             SafetyProperty::SleepInAtomic => "no sleeping call in atomic (spinlock-held) context",
+            SafetyProperty::TaintedSink => "no tainted value reaches an unsafe sink",
         }
     }
 
@@ -151,6 +163,7 @@ impl SafetyProperty {
             DataRace,
             DoubleFetch,
             SleepInAtomic,
+            TaintedSink,
         ]
     }
 }

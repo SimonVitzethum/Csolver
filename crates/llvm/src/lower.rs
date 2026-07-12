@@ -8,7 +8,7 @@
 use crate::parser::{
     LBin, LBlock, LCast, LFunc, LInst, LModule, LPred, LTerm, LType, LValue,
 };
-use csolver_contracts::{ApiContract, Contracts, Effect, Fill, ReadSink, SizeExpr};
+use csolver_contracts::{ApiContract, Contracts, Effect, Fill, ReadSink, SizeExpr, RET_ARG};
 use csolver_core::{BitVector, Error, RegionKind, Result};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Const, DataLayout, FuncId, Function, Inst,
@@ -1251,6 +1251,9 @@ fn prov_interner() -> &'static ProvInterner {
                 match effect {
                     Effect::Label { label, .. } => names.push(label),
                     Effect::Require { cap, .. } => names.push(cap),
+                    Effect::TaintSource { label, .. }
+                    | Effect::TaintSink { label, .. }
+                    | Effect::TaintSanitize { label, .. } => names.push(label),
                     _ => {}
                 }
             }
@@ -1394,6 +1397,27 @@ fn emit_contract(
                     });
                 }
             }
+            // Directional taint (injection J / tainted-length F / info-flow D). A `taint-sink`
+            // on an argument emits the check inline. A `taint-source`/`taint-sanitize` on an
+            // **argument** likewise; when the target is `ret` (the call's result) it is deferred
+            // and emitted *after* the result register is bound (below).
+            Effect::TaintSink { arg, label } => {
+                if let (Some(a), Some(id)) = (args.get(*arg), prov_interner().id(label)) {
+                    insts.push(Inst::TaintCheck { val: ctx.operand(a, 64)?, taint: id });
+                }
+            }
+            Effect::TaintSource { arg, label } if *arg != RET_ARG => {
+                if let (Some(a), Some(id)) = (args.get(*arg), prov_interner().id(label)) {
+                    insts.push(Inst::TaintSource { val: ctx.operand(a, 64)?, taint: id });
+                }
+            }
+            Effect::TaintSanitize { arg, label } if *arg != RET_ARG => {
+                if let (Some(a), Some(id)) = (args.get(*arg), prov_interner().id(label)) {
+                    insts.push(Inst::TaintClear { val: ctx.operand(a, 64)?, taint: id });
+                }
+            }
+            // `ret`-targeted taint source/sanitiser: handled after result binding.
+            Effect::TaintSource { .. } | Effect::TaintSanitize { .. } => {}
         }
     }
     // A recognized non-allocating call still yields a result the caller may use
@@ -1405,6 +1429,26 @@ fn emit_contract(
                 ty: lower_type(ret),
                 value: RValue::Use(Operand::Const(Const::Undef)),
             });
+        }
+    }
+    // `ret`-targeted taint source/sanitiser: the result register now exists (bound above or
+    // by the allocation/model), so mark or clear its taint. A `recv`-style API whose *return*
+    // is an untrusted length is the archetype.
+    if let Some(dst) = dst {
+        for effect in &contract.effects {
+            match effect {
+                Effect::TaintSource { arg, label } if *arg == RET_ARG => {
+                    if let Some(id) = prov_interner().id(label) {
+                        insts.push(Inst::TaintSource { val: Operand::Reg(ctx.reg(dst)?), taint: id });
+                    }
+                }
+                Effect::TaintSanitize { arg, label } if *arg == RET_ARG => {
+                    if let Some(id) = prov_interner().id(label) {
+                        insts.push(Inst::TaintClear { val: Operand::Reg(ctx.reg(dst)?), taint: id });
+                    }
+                }
+                _ => {}
+            }
         }
     }
     Ok(handled)

@@ -446,6 +446,9 @@ fn visit_operands(inst: &Inst, op: &mut impl FnMut(&Operand)) {
             op(b);
         }
         Inst::CapRequireIfAliasFields { obj, .. } => op(obj),
+        Inst::TaintSource { val, .. } | Inst::TaintCheck { val, .. } | Inst::TaintClear { val, .. } => {
+            op(val)
+        }
         Inst::SafetyCheck { condition, .. } => condition_operands(condition, op),
         Inst::Asm { .. } => {}
     }

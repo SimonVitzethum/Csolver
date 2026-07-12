@@ -316,6 +316,9 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                 Inst::ProvPropagate { dst, src } => { op(dst); op(src); }
                 Inst::CapRequireIfAlias { a, b, .. } => { op(a); op(b); }
                 Inst::CapRequireIfAliasFields { obj, .. } => op(obj),
+                Inst::TaintSource { val, .. }
+                | Inst::TaintCheck { val, .. }
+                | Inst::TaintClear { val, .. } => op(val),
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -625,6 +628,7 @@ fn discharge_inner(
         unwritten_reads: HashMap::new(),
         ref_regions: HashMap::new(),
             opaque_labels: HashMap::new(),
+        tainted: HashMap::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
         spin_held: HashSet::new(),
@@ -1202,6 +1206,14 @@ struct PathState {
     /// so it cannot introduce a false PASS. Persistent (a fact about the SSA value, not memory),
     /// so not cleared on havoc.
     opaque_labels: HashMap<u32, HashSet<u32>>,
+    /// **Scalar taint labels** per SSA register (the directional taint lattice, G6-family J/F/D):
+    /// interned taint-label ids a register's value carries, sourced by a `taint-source` contract
+    /// or a load from a labelled region, propagated through arithmetic/casts, checked by a
+    /// `taint-sink` (`Inst::TaintCheck`) and cleared by a `taint-sanitize`. Pointer/region taint
+    /// reuses `prov_labels`; this map is the scalar complement. Meet-joined at merges (a value is
+    /// "definitely tainted" only if tainted on every incoming path — no false FAIL under a
+    /// partly-tainted phi). A fact about the SSA value, not memory (not cleared on havoc).
+    tainted: HashMap<RegId, HashSet<u32>>,
     /// **Resolved function-pointer values**: a register holding a function address
     /// devirtualised from a constant ops-struct load (see `global_fnptrs`) maps to
     /// its target `FuncId`, so an indirect call through that register is analysed
@@ -1800,6 +1812,27 @@ impl Explorer<'_> {
             })
             .collect();
 
+        // Scalar taint survives the join by the same **meet**: a register keeps a taint label
+        // only if every incoming edge has it — so a sink refutes only on a *definitely*-tainted
+        // value (no false FAIL under a partly-tainted phi). Under-taints (a value tainted on one
+        // branch only is dropped) — sound, recall-only loss.
+        let tainted: HashMap<RegId, HashSet<u32>> = first
+            .tainted
+            .iter()
+            .filter_map(|(reg, labels)| {
+                let common: HashSet<u32> = labels
+                    .iter()
+                    .copied()
+                    .filter(|l| {
+                        edges
+                            .iter()
+                            .all(|e| e.pred_state.tainted.get(reg).is_some_and(|s| s.contains(l)))
+                    })
+                    .collect();
+                (!common.is_empty()).then_some((*reg, common))
+            })
+            .collect();
+
         // Resolved function-pointer identities survive the join by the same meet:
         // a register keeps its target only if every incoming edge resolved it to
         // the *same* function (an SSA value dominating the merge does; a phi does
@@ -1864,6 +1897,7 @@ impl Explorer<'_> {
             unwritten_reads: HashMap::new(),
             ref_regions: HashMap::new(),
             opaque_labels,
+            tainted,
             fn_ptrs,
             locks_held,
             spin_held,
@@ -2631,6 +2665,13 @@ impl Explorer<'_> {
             Inst::Assign { dst, value, .. } => {
                 let v = self.eval_rvalue(value, state);
                 state.env.insert(*dst, v);
+                // Taint propagation: the result carries the union of its operands' taint.
+                let t = self.rvalue_taint(value, state);
+                if t.is_empty() {
+                    state.tainted.remove(dst);
+                } else {
+                    state.tainted.insert(*dst, t);
+                }
             }
             Inst::Alloc { dst, region, elem, count, align } => {
                 let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1).max(1);
@@ -2822,6 +2863,23 @@ impl Explorer<'_> {
                         }
                     }
                 }
+                // Taint-on-read for **scalars**: a scalar loaded from a tainted region (a
+                // `taint-source`-labelled buffer — e.g. a `copy_from_user` destination)
+                // inherits the region's taint labels. (The pointer case is handled above.)
+                if !ty.is_ptr() {
+                    let src_labels = match p.prov {
+                        Prov::Region(rid) => {
+                            state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default()
+                        }
+                        Prov::Unknown(_, Some(id)) => {
+                            state.opaque_labels.get(&id).cloned().unwrap_or_default()
+                        }
+                        _ => HashSet::new(),
+                    };
+                    if !src_labels.is_empty() {
+                        state.tainted.entry(*dst).or_default().extend(src_labels);
+                    }
+                }
                 state.env.insert(*dst, value);
             }
             Inst::Store { ty, ptr, value, align } => {
@@ -2829,6 +2887,24 @@ impl Explorer<'_> {
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidWrite, state);
                 let v = self.eval_value(value, state);
+                // Taint through memory: storing a tainted scalar into a region taints the
+                // region, so a value later loaded from it stays tainted (a `user`-tainted
+                // length written into a descriptor field and read back at a sink).
+                if let Operand::Reg(r) = value {
+                    if let Some(labels) = state.tainted.get(r).cloned() {
+                        match &p.prov {
+                            Prov::Region(rid) => {
+                                if let Some(reg) = state.regions.get_mut(*rid) {
+                                    reg.prov_labels.extend(labels);
+                                }
+                            }
+                            Prov::Unknown(_, Some(id)) => {
+                                state.opaque_labels.entry(*id).or_default().extend(labels);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 state.heap.push(StoreRecord { target: p, value: v, size: asize });
                 // A store may reassign a raw-pointer field, so the region a later `RefWitness`
                 // load of that field should materialise is now a *different* object. Drop the
@@ -2931,6 +3007,27 @@ impl Explorer<'_> {
                     state,
                     "an in-place operation's aliased field region grants the required capability",
                     "an in-place operation writes a field region whose provenance may not grant it",
+                );
+            }
+            // Directional taint (injection J / tainted-length F / info-flow D).
+            Inst::TaintSource { val, taint } => {
+                self.taint_add(val, *taint, state);
+            }
+            Inst::TaintClear { val, taint } => {
+                self.taint_remove(val, *taint, state);
+            }
+            // A tainted value reaching a sink is refuted (a definite taint on this path — the
+            // taint map is meet-joined, so no false FAIL under a partly-tainted phi). An
+            // untainted / sanitised value passes. Mirrors `CapRequire`.
+            Inst::TaintCheck { val, taint } => {
+                let tainted = self.taint_has(val, *taint, state);
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::TaintedSink,
+                    tainted,
+                    state,
+                    "no untrusted (tainted) value reaches this sink",
+                    "an untrusted (tainted) value reaches an unsafe sink (injection / tainted length)",
                 );
             }
             Inst::RefWitness { dst, size, align, writable, assumed, src } => {
@@ -3271,6 +3368,82 @@ impl Explorer<'_> {
                 state.opaque_labels.entry(id).or_default().insert(label);
             }
             _ => {}
+        }
+    }
+
+    /// The taint labels an r-value's result carries: the **union** of its register operands'
+    /// scalar taint (a `tainted` length + 1 is still tainted; a cast/compare of a tainted
+    /// value is tainted). Constants are untainted. The propagation rule of the taint lattice.
+    fn rvalue_taint(&self, rv: &RValue, state: &PathState) -> HashSet<u32> {
+        let ops: Vec<&Operand> = match rv {
+            RValue::Use(o) => vec![o],
+            RValue::Bin { lhs, rhs, .. } | RValue::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
+            RValue::Cast { operand, .. } => vec![operand],
+            RValue::Select { cond, then_val, else_val } => vec![cond, then_val, else_val],
+        };
+        let mut t = HashSet::new();
+        for o in ops {
+            if let Operand::Reg(r) = o {
+                if let Some(s) = state.tainted.get(r) {
+                    t.extend(s.iter().copied());
+                }
+            }
+        }
+        t
+    }
+
+    /// Mark a value operand tainted with `taint`: a pointer taints its region (so bytes read
+    /// from it are tainted), a scalar taints its register.
+    fn taint_add(&mut self, op: &Operand, taint: u32, state: &mut PathState) {
+        if matches!(self.eval_value(op, state), SymValue::Ptr(_)) {
+            self.add_ptr_label(op, taint, state);
+        } else if let Operand::Reg(r) = op {
+            state.tainted.entry(*r).or_default().insert(taint);
+        }
+    }
+
+    /// Whether a value operand is definitely tainted with `taint` — a scalar register's taint
+    /// set, or (for a pointer) its region/opaque provenance labels.
+    fn taint_has(&mut self, op: &Operand, taint: u32, state: &PathState) -> bool {
+        if let Operand::Reg(r) = op {
+            if state.tainted.get(r).is_some_and(|s| s.contains(&taint)) {
+                return true;
+            }
+        }
+        matches!(self.eval_value(op, state), SymValue::Ptr(_))
+            && match self.eval_pointer(op, state).prov {
+                Prov::Region(rid) => {
+                    state.regions.get(rid).is_some_and(|r| r.prov_labels.contains(&taint))
+                }
+                Prov::Unknown(_, Some(id)) => {
+                    state.opaque_labels.get(&id).is_some_and(|s| s.contains(&taint))
+                }
+                _ => false,
+            }
+    }
+
+    /// Clear `taint` from a value operand (a recognised sanitiser): both its scalar register
+    /// taint and, for a pointer, its region/opaque provenance labels.
+    fn taint_remove(&mut self, op: &Operand, taint: u32, state: &mut PathState) {
+        if let Operand::Reg(r) = op {
+            if let Some(s) = state.tainted.get_mut(r) {
+                s.remove(&taint);
+            }
+        }
+        if matches!(self.eval_value(op, state), SymValue::Ptr(_)) {
+            match self.eval_pointer(op, state).prov {
+                Prov::Region(rid) => {
+                    if let Some(r) = state.regions.get_mut(rid) {
+                        r.prov_labels.remove(&taint);
+                    }
+                }
+                Prov::Unknown(_, Some(id)) => {
+                    if let Some(s) = state.opaque_labels.get_mut(&id) {
+                        s.remove(&taint);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
