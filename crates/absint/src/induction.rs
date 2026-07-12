@@ -547,7 +547,7 @@ mod tests {
             dst: x,
             ty: Type::int(32),
             ptr: Operand::Reg(iter),
-            align: 4,
+            align: 4, volatile: false
         });
         bb1.insts.push(Inst::PtrOffset {
             dst: nx,

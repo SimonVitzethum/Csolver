@@ -3350,6 +3350,10 @@ fn inconsistently_locked_global_is_a_candidate_race() {
     let safe = module("  call void @spin_lock(ptr @lk)\n  %v = load i32, ptr @counter, align 4\n  \
                         call void @spin_unlock(ptr @lk)\n  ret i32 %v\n");
     assert!(safe.data_races().is_empty(), "a consistently-locked global is not flagged");
+    // Hardening: a `volatile`/`atomic` reader (READ_ONCE) is race-free by construction — even
+    // with a disjoint lockset it is not flagged.
+    let atomic = module("  %v = load volatile i32, ptr @counter, align 4\n  ret i32 %v\n");
+    assert!(atomic.data_races().is_empty(), "an atomic/volatile access is not a data race");
 }
 
 /// **The remaining typestate/taint classes (TOCTOU G2, refcount G8, leak K, type-confusion H,

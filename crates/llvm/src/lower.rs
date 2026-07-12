@@ -646,12 +646,14 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
                 ty: msir_ty.clone(),
                 ptr: ctx.operand(ptr, 64)?,
                 align,
+                volatile: true, // an atomic RMW is race-free
             });
             insts.push(Inst::Store {
                 ty: msir_ty,
                 ptr: ctx.operand(ptr, 64)?,
                 value: Operand::Const(Const::Undef),
                 align,
+                volatile: true,
             });
             if *tuple {
                 insts.push(Inst::Assign {
@@ -817,17 +819,19 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
             count: Operand::int(64, 1),
             align: align_or(*align, ty),
         },
-        LInst::Load { dst, ty, ptr, align, .. } => Inst::Load {
+        LInst::Load { dst, ty, ptr, align, atomic, .. } => Inst::Load {
             dst: ctx.reg(dst)?,
             ty: lower_type(ty),
             ptr: ctx.operand(ptr, 64)?,
             align: align_or(*align, ty),
+            volatile: *atomic,
         },
-        LInst::Store { ty, val, ptr, align } => Inst::Store {
+        LInst::Store { ty, val, ptr, align, atomic } => Inst::Store {
             ty: lower_type(ty),
             ptr: ctx.operand(ptr, 64)?,
             value: ctx.operand(val, type_width(ty))?,
             align: align_or(*align, ty),
+            volatile: *atomic,
         },
         LInst::Gep { dst, elem, base, index } => Inst::PtrOffset {
             dst: ctx.reg(dst)?,

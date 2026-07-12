@@ -246,6 +246,10 @@ pub enum Inst {
         ptr: Operand,
         /// Required alignment in bytes.
         align: u32,
+        /// An `atomic`/`volatile` access (`READ_ONCE`/`atomic_*`) — **race-free by
+        /// construction**, so the data-race pass excludes it. Does not affect any
+        /// memory-safety obligation (the access is still checked).
+        volatile: bool,
     },
     /// Write `value: ty` to `ptr`. Implies `ValidWrite`, `InBounds`,
     /// `Alignment`, `NoNullDeref`, `NoUseAfterFree`.
@@ -258,6 +262,9 @@ pub enum Inst {
         value: Operand,
         /// Required alignment in bytes.
         align: u32,
+        /// An `atomic`/`volatile` access (`WRITE_ONCE`/`atomic_*`) — **race-free by
+        /// construction**, so the data-race pass excludes it.
+        volatile: bool,
     },
     /// Allocate `count` elements of `elem` in `region`, yielding a pointer.
     Alloc {

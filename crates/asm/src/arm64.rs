@@ -237,12 +237,12 @@ fn decode_one(
             0 => {
                 // STR Rt, [Rn, #off]; register 31 here is the zero register.
                 let value = if rt == 31 { Operand::int(width, 0) } else { Operand::Reg(reg(rt)) };
-                fall(vec![off, Inst::Store { ty, ptr: Operand::Reg(ptr), value, align: 1 }])
+                fall(vec![off, Inst::Store { ty, ptr: Operand::Reg(ptr), value, align: 1 , volatile: false}])
             }
             1 => {
                 // LDR Rt, [Rn, #off]; loading into the zero register is a discard.
                 let dst = if rt == 31 { temp_reg(pos + 1) } else { reg(rt) };
-                fall(vec![off, Inst::Load { dst, ty, ptr: Operand::Reg(ptr), align: 1 }])
+                fall(vec![off, Inst::Load { dst, ty, ptr: Operand::Reg(ptr), align: 1 , volatile: false}])
             }
             _ => Err(CoreError::unsupported("arm64: unsupported load/store variant")),
         };

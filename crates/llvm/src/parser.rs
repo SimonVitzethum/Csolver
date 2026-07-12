@@ -234,6 +234,8 @@ pub enum LInst {
         ptr: LValue,
         align: u32,
         align_meta: Option<u32>,
+        /// `atomic`/`volatile` — a race-free access (excluded from the data-race pass).
+        atomic: bool,
     },
     /// `store ty v, ptr p[, align n]`.
     Store {
@@ -241,6 +243,8 @@ pub enum LInst {
         val: LValue,
         ptr: LValue,
         align: u32,
+        /// `atomic`/`volatile` — a race-free access (excluded from the data-race pass).
+        atomic: bool,
     },
     /// `dst = getelementptr [inbounds] elem, ptr base, i.. index`.
     Gep {
@@ -739,9 +743,15 @@ impl Parser {
         }
     }
 
-    /// Skip the `atomic` / `volatile` qualifiers of a `load`/`store`.
-    fn skip_memory_qualifiers(&mut self) {
-        while self.eat_word("atomic") || self.eat_word("volatile") {}
+    /// Skip the `atomic` / `volatile` qualifiers of a `load`/`store`, returning whether either
+    /// was present — such an access is **race-free by construction** (`READ_ONCE`/`WRITE_ONCE`/
+    /// `atomic_*` lower to volatile/atomic accesses), so the data-race pass excludes it.
+    fn skip_memory_qualifiers(&mut self) -> bool {
+        let mut atomic = false;
+        while self.eat_word("atomic") || self.eat_word("volatile") {
+            atomic = true;
+        }
+        atomic
     }
 
     /// Skip an atomic access's trailing `syncscope("…")` and ordering keyword
@@ -1632,7 +1642,7 @@ impl Parser {
                 // `atomic`/`volatile` qualifiers don't change the memory-safety
                 // obligations (the analysis models sequential memory, as does the
                 // Miri oracle); the access itself must still be checked.
-                self.skip_memory_qualifiers();
+                let atomic = self.skip_memory_qualifiers();
                 let ty = self.ltype()?;
                 self.expect_punct(',')?;
                 let _pty = self.ltype()?;
@@ -1649,10 +1659,11 @@ impl Parser {
                     ptr,
                     align,
                     align_meta,
+                    atomic,
                 }
             }
             "store" => {
-                self.skip_memory_qualifiers();
+                let atomic = self.skip_memory_qualifiers();
                 let ty = self.ltype()?;
                 let val = self.value()?;
                 self.expect_punct(',')?;
@@ -1665,6 +1676,7 @@ impl Parser {
                     val,
                     ptr,
                     align,
+                    atomic,
                 }
             }
             "getelementptr" => self.gep(need_dst()?)?,

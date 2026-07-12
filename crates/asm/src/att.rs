@@ -234,7 +234,7 @@ fn lower_mov(ops: &[&str], off: usize, width: u32) -> Result<Vec<Inst>> {
         // store src -> [mem]
         let (mut insts, ptr) = mem.lower(off);
         insts.extend(src.pre);
-        insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: src.value, align: 1 });
+        insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: src.value, align: 1 , volatile: false});
         Ok(insts)
     } else {
         Err(Error::unsupported(format!("asm: mov destination `{dst}`")))
@@ -280,7 +280,7 @@ fn operand_value(ops: &[&str], i: usize, off: usize, width: u32) -> Result<OpVal
     if let Some(mem) = parse_mem(tok) {
         let (mut pre, ptr) = mem.lower(off);
         let loaded = RegId(3000 + off as u32);
-        pre.push(Inst::Load { dst: loaded, ty: Type::int(width), ptr: Operand::Reg(ptr), align: 1 });
+        pre.push(Inst::Load { dst: loaded, ty: Type::int(width), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
         return Ok(OpVal { value: Operand::Reg(loaded), pre });
     }
     Err(Error::unsupported(format!("asm: operand `{tok}`")))

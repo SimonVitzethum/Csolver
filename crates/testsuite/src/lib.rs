@@ -130,7 +130,7 @@ pub fn interproc_module() -> Module {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
     let entry = Function {
         id: FuncId(1),
@@ -281,7 +281,7 @@ pub fn safe_buffer_store() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
 
     let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
@@ -371,7 +371,7 @@ pub fn loop_array_store() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
     bb2.insts.push(Inst::Assign {
         dst: nj,
@@ -457,7 +457,7 @@ pub fn relational_loop() -> Function {
         index: Operand::Reg(j),
         elem: Type::int(32),
     });
-    bb2.insts.push(Inst::Store { ty: Type::int(32), ptr: Operand::Reg(p), value: Operand::int(32, 0), align: 4 });
+    bb2.insts.push(Inst::Store { ty: Type::int(32), ptr: Operand::Reg(p), value: Operand::int(32, 0), align: 4 , volatile: false});
     bb2.insts.push(Inst::Assign {
         dst: ni,
         ty: Type::int(64),
@@ -515,19 +515,19 @@ pub fn indirect_store() -> Function {
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
         value: Operand::Reg(buf),
-        align: 8,
+        align: 8, volatile: false
     });
     bb0.insts.push(Inst::Load {
         dst: p,
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
-        align: 8,
+        align: 8, volatile: false
     });
     bb0.insts.push(Inst::Store {
         ty: Type::int(8),
         ptr: Operand::Reg(p),
         value: Operand::int(8, 0),
-        align: 1,
+        align: 1, volatile: false
     });
     Function {
         id: FuncId(0),
@@ -563,7 +563,7 @@ pub fn uninit_read() -> Function {
         dst: v,
         ty: Type::int(32),
         ptr: Operand::Reg(buf),
-        align: 4,
+        align: 4, volatile: false
     });
     Function {
         id: FuncId(0),
@@ -599,13 +599,13 @@ pub fn init_read() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(buf),
         value: Operand::int(32, 7),
-        align: 4,
+        align: 4, volatile: false
     });
     bb0.insts.push(Inst::Load {
         dst: v,
         ty: Type::int(32),
         ptr: Operand::Reg(buf),
-        align: 4,
+        align: 4, volatile: false
     });
     Function {
         id: FuncId(0),
@@ -697,7 +697,7 @@ fn eq_exit_loop_to(exit: u128) -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
     bb2.insts.push(Inst::Assign {
         dst: ni,
@@ -802,7 +802,7 @@ fn ptr_walk_to(end_elems: u128) -> Function {
         dst: x,
         ty: Type::int(32),
         ptr: Operand::Reg(iter),
-        align: 4,
+        align: 4, volatile: false
     });
     bb2.insts.push(Inst::PtrOffset {
         dst: nx,
@@ -909,7 +909,7 @@ fn ptr_walk_bottom_impl(guard: bool) -> Function {
         },
     );
     bb1.params = vec![(iter, Type::ptr(Type::int(32)))];
-    bb1.insts.push(Inst::Load { dst: x, ty: Type::int(32), ptr: Operand::Reg(iter), align: 4 });
+    bb1.insts.push(Inst::Load { dst: x, ty: Type::int(32), ptr: Operand::Reg(iter), align: 4 , volatile: false});
     bb1.insts.push(Inst::PtrOffset {
         dst: nx,
         base: Operand::Reg(iter),
@@ -984,7 +984,7 @@ pub fn masked_index_store() -> Function {
         ty: Type::int(8),
         ptr: Operand::Reg(p),
         value: Operand::int(8, 0),
-        align: 1,
+        align: 1, volatile: false
     });
     Function {
         id: FuncId(0),
@@ -1075,7 +1075,7 @@ pub fn oob_index_store() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
     Function {
         id: FuncId(0),
@@ -1123,7 +1123,7 @@ pub fn oob_dynamic_store() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
     Function {
         id: FuncId(0),
@@ -1156,7 +1156,7 @@ pub fn dangling_store() -> Function {
         ty: Type::int(8),
         ptr: Operand::Reg(buf),
         value: Operand::int(8, 0),
-        align: 1,
+        align: 1, volatile: false
     });
     Function {
         id: FuncId(0),

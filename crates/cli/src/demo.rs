@@ -67,7 +67,7 @@ fn interproc_caller() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
     Function {
         id: FuncId(7),
@@ -105,19 +105,19 @@ fn indirect_store() -> Function {
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
         value: Operand::Reg(buf),
-        align: 8,
+        align: 8, volatile: false
     });
     bb0.insts.push(Inst::Load {
         dst: p,
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
-        align: 8,
+        align: 8, volatile: false
     });
     bb0.insts.push(Inst::Store {
         ty: Type::int(8),
         ptr: Operand::Reg(p),
         value: Operand::int(8, 0),
-        align: 1,
+        align: 1, volatile: false
     });
     Function {
         id: FuncId(5),
@@ -195,7 +195,7 @@ fn loop_array_store() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
     bb2.insts.push(Inst::Assign {
         dst: nj,
@@ -287,7 +287,7 @@ fn safe_buffer_store() -> Function {
         ty: Type::int(32),
         ptr: Operand::Reg(p),
         value: Operand::int(32, 0),
-        align: 4,
+        align: 4, volatile: false
     });
 
     let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));

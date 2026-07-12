@@ -888,7 +888,7 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(p),
             value: Operand::int(32, 0),
-            align: 4,
+            align: 4, volatile: false
         };
         let call = |callee: Callee, args: Vec<Operand>| Inst::Call {
             dst: None,
@@ -963,7 +963,7 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(p),
             value: Operand::int(32, 0),
-            align: 4,
+            align: 4, volatile: false
         };
         let call_writer = Inst::Call {
             dst: None,
@@ -1029,7 +1029,7 @@ mod tests {
                             ty: Type::int(32),
                             ptr: Operand::Reg(p),
                             value: Operand::int(32, 0),
-                            align: 4,
+                            align: 4, volatile: false
                         });
                     }
                     if rng() % 4 == 0 {

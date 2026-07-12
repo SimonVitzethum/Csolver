@@ -2339,7 +2339,7 @@ mod program_equiv_tests {
                     ty: Type::ptr(Type::int(64)),
                     ptr: Operand::Reg(RegId(1)),
                     value: Operand::Reg(RegId(2)),
-                    align: 8,
+                    align: 8, volatile: false
                 },
                 Inst::Call {
                     dst: None,
@@ -2429,7 +2429,7 @@ mod program_equiv_tests {
                             ty: Type::ptr(Type::int(64)),
                             ptr: Operand::Reg(target),
                             value,
-                            align: 8,
+                            align: 8, volatile: false
                         });
                     }
                     // Pass R to some targets (and maybe escape it via an extra call).
@@ -2515,7 +2515,7 @@ mod program_equiv_tests {
                             ty: Type::ptr(Type::int(64)),
                             ptr: Operand::Reg(RegId(1)),
                             value: Operand::Reg(RegId(2)),
-                            align: 8,
+                            align: 8, volatile: false
                         });
                     }
                     for _ in 0..(1 + rng() % 2) {
@@ -2631,7 +2631,7 @@ mod program_equiv_tests {
                             ty: Type::ptr(Type::int(64)),
                             ptr: Operand::Reg(target),
                             value,
-                            align: 8,
+                            align: 8, volatile: false
                         });
                     }
                     for _ in 0..(1 + rng() % 2) {
@@ -2706,7 +2706,7 @@ mod program_equiv_tests {
                         ty: Type::ptr(Type::int(64)),
                         ptr: Operand::Reg(RegId(1)),
                         value: Operand::Reg(RegId(2)),
-                        align: 8,
+                        align: 8, volatile: false
                     },
                     Inst::Call {
                         dst: None,

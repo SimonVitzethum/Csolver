@@ -2888,11 +2888,15 @@ impl Explorer<'_> {
                 };
                 state.env.insert(*dst, SymValue::Ptr(result));
             }
-            Inst::Load { dst, ty, ptr, align } => {
+            Inst::Load { dst, ty, ptr, align, volatile } => {
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidRead, state);
-                self.record_shared_access(ptr, false, &p, state);
+                // An atomic/volatile read (`READ_ONCE`/`atomic_read`) is race-free by
+                // construction — excluded from the data-race pass.
+                if !*volatile {
+                    self.record_shared_access(ptr, false, &p, state);
+                }
                 let exact_before = state.exact;
                 let (value, origin) = self.load_value(&p, asize, ty, state);
                 match origin {
@@ -2977,11 +2981,15 @@ impl Explorer<'_> {
                 }
                 state.env.insert(*dst, value);
             }
-            Inst::Store { ty, ptr, value, align } => {
+            Inst::Store { ty, ptr, value, align, volatile } => {
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidWrite, state);
-                self.record_shared_access(ptr, true, &p, state);
+                // An atomic/volatile write (`WRITE_ONCE`/`atomic_set`) is race-free by
+                // construction — excluded from the data-race pass.
+                if !*volatile {
+                    self.record_shared_access(ptr, true, &p, state);
+                }
                 let v = self.eval_value(value, state);
                 // Taint through memory: storing a tainted scalar into a region taints the
                 // region, so a value later loaded from it stays tainted (a `user`-tainted
@@ -5447,7 +5455,7 @@ mod tests {
             count: Operand::int(64, 4),
             align: 4,
         });
-        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false});
         Function {
             id: FuncId(0),
             name: "uninit".into(),
@@ -5494,7 +5502,7 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(a),
             value: Operand::int(32, 7),
-            align: 4,
+            align: 4, volatile: false
         });
         bb0.insts.push(Inst::MemIntrinsic {
             kind: MemKind::Copy,
@@ -5502,7 +5510,7 @@ mod tests {
             src: Some(Operand::Reg(a)),
             len: Operand::int(64, 4),
         });
-        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(b), align: 4 });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(b), align: 4 , volatile: false});
         let f = Function {
             id: FuncId(0),
             name: "copy_init".into(),
@@ -5776,7 +5784,7 @@ mod tests {
             ty: Type::int(64),
             ptr: Operand::Reg(buf),
             value: Operand::int(64, 0),
-            align: 8,
+            align: 8, volatile: false
         });
         bb0.insts.push(Inst::MemIntrinsic {
             kind: MemKind::UserDrain,
@@ -5963,7 +5971,7 @@ mod tests {
             ty: Type::ptr(Type::int(8)),
             ptr: Operand::Reg(fsrc),
             value: Operand::Reg(obj),
-            align: 8,
+            align: 8, volatile: false
         });
         // req->dst = obj  (field at +72) — same pointer ⇒ in-place
         bb0.insts.push(Inst::PtrOffset {
@@ -5976,7 +5984,7 @@ mod tests {
             ty: Type::ptr(Type::int(8)),
             ptr: Operand::Reg(fdst),
             value: Operand::Reg(obj),
-            align: 8,
+            align: 8, volatile: false
         });
         // Sink: read req->src (+64) and req->dst (+72) back; iff they alias, require `write` (1).
         bb0.insts.push(Inst::CapRequireIfAliasFields {
@@ -6018,9 +6026,9 @@ mod tests {
         bb0.insts.push(Inst::ProvLabel { ptr: Operand::Reg(obj), label: 0 });
         bb0.insts.push(Inst::PtrOffset { dst: p, base: Operand::Reg(obj), index: Operand::int(64, 16), elem: Type::int(8) });
         bb0.insts.push(Inst::PtrOffset { dst: fsrc, base: Operand::Reg(obj), index: Operand::int(64, 64), elem: Type::int(8) });
-        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(p), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(p), align: 8 , volatile: false});
         bb0.insts.push(Inst::PtrOffset { dst: fdst, base: Operand::Reg(obj), index: Operand::int(64, 72), elem: Type::int(8) });
-        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p), align: 8 , volatile: false});
         bb0.insts.push(Inst::CapRequireIfAliasFields { obj: Operand::Reg(obj), off_a: 64, off_b: 72, cap: 1 });
         let idx = bb0.insts.len() - 1;
         let f = Function {
@@ -6055,9 +6063,9 @@ mod tests {
         bb0.insts.push(Inst::PtrOffset { dst: p1, base: Operand::Reg(obj), index: Operand::int(64, 16), elem: Type::int(8) });
         bb0.insts.push(Inst::PtrOffset { dst: p2, base: Operand::Reg(obj), index: Operand::int(64, 32), elem: Type::int(8) });
         bb0.insts.push(Inst::PtrOffset { dst: fsrc, base: Operand::Reg(obj), index: Operand::int(64, 64), elem: Type::int(8) });
-        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(p1), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(p1), align: 8 , volatile: false});
         bb0.insts.push(Inst::PtrOffset { dst: fdst, base: Operand::Reg(obj), index: Operand::int(64, 72), elem: Type::int(8) });
-        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p2), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p2), align: 8 , volatile: false});
         bb0.insts.push(Inst::CapRequireIfAliasFields { obj: Operand::Reg(obj), off_a: 64, off_b: 72, cap: 1 });
         let idx = bb0.insts.len() - 1;
         let f = Function {
@@ -6109,9 +6117,9 @@ mod tests {
         let mut bb1 = BasicBlock::new(BlockId(1), Terminator::Return(None));
         bb1.params = vec![(src, Type::ptr(Type::int(8)))];
         bb1.insts.push(Inst::PtrOffset { dst: fsrc, base: Operand::Reg(obj), index: Operand::int(64, 64), elem: Type::int(8) });
-        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(src), align: 8 });
+        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(src), align: 8 , volatile: false});
         bb1.insts.push(Inst::PtrOffset { dst: fdst, base: Operand::Reg(obj), index: Operand::int(64, 72), elem: Type::int(8) });
-        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p143), align: 8 });
+        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p143), align: 8 , volatile: false});
         bb1.insts.push(Inst::CapRequireIfAliasFields { obj: Operand::Reg(obj), off_a: 64, off_b: 72, cap: 1 });
         let idx = bb1.insts.len() - 1;
         let f = Function {
@@ -6164,9 +6172,9 @@ mod tests {
         let mut bb1 = BasicBlock::new(BlockId(1), Terminator::Return(None));
         bb1.params = vec![(src, Type::ptr(Type::int(8)))];
         bb1.insts.push(Inst::PtrOffset { dst: fsrc, base: Operand::Reg(obj), index: Operand::int(64, 64), elem: Type::int(8) });
-        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(src), align: 8 });
+        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(src), align: 8 , volatile: false});
         bb1.insts.push(Inst::PtrOffset { dst: fdst, base: Operand::Reg(obj), index: Operand::int(64, 72), elem: Type::int(8) });
-        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p143), align: 8 });
+        bb1.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p143), align: 8 , volatile: false});
         bb1.insts.push(Inst::CapRequireIfAliasFields { obj: Operand::Reg(obj), off_a: 64, off_b: 72, cap: 1 });
         let idx = bb1.insts.len() - 1;
         let f = Function {
@@ -6205,10 +6213,10 @@ mod tests {
         bb0.insts.push(Inst::PtrOffset { dst: p, base: Operand::Reg(obj), index: Operand::int(64, 16), elem: Type::int(8) });
         // req->src = p  (reqbase + 64)
         bb0.insts.push(Inst::PtrOffset { dst: fsrc, base: Operand::Reg(reqbase), index: Operand::int(64, 64), elem: Type::int(8) });
-        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(p), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fsrc), value: Operand::Reg(p), align: 8 , volatile: false});
         // req->dst = p  (reqbase + 72)
         bb0.insts.push(Inst::PtrOffset { dst: fdst, base: Operand::Reg(reqbase), index: Operand::int(64, 72), elem: Type::int(8) });
-        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(fdst), value: Operand::Reg(p), align: 8 , volatile: false});
         // sink on the NESTED base reqbase, offsets 64/72
         bb0.insts.push(Inst::CapRequireIfAliasFields { obj: Operand::Reg(reqbase), off_a: 64, off_b: 72, cap: 1 });
         let idx = bb0.insts.len() - 1;
@@ -6251,9 +6259,9 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(buf),
             value: Operand::int(32, 7),
-            align: 4,
+            align: 4, volatile: false
         });
-        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false});
         Function {
             id: FuncId(0),
             name: "init".into(),
@@ -6325,7 +6333,7 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(p),
             value: Operand::int(32, 0),
-            align: 4,
+            align: 4, volatile: false
         });
         Function {
             id: FuncId(0),
@@ -6415,7 +6423,7 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(p),
             value: Operand::int(32, 0),
-            align: 4,
+            align: 4, volatile: false
         });
 
         let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
@@ -6529,7 +6537,7 @@ mod tests {
             ty: Type::int(8),
             ptr: Operand::Reg(buf),
             value: Operand::int(8, 0),
-            align: 1,
+            align: 1, volatile: false
         });
         Function {
             id: FuncId(0),
@@ -6795,7 +6803,7 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(buf),
             value: Operand::int(32, 7),
-            align: 4,
+            align: 4, volatile: false
         });
         bb0.insts.push(Inst::Call {
             dst: None,
@@ -6804,7 +6812,7 @@ mod tests {
             ret_ty: Type::Unit,
             ret_ref: None,
         });
-        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 });
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false});
         Function {
             id: FuncId(0),
             name: "call_then_load".into(),
@@ -6934,7 +6942,7 @@ mod tests {
             ty: Type::int(32),
             ptr: Operand::Reg(p),
             value: Operand::int(32, 0),
-            align: 4,
+            align: 4, volatile: false
         });
         bb2.insts.push(Inst::Assign {
             dst: nj,
@@ -6984,19 +6992,19 @@ mod tests {
             ty: Type::ptr(Type::int(8)),
             ptr: Operand::Reg(slot),
             value: Operand::Reg(buf),
-            align: 8,
+            align: 8, volatile: false
         });
         bb0.insts.push(Inst::Load {
             dst: p,
             ty: Type::ptr(Type::int(8)),
             ptr: Operand::Reg(slot),
-            align: 8,
+            align: 8, volatile: false
         });
         bb0.insts.push(Inst::Store {
             ty: Type::int(8),
             ptr: Operand::Reg(p),
             value: Operand::int(8, 0),
-            align: 1,
+            align: 1, volatile: false
         });
         Function {
             id: FuncId(0),
@@ -7019,10 +7027,10 @@ mod tests {
         let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
         bb0.insts.push(Inst::Alloc { dst: slot, region: RegionKind::Heap, elem: Type::ptr(Type::int(8)), count: Operand::int(64, 1), align: 8 });
         bb0.insts.push(Inst::Alloc { dst: buf, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 1 });
-        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), value: Operand::Reg(buf), align: 8 });
+        bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), value: Operand::Reg(buf), align: 8 , volatile: false});
         bb0.insts.push(Inst::Call { dst: None, callee: csolver_ir::Callee::Symbol(asm_name.into()), args: vec![], ret_ty: Type::Unit, ret_ref: None });
-        bb0.insts.push(Inst::Load { dst: p, ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), align: 8 });
-        bb0.insts.push(Inst::Store { ty: Type::int(8), ptr: Operand::Reg(p), value: Operand::int(8, 0), align: 1 });
+        bb0.insts.push(Inst::Load { dst: p, ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), align: 8 , volatile: false});
+        bb0.insts.push(Inst::Store { ty: Type::int(8), ptr: Operand::Reg(p), value: Operand::int(8, 0), align: 1 , volatile: false});
         Function { id: FuncId(0), name: "asm_rt".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) }
     }
 
@@ -7105,7 +7113,7 @@ mod tests {
             ty: Type::int(8),
             ptr: Operand::Reg(buf),
             value: Operand::int(8, 0),
-            align: 1,
+            align: 1, volatile: false
         });
         bb2.insts.push(Inst::Dealloc { region: RegionKind::Heap, ptr: Operand::Reg(buf) });
         bb2.insts.push(Inst::Assign {
@@ -7154,7 +7162,7 @@ mod tests {
             ty: Type::int(8),
             ptr: Operand::Reg(buf),
             value: Operand::int(8, 0),
-            align: 1,
+            align: 1, volatile: false
         });
         let f = Function {
             id: FuncId(0),
@@ -7271,13 +7279,13 @@ mod tests {
             ty: Type::ptr(Type::int(8)),
             ptr: Operand::Reg(slot),
             value: Operand::Reg(buf),
-            align: 8,
+            align: 8, volatile: false
         });
         bb0.insts.push(Inst::Load {
             dst: fp,
             ty: Type::ptr(Type::int(8)),
             ptr: Operand::Const(Const::Symbol("G".into())),
-            align: 8,
+            align: 8, volatile: false
         });
         bb0.insts.push(Inst::Call {
             dst: None,
@@ -7290,13 +7298,13 @@ mod tests {
             dst: p,
             ty: Type::ptr(Type::int(8)),
             ptr: Operand::Reg(slot),
-            align: 8,
+            align: 8, volatile: false
         });
         bb0.insts.push(Inst::Store {
             ty: Type::int(8),
             ptr: Operand::Reg(p),
             value: Operand::int(8, 0),
-            align: 1,
+            align: 1, volatile: false
         });
         Function {
             id: FuncId(0),
@@ -7364,7 +7372,7 @@ mod tests {
                 ty: Type::int(32),
                 ptr: Operand::Const(Const::Symbol(name.into())),
                 value: Operand::int(32, 7),
-                align: 4,
+                align: 4, volatile: false
             });
             Function {
                 id: FuncId(0),
@@ -7423,7 +7431,7 @@ mod tests {
             ty: Type::int(8),
             ptr: Operand::Reg(buf),
             value: Operand::int(8, 0),
-            align: 1,
+            align: 1, volatile: false
         });
         let f = Function {
             id: FuncId(0),
