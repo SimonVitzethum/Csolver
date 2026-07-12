@@ -131,4 +131,18 @@ impl ModuleReport {
             .collect();
         crate::find_atomicity_violations(&threads)
     }
+
+    /// Candidate **store-buffer / missing-barrier** weak-memory bugs among this module's
+    /// functions (subsystem 4): two functions each writing one shared location then reading the
+    /// other's, with no barrier between — the store-buffer litmus (SC-impossible, weak-memory
+    /// possible).
+    pub fn store_buffer_bugs(&self) -> Vec<crate::interleave::StoreBufferWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::interleave::store_buffer_violations(&threads)
+    }
 }

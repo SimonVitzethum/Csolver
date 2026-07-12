@@ -1348,9 +1348,6 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
         .map(|(name, tr)| csolver_verifier::trace_to_thread(name, tr))
         .collect();
     let violations = csolver_verifier::find_atomicity_violations(&threads);
-    if violations.is_empty() {
-        return;
-    }
     let ev = |e: &csolver_verifier::interleave::Event| -> String {
         use csolver_verifier::interleave::Event::*;
         match e {
@@ -1358,14 +1355,26 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             Release(l) => format!("release {l}"),
             Read(x) => format!("read {x}"),
             Write(x) => format!("write {x}"),
+            Fence => "barrier".to_string(),
         }
     };
-    println!("\n== atomicity violations (interleaving) ({}) [bug-finding] ==", violations.len());
-    for v in &violations {
-        println!("  location: {}  (non-atomic read-modify-write, lost update)", v.location);
-        println!("    witness interleaving:");
-        for (thread, event) in &v.schedule {
-            println!("      {thread}: {}", ev(event));
+    if !violations.is_empty() {
+        println!("\n== atomicity violations (interleaving) ({}) [bug-finding] ==", violations.len());
+        for v in &violations {
+            println!("  location: {}  (non-atomic read-modify-write, lost update)", v.location);
+            println!("    witness interleaving:");
+            for (thread, event) in &v.schedule {
+                println!("      {thread}: {}", ev(event));
+            }
+        }
+    }
+    // Store-buffer / missing-barrier weak-memory bugs (subsystem 4, weak memory).
+    let sb = csolver_verifier::store_buffer_violations(&threads);
+    if !sb.is_empty() {
+        println!("\n== store-buffer / missing-barrier bugs (weak memory) ({}) [bug-finding] ==", sb.len());
+        for w in &sb {
+            println!("  {} writes {} then reads {}; {} writes {} then reads {} — no barrier between",
+                w.threads.0, w.locations.0, w.locations.1, w.threads.1, w.locations.1, w.locations.0);
         }
     }
 }

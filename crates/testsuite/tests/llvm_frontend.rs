@@ -3296,6 +3296,33 @@ define void @resetter() {
     assert!(inc_read < res_write && res_write < inc_write, "witness realises read < foreign-write < write");
 }
 
+/// **Store-buffer / missing-barrier weak-memory bug (subsystem 4, weak memory).** Two threads
+/// each write one flag and then read the other's, with no barrier between — under a weak memory
+/// model (TSO/ARM) both reads may observe the stale value, an outcome sequential consistency
+/// forbids (the Dekker / store-buffer litmus). A barrier (`smp_mb`) between the write and read
+/// in both threads fixes it — the detector is barrier-aware.
+#[test]
+fn store_buffer_without_barrier_is_a_weak_memory_bug() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |mid: &str| {
+        let src = format!(
+            "@x = global i32 0, align 4\n@y = global i32 0, align 4\ndeclare void @smp_mb()\n\
+             define i32 @t1() {{\n  store i32 1, ptr @x, align 4\n{mid}  \
+               %v = load i32, ptr @y, align 4\n  ret i32 %v\n}}\n\
+             define i32 @t2() {{\n  store i32 1, ptr @y, align 4\n{mid}  \
+               %v = load i32, ptr @x, align 4\n  ret i32 %v\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "sb".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // No barrier → the store-buffer litmus is a weak-memory bug.
+    let bad = module("");
+    assert_eq!(bad.store_buffer_bugs().len(), 1, "store-buffer with no barrier is a weak-memory bug");
+    // A full barrier between each write and read forbids the reordering.
+    let good = module("  call void @smp_mb()\n");
+    assert!(good.store_buffer_bugs().is_empty(), "an smp_mb barrier fixes the store-buffer bug");
+}
+
 /// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and
 /// accessed without that lock in another is a candidate race (inconsistent lockset, a write,
 /// two functions). Consistent locking on every access is not flagged (no false positive).

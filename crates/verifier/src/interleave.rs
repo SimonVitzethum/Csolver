@@ -36,6 +36,10 @@ pub enum Event {
     Read(String),
     /// Write the shared location of the given class.
     Write(String),
+    /// A full **memory barrier** (`smp_mb`/`mb`/…): orders this thread's prior writes before
+    /// its subsequent reads, so a store cannot be buffered past it (relevant only under weak
+    /// memory — see [`store_buffer_violations`]). A lock acquire/release is also a barrier.
+    Fence,
 }
 
 /// A thread: a name and its ordered event trace.
@@ -73,6 +77,7 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             0 => Event::Acquire(c.clone()),
             1 => Event::Release(c.clone()),
             2 => Event::Read(c.clone()),
+            4 => Event::Fence,
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -147,6 +152,76 @@ pub fn find_atomicity_violations(threads: &[Thread]) -> Vec<AtomicityWitness> {
     out
 }
 
+/// A witnessed **store-buffer / missing-barrier** weak-memory bug: two threads each write one
+/// location and then read the other's, with **no barrier** in between — so under a weak memory
+/// model (TSO/ARM) both stores can be buffered and both reads observe the *stale* value, an
+/// outcome sequential consistency forbids. The classic Dekker / store-buffer litmus; the fix
+/// is a barrier (`smp_mb`) between each write and read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreBufferWitness {
+    /// The two threads involved.
+    pub threads: (String, String),
+    /// The two locations: the first thread writes `a` then reads `b`; the second writes `b`
+    /// then reads `a`.
+    pub locations: (String, String),
+}
+
+/// The set of `(written, later-read)` location pairs a thread has with **no barrier** (a
+/// fence, or any lock acquire/release — all full barriers) between the write and the read.
+/// These are the writes a weak memory model may reorder after the read.
+fn buffered_write_read_pairs(t: &Thread) -> std::collections::BTreeSet<(String, String)> {
+    let mut pairs = std::collections::BTreeSet::new();
+    // For each write, scan forward to reads until a barrier is hit.
+    for (i, ev) in t.events.iter().enumerate() {
+        let Event::Write(x) = ev else { continue };
+        for later in &t.events[i + 1..] {
+            match later {
+                // Any barrier stops the reordering window for this write.
+                Event::Fence | Event::Acquire(_) | Event::Release(_) => break,
+                Event::Read(y) if y != x => {
+                    pairs.insert((x.clone(), y.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+    pairs
+}
+
+/// Whole-program store-buffer search: find every pair of threads exhibiting the store-buffer
+/// litmus (`Ti: W(a)…R(b)` and `Tj: W(b)…R(a)`, no barrier in either window) — a missing-barrier
+/// weak-memory bug. Bounded by [`MAX_PAIRS`]. Bug-finding: the reordering is only a bug if the
+/// code relies on the SC outcome (a flag handshake / Dekker lock), so it is a candidate.
+pub fn store_buffer_violations(threads: &[Thread]) -> Vec<StoreBufferWitness> {
+    let pairs: Vec<_> = threads.iter().map(buffered_write_read_pairs).collect();
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut checked = 0usize;
+    for i in 0..threads.len() {
+        for j in (i + 1)..threads.len() {
+            if checked >= MAX_PAIRS {
+                return out;
+            }
+            checked += 1;
+            for (a, b) in &pairs[i] {
+                // Thread j must write `b` then read `a` (the mirrored litmus).
+                if pairs[j].contains(&(b.clone(), a.clone())) {
+                    // Canonicalise the location pair so the mirror is not reported twice.
+                    let key = if a <= b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+                    if seen.insert(key) {
+                        out.push(StoreBufferWitness {
+                            threads: (threads[i].name.clone(), threads[j].name.clone()),
+                            locations: (a.clone(), b.clone()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|x, y| x.locations.cmp(&y.locations));
+    out
+}
+
 /// Search for an atomicity violation (lost update) between two threads: a valid interleaving
 /// (respecting lock mutual exclusion + per-thread program order) in which one thread's write
 /// to `x` lands between the other thread's read of `x` and its later dependent write of `x`.
@@ -200,6 +275,9 @@ fn dfs(
         let mut child = st.clone();
         child.ip[t] += 1;
         match ev {
+            // A fence is a no-op for the sequentially-consistent lost-update search (the
+            // interleaving is already a total order); it matters only for weak memory.
+            Event::Fence => {}
             Event::Acquire(l) => child.held[t].push(l.clone()),
             Event::Release(l) => child.held[t].retain(|h| h != l),
             Event::Read(x) => {
@@ -298,5 +376,31 @@ mod tests {
         let a = thread("A", vec![Read("x".into()), Write("x".into())]);
         let b = thread("B", vec![Read("x".into())]); // B only reads
         assert!(atomicity_violation(&a, &b).is_none(), "a read-only other thread cannot cause a lost update");
+    }
+
+    // Store-buffer litmus: T1 writes x then reads y, T2 writes y then reads x, no barriers →
+    // under weak memory both reads may observe stale values (a missing-barrier bug).
+    #[test]
+    fn store_buffer_without_barrier_is_a_violation() {
+        let t1 = thread("t1", vec![Write("x".into()), Read("y".into())]);
+        let t2 = thread("t2", vec![Write("y".into()), Read("x".into())]);
+        let v = store_buffer_violations(&[t1, t2]);
+        assert_eq!(v.len(), 1, "the store-buffer litmus with no barrier is a weak-memory bug");
+    }
+
+    // A full barrier between the write and the read in both threads forbids the reordering.
+    #[test]
+    fn store_buffer_with_barrier_is_safe() {
+        let t1 = thread("t1", vec![Write("x".into()), Fence, Read("y".into())]);
+        let t2 = thread("t2", vec![Write("y".into()), Fence, Read("x".into())]);
+        assert!(store_buffer_violations(&[t1, t2]).is_empty(), "a barrier between W and R fixes it");
+    }
+
+    // A lock release/acquire is also a full barrier → no store-buffer reordering.
+    #[test]
+    fn lock_acts_as_a_barrier() {
+        let t1 = thread("t1", vec![Write("x".into()), Release("L".into()), Read("y".into())]);
+        let t2 = thread("t2", vec![Write("y".into()), Release("L".into()), Read("x".into())]);
+        assert!(store_buffer_violations(&[t1, t2]).is_empty(), "a lock op is a barrier");
     }
 }

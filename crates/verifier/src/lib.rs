@@ -32,7 +32,10 @@ mod report;
 mod wholeprog;
 
 pub use datarace::{detect_races, DataRace, TaggedAccess};
-pub use interleave::{find_atomicity_violations, trace_to_thread, AtomicityWitness, Thread};
+pub use interleave::{
+    find_atomicity_violations, store_buffer_violations, trace_to_thread, AtomicityWitness,
+    StoreBufferWitness, Thread,
+};
 pub use lockorder::{detect_cycles, LockOrderCycle, TaggedEdge};
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
 pub use csolver_symbolic::Summary;

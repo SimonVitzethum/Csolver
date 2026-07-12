@@ -266,6 +266,10 @@ pub enum Effect {
         /// `true` for a decrement (`put`), `false` for an increment (`get`).
         dec: bool,
     },
+    /// **Memory barrier** (weak-memory, subsystem 4): the call is a full memory barrier
+    /// (`smp_mb`/`mb`/…) — it orders the thread's prior writes before its later reads, so a
+    /// store cannot be reordered past it. Recorded in the interleaving trace as a fence.
+    Barrier,
     /// **Leak-state declaration** (K): a resource left in `state` of `protocol` at a function
     /// **return** (without being released or escaping via the return value) is a resource
     /// leak. Not applied at a call — it registers `(protocol, state)` as a leak state checked
@@ -563,6 +567,8 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let protocol = rest.get(1).copied().ok_or("`refcount` needs a protocol")?.to_string();
             Ok(Effect::Refcount { arg, protocol, dec: kind == "refcount-dec" })
         }
+        // `barrier` (a full memory barrier; no arguments).
+        "barrier" => Ok(Effect::Barrier),
         // `typestate-leak <protocol> <state>` (registers a leak state; checked at returns).
         "typestate-leak" => {
             let protocol = rest.first().copied().ok_or("`typestate-leak` needs a protocol")?.to_string();
@@ -630,6 +636,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("provenance.contract", include_str!("../data/provenance.contract")),
     ("taint.contract", include_str!("../data/taint.contract")),
     ("typestate.contract", include_str!("../data/typestate.contract")),
+    ("barrier.contract", include_str!("../data/barrier.contract")),
 ];
 
 #[cfg(test)]
@@ -788,6 +795,10 @@ mod tests {
             c.lookup("own").unwrap().effects,
             vec![Effect::TypestateLeak { protocol: "file".into(), state: "open".into() }]
         );
+        // A barrier effect (no arguments).
+        let mut c2 = Contracts::default();
+        c2.parse_str("[smp_mb]\nbarrier\n", "t").unwrap();
+        assert_eq!(c2.lookup("smp_mb").unwrap().effects, vec![Effect::Barrier]);
     }
 
     #[test]

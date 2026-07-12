@@ -1,0 +1,10 @@
+# Memory barriers (weak-memory / subsystem 4). A full barrier orders a thread's prior writes
+# before its later reads, so the store-buffer / missing-barrier check knows a store cannot be
+# reordered past it. Modelled as a fence in the interleaving trace (a lock acquire/release is
+# also a full barrier and is handled directly).
+[smp_mb mb smp_mb__before_atomic smp_mb__after_atomic smp_store_mb __smp_mb]
+barrier
+
+# Read/write barriers and acquire/release fences also order accesses for this litmus.
+[smp_wmb wmb smp_rmb rmb smp_read_barrier_depends dma_wmb dma_rmb]
+barrier

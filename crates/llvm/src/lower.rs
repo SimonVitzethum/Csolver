@@ -1543,6 +1543,8 @@ fn emit_contract(
             // Leak-state declarations are collected globally and injected before returns
             // (see `inject_leak_and_secret_checks`), not emitted at a call.
             Effect::TypestateLeak { .. } => {}
+            // A memory barrier: recorded in the interleaving trace as a fence.
+            Effect::Barrier => insts.push(Inst::Barrier),
         }
     }
     // A recognized non-allocating call still yields a result the caller may use
