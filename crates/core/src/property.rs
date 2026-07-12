@@ -75,6 +75,16 @@ pub enum SafetyProperty {
     /// obligation, refuted only when the value is **definitely tainted** on the path reaching
     /// the sink (taint meet-joined at merges — no false FAIL under a partly-tainted phi).
     TaintedSink,
+    /// No **typestate/protocol violation**: a named resource (a file/fd/lock/handle, keyed by
+    /// its pointer base or scalar identity) is used in a state its protocol forbids — a
+    /// use-after-close/double-close (a `close`d handle read again), a missing-check (a
+    /// privileged op on a resource never `checked`), or any contract-defined finite-state
+    /// protocol. A **generalisation** of the lifetime/lock/taint typestates: a per-path map
+    /// `resource → state`, advanced by `typestate-set` transitions and checked by
+    /// `typestate-require[-not]` obligations, all contract-driven. A bug-finding-only
+    /// obligation, refuted only when the resource is **definitely** in the forbidden state on
+    /// the path (state meet-joined at merges — no false FAIL under a partial state).
+    TypestateViolation,
     /// No **blocking/sleeping call in atomic context**: a call that may sleep
     /// (`mutex_lock`/`kmalloc(GFP_KERNEL)`/`schedule`/`msleep`/`down`/…) must not run while a
     /// **spinlock is held** (or IRQs/preemption are disabled) — it deadlocks or corrupts the
@@ -109,6 +119,7 @@ impl SafetyProperty {
             SafetyProperty::DoubleFetch => "double_fetch",
             SafetyProperty::SleepInAtomic => "sleep_in_atomic",
             SafetyProperty::TaintedSink => "tainted_sink",
+            SafetyProperty::TypestateViolation => "typestate_violation",
         }
     }
 
@@ -136,6 +147,7 @@ impl SafetyProperty {
             SafetyProperty::DoubleFetch => "no double-fetch of user memory",
             SafetyProperty::SleepInAtomic => "no sleeping call in atomic (spinlock-held) context",
             SafetyProperty::TaintedSink => "no tainted value reaches an unsafe sink",
+            SafetyProperty::TypestateViolation => "no resource is used in a forbidden protocol state",
         }
     }
 
@@ -164,6 +176,7 @@ impl SafetyProperty {
             DoubleFetch,
             SleepInAtomic,
             TaintedSink,
+            TypestateViolation,
         ]
     }
 }

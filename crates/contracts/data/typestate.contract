@@ -1,0 +1,34 @@
+# Generalised typestate / protocol tracker (use-after-scope B, missing-check E, order G5).
+#
+# A named resource (keyed by its pointer base or scalar identity) moves through a finite set
+# of states via `typestate-set` transitions; `typestate-require[-not]` obligations flag a use
+# in a forbidden state. All contract-driven — new protocols are new contract lines, not code.
+# A bug-finding-only check; a violation is refuted only when the resource is *definitely* in
+# the forbidden state on the path (states are meet-joined at merges — no false FAIL).
+
+# --- stdio handle: use-after-close and double-close (FILE* is a pointer handle) -----------
+# fopen returns an OPEN handle.
+[fopen fdopen freopen tmpfile]
+typestate-set ret file open
+
+# fclose closes it — and refuses to close an already-closed handle (double-close).
+[fclose]
+typestate-require-not arg0 file closed
+typestate-set arg0 file closed
+
+# An operation on a stream whose handle is arg0 must not run on a closed handle.
+[fflush fseek ftell feof ferror fileno rewind clearerr]
+typestate-require-not arg0 file closed
+
+# fread(ptr,size,nmemb,stream) / fwrite(...): the stream is arg3 — use-after-close.
+[fread fwrite]
+typestate-require-not arg3 file closed
+
+# --- missing permission check (E): a privileged op requires a prior validation ------------
+# A recognised check marks the object validated.
+[security_check validate_access authorize_request]
+typestate-set arg0 perm checked
+
+# The privileged operation requires the object to have been checked first.
+[privileged_write]
+typestate-require arg0 perm checked

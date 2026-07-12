@@ -482,6 +482,30 @@ pub enum Inst {
         /// The interned taint-label id cleared.
         taint: u32,
     },
+    /// **Typestate transition** (a contract's `typestate-set`): move the resource identified
+    /// by `val` (its pointer base or scalar identity) into `state` within `protocol`.
+    TypestateSet {
+        /// The value naming the resource (a handle pointer or an fd scalar).
+        val: Operand,
+        /// The interned protocol id.
+        protocol: u32,
+        /// The interned state id the resource enters.
+        state: u32,
+    },
+    /// **Typestate obligation** (a contract's `typestate-require[-not]`): require the resource
+    /// `val` to be (`negate=false`) or not be (`negate=true`) in `state` within `protocol`.
+    /// Implies [`SafetyProperty::TypestateViolation`]: refuted when the resource is definitely
+    /// in the forbidden state on the path.
+    TypestateRequire {
+        /// The value naming the resource.
+        val: Operand,
+        /// The interned protocol id.
+        protocol: u32,
+        /// The interned state id required or forbidden.
+        state: u32,
+        /// When `true`, `val` must **not** be in `state`; when `false`, it must be.
+        negate: bool,
+    },
 }
 
 /// The reference-validity facts a call's `&T`/`&mut T` result carries.
@@ -526,6 +550,7 @@ impl Inst {
             Inst::CapRequireIfAlias { .. } => &[WriteCapability],
             Inst::CapRequireIfAliasFields { .. } => &[WriteCapability],
             Inst::TaintCheck { .. } => &[TaintedSink],
+            Inst::TypestateRequire { .. } => &[TypestateViolation],
             // A freeing-wrapper call must not re-free a pointer an earlier freeing call
             // already freed (`NoDoubleFree`); a lock-acquiring call must not re-acquire a
             // held lock (`DataRace`, bug-finding only).
@@ -556,6 +581,8 @@ impl Inst {
             | Inst::TaintSource { .. }
             | Inst::TaintCheck { .. }
             | Inst::TaintClear { .. }
+            | Inst::TypestateSet { .. }
+            | Inst::TypestateRequire { .. }
             | Inst::MemIntrinsic { .. } => None,
         }
     }

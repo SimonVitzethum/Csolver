@@ -318,7 +318,9 @@ fn referenced_symbols(f: &Function) -> Vec<String> {
                 Inst::CapRequireIfAliasFields { obj, .. } => op(obj),
                 Inst::TaintSource { val, .. }
                 | Inst::TaintCheck { val, .. }
-                | Inst::TaintClear { val, .. } => op(val),
+                | Inst::TaintClear { val, .. }
+                | Inst::TypestateSet { val, .. }
+                | Inst::TypestateRequire { val, .. } => op(val),
                 Inst::SafetyCheck { .. } | Inst::Asm { .. } => {}
             }
         }
@@ -629,6 +631,7 @@ fn discharge_inner(
         ref_regions: HashMap::new(),
             opaque_labels: HashMap::new(),
         tainted: HashMap::new(),
+        typestates: HashMap::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
         spin_held: HashSet::new(),
@@ -693,6 +696,15 @@ fn discharge_inner(
 enum RefBase {
     Region(usize),
     Opaque(u32),
+}
+
+/// The identity a **typestate resource** is keyed by: a pointer handle's base (a `FILE*`,
+/// a lock, a struct) or a scalar value's identity (an `fd` integer — the same SSA value
+/// denotes the same fd). General over both pointer and non-pointer resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ResKey {
+    Ptr(RefBase),
+    Val(ExprId),
 }
 
 /// Provenance of a symbolic pointer.
@@ -1214,6 +1226,14 @@ struct PathState {
     /// "definitely tainted" only if tainted on every incoming path — no false FAIL under a
     /// partly-tainted phi). A fact about the SSA value, not memory (not cleared on havoc).
     tainted: HashMap<RegId, HashSet<u32>>,
+    /// **Typestate per resource per protocol** (the generalised protocol tracker, roadmap #4):
+    /// `(resource identity, protocol id) → current state id`. Advanced by `Inst::TypestateSet`
+    /// transitions and checked by `Inst::TypestateRequire` obligations (both contract-driven).
+    /// Generalises the lifetime/lock/taint typestates to any contract-defined finite-state
+    /// protocol. Meet-joined at merges (a resource is "definitely in state S" only if it is S
+    /// on every incoming path — so a require refutes with no false FAIL under a partial state).
+    /// A fact about the resource, not memory (not cleared on havoc).
+    typestates: HashMap<(ResKey, u32), u32>,
     /// **Resolved function-pointer values**: a register holding a function address
     /// devirtualised from a constant ops-struct load (see `global_fnptrs`) maps to
     /// its target `FuncId`, so an indirect call through that register is analysed
@@ -1833,6 +1853,17 @@ impl Explorer<'_> {
             })
             .collect();
 
+        // Typestate survives the join by the same **meet**: a `(resource, protocol)` keeps its
+        // state only if every incoming edge agrees on the *same* state — so a require refutes
+        // only on a resource *definitely* in the forbidden state (no false FAIL under a partial
+        // state; a disagreement drops the entry, conservatively "unknown").
+        let typestates: HashMap<(ResKey, u32), u32> = first
+            .typestates
+            .iter()
+            .filter(|(k, st)| edges.iter().all(|e| e.pred_state.typestates.get(k) == Some(*st)))
+            .map(|(k, st)| (*k, *st))
+            .collect();
+
         // Resolved function-pointer identities survive the join by the same meet:
         // a register keeps its target only if every incoming edge resolved it to
         // the *same* function (an SSA value dominating the merge does; a phi does
@@ -1898,6 +1929,7 @@ impl Explorer<'_> {
             ref_regions: HashMap::new(),
             opaque_labels,
             tainted,
+            typestates,
             fn_ptrs,
             locks_held,
             spin_held,
@@ -3030,6 +3062,33 @@ impl Explorer<'_> {
                     "an untrusted (tainted) value reaches an unsafe sink (injection / tainted length)",
                 );
             }
+            // Typestate transition: move the named resource into `state` within `protocol`.
+            Inst::TypestateSet { val, protocol, state: st } => {
+                if let Some(key) = self.res_key(val, state) {
+                    state.typestates.insert((key, *protocol), *st);
+                }
+            }
+            // Typestate obligation: the resource must (not) be in `state`. A definite match
+            // to the forbidden state on this path is refuted (use-after-close, missing-check).
+            // An untracked resource (`None`, or no recorded state) is treated as *not* in any
+            // named state — so `require-not` never false-FAILs an unseen handle, and `require`
+            // (must-be-in-state) fires when the state was never established. Sound for bug-
+            // finding; the meet-join guarantees a refutation is on a definite path.
+            Inst::TypestateRequire { val, protocol, state: st, negate } => {
+                let cur = self
+                    .res_key(val, state)
+                    .and_then(|key| state.typestates.get(&(key, *protocol)).copied());
+                let in_state = cur == Some(*st);
+                let violated = if *negate { in_state } else { !in_state };
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::TypestateViolation,
+                    violated,
+                    state,
+                    "the resource is in a protocol state this operation allows",
+                    "the resource is used in a state its protocol forbids (use-after-close / missing-check)",
+                );
+            }
             Inst::RefWitness { dst, size, align, writable, assumed, src } => {
                 // A raw-pointer field (`assumed`) is a valid reference only under the
                 // `assume_valid_params` opt-in; otherwise leave the loaded pointer with
@@ -3447,6 +3506,16 @@ impl Explorer<'_> {
         }
     }
 
+
+    /// The identity a typestate resource operand is keyed by: a pointer handle by its base
+    /// object, a scalar (an `fd`) by its symbolic value. `None` for a pointer with no tracked
+    /// base (then the resource cannot be named — the transition/obligation is skipped, sound).
+    fn res_key(&mut self, op: &Operand, state: &PathState) -> Option<ResKey> {
+        match self.eval_value(op, state) {
+            SymValue::Ptr(_) => Self::ptr_base_key(&self.eval_value(op, state)).map(ResKey::Ptr),
+            SymValue::Scalar(e) => Some(ResKey::Val(e)),
+        }
+    }
 
     /// Whether two symbolic pointers **alias the same region/identity** and that region's
     /// provenance lacks `cap` — decomposing a `Prov::Select` (a PHI/`select` join) on either

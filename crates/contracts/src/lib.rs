@@ -214,6 +214,33 @@ pub enum Effect {
         /// The taint label cleared.
         label: String,
     },
+    /// **Typestate transition** (the generalised protocol tracker): the call moves the
+    /// resource identified by argument `arg` into `state` within `protocol` — `close(f)`
+    /// → `file.closed`, `verify(obj)` → `perm.checked`. Unconditional (the new state
+    /// replaces any prior state for that protocol).
+    TypestateSet {
+        /// The 0-based argument index naming the resource (`ret` for the result handle).
+        arg: usize,
+        /// The protocol name (e.g. `file`, `perm`).
+        protocol: String,
+        /// The state the resource enters (e.g. `closed`, `checked`).
+        state: String,
+    },
+    /// **Typestate obligation**: the call requires the resource at argument `arg` to be
+    /// (`negate=false`) or **not** be (`negate=true`) in `state` within `protocol`. A
+    /// violation (`TypestateViolation`) when the resource is definitely in the forbidden
+    /// state — a `read` of a `file.closed` handle (`require-not`), a privileged op on a
+    /// resource not `perm.checked` (`require`).
+    TypestateRequire {
+        /// The 0-based argument index naming the resource.
+        arg: usize,
+        /// The protocol name.
+        protocol: String,
+        /// The required (or forbidden) state.
+        state: String,
+        /// When `true`, the resource must **not** be in `state`; when `false`, it must be.
+        negate: bool,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -474,6 +501,20 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let label = rest.get(1).copied().ok_or("`taint-sanitize` needs a label name")?.to_string();
             Ok(Effect::TaintSanitize { arg, label })
         }
+        // `typestate-set arg<k>|ret <protocol> <state>` and
+        // `typestate-require[-not] arg<k> <protocol> <state>`.
+        "typestate-set" => {
+            let arg = parse_arg_or_ret(rest.first().copied().unwrap_or(""))?;
+            let protocol = rest.get(1).copied().ok_or("`typestate-set` needs a protocol")?.to_string();
+            let state = rest.get(2).copied().ok_or("`typestate-set` needs a state")?.to_string();
+            Ok(Effect::TypestateSet { arg, protocol, state })
+        }
+        "typestate-require" | "typestate-require-not" => {
+            let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let protocol = rest.get(1).copied().ok_or("`typestate-require` needs a protocol")?.to_string();
+            let state = rest.get(2).copied().ok_or("`typestate-require` needs a state")?.to_string();
+            Ok(Effect::TypestateRequire { arg, protocol, state, negate: kind == "typestate-require-not" })
+        }
         other => Err(format!("unknown effect `{other}`")),
     }
 }
@@ -534,6 +575,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("user_copy.contract", include_str!("../data/user_copy.contract")),
     ("provenance.contract", include_str!("../data/provenance.contract")),
     ("taint.contract", include_str!("../data/taint.contract")),
+    ("typestate.contract", include_str!("../data/typestate.contract")),
 ];
 
 #[cfg(test)]
@@ -635,6 +677,33 @@ mod tests {
         assert_eq!(
             c.lookup("san").unwrap().effects,
             vec![Effect::TaintSanitize { arg: RET_ARG, label: "user".into() }]
+        );
+    }
+
+    #[test]
+    fn typestate_effects_parse() {
+        let mut c = Contracts::default();
+        c.parse_str(
+            "[open_h]\ntypestate-set ret file open\n\
+             [close_h]\ntypestate-require-not arg0 file closed\ntypestate-set arg0 file closed\n\
+             [use_h]\ntypestate-require arg0 perm checked\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            c.lookup("open_h").unwrap().effects,
+            vec![Effect::TypestateSet { arg: RET_ARG, protocol: "file".into(), state: "open".into() }]
+        );
+        assert_eq!(
+            c.lookup("close_h").unwrap().effects,
+            vec![
+                Effect::TypestateRequire { arg: 0, protocol: "file".into(), state: "closed".into(), negate: true },
+                Effect::TypestateSet { arg: 0, protocol: "file".into(), state: "closed".into() },
+            ]
+        );
+        assert_eq!(
+            c.lookup("use_h").unwrap().effects,
+            vec![Effect::TypestateRequire { arg: 0, protocol: "perm".into(), state: "checked".into(), negate: false }]
         );
     }
 

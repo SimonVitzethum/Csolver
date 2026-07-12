@@ -672,6 +672,7 @@ fn verify_function_with(
                         | SafetyProperty::DoubleFetch
                         | SafetyProperty::SleepInAtomic
                         | SafetyProperty::TaintedSink
+                        | SafetyProperty::TypestateViolation
                 ) && !config.bug_finding
                 {
                     continue;

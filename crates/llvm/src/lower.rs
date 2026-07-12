@@ -1254,6 +1254,11 @@ fn prov_interner() -> &'static ProvInterner {
                     Effect::TaintSource { label, .. }
                     | Effect::TaintSink { label, .. }
                     | Effect::TaintSanitize { label, .. } => names.push(label),
+                    Effect::TypestateSet { protocol, state, .. }
+                    | Effect::TypestateRequire { protocol, state, .. } => {
+                        names.push(protocol);
+                        names.push(state);
+                    }
                     _ => {}
                 }
             }
@@ -1418,6 +1423,30 @@ fn emit_contract(
             }
             // `ret`-targeted taint source/sanitiser: handled after result binding.
             Effect::TaintSource { .. } | Effect::TaintSanitize { .. } => {}
+            // Typestate transitions/obligations (the protocol tracker). `typestate-set` on a
+            // non-`ret` argument, and all `typestate-require`, are emitted inline; a `ret`-
+            // targeted set is deferred to after the result binding (below).
+            Effect::TypestateSet { arg, protocol, state } if *arg != RET_ARG => {
+                if let (Some(a), Some(p), Some(s)) =
+                    (args.get(*arg), prov_interner().id(protocol), prov_interner().id(state))
+                {
+                    insts.push(Inst::TypestateSet { val: ctx.operand(a, 64)?, protocol: p, state: s });
+                }
+            }
+            Effect::TypestateRequire { arg, protocol, state, negate } => {
+                if let (Some(a), Some(p), Some(s)) =
+                    (args.get(*arg), prov_interner().id(protocol), prov_interner().id(state))
+                {
+                    insts.push(Inst::TypestateRequire {
+                        val: ctx.operand(a, 64)?,
+                        protocol: p,
+                        state: s,
+                        negate: *negate,
+                    });
+                }
+            }
+            // `ret`-targeted typestate-set: handled after result binding.
+            Effect::TypestateSet { .. } => {}
         }
     }
     // A recognized non-allocating call still yields a result the caller may use
@@ -1445,6 +1474,17 @@ fn emit_contract(
                 Effect::TaintSanitize { arg, label } if *arg == RET_ARG => {
                     if let Some(id) = prov_interner().id(label) {
                         insts.push(Inst::TaintClear { val: Operand::Reg(ctx.reg(dst)?), taint: id });
+                    }
+                }
+                // A `ret`-targeted typestate transition (`fopen` → the returned handle is
+                // `file.open`).
+                Effect::TypestateSet { arg, protocol, state } if *arg == RET_ARG => {
+                    if let (Some(p), Some(s)) = (prov_interner().id(protocol), prov_interner().id(state)) {
+                        insts.push(Inst::TypestateSet {
+                            val: Operand::Reg(ctx.reg(dst)?),
+                            protocol: p,
+                            state: s,
+                        });
                     }
                 }
                 _ => {}

@@ -481,6 +481,8 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
         | Inst::TaintSource { .. }
         | Inst::TaintCheck { .. }
         | Inst::TaintClear { .. }
+        | Inst::TypestateSet { .. }
+        | Inst::TypestateRequire { .. }
         | Inst::SafetyCheck { .. } => {}
     }
 }

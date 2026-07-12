@@ -3247,6 +3247,55 @@ define void @f(ptr %kbuf) {
         "an untainted pointer to system() is not a tainted sink");
 }
 
+/// **Generalised typestate tracker (use-after-close B / missing-check E, roadmap #4).** A
+/// contract-driven per-resource protocol: `fopen`→`file.open`, `fclose`→`file.closed` and
+/// refuses a closed handle; a `fread`/second `fclose` on a closed handle is refused
+/// (use-after-close / double-close). A separate `perm` protocol: a `security_check` marks an
+/// object checked, and `privileged_write` requires it — a missing check is refused. Correct
+/// orderings pass (no false FAIL).
+#[test]
+fn typestate_protocol_violations_are_refused() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let decls = "declare ptr @fopen(ptr, ptr)\ndeclare i32 @fclose(ptr)\n\
+                 declare i64 @fread(ptr, i64, i64, ptr)\n\
+                 declare void @privileged_write(ptr)\ndeclare void @security_check(ptr)\n";
+    let verdict = |name: &str, body: &str| -> Verdict {
+        let src = format!("{decls}define void @{name}(ptr %path, ptr %mode, ptr %buf, ptr %obj) {{\n{body}  ret void\n}}\n");
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: name.into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // Double-close → violation.
+    assert_eq!(
+        verdict("dc", "  %f = call ptr @fopen(ptr %path, ptr %mode)\n  \
+                        %a = call i32 @fclose(ptr %f)\n  %b = call i32 @fclose(ptr %f)\n"),
+        Verdict::Fail, "closing an already-closed handle is a double-close"
+    );
+    // Use-after-close (fread after fclose) → violation.
+    assert_eq!(
+        verdict("uac", "  %f = call ptr @fopen(ptr %path, ptr %mode)\n  \
+                         %a = call i32 @fclose(ptr %f)\n  \
+                         %n = call i64 @fread(ptr %buf, i64 1, i64 16, ptr %f)\n"),
+        Verdict::Fail, "reading a closed handle is use-after-close"
+    );
+    // Correct open → read → close order: no violation.
+    assert_ne!(
+        verdict("ok", "  %f = call ptr @fopen(ptr %path, ptr %mode)\n  \
+                        %n = call i64 @fread(ptr %buf, i64 1, i64 16, ptr %f)\n  \
+                        %a = call i32 @fclose(ptr %f)\n"),
+        Verdict::Fail, "open→read→close is a correct protocol run"
+    );
+    // Missing permission check → violation.
+    assert_eq!(
+        verdict("mc", "  call void @privileged_write(ptr %obj)\n"),
+        Verdict::Fail, "a privileged op on an unchecked resource is a missing-check"
+    );
+    // Checked before use: no violation.
+    assert_ne!(
+        verdict("chk", "  call void @security_check(ptr %obj)\n  call void @privileged_write(ptr %obj)\n"),
+        Verdict::Fail, "a checked resource passes the privileged op"
+    );
+}
+
 /// **ABBA lock-order cycle (G6).** Two functions acquire two locks (two fields of the
 /// same struct type, so two stable cross-function *classes*) in the **opposite order**:
 /// `f` takes field-0 then field-1, `g` takes field-1 then field-0. The whole-program
