@@ -89,6 +89,26 @@ const SPIN_ACQUIRE: &[&str] = &[
 /// most this many events, keeping the two-thread interleaving DFS bounded.
 const RACE_TRACE_CAP: usize = 64;
 
+/// RCU read-side critical-section entry/exit. A shared **read** inside an RCU read-side section
+/// is race-free by the RCU contract (the updater publishes atomically and defers reclamation),
+/// so the data-race pass excludes it — a major false-positive reducer for RCU-heavy code.
+const RCU_READ_LOCK: &[&str] = &[
+    "rcu_read_lock", "rcu_read_lock_bh", "rcu_read_lock_sched", "srcu_read_lock",
+    "rcu_read_lock_trace", "rcu_read_lock_any_held",
+];
+const RCU_READ_UNLOCK: &[&str] = &[
+    "rcu_read_unlock", "rcu_read_unlock_bh", "rcu_read_unlock_sched", "srcu_read_unlock",
+    "rcu_read_unlock_trace",
+];
+
+/// Accessors returning a pointer to **per-CPU** data — thread-local by construction (each CPU
+/// has its own instance, accessed with preemption disabled), so accesses through the result are
+/// not shared races. The data-race pass excludes them.
+const PERCPU_ACCESSOR: &[&str] = &[
+    "this_cpu_ptr", "per_cpu_ptr", "raw_cpu_ptr", "get_cpu_ptr", "get_cpu_var",
+    "__this_cpu_ptr", "this_cpu_read", "alloc_percpu", "__alloc_percpu",
+];
+
 // A spinning-lock **release** (`spin_unlock`/…) leaves atomic context. It is not a named
 // set here: like any other call it is handed the lock base as a pointer argument, and the
 // general call arm below already drops every passed base from `spin_held` (and `locks_held`).
@@ -653,6 +673,8 @@ fn discharge_inner(
         tainted: HashMap::new(),
         typestates: HashMap::new(),
         refcounts: HashMap::new(),
+        rcu_depth: 0,
+        percpu: HashSet::new(),
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
         spin_held: HashSet::new(),
@@ -1264,6 +1286,15 @@ struct PathState {
     /// underflow (premature free → UAF). Meet-joined at merges (kept only if all incoming
     /// paths agree on the count — so an underflow refutes only when definite; no false FAIL).
     refcounts: HashMap<(ResKey, u32), i64>,
+    /// **RCU read-side nesting depth** on this path (data-race hardening): a shared *read* while
+    /// this is > 0 is inside an RCU read-side critical section and race-free by the RCU contract,
+    /// so excluded from the data-race pass. Meet-joined (min) at merges — an access counts as
+    /// RCU-protected only if it is on every incoming path.
+    rcu_depth: u32,
+    /// **Per-CPU pointer identities** on this path (data-race hardening): opaque-pointer ids
+    /// returned by a per-CPU accessor (`this_cpu_ptr`/…). Accesses through them are thread-local
+    /// (not shared), so excluded from the data-race pass. Meet-joined at merges.
+    percpu: HashSet<u32>,
     /// **Resolved function-pointer values**: a register holding a function address
     /// devirtualised from a constant ops-struct load (see `global_fnptrs`) maps to
     /// its target `FuncId`, so an indirect call through that register is analysed
@@ -1914,6 +1945,15 @@ impl Explorer<'_> {
             .filter(|(k, c)| edges.iter().all(|e| e.pred_state.refcounts.get(k) == Some(*c)))
             .map(|(k, c)| (*k, *c))
             .collect();
+        // RCU depth after the join is the min over edges (an access is RCU-protected only if in
+        // a read-side section on every path); per-CPU ids survive by intersection (meet).
+        let rcu_depth = edges.iter().map(|e| e.pred_state.rcu_depth).min().unwrap_or(0);
+        let percpu: HashSet<u32> = first
+            .percpu
+            .iter()
+            .copied()
+            .filter(|id| edges.iter().all(|e| e.pred_state.percpu.contains(id)))
+            .collect();
 
         // Resolved function-pointer identities survive the join by the same meet:
         // a register keeps its target only if every incoming edge resolved it to
@@ -1982,6 +2022,8 @@ impl Explorer<'_> {
             tainted,
             typestates,
             refcounts,
+            rcu_depth,
+            percpu,
             fn_ptrs,
             locks_held,
             spin_held,
@@ -3024,6 +3066,17 @@ impl Explorer<'_> {
             Inst::Call { dst, callee, args, ret_ty, ret_ref } => {
                 self.check_lock_call((block, idx), callee, args, state);
                 self.step_call((block, idx), dst.as_ref(), callee, args, ret_ty, *ret_ref, state);
+                // Per-CPU accessor: tag the returned pointer's identity so accesses through it
+                // are excluded from the data-race pass (per-CPU data is thread-local).
+                if let (Some(d), Callee::Symbol(n)) = (dst, callee) {
+                    if PERCPU_ACCESSOR.contains(&n.as_str()) {
+                        if let Some(RefBase::Opaque(id)) =
+                            state.env.get(d).and_then(Self::ptr_base_key)
+                        {
+                            state.percpu.insert(id);
+                        }
+                    }
+                }
             }
             Inst::Intrinsic { dst: Some(d), .. } => {
                 let s = self.fresh_scalar(PTR_WIDTH);
@@ -3657,13 +3710,19 @@ impl Explorer<'_> {
     /// `(class, is_write, lock-classes held)`. The whole-program pass then flags a location
     /// accessed under no common lock, with a write, from ≥2 functions.
     fn record_shared_access(&mut self, ptr: &Operand, is_write: bool, p: &SymPointer, state: &PathState) {
+        // Hardening: a shared **read** inside an RCU read-side critical section is race-free by
+        // the RCU contract — exclude it (writers are still checked).
+        if !is_write && state.rcu_depth > 0 {
+            return;
+        }
         // Sharedness: a global is definitionally shared; a param-derived opaque object may be
-        // shared across threads. A stack/TLS/fresh-heap region is thread-local — skip it.
+        // shared across threads. A stack/TLS/fresh-heap region is thread-local — skip it. A
+        // per-CPU accessor's result is thread-local too (hardening).
         let shared = match &p.prov {
             Prov::Region(rid) => {
                 matches!(state.regions.get(*rid).map(|r| r.kind), Some(RegionKind::Global))
             }
-            Prov::Unknown(_, Some(_)) => true,
+            Prov::Unknown(_, Some(id)) => !state.percpu.contains(id),
             _ => false,
         };
         if !shared {
@@ -3796,6 +3855,13 @@ impl Explorer<'_> {
                 return;
             }
         };
+        // RCU read-side critical section: track nesting depth so a shared read inside it is
+        // excluded from the data-race pass (race-free by the RCU contract).
+        if RCU_READ_LOCK.contains(&name) {
+            state.rcu_depth += 1;
+        } else if RCU_READ_UNLOCK.contains(&name) {
+            state.rcu_depth = state.rcu_depth.saturating_sub(1);
+        }
         let base = args.first().map(|a| self.eval_value(a, state)).and_then(|v| Self::ptr_base_key(&v));
         // Sleep-in-atomic: a blocking/sleeping call while a spinlock is *definitely* held is a
         // deadlock/scheduler-corruption bug — refuted with a reachability witness. Every other

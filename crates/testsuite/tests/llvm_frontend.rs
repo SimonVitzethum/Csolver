@@ -3387,6 +3387,34 @@ fn inconsistently_locked_global_is_a_candidate_race() {
     assert!(atomic.data_races().is_empty(), "an atomic/volatile access is not a data race");
 }
 
+/// **Data-race hardening: RCU read-side.** A reader inside an RCU read-side critical section
+/// (`rcu_read_lock`…`rcu_read_unlock`) is race-free with a concurrent updater by the RCU
+/// contract — so an unlocked RCU read of a lock-written global is not flagged, while the same
+/// read *without* RCU is.
+#[test]
+fn rcu_protected_read_is_not_a_data_race() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |reader_body: &str| {
+        let src = format!(
+            "@shared = global i32 0, align 4\n@lk = global i32 0, align 4\n\
+             declare void @spin_lock(ptr)\ndeclare void @spin_unlock(ptr)\n\
+             declare void @rcu_read_lock()\ndeclare void @rcu_read_unlock()\n\
+             define void @writer() {{\n  call void @spin_lock(ptr @lk)\n  \
+               store i32 1, ptr @shared, align 4\n  call void @spin_unlock(ptr @lk)\n  ret void\n}}\n\
+             define i32 @reader() {{\n{reader_body}}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "r".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // Reader under RCU → race-free by the RCU contract.
+    let rcu = module("  call void @rcu_read_lock()\n  %v = load i32, ptr @shared, align 4\n  \
+                      call void @rcu_read_unlock()\n  ret i32 %v\n");
+    assert!(rcu.data_races().is_empty(), "an RCU read-side access is not flagged");
+    // The same read without RCU → flagged (control).
+    let plain = module("  %v = load i32, ptr @shared, align 4\n  ret i32 %v\n");
+    assert_eq!(plain.data_races().len(), 1, "the same read without RCU is a candidate race");
+}
+
 /// **The remaining typestate/taint classes (TOCTOU G2, refcount G8, leak K, type-confusion H,
 /// secret side-channel L).** All contract-driven on the general typestate + taint engines.
 #[test]
