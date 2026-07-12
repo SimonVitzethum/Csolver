@@ -36,7 +36,11 @@ pub use summary::{
 /// Resource bounds for symbolic exploration.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecLimits {
-    /// Maximum number of block visits before exploration is truncated.
+    /// Maximum number of block visits before exploration is truncated. The default is *unbounded*
+    /// (`usize::MAX`): the merged exploration walks each basic block of the reverse-postorder at most
+    /// once (loop back-edges are cut, headers over-approximated), so the visit count is bounded by
+    /// the CFG size *by construction* — no artificial cap is needed. A test may set a small value to
+    /// force truncation.
     pub max_visits: usize,
     /// Wall-clock budget for exploring one function. On expiry, exploration
     /// truncates exactly as the visit budget does — no decisions are reported, so
@@ -74,7 +78,7 @@ pub struct ExecLimits {
 impl Default for ExecLimits {
     fn default() -> Self {
         ExecLimits {
-            max_visits: 200_000,
+            max_visits: usize::MAX,
             time_budget: Some(std::time::Duration::from_secs(30)),
             bug_finding: false,
             exported: true,

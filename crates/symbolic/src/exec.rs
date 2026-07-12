@@ -92,10 +92,6 @@ const SPIN_ACQUIRE: &[&str] = &[
     "raw_write_seqlock", "__write_seqlock",
 ];
 
-/// Cap on the per-function ordered interleaving trace — a very long function contributes at
-/// most this many events, keeping the two-thread interleaving DFS bounded.
-const RACE_TRACE_CAP: usize = 64;
-
 /// RCU read-side critical-section entry/exit. A shared **read** inside an RCU read-side section
 /// is race-free by the RCU contract (the updater publishes atomically and defers reclamation),
 /// so the data-race pass excludes it — a major false-positive reducer for RCU-heavy code.
@@ -480,6 +476,10 @@ fn discharge_inner(
         visits: 0,
         truncated: false,
         limits,
+        // Trace length bound = the function's instruction count — the exact upper bound on how many
+        // events a trace can hold (each event comes from one instruction), so it never truncates
+        // artificially; the interleaving search's own budget bounds the cost of a long trace.
+        race_trace_cap: f.blocks.iter().map(|b| b.insts.len()).sum::<usize>().max(1),
         deadline: limits.time_budget.map(|b| std::time::Instant::now() + b),
         scalar: HashMap::new(),
         mem: HashMap::new(),
@@ -1508,6 +1508,11 @@ struct Explorer<'f> {
     visits: usize,
     truncated: bool,
     limits: ExecLimits,
+    /// The interleaving-trace length bound, **derived from the function** (its basic-block count) —
+    /// a trace can hold at most this many ordered events. Replaces a fixed magic length: a bigger
+    /// function is allowed a proportionally longer trace (better weak-memory recall), while the trace
+    /// stays bounded by the CFG size (the interleaving search's own state budget bounds the cost).
+    race_trace_cap: usize,
     /// When exploration must stop (from `limits.time_budget`); `None` ⇒ no clock.
     deadline: Option<std::time::Instant>,
     /// Scalar `SafetyCheck` aggregation, keyed by (block, idx).
@@ -3423,7 +3428,7 @@ impl Explorer<'_> {
                 // and a put (kind 13). A put may drop the count to zero and free; a plain get that
                 // races it can raise a zeroed count and resurrect a dying object (UAF). A *checked*
                 // get (`*_not_zero`) refuses that, so it emits no race event.
-                if self.race_trace.len() < RACE_TRACE_CAP && (*dec || !*checked) {
+                if self.race_trace.len() < self.race_trace_cap && (*dec || !*checked) {
                     if let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, val) {
                         self.race_trace.push((if *dec { 13 } else { 12 }, class));
                     }
@@ -3478,26 +3483,26 @@ impl Explorer<'_> {
             // A memory barrier: record a fence in the interleaving trace (weak-memory model).
             // Trace kind 4 = full (`smp_mb`), 5 = write (`smp_wmb`), 6 = read (`smp_rmb`).
             Inst::Barrier { kind } => {
-                if self.race_trace.len() < RACE_TRACE_CAP {
+                if self.race_trace.len() < self.race_trace_cap {
                     self.race_trace.push((4 + *kind, String::new()));
                 }
             }
             // Thread spawn/join: record a happens-before event (kind 7 = spawn with the child's
             // function name, 8 = join) for the weak-memory model.
             Inst::Spawn { child } => {
-                if self.race_trace.len() < RACE_TRACE_CAP {
+                if self.race_trace.len() < self.race_trace_cap {
                     self.race_trace.push((7, child.clone()));
                 }
             }
             Inst::Join => {
-                if self.race_trace.len() < RACE_TRACE_CAP {
+                if self.race_trace.len() < self.race_trace_cap {
                     self.race_trace.push((8, String::new()));
                 }
             }
             // Compare-and-swap (ABA): record a CAS event on the location's class.
             Inst::Cas { val } => {
                 if let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, val) {
-                    if self.race_trace.len() < RACE_TRACE_CAP {
+                    if self.race_trace.len() < self.race_trace_cap {
                         self.race_trace.push((11, class));
                     }
                 }
@@ -3971,7 +3976,7 @@ impl Explorer<'_> {
         // Ordered trace for the interleaving check (read=2, dependent-read=9, write=3), bounded
         // so a huge function does not grow an unbounded trace. A read through a load-derived
         // pointer is address-dependent (`rcu_dereference`-style) and does not reorder.
-        if self.race_trace.len() < RACE_TRACE_CAP {
+        if self.race_trace.len() < self.race_trace_cap {
             let kind = if is_write {
                 3
             } else if matches!(ptr, Operand::Reg(r) if self.load_derived.contains(r)) {
@@ -4005,7 +4010,7 @@ impl Explorer<'_> {
         let mut lockset: Vec<String> = state.held_classes.values().cloned().collect();
         lockset.sort();
         lockset.dedup();
-        if self.race_trace.len() < RACE_TRACE_CAP {
+        if self.race_trace.len() < self.race_trace_cap {
             self.race_trace.push((10, class.clone()));
         }
         // A free is a write to the object (it invalidates its bytes) — feeds the lockset race.
@@ -4019,7 +4024,7 @@ impl Explorer<'_> {
     /// skipped. The payload encodes `k`, the class, and the interned protocol/state ids, unit-
     /// separated, for `find_cross_entry_typestate` to parse.
     fn record_global_typestate(&mut self, k: u8, val: &Operand, protocol: u32, st: u32) {
-        if self.race_trace.len() >= RACE_TRACE_CAP {
+        if self.race_trace.len() >= self.race_trace_cap {
             return;
         }
         let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, val) else {
@@ -4197,7 +4202,7 @@ impl Explorer<'_> {
                     }
                 }
                 // Ordered interleaving trace: acquire = 0.
-                if self.race_trace.len() < RACE_TRACE_CAP {
+                if self.race_trace.len() < self.race_trace_cap {
                     self.race_trace.push((0, nc.clone()));
                 }
             }
@@ -4251,7 +4256,7 @@ impl Explorer<'_> {
                     state.spin_held.remove(&b);
                     // Ordered interleaving trace: release = 1 (recorded for the dropped class).
                     if let Some(cls) = state.held_classes.remove(&b) {
-                        if self.race_trace.len() < RACE_TRACE_CAP {
+                        if self.race_trace.len() < self.race_trace_cap {
                             self.race_trace.push((1, cls));
                         }
                     }
