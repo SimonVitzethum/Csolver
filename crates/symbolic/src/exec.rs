@@ -3321,7 +3321,16 @@ impl Explorer<'_> {
             }
             // Reference-count change: inc/dec the resource's count; a `dec` below zero is an
             // underflow (premature free → UAF), refuted on a definite path.
-            Inst::Refcount { val, protocol, dec } => {
+            Inst::Refcount { val, protocol, dec, checked } => {
+                // Ordered trace for the concurrent-refcount-race check: an unchecked get (kind 12)
+                // and a put (kind 13). A put may drop the count to zero and free; a plain get that
+                // races it can raise a zeroed count and resurrect a dying object (UAF). A *checked*
+                // get (`*_not_zero`) refuses that, so it emits no race event.
+                if self.race_trace.len() < RACE_TRACE_CAP && (*dec || !*checked) {
+                    if let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, val) {
+                        self.race_trace.push((if *dec { 13 } else { 12 }, class));
+                    }
+                }
                 if let Some(key) = self.res_key(val, state) {
                     if *dec {
                         // A put on an object whose count was **established in this scope** (a prior

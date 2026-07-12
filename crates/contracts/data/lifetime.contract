@@ -3,21 +3,31 @@
 # (use-after-free). The count is composed interprocedurally (Summary.refcount_effect), so a get
 # in one function/syscall and a put in another balance — an unbalanced put underflows.
 
+# A *plain* (unchecked) get raises the count unconditionally; concurrent with the final put it can
+# resurrect a zeroed object (a refcount race — subsystem 4). A *checked* get (`*_unless_zero` /
+# `*_inc_not_zero`) refuses to raise a zeroed count and so is race-safe — `refcount-inc-checked`.
+
 # --- kref (generic kernel refcount) --------------------------------------------------------
-[kref_get kref_get_unless_zero]
+[kref_get]
 refcount-inc arg0 lifetime
+[kref_get_unless_zero]
+refcount-inc-checked arg0 lifetime
 [kref_put kref_put_lock refcount_dec_and_test]
 refcount-dec arg0 lifetime
 
 # --- struct sock (network socket) ----------------------------------------------------------
 [sock_hold __sock_put_hold sk_get sock_get]
 refcount-inc arg0 lifetime
+[refcount_inc_not_zero atomic_inc_not_zero sk_get_unless_zero]
+refcount-inc-checked arg0 lifetime
 [sock_put __sock_put sk_put]
 refcount-dec arg0 lifetime
 
 # --- kobject -------------------------------------------------------------------------------
-[kobject_get kobject_get_unless_zero]
+[kobject_get]
 refcount-inc arg0 lifetime
+[kobject_get_unless_zero]
+refcount-inc-checked arg0 lifetime
 [kobject_put]
 refcount-dec arg0 lifetime
 

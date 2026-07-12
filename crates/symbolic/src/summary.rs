@@ -593,7 +593,7 @@ fn refcount_effect_of_fn(f: &Function) -> Vec<(usize, u32, i64)> {
     let params = ptr_param_of(f);
     let mut acc: std::collections::BTreeMap<(usize, u32), i64> = std::collections::BTreeMap::new();
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
-        if let Inst::Refcount { val: Operand::Reg(r), protocol, dec } = inst {
+        if let Inst::Refcount { val: Operand::Reg(r), protocol, dec, .. } = inst {
             if let Some(&p) = params.get(r) {
                 *acc.entry((p, *protocol)).or_insert(0) += if *dec { -1 } else { 1 };
             }

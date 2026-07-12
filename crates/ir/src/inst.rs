@@ -534,6 +534,12 @@ pub enum Inst {
         protocol: u32,
         /// `true` for a decrement (`put`), `false` for an increment (`get`).
         dec: bool,
+        /// For an increment, whether it is a **checked** get (`*_inc_not_zero` /
+        /// `*_get_unless_zero`) — one that refuses to raise a count that already reached zero, so
+        /// it cannot resurrect a dying object and does not race the final `put`. A plain
+        /// (unchecked) get concurrent with a `put` is a refcount race (subsystem 4). Ignored for
+        /// a decrement.
+        checked: bool,
     },
     /// **Leak check at return** (K, from a contract's `typestate-leak`): a resource still in
     /// `state` of `protocol` on this path — and not escaping via `escaping` (the return

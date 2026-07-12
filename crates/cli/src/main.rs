@@ -1364,6 +1364,8 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             Join => "join".to_string(),
             Free(x) => format!("free {x}"),
             Cas(x) => format!("cas {x}"),
+            RefGet(x) => format!("ref-get {x}"),
+            RefPut(x) => format!("ref-put {x}"),
         }
     };
     if !violations.is_empty() {
@@ -1397,6 +1399,16 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             let kind = if w.double_free { "double-free" } else { "use-after-free" };
             println!("  {kind} of {} : entry {} frees it (root left dangling), entry {} later {}s it",
                 w.location, w.entries.0, w.entries.1, if w.double_free { "free" } else { "use" });
+        }
+    }
+    // Concurrent refcount race: an unchecked get concurrent with a put of the same object.
+    let rc = csolver_verifier::find_refcount_races(&threads);
+    if !rc.is_empty() {
+        println!("\n== concurrent reference-count races ({}) [bug-finding] ==", rc.len());
+        for w in &rc {
+            println!("  object: {} — {} does an unchecked get while {} concurrently puts it \
+                (disjoint locks); the get can resurrect a zeroed count (use `*_inc_not_zero`)",
+                w.location, w.threads.0, w.threads.1);
         }
     }
     // ABA: a compare-and-swap concurrent with a modification of the same location.

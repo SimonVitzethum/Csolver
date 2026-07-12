@@ -66,6 +66,15 @@ pub enum Event {
     /// or free) of the same location by another thread means the value can change A→B→A under the
     /// CAS — the ABA problem.
     Cas(String),
+    /// **Unchecked reference-count get** (`kref_get`/`sock_hold`/… — not a `*_not_zero` variant) on
+    /// the object of the given class. Concurrent with another thread's [`Event::RefPut`] that drops
+    /// the last reference, it can raise a count that already reached zero — resurrecting a dying
+    /// object into a use-after-free. A checked get emits no such event.
+    RefGet(String),
+    /// **Reference-count put** (`kref_put`/`sock_put`/…) on the object of the given class — it may
+    /// drop the last reference and free. Concurrent with an unchecked [`Event::RefGet`] it is a
+    /// refcount race.
+    RefPut(String),
 }
 
 /// A thread: a name and its ordered event trace.
@@ -111,6 +120,8 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             9 => Event::DepRead(c.clone()),
             10 => Event::Free(c.clone()),
             11 => Event::Cas(c.clone()),
+            12 => Event::RefGet(c.clone()),
+            13 => Event::RefPut(c.clone()),
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -539,6 +550,71 @@ pub fn find_aba(threads: &[Thread]) -> Vec<AbaWitness> {
     out
 }
 
+/// A witnessed **concurrent reference-count race**: one thread does an *unchecked* get on an
+/// object while another concurrently does a put that may drop the last reference — with disjoint
+/// locksets, so nothing orders the get before the final put. The get can then raise a count that
+/// already reached zero, resurrecting a freed object (use-after-free). The fix is a *checked* get
+/// (`*_inc_not_zero` / `*_get_unless_zero`), which emits no [`Event::RefGet`] and so never fires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefcountRaceWitness {
+    /// The refcounted object's class.
+    pub location: String,
+    /// The threads: the one doing the unchecked get, and the one doing the concurrent put.
+    pub threads: (String, String),
+}
+
+/// Per-thread, the `(class, lockset)` of every unchecked get and every put.
+fn get_and_put_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
+    let mut held: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut gets = Vec::new();
+    let mut puts = Vec::new();
+    for e in &t.events {
+        match e {
+            Event::Acquire(l) => {
+                held.insert(l.clone());
+            }
+            Event::Release(l) => {
+                held.remove(l);
+            }
+            Event::RefGet(x) => gets.push((x.clone(), held.clone())),
+            Event::RefPut(x) => puts.push((x.clone(), held.clone())),
+            _ => {}
+        }
+    }
+    (gets, puts)
+}
+
+/// Whole-program **concurrent refcount race** search: an unchecked get of an object in one thread
+/// concurrent (disjoint locksets) with a put of the same object in another thread. Bounded by
+/// [`MAX_PAIRS`]. A bug-finding heuristic — a real race also needs the put to actually be the last
+/// reference, which is not modelled, so it reports candidates.
+pub fn find_refcount_races(threads: &[Thread]) -> Vec<RefcountRaceWitness> {
+    let per: Vec<_> = threads.iter().map(get_and_put_locksets).collect();
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut checked = 0usize;
+    for i in 0..threads.len() {
+        for j in 0..threads.len() {
+            if i == j || checked >= MAX_PAIRS {
+                continue;
+            }
+            checked += 1;
+            for (gx, gl) in &per[i].0 {
+                for (px, pl) in &per[j].1 {
+                    if gx == px && gl.is_disjoint(pl) && seen.insert(gx.clone()) {
+                        out.push(RefcountRaceWitness {
+                            location: gx.clone(),
+                            threads: (threads[i].name.clone(), threads[j].name.clone()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.location.cmp(&b.location));
+    out
+}
+
 // ---------------------------------------------------------------------------------------------
 // Operational weak-memory model (PSO — per-location store buffers) + SC-robustness check.
 // ---------------------------------------------------------------------------------------------
@@ -843,6 +919,10 @@ fn op_reachable(
                     // UAF has its own detector, `find_cross_thread_uaf`).
                     Event::Free(x) => format!("free {x}"),
                     Event::Cas(x) => format!("cas {x}"),
+                    // Refcount get/put carry no value effect for the SC-robustness check (the
+                    // concurrent-refcount race has its own detector, `find_refcount_races`).
+                    Event::RefGet(x) => format!("ref-get {x}"),
+                    Event::RefPut(x) => format!("ref-put {x}"),
                     // Spawn the named child: a happens-before edge (it may now run) with release
                     // semantics — the parent's prior writes are made globally visible first, so
                     // the child observes everything the parent did before the spawn.
@@ -1085,7 +1165,7 @@ fn dfs(
             // interleaving is already a total order); it matters only for weak memory. Spawn/join
             // are likewise treated as plain steps here (the SC lost-update pattern is unaffected).
             Event::Fence | Event::WFence | Event::RFence | Event::Spawn(_) | Event::Join
-| Event::Free(_) | Event::Cas(_) => {}
+| Event::Free(_) | Event::Cas(_) | Event::RefGet(_) | Event::RefPut(_) => {}
             Event::Acquire(l) => child.held[t].push(l.clone()),
             Event::Release(l) => child.held[t].retain(|h| h != l),
             Event::Read(x) | Event::DepRead(x) => {

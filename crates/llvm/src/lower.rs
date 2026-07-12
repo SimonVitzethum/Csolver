@@ -1555,9 +1555,14 @@ fn emit_contract(
                 }
             }
             // Reference-count inc/dec.
-            Effect::Refcount { arg, protocol, dec } => {
+            Effect::Refcount { arg, protocol, dec, checked } => {
                 if let (Some(a), Some(p)) = (args.get(*arg), prov_interner().id(protocol)) {
-                    insts.push(Inst::Refcount { val: ctx.operand(a, 64)?, protocol: p, dec: *dec });
+                    insts.push(Inst::Refcount {
+                        val: ctx.operand(a, 64)?,
+                        protocol: p,
+                        dec: *dec,
+                        checked: *checked,
+                    });
                 }
             }
             // Leak-state declarations are collected globally and injected before returns

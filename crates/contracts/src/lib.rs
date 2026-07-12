@@ -265,6 +265,10 @@ pub enum Effect {
         protocol: String,
         /// `true` for a decrement (`put`), `false` for an increment (`get`).
         dec: bool,
+        /// For an increment, whether it is a **checked** get (`refcount-inc-checked`, the
+        /// `*_not_zero` / `*_unless_zero` variants) that cannot resurrect a zeroed object, so it
+        /// does not race a concurrent final `put`. Ignored for a decrement.
+        checked: bool,
     },
     /// **Memory barrier** (weak-memory, subsystem 4): the call is a memory barrier —
     /// `kind` 0 = full (`smp_mb`, orders W→R), 1 = write (`smp_wmb`, orders W→W), 2 = read
@@ -583,11 +587,16 @@ fn parse_effect(line: &str) -> Result<Effect, String> {
             let to = rest.get(2).copied().ok_or("`typestate-yield` needs a to-state")?.to_string();
             Ok(Effect::TypestateYield { protocol, from, to })
         }
-        // `refcount-inc arg<k> <protocol>` / `refcount-dec arg<k> <protocol>`.
-        "refcount-inc" | "refcount-dec" => {
+        // `refcount-inc arg<k> <protocol>` / `refcount-inc-checked …` / `refcount-dec …`.
+        "refcount-inc" | "refcount-inc-checked" | "refcount-dec" => {
             let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
             let protocol = rest.get(1).copied().ok_or("`refcount` needs a protocol")?.to_string();
-            Ok(Effect::Refcount { arg, protocol, dec: kind == "refcount-dec" })
+            Ok(Effect::Refcount {
+                arg,
+                protocol,
+                dec: kind == "refcount-dec",
+                checked: kind == "refcount-inc-checked",
+            })
         }
         // `spawn arg<k>` (child function pointer) and `join` (no arguments).
         "spawn" => Ok(Effect::Spawn { arg: parse_arg(rest.first().copied().unwrap_or(""))? }),
@@ -830,11 +839,11 @@ mod tests {
         );
         assert_eq!(
             c.lookup("get").unwrap().effects,
-            vec![Effect::Refcount { arg: 0, protocol: "kref".into(), dec: false }]
+            vec![Effect::Refcount { arg: 0, protocol: "kref".into(), dec: false, checked: false }]
         );
         assert_eq!(
             c.lookup("put").unwrap().effects,
-            vec![Effect::Refcount { arg: 0, protocol: "kref".into(), dec: true }]
+            vec![Effect::Refcount { arg: 0, protocol: "kref".into(), dec: true, checked: false }]
         );
         assert_eq!(
             c.lookup("own").unwrap().effects,

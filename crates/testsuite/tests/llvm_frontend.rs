@@ -3567,6 +3567,40 @@ fn rcu_grace_period_violation_is_refused() {
     );
 }
 
+/// **Concurrent reference-count race.** One thread does an *unchecked* get (`sock_hold`) on a
+/// shared object while another concurrently does a put (`sock_put`) that may drop the last
+/// reference — with disjoint locks, nothing orders the get before the final put, so the get can
+/// raise a count that already reached zero (resurrecting a freed object → UAF). A *checked* get
+/// (`refcount_inc_not_zero`) refuses that and does not race.
+#[test]
+fn concurrent_refcount_race_is_detected() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let races = |getter: &str| -> Vec<csolver_verifier::RefcountRaceWitness> {
+        let src = format!(
+            "@obj = global ptr null, align 8\n\
+             declare void @{getter}(ptr)\ndeclare void @sock_put(ptr)\n\
+             define void @thread_get() {{\n  %p = load ptr, ptr @obj, align 8\n  \
+               call void @{getter}(ptr %p)\n  ret void\n}}\n\
+             define void @thread_put() {{\n  %p = load ptr, ptr @obj, align 8\n  \
+               call void @sock_put(ptr %p)\n  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "rc".into() }).expect("lower");
+        verify_module(&m, &cfg).refcount_races()
+    };
+    // Unchecked get concurrent with a put → race on the shared object.
+    let racy = races("sock_hold");
+    assert!(
+        racy.iter().any(|w| w.location.contains("g:obj")),
+        "an unchecked get racing a concurrent put is a refcount race: {racy:?}"
+    );
+    // Checked get (`*_inc_not_zero`) → no race event, no finding.
+    let safe = races("refcount_inc_not_zero");
+    assert!(
+        !safe.iter().any(|w| w.location.contains("g:obj")),
+        "a checked get (`_not_zero`) does not race the put: {safe:?}"
+    );
+}
+
 /// **Cross-syscall (cross-entry) use-after-free.** Two entry points with *no common caller* — a
 /// `close` that frees the object held by a global and a `read` that dereferences that same global —
 /// compose into a use-after-free: the attacker invokes `close` then `read`, and the global still

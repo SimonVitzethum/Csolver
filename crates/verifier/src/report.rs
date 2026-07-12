@@ -171,6 +171,19 @@ impl ModuleReport {
         crate::find_aba(&threads)
     }
 
+    /// Candidate **concurrent reference-count races** among this module's functions: an unchecked
+    /// get of an object in one thread concurrent (disjoint lockset) with a put of the same object in
+    /// another — the get can resurrect a zeroed count (UAF). A checked `*_not_zero` get never fires.
+    pub fn refcount_races(&self) -> Vec<crate::interleave::RefcountRaceWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::interleave::find_refcount_races(&threads)
+    }
+
     /// Candidate **cross-entry (cross-syscall) use-after-free / double-free**: an object freed via
     /// a shared global root in one entry and dereferenced (or freed again) in another, independently
     /// reachable entry — the `ioctl`→`close`→`read` pattern across *separate* syscall entries with
