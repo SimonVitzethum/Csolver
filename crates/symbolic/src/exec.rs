@@ -1435,7 +1435,16 @@ impl Explorer<'_> {
                 }
             }
             Terminator::CondBr { cond, then_blk, then_args, else_blk, else_args } => {
-                let ce = self.eval_scalar(cond, &state);
+                let mut ce = self.eval_scalar(cond, &state);
+                // Coerce a non-boolean condition to `c != 0` (LLVM truthiness). A wider
+                // value can reach here — an `i1` register that holds a widened expression,
+                // or a loop-havoc'd condition — and using it directly as a boolean guard is
+                // unencodable, which spuriously makes the whole path condition UNSAT (so a
+                // real violation on that path is recorded UNKNOWN instead of refuted).
+                if self.ctx.width(ce) != 1 {
+                    let zero = self.ctx.int(self.ctx.width(ce), 0);
+                    ce = self.ctx.cmp(SCmp::Ne, ce, zero);
+                }
                 let nce = self.ctx.not(ce);
                 if !self.is_back_edge(block, *then_blk) && !self.branch_infeasible(ce, &state) {
                     incoming.entry(*then_blk).or_default().push(EdgeState {

@@ -3118,6 +3118,43 @@ entry:
         "a distinct dst (patched out-of-place) does not fire — no false FAIL");
 }
 
+/// **A loop-guarded foreign write is refused, not left spurious-UNKNOWN.** The AAD copy
+/// in the real crypto worker sits behind a `br` whose condition is loop-carried; such a
+/// condition can reach the executor wider than `i1`, and using it directly as a boolean
+/// guard is unencodable — which made the whole path condition spuriously UNSAT, so the
+/// (real) capability violation was recorded UNKNOWN instead of refuted. Coercing a
+/// non-`i1` condition to `c != 0` (LLVM truthiness) fixes it: the write of a `foreign`
+/// page behind a loop-carried guard now FAILs.
+#[test]
+fn loop_guarded_foreign_write_is_refused() {
+    let src = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare i32 @crypto_aead_copy_sgl(ptr, ptr, ptr, i32)
+declare i1 @more()
+define void @f(ptr %sk, ptr %tfm, ptr %src, ptr %foreign) {
+entry:
+  call void @af_alg_sendpage(ptr %sk, ptr %foreign)
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %ni, %latch ]
+  %c = call i1 @more()
+  br i1 %c, label %write, label %exit
+write:
+  %r = call i32 @crypto_aead_copy_sgl(ptr %tfm, ptr %src, ptr %foreign, i32 16)
+  br label %latch
+latch:
+  %ni = add i32 %i, 1
+  br label %loop
+exit:
+  ret void
+}
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "l".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "a foreign write behind a loop-carried guard must be refused, not spurious-UNKNOWN");
+}
+
 /// **Provenance flows through a `switch` (mem2reg critical-edge splitting).** A `foreign`
 /// pointer is stored to a stack slot, the CFG passes through a `switch` whose default edge
 /// targets a multi-predecessor block, and the slot is reloaded past it and written via the
