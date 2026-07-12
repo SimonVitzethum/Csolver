@@ -425,6 +425,9 @@ struct FileScan {
     /// Shared-memory accesses `(function, location-class, is_write, lock-classes)` seen in this
     /// unit — aggregated program-wide for the lockset data-race check (G1).
     race_accesses: Vec<(String, String, bool, Vec<String>)>,
+    /// Ordered per-function interleaving traces `(function, trace)` — aggregated program-wide
+    /// for the two-thread atomicity-violation check (subsystem 4).
+    race_traces: Vec<(String, Vec<(u8, String)>)>,
     /// Symbolic exploration hit its budget on ≥1 function: the unit is a
     /// candidate for a full-effort *deferred* re-run rather than accepting Unknown.
     truncated: bool,
@@ -762,6 +765,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
     let mut findings: Vec<Finding> = Vec::new();
     let mut lock_edges: Vec<(String, String, String)> = Vec::new();
     let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
+    let mut race_traces: Vec<(String, Vec<(u8, String)>)> = Vec::new();
     for fs in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -771,11 +775,13 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
         findings.extend(fs.findings);
         lock_edges.extend(fs.lock_edges);
         race_accesses.extend(fs.race_accesses);
+        race_traces.extend(fs.race_traces);
     }
     let mut seen_find = HashSet::new();
     findings.retain(|f| seen_find.insert(finding_key(f)));
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses);
+    report_atomicity(&race_traces);
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -815,6 +821,9 @@ fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: &Config) ->
         }
         for (loc, w, ls) in &f.race_accesses {
             fs.race_accesses.push((f.function.clone(), loc.clone(), *w, ls.clone()));
+        }
+        if !f.race_trace.is_empty() {
+            fs.race_traces.push((f.function.clone(), f.race_trace.clone()));
         }
     }
     fs
@@ -932,6 +941,9 @@ fn scan_one_unit(
         }
         for (loc, w, ls) in &f.race_accesses {
             fs.race_accesses.push((f.function.clone(), loc.clone(), *w, ls.clone()));
+        }
+        if !f.race_trace.is_empty() {
+            fs.race_traces.push((f.function.clone(), f.race_trace.clone()));
         }
     }
     fs
@@ -1231,6 +1243,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     let mut findings: Vec<Finding> = Vec::new();
     let mut lock_edges: Vec<(String, String, String)> = Vec::new();
     let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
+    let mut race_traces: Vec<(String, Vec<(u8, String)>)> = Vec::new();
     for (_, fs) in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -1240,6 +1253,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
         findings.extend(fs.findings);
         lock_edges.extend(fs.lock_edges);
         race_accesses.extend(fs.race_accesses);
+        race_traces.extend(fs.race_traces);
     }
     // De-duplicate the inventory: the same bug in many files (a duplicated / static-inline
     // function) is one finding, not N. Keeps the first (unit-ordered) occurrence.
@@ -1248,6 +1262,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
 
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses);
+    report_atomicity(&race_traces);
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -1320,6 +1335,38 @@ fn report_data_races(accesses: &[(String, String, bool, Vec<String>)]) {
     for r in &races {
         println!("  location: {}", r.location);
         println!("    accessed under inconsistent locking in: {}", r.functions.join(", "));
+    }
+}
+
+/// Report candidate **atomicity violations** (subsystem 4, two-thread interleaving) across the
+/// scan. Pairs functions whose event traces share a written location and searches for a valid
+/// interleaving that interrupts a split-critical-section read-modify-write — a lost update the
+/// lockset pass cannot see. Prints the interleaving witness. A bug-finding heuristic.
+fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
+    let threads: Vec<csolver_verifier::Thread> = traces
+        .iter()
+        .map(|(name, tr)| csolver_verifier::trace_to_thread(name, tr))
+        .collect();
+    let violations = csolver_verifier::find_atomicity_violations(&threads);
+    if violations.is_empty() {
+        return;
+    }
+    let ev = |e: &csolver_verifier::interleave::Event| -> String {
+        use csolver_verifier::interleave::Event::*;
+        match e {
+            Acquire(l) => format!("acquire {l}"),
+            Release(l) => format!("release {l}"),
+            Read(x) => format!("read {x}"),
+            Write(x) => format!("write {x}"),
+        }
+    };
+    println!("\n== atomicity violations (interleaving) ({}) [bug-finding] ==", violations.len());
+    for v in &violations {
+        println!("  location: {}  (non-atomic read-modify-write, lost update)", v.location);
+        println!("    witness interleaving:");
+        for (thread, event) in &v.schedule {
+            println!("      {thread}: {}", ev(event));
+        }
     }
 }
 

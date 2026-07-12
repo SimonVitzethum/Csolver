@@ -3247,6 +3247,55 @@ define void @f(ptr %kbuf) {
         "an untainted pointer to system() is not a tainted sink");
 }
 
+/// **Atomicity violation via two-thread interleaving (subsystem 4 — a genuine second
+/// timeline).** A read-modify-write of a global split across *two* critical sections: every
+/// access holds the lock, so the lockset (Eraser) pass sees **no** race — yet another
+/// function's write can interleave in the gap between the read and the dependent write, a lost
+/// update. The interleaving product finds it with a witness; the lockset pass does not.
+#[test]
+fn split_critical_section_rmw_is_an_atomicity_violation() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let src = r#"
+@counter = global i32 0, align 4
+@L = global i32 0, align 4
+declare void @spin_lock(ptr)
+declare void @spin_unlock(ptr)
+declare void @work()
+define void @incrementer() {
+  call void @spin_lock(ptr @L)
+  %t = load i32, ptr @counter, align 4
+  call void @spin_unlock(ptr @L)
+  call void @work()
+  call void @spin_lock(ptr @L)
+  %n = add i32 %t, 1
+  store i32 %n, ptr @counter, align 4
+  call void @spin_unlock(ptr @L)
+  ret void
+}
+define void @resetter() {
+  call void @spin_lock(ptr @L)
+  store i32 0, ptr @counter, align 4
+  call void @spin_unlock(ptr @L)
+  ret void
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "a".into() }).expect("lower");
+    let report = verify_module(&m, &cfg);
+    // The lockset pass is silent — `counter` is consistently locked.
+    assert!(report.data_races().is_empty(), "consistent locking → no lockset race");
+    // The interleaving product finds the lost update, with a witness.
+    let v = report.atomicity_violations();
+    assert_eq!(v.len(), 1, "a split-critical-section RMW is an atomicity violation: {v:?}");
+    assert_eq!(v[0].location, "g:counter@0");
+    // The witness schedules the resetter's write between the incrementer's read and write.
+    use csolver_verifier::interleave::Event;
+    let sched = &v[0].schedule;
+    let inc_read = sched.iter().position(|(n, e)| n == "incrementer" && matches!(e, Event::Read(_))).unwrap();
+    let res_write = sched.iter().position(|(n, e)| n == "resetter" && matches!(e, Event::Write(_))).unwrap();
+    let inc_write = sched.iter().position(|(n, e)| n == "incrementer" && matches!(e, Event::Write(_))).unwrap();
+    assert!(inc_read < res_write && res_write < inc_write, "witness realises read < foreign-write < write");
+}
+
 /// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and
 /// accessed without that lock in another is a candidate race (inconsistent lockset, a write,
 /// two functions). Consistent locking on every access is not flagged (no false positive).

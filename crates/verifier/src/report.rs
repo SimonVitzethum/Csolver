@@ -39,6 +39,9 @@ pub struct FunctionReport {
     /// **Shared-memory access records**: `(access-class, is_write, lock-classes held)` per
     /// access to a shareable location. Aggregated program-wide for the lockset data-race check.
     pub race_accesses: Vec<(String, bool, Vec<String>)>,
+    /// **Ordered event trace** `(kind, class)` (0=acquire,1=release,2=read,3=write) for the
+    /// two-thread interleaving atomicity check.
+    pub race_trace: Vec<(u8, String)>,
 }
 
 impl FunctionReport {
@@ -112,5 +115,20 @@ impl ModuleReport {
             })
             .collect();
         crate::detect_races(&accesses)
+    }
+
+    /// Candidate **atomicity violations** among this module's functions (the two-thread
+    /// interleaving product, subsystem 4): a split-critical-section read-modify-write one
+    /// function performs, which another function's write can interrupt in a valid interleaving.
+    /// Complements the lockset pass — it finds lost updates where every access is *consistently*
+    /// locked (so Eraser sees no race) but the RMW spans two critical sections.
+    pub fn atomicity_violations(&self) -> Vec<crate::AtomicityWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::find_atomicity_violations(&threads)
     }
 }

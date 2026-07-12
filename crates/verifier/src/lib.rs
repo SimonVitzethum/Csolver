@@ -24,6 +24,7 @@
 
 mod contracts;
 pub mod datarace;
+pub mod interleave;
 pub mod lockorder;
 mod mem2reg;
 pub mod precond;
@@ -31,6 +32,7 @@ mod report;
 mod wholeprog;
 
 pub use datarace::{detect_races, DataRace, TaggedAccess};
+pub use interleave::{find_atomicity_violations, trace_to_thread, AtomicityWitness, Thread};
 pub use lockorder::{detect_cycles, LockOrderCycle, TaggedEdge};
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
 pub use csolver_symbolic::Summary;
@@ -259,6 +261,7 @@ fn verify_module_inner(
             truncated: false,
             lock_edges: Vec::new(),
             race_accesses: Vec::new(),
+            race_trace: Vec::new(),
         });
     }
 
@@ -718,6 +721,10 @@ fn verify_function_with(
         .as_ref()
         .map(|r| r.race_accesses.clone())
         .unwrap_or_default();
+    let race_trace = symbolic
+        .as_ref()
+        .map(|r| r.race_trace.clone())
+        .unwrap_or_default();
     FunctionReport {
         function: f.name.clone(),
         verdict,
@@ -725,6 +732,7 @@ fn verify_function_with(
         truncated,
         lock_edges,
         race_accesses,
+        race_trace,
     }
 }
 

@@ -85,6 +85,10 @@ const SPIN_ACQUIRE: &[&str] = &[
     "_raw_read_lock", "_raw_write_lock",
 ];
 
+/// Cap on the per-function ordered interleaving trace — a very long function contributes at
+/// most this many events, keeping the two-thread interleaving DFS bounded.
+const RACE_TRACE_CAP: usize = 64;
+
 // A spinning-lock **release** (`spin_unlock`/…) leaves atomic context. It is not a named
 // set here: like any other call it is handed the lock base as a pointer argument, and the
 // general call arm below already drops every passed base from `spin_held` (and `locks_held`).
@@ -147,6 +151,9 @@ pub struct SymbolicReport {
     /// **Shared-memory access records**: `(access-class, is_write, lock-classes held)` per
     /// access to a shareable location. Aggregated program-wide for the lockset data-race check.
     pub race_accesses: Vec<(String, bool, Vec<String>)>,
+    /// **Ordered event trace** `(kind, class)` (0=acquire,1=release,2=read,3=write) for the
+    /// two-thread interleaving atomicity check (`csolver_verifier::interleave`).
+    pub race_trace: Vec<(u8, String)>,
     /// Whether exploration was truncated (then no decisions are reported).
     pub truncated: bool,
 }
@@ -450,6 +457,7 @@ fn discharge_inner(
         lock_classes: crate::lockclass::resolve_lock_classes(f),
         lock_edges: HashSet::new(),
         race_accesses: HashSet::new(),
+        race_trace: Vec::new(),
         f,
     };
 
@@ -702,6 +710,7 @@ fn discharge_inner(
         assumptions,
         lock_edges,
         race_accesses,
+        race_trace: ex.race_trace,
         truncated: false,
     }
 }
@@ -1444,6 +1453,12 @@ struct Explorer<'f> {
     /// include a write, and span ≥2 functions is a candidate race (the Eraser lockset signal).
     /// `(access-class, is_write, sorted lock-classes held)`.
     race_accesses: HashSet<(String, bool, Vec<String>)>,
+    /// **Ordered event trace** for the two-thread interleaving check (subsystem 4): the
+    /// sequence of lock acquires/releases and shared reads/writes in execution order, as
+    /// `(kind, class)` with kind `0`=acquire, `1`=release, `2`=read, `3`=write. Consumed by
+    /// `csolver_verifier::interleave` to find atomicity violations (a split-critical-section
+    /// read-modify-write a foreign write can interrupt) with an interleaving witness.
+    race_trace: Vec<(u8, String)>,
     f: &'f Function,
 }
 
@@ -3645,6 +3660,11 @@ impl Explorer<'_> {
         let mut lockset: Vec<String> = state.held_classes.values().cloned().collect();
         lockset.sort();
         lockset.dedup();
+        // Ordered trace for the interleaving check (read=2, write=3), bounded so a huge
+        // function does not grow an unbounded trace.
+        if self.race_trace.len() < RACE_TRACE_CAP {
+            self.race_trace.push((if is_write { 3 } else { 2 }, class.clone()));
+        }
         self.race_accesses.insert((class, is_write, lockset));
     }
 
@@ -3792,6 +3812,10 @@ impl Explorer<'_> {
                         self.lock_edges.insert((held.clone(), nc.clone()));
                     }
                 }
+                // Ordered interleaving trace: acquire = 0.
+                if self.race_trace.len() < RACE_TRACE_CAP {
+                    self.race_trace.push((0, nc.clone()));
+                }
             }
             match base {
                 // Re-acquiring a lock already held on this path: a definite AA deadlock.
@@ -3841,7 +3865,12 @@ impl Explorer<'_> {
                 if let Some(b) = Self::ptr_base_key(&self.eval_value(a, state)) {
                     state.locks_held.remove(&b);
                     state.spin_held.remove(&b);
-                    state.held_classes.remove(&b);
+                    // Ordered interleaving trace: release = 1 (recorded for the dropped class).
+                    if let Some(cls) = state.held_classes.remove(&b) {
+                        if self.race_trace.len() < RACE_TRACE_CAP {
+                            self.race_trace.push((1, cls));
+                        }
+                    }
                 }
             }
             self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", "");
