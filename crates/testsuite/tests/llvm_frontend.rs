@@ -3567,6 +3567,41 @@ fn rcu_grace_period_violation_is_refused() {
     );
 }
 
+/// **Deferred reclamation beyond RCU.** Hazard pointers and epoch-based reclamation share RCU's
+/// shape: an object retired/protected for lock-free readers must not be plain-`kfree`d until the
+/// safe point (a hazard scan / epoch advance). The same `reclaim` typestate that guards RCU guards
+/// these, so a retire-then-free without the safe point is refused; with it, it is safe.
+#[test]
+fn hazard_pointer_and_epoch_reclamation_are_guarded() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let verdict = |decls: &str, body: &str| -> Verdict {
+        let src = format!(
+            "declare void @kfree(ptr)\n{decls}\
+             define void @f(ptr %n) {{\n{body}  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "h".into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // Epoch: retire then free with no epoch advance → reader UAF.
+    assert_eq!(
+        verdict("declare void @ebr_retire(ptr)\n",
+            "  call void @ebr_retire(ptr %n)\n  call void @kfree(ptr %n)\n"),
+        Verdict::Fail, "freeing an epoch-retired node before the epoch advance is a violation"
+    );
+    // Epoch: retire, advance, then free → safe.
+    assert_ne!(
+        verdict("declare void @ebr_retire(ptr)\ndeclare void @ebr_advance()\n",
+            "  call void @ebr_retire(ptr %n)\n  call void @ebr_advance()\n  call void @kfree(ptr %n)\n"),
+        Verdict::Fail, "an epoch advance before the free is safe"
+    );
+    // Hazard pointers: protect then free with no scan → violation.
+    assert_eq!(
+        verdict("declare void @hazptr_protect(ptr)\n",
+            "  call void @hazptr_protect(ptr %n)\n  call void @kfree(ptr %n)\n"),
+        Verdict::Fail, "freeing a hazard-protected node before the scan is a violation"
+    );
+}
+
 /// **Cross-thread use-after-free.** One function frees an object (`kfree`) while another
 /// concurrently dereferences it, under *disjoint* locks — nothing orders the free before the
 /// use, so it is a cross-thread UAF. A common lock orders them (no finding).
@@ -3761,6 +3796,27 @@ fn typestate_protocol_violations_are_refused() {
 /// same struct type, so two stable cross-function *classes*) in the **opposite order**:
 /// `f` takes field-0 then field-1, `g` takes field-1 then field-0. The whole-program
 /// lock-order graph then has edges `S@0→S@8` and `S@8→S@0` — a 2-cycle, a potential ABBA
+/// **Seqlock writers are locks.** `write_seqlock` mutually excludes writers, so it participates
+/// in lock-order analysis exactly like a spinlock: taking a spinlock while holding a seqlock in
+/// one path and the opposite order in another is an ABBA cycle.
+#[test]
+fn seqlock_writer_participates_in_lock_order() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let src = "\
+        @sl = global i32 0\n@sp = global i32 0\n\
+        declare void @write_seqlock(ptr)\ndeclare void @write_sequnlock(ptr)\n\
+        declare void @spin_lock(ptr)\ndeclare void @spin_unlock(ptr)\n\
+        define void @writer() {\n\
+          call void @write_seqlock(ptr @sl)\n  call void @spin_lock(ptr @sp)\n\
+          call void @spin_unlock(ptr @sp)\n  call void @write_sequnlock(ptr @sl)\n  ret void\n}\n\
+        define void @other() {\n\
+          call void @spin_lock(ptr @sp)\n  call void @write_seqlock(ptr @sl)\n\
+          call void @write_sequnlock(ptr @sl)\n  call void @spin_unlock(ptr @sp)\n  ret void\n}\n";
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "sq".into() }).expect("lower");
+    let cycles = verify_module(&m, &cfg).lock_order_cycles();
+    assert_eq!(cycles.len(), 1, "seqlock-vs-spinlock opposite order is an ABBA cycle: {cycles:?}");
+}
+
 /// deadlock. Distinct objects (`%x`/`%y`) are used so the base identities differ (no AA
 /// self-deadlock false positive). A consistent order (both `f`-style) has no cycle.
 #[test]

@@ -71,6 +71,11 @@ const LOCK_ACQUIRE: &[&str] = &[
     "read_lock_irqsave", "write_lock_irqsave", "read_lock_bh", "write_lock_bh",
     "_raw_read_lock", "_raw_write_lock", "down", "down_write", "down_read",
     "down_interruptible", "down_killable", "down_write_killable",
+    // Seqlock write side: `write_seqlock` excludes other writers exactly like a spinlock (the
+    // read side is lock-free and retried, so only writers take a lock). A missing unlock, a
+    // double `write_seqlock` (AA), or an ABBA against another lock is then caught for free.
+    "write_seqlock", "write_seqlock_irq", "write_seqlock_bh", "write_seqlock_irqsave",
+    "raw_write_seqlock", "__write_seqlock",
 ];
 
 /// **Spinning** lock acquisitions — those that enter **atomic context** (preemption off),
@@ -83,6 +88,8 @@ const SPIN_ACQUIRE: &[&str] = &[
     "read_lock", "write_lock", "read_lock_irq", "write_lock_irq",
     "read_lock_irqsave", "write_lock_irqsave", "read_lock_bh", "write_lock_bh",
     "_raw_read_lock", "_raw_write_lock",
+    "write_seqlock", "write_seqlock_irq", "write_seqlock_bh", "write_seqlock_irqsave",
+    "raw_write_seqlock", "__write_seqlock",
 ];
 
 /// Cap on the per-function ordered interleaving trace — a very long function contributes at
@@ -110,6 +117,7 @@ const IRQ_DISABLE: &[&str] = &[
     "raw_spin_lock_irqsave", "raw_spin_lock_irq", "read_lock_irqsave", "write_lock_irqsave",
     "read_lock_irq", "write_lock_irq", "local_irq_save", "local_irq_disable",
     "local_bh_disable", "spin_lock_bh", "_raw_spin_lock_bh", "raw_spin_lock_bh",
+    "write_seqlock_irqsave", "write_seqlock_irq",
 ];
 const IRQ_ENABLE: &[&str] = &[
     "spin_unlock_irqrestore", "spin_unlock_irq", "_raw_spin_unlock_irqrestore",
@@ -117,6 +125,7 @@ const IRQ_ENABLE: &[&str] = &[
     "read_unlock_irqrestore", "write_unlock_irqrestore", "read_unlock_irq", "write_unlock_irq",
     "local_irq_restore", "local_irq_enable", "local_bh_enable", "spin_unlock_bh",
     "_raw_spin_unlock_bh", "raw_spin_unlock_bh",
+    "write_sequnlock_irqrestore", "write_sequnlock_irq",
 ];
 
 /// Accessors returning a pointer to **per-CPU** data — thread-local by construction (each CPU

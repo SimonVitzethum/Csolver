@@ -1,20 +1,27 @@
-# RCU grace-period lifetime. An object published to RCU readers must not be freed with a plain
-# `kfree` until a grace period has elapsed (`synchronize_rcu`, or a deferred `call_rcu`/
-# `kfree_rcu`); otherwise a concurrent reader still holding it dereferences freed memory.
+# Deferred-reclamation lifetime — RCU, SRCU, hazard pointers, epoch-based reclamation.
 #
-# Modelled as a typestate on the object: publishing sets `rcu.published`; a grace period clears
-# it program-wide; a plain free requires it NOT be set (see free.contract). SRCU and the
-# read-side (`rcu_read_lock`) are handled separately (the data-race hardening).
+# All share one shape: an object published/protected for lock-free readers must not be freed with
+# a plain `kfree` until the corresponding safe point has passed (an RCU/SRCU grace period, a
+# hazard-pointer scan, or an epoch advance). Otherwise a concurrent reader dereferences freed
+# memory. Modelled as a `reclaim` typestate on the object: publish/protect → `deferred`; the safe
+# point clears it program-wide; a plain free requires it NOT be `deferred` (see free.contract).
 
-# rcu_assign_pointer(p, v) / rcu_replace_pointer(p, v, ...) publish object v (arg1).
-[rcu_assign_pointer rcu_replace_pointer]
-typestate-set arg1 rcu published
+# --- RCU / SRCU publish --------------------------------------------------------------------
+[rcu_assign_pointer rcu_replace_pointer srcu_assign_pointer]
+typestate-set arg1 reclaim deferred
 
-# A grace period makes every published object safe to free (protocol-wide transition).
-[synchronize_rcu synchronize_rcu_expedited synchronize_sched synchronize_srcu]
-typestate-yield rcu published safe
+# --- Hazard pointers: publishing a node others may still be scanning --------------------------
+[hazptr_protect hazard_pointer_set hp_protect llist_add]
+typestate-set arg0 reclaim deferred
 
-# The deferred frees are the safe path — they clear the object's published state directly, so a
-# following (internal) free is not a violation.
-[kfree_rcu call_rcu call_srcu kvfree_rcu]
-typestate-set arg0 rcu safe
+# --- Epoch-based reclamation: retiring a node into the current epoch --------------------------
+[ebr_retire epoch_retire retire_node call_rcu_epoch]
+typestate-set arg0 reclaim deferred
+
+# --- Safe points (grace period / scan / epoch advance) make deferred objects reclaimable -----
+[synchronize_rcu synchronize_rcu_expedited synchronize_sched synchronize_srcu synchronize_srcu_expedited hazptr_scan hazard_pointer_scan ebr_advance epoch_advance rcu_barrier srcu_barrier]
+typestate-yield reclaim deferred safe
+
+# --- The deferred frees are the safe path — they clear the object's deferred state directly ---
+[kfree_rcu call_rcu call_srcu kvfree_rcu hazptr_retire]
+typestate-set arg0 reclaim safe

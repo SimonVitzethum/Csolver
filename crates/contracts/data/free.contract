@@ -4,10 +4,10 @@
 
 [free kfree vfree kvfree kfree_sensitive kzfree __kfree free_pages __free_pages kfree_const]
 free arg0
-# RCU grace-period (see rcu.contract): freeing an object still published for RCU readers —
-# without an intervening synchronize_rcu — is a grace-period violation (reader UAF). A non-RCU
-# object is never `rcu.published`, so this never false-fires on an ordinary free.
-typestate-require-not arg0 rcu published
+# Deferred reclamation (see rcu.contract): freeing an object still published/protected for
+# lock-free readers — RCU, SRCU, hazard-pointer or epoch — without the intervening safe point is a
+# reader UAF. An ordinary object is never `reclaim.deferred`, so this never false-fires on a plain free.
+typestate-require-not arg0 reclaim deferred
 
 # kmem_cache_free(cache, ptr) — the freed pointer is the second argument.
 [kmem_cache_free]

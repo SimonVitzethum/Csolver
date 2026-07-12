@@ -697,7 +697,7 @@ mod tests {
             vec![
                 Effect::Free { ptr: 0 },
                 // RCU grace-period guard (rcu.contract): a plain free of a still-published object.
-                Effect::TypestateRequire { arg: 0, protocol: "rcu".into(), state: "published".into(), negate: true },
+                Effect::TypestateRequire { arg: 0, protocol: "reclaim".into(), state: "deferred".into(), negate: true },
             ]
         );
         assert_eq!(c.lookup("kmem_cache_free").unwrap().effects, vec![Effect::Free { ptr: 1 }]);
