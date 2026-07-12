@@ -624,7 +624,7 @@ impl Inst {
             // A freeing-wrapper call must not re-free a pointer an earlier freeing call
             // already freed (`NoDoubleFree`); a lock-acquiring call must not re-acquire a
             // held lock (`DataRace`, bug-finding only).
-            Inst::Call { .. } => &[NoDoubleFree, DataRace, SleepInAtomic],
+            Inst::Call { .. } => &[NoDoubleFree, DataRace, SleepInAtomic, TypestateViolation],
             _ => &[],
         }
     }

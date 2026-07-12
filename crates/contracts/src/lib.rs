@@ -664,6 +664,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("typestate.contract", include_str!("../data/typestate.contract")),
     ("barrier.contract", include_str!("../data/barrier.contract")),
     ("thread.contract", include_str!("../data/thread.contract")),
+    ("lifetime.contract", include_str!("../data/lifetime.contract")),
 ];
 
 #[cfg(test)]

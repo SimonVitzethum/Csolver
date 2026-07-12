@@ -3503,6 +3503,41 @@ fn inline_asm_memory_operand_is_checked() {
     );
 }
 
+/// **Interprocedural reference count (object lifetime across functions).** A `get`/`put`
+/// protocol (`sock_hold`/`sock_put`) balances across a *call*: the callee's net refcount effect
+/// is composed into the caller (`Summary.refcount_effect`), so a put that drops the count below
+/// an in-scope get — even when the extra put lives in a helper function — is an underflow
+/// (premature free / UAF). A balanced hold/put across functions is fine; a bare put on a
+/// parameter (unknown caller-held count) is not flagged.
+#[test]
+fn interprocedural_refcount_underflow() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |caller_body: &str| {
+        let src = format!(
+            "declare void @sock_hold(ptr)\ndeclare void @sock_put(ptr)\n\
+             define void @release(ptr %sk) {{\n  call void @sock_put(ptr %sk)\n  ret void\n}}\n\
+             define void @caller(ptr %sk) {{\n{caller_body}  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "rc".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // hold once, then put twice (one direct, one via the helper) → underflow across the call.
+    assert_eq!(
+        module("  call void @sock_hold(ptr %sk)\n  call void @sock_put(ptr %sk)\n  call void @release(ptr %sk)\n").verdict,
+        Verdict::Fail, "a put below an in-scope get, composed through a call, underflows"
+    );
+    // hold once, put once (via the helper) → balanced.
+    assert_ne!(
+        module("  call void @sock_hold(ptr %sk)\n  call void @release(ptr %sk)\n").verdict,
+        Verdict::Fail, "a balanced hold/put across functions is fine"
+    );
+    // the helper alone (a bare put on a parameter) is not an underflow — the caller holds it.
+    assert_ne!(
+        module("  call void @release(ptr %sk)\n").verdict,
+        Verdict::Fail, "a bare put on a parameter is sound (unknown caller-held count)"
+    );
+}
+
 /// **Cross-thread use-after-free.** One function frees an object (`kfree`) while another
 /// concurrently dereferences it, under *disjoint* locks — nothing orders the free before the
 /// use, so it is a cross-thread UAF. A common lock orders them (no finding).
@@ -3615,11 +3650,16 @@ fn toctou_refcount_leak_typeconfusion_and_secret_are_refused() {
     assert_ne!(v("void @f(ptr %p)",
         "  %c = call i32 @access(ptr %p, i32 0)\n  %o = call i32 @open(ptr %p, i32 0)\n  ret void\n"),
         Verdict::Fail, "check→use with no yield is fine");
-    // G8 refcount underflow: a put with no matching get.
-    assert_eq!(v("void @f(ptr %o)", "  call void @kref_put(ptr %o)\n  ret void\n"),
-        Verdict::Fail, "a refcount decrement below zero underflows");
+    // G8 refcount underflow: a get establishes the count, two puts drop it below zero.
+    assert_eq!(v("void @f(ptr %o)", "  call void @kref_get(ptr %o)\n  \
+                  call void @kref_put(ptr %o)\n  call void @kref_put(ptr %o)\n  ret void\n"),
+        Verdict::Fail, "a put below an in-scope get is an underflow");
+    // A balanced get/put is fine; and a bare put on a parameter (the caller holds the ref, unknown
+    // count) is NOT an underflow — sound, no false positive on a plain drop helper.
     assert_ne!(v("void @f(ptr %o)", "  call void @kref_get(ptr %o)\n  call void @kref_put(ptr %o)\n  ret void\n"),
         Verdict::Fail, "a balanced get/put is fine");
+    assert_ne!(v("void @f(ptr %o)", "  call void @kref_put(ptr %o)\n  ret void\n"),
+        Verdict::Fail, "a bare put on a parameter is not an underflow (caller holds it)");
     // K leak: an open handle neither closed nor returned.
     assert_eq!(v("void @f(ptr %p, ptr %m)", "  %h = call ptr @fopen(ptr %p, ptr %m)\n  ret void\n"),
         Verdict::Fail, "an unclosed, unreturned FILE* is a leak");

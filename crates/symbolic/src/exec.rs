@@ -3314,20 +3314,30 @@ impl Explorer<'_> {
             // underflow (premature free → UAF), refuted on a definite path.
             Inst::Refcount { val, protocol, dec } => {
                 if let Some(key) = self.res_key(val, state) {
-                    let entry = state.refcounts.entry((key, *protocol)).or_insert(0);
                     if *dec {
-                        let underflow = *entry <= 0;
-                        *entry -= 1;
-                        self.record_temporal(
-                            (block, idx),
-                            SafetyProperty::TypestateViolation,
-                            underflow,
-                            state,
-                            "the reference count stays non-negative",
-                            "a reference-count decrement underflows (premature free / use-after-free)",
-                        );
+                        // A put on an object whose count was **established in this scope** (a prior
+                        // get, tracked in the map) below zero is an underflow (premature free /
+                        // UAF). A put on an *untracked* object — a bare parameter the caller holds
+                        // with an unknown count — is not an underflow (sound: no false FAIL on a
+                        // helper that just drops the caller's reference).
+                        let tracked = state.refcounts.get(&(key, *protocol)).copied();
+                        match tracked {
+                            Some(c) => {
+                                let underflow = c <= 0;
+                                state.refcounts.insert((key, *protocol), c - 1);
+                                self.record_temporal(
+                                    (block, idx),
+                                    SafetyProperty::TypestateViolation,
+                                    underflow,
+                                    state,
+                                    "the reference count stays non-negative",
+                                    "a reference-count decrement underflows (premature free / use-after-free)",
+                                );
+                            }
+                            None => self.record(block, idx, SafetyProperty::TypestateViolation, true, "the reference count stays non-negative", ""),
+                        }
                     } else {
-                        *entry += 1;
+                        *state.refcounts.entry((key, *protocol)).or_insert(0) += 1;
                         self.record(block, idx, SafetyProperty::TypestateViolation, true, "the reference count stays non-negative", "");
                     }
                 }
@@ -3984,6 +3994,10 @@ impl Explorer<'_> {
         state: &mut PathState,
     ) {
         let (block, idx) = at;
+        // Every call records `TypestateViolation` proven by default (the verifier enumerates it
+        // at each `Inst::Call` for the interprocedural refcount check); an actual underflow in
+        // `step_call` refutes it. Without this a plain call would leave the obligation Open.
+        self.record(block, idx, SafetyProperty::TypestateViolation, true, "the reference count stays non-negative across calls", "");
         let name = match callee {
             Callee::Symbol(n) => n.as_str(),
             _ => {
@@ -4164,6 +4178,37 @@ impl Explorer<'_> {
                 None => self.record(block, idx, SafetyProperty::NoDoubleFree, true, "no double free through freeing calls", ""),
             },
             None => self.record(block, idx, SafetyProperty::NoDoubleFree, true, "no double free through freeing calls", ""),
+        }
+
+        // Interprocedural reference count (get/put lifetime protocols across functions): apply
+        // the callee's net refcount effect on each pointer argument's object. A decrement that
+        // takes the count below zero is an underflow (a premature free → use-after-free), caught
+        // even when the `get` and `put` live in different functions / syscalls.
+        if let Some(effs) = summary.as_ref().map(|s| s.refcount_effect.clone()) {
+            for (param, protocol, delta) in effs {
+                let Some(SymValue::Ptr(pp)) = argvals.get(param) else { continue };
+                let Some(key) = Self::ptr_base_key(&SymValue::Ptr(pp.clone())).map(ResKey::Ptr)
+                else {
+                    continue;
+                };
+                if delta >= 0 {
+                    *state.refcounts.entry((key, protocol)).or_insert(0) += delta;
+                } else if let Some(&c) = state.refcounts.get(&(key, protocol)) {
+                    // A net put only underflows a count *established in this scope* (a prior get);
+                    // an untracked param the caller holds is left alone (sound).
+                    state.refcounts.insert((key, protocol), c + delta);
+                    if c + delta < 0 {
+                        self.record_temporal(
+                            (block, idx),
+                            SafetyProperty::TypestateViolation,
+                            true,
+                            state,
+                            "the reference count stays non-negative across calls",
+                            "a cross-function reference-count put underflows (premature free / use-after-free)",
+                        );
+                    }
+                }
+            }
         }
 
         // A call is an over-approximation point (havoc'd heap/return unless a
@@ -7402,6 +7447,7 @@ mod tests {
                 frees: true,
                 frees_arg: None,
                 prov: crate::summary::ProvTransfer::default(),
+                refcount_effect: vec![],
             },
         );
         let r = discharge_with_summaries(&f, &summaries);
@@ -7444,7 +7490,7 @@ mod tests {
         let mut summaries = HashMap::new();
         summaries.insert(
             FuncId(9),
-            Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default() },
+            Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default(), refcount_effect: vec![] },
         );
         let r = discharge_with_fields(
             &f, &summaries, &[], &[], &HashMap::new(), &HashMap::new(), true, true, false,
@@ -7545,7 +7591,7 @@ mod tests {
         // A pure callee: no writes, no frees.
         summaries.insert(
             FuncId(1),
-            Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default() },
+            Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default(), refcount_effect: vec![] },
         );
         let mut globals = HashMap::new();
         globals.insert("G".to_string(), csolver_ir::GlobalDef { size: 8, align: 8, writable: false });
@@ -7677,7 +7723,7 @@ mod tests {
         let mut pure = HashMap::new();
         pure.insert(
             "remote".to_string(),
-            Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default() },
+            Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default(), refcount_effect: vec![] },
         );
         let r_pure = discharge_inner(
             &f, ExecLimits::default(), &HashMap::new(), &pure, &[], &[], &[], &HashMap::new(),
@@ -7691,7 +7737,7 @@ mod tests {
         let mut frees = HashMap::new();
         frees.insert(
             "remote".to_string(),
-            Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default() },
+            Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default(), refcount_effect: vec![] },
         );
         let r_free = discharge_inner(
             &f, ExecLimits::default(), &HashMap::new(), &frees, &[], &[], &[], &HashMap::new(),

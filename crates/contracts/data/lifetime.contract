@@ -1,0 +1,46 @@
+# Object-lifetime reference counts (get/put protocols). Each `get` raises and each `put` lowers
+# the object's refcount; a `put` that takes it below the number of holders is a premature free
+# (use-after-free). The count is composed interprocedurally (Summary.refcount_effect), so a get
+# in one function/syscall and a put in another balance — an unbalanced put underflows.
+
+# --- kref (generic kernel refcount) --------------------------------------------------------
+[kref_get kref_get_unless_zero]
+refcount-inc arg0 lifetime
+[kref_put kref_put_lock refcount_dec_and_test]
+refcount-dec arg0 lifetime
+
+# --- struct sock (network socket) ----------------------------------------------------------
+[sock_hold __sock_put_hold sk_get sock_get]
+refcount-inc arg0 lifetime
+[sock_put __sock_put sk_put]
+refcount-dec arg0 lifetime
+
+# --- kobject -------------------------------------------------------------------------------
+[kobject_get kobject_get_unless_zero]
+refcount-inc arg0 lifetime
+[kobject_put]
+refcount-dec arg0 lifetime
+
+# --- net_device ----------------------------------------------------------------------------
+[dev_hold dev_hold_track netdev_hold]
+refcount-inc arg0 lifetime
+[dev_put dev_put_track netdev_put]
+refcount-dec arg0 lifetime
+
+# --- block I/O (bio) -----------------------------------------------------------------------
+[bio_get bio_inc_remaining]
+refcount-inc arg0 lifetime
+[bio_put]
+refcount-dec arg0 lifetime
+
+# --- dma_buf / DRM GEM objects (driver object lifetime) ------------------------------------
+[dma_buf_get get_dma_buf drm_gem_object_get drm_gem_object_get_unlocked]
+refcount-inc arg0 lifetime
+[dma_buf_put drm_gem_object_put drm_gem_object_put_unlocked]
+refcount-dec arg0 lifetime
+
+# --- generic get_device / put_device -------------------------------------------------------
+[get_device get_task_struct mmgrab mmget]
+refcount-inc arg0 lifetime
+[put_device put_task_struct mmdrop mmput]
+refcount-dec arg0 lifetime

@@ -135,6 +135,14 @@ pub struct Summary {
     pub frees_arg: Option<usize>,
     /// How a call moves provenance labels between its pointer arguments.
     pub prov: ProvTransfer,
+    /// **Interprocedural reference-count effect**: the net change this function makes to the
+    /// refcount of each pointer parameter's object, per protocol — `(param index, protocol id,
+    /// delta)`. Composed through direct calls to a fixpoint, so a `get`/`put` protocol
+    /// (`sock_hold`/`sock_put`, `kobject_get`/`_put`, `dev_hold`/`_put`, …) balances across
+    /// *many* functions. Applied at a call so an unbalanced put (underflow → premature free /
+    /// UAF) is caught cross-function. A straight-line sum (path-approximate — a `get`/`put`
+    /// wrapper is unconditional), so it only ever *adds* a bug-finding check.
+    pub refcount_effect: Vec<(usize, u32, i64)>,
 }
 
 impl Summary {
@@ -266,6 +274,47 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
                 s.prov.labels.extend(add.labels);
                 dedup(&mut s.prov);
                 if (s.prov.transfers.len(), s.prov.labels.len()) != before {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Propagate the reference-count effect through direct calls: `f`'s total effect is its own
+    // (base) plus, for each call `g(args)`, `g`'s effect mapped from `g`'s parameters onto `f`'s
+    // (via argument aliasing). Recomputed from the base each round (the effect is additive, so it
+    // must not accumulate across iterations) and capped, so a recursive refcount terminates.
+    let base: HashMap<FuncId, Vec<(usize, u32, i64)>> =
+        module.functions.iter().map(|f| (f.id, refcount_effect_of_fn(f))).collect();
+    for _ in 0..8 {
+        let mut changed = false;
+        let snapshot: HashMap<FuncId, Vec<(usize, u32, i64)>> =
+            map.iter().map(|(k, s)| (*k, s.refcount_effect.clone())).collect();
+        for f in &module.functions {
+            let pof = &param_of[&f.id];
+            let arg = |op: &Operand| match op {
+                Operand::Reg(r) => pof.get(r).copied(),
+                _ => None,
+            };
+            let mut acc: std::collections::BTreeMap<(usize, u32), i64> =
+                base[&f.id].iter().map(|&(p, pr, d)| ((p, pr), d)).collect();
+            for inst in f.blocks.iter().filter(|b| observable(b)).flat_map(|b| &b.insts) {
+                let Inst::Call { callee: Callee::Direct(g), args, .. } = inst else { continue };
+                let Some(eff) = snapshot.get(g) else { continue };
+                for &(k, proto, d) in eff {
+                    if let Some(pj) = args.get(k).and_then(&arg) {
+                        *acc.entry((pj, proto)).or_insert(0) += d;
+                    }
+                }
+            }
+            let new_eff: Vec<(usize, u32, i64)> =
+                acc.into_iter().filter(|(_, d)| *d != 0).map(|((p, pr), d)| (p, pr, d)).collect();
+            if let Some(s) = map.get_mut(&f.id) {
+                if s.refcount_effect != new_eff {
+                    s.refcount_effect = new_eff;
                     changed = true;
                 }
             }
@@ -527,7 +576,30 @@ fn summarize_fn(f: &Function) -> Summary {
         }
     }
 
-    Summary { ret: ret_of_fn(f), writes, frees, frees_arg: derive_frees_arg(f), prov: prov_transfer_of_fn(f) }
+    Summary {
+        ret: ret_of_fn(f),
+        writes,
+        frees,
+        frees_arg: derive_frees_arg(f),
+        prov: prov_transfer_of_fn(f),
+        refcount_effect: refcount_effect_of_fn(f),
+    }
+}
+
+/// The net reference-count change this function makes to each pointer parameter's object, per
+/// protocol — a straight-line sum of the `Inst::Refcount` operations whose value is (derived
+/// from) a parameter. Composed interprocedurally by the fixpoint in `summarize_module`.
+fn refcount_effect_of_fn(f: &Function) -> Vec<(usize, u32, i64)> {
+    let params = ptr_param_of(f);
+    let mut acc: std::collections::BTreeMap<(usize, u32), i64> = std::collections::BTreeMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let Inst::Refcount { val: Operand::Reg(r), protocol, dec } = inst {
+            if let Some(&p) = params.get(r) {
+                *acc.entry((p, *protocol)).or_insert(0) += if *dec { -1 } else { 1 };
+            }
+        }
+    }
+    acc.into_iter().filter(|(_, d)| *d != 0).map(|((p, proto), d)| (p, proto, d)).collect()
 }
 
 /// The parameter a **single-block** function definitely frees: it has exactly one
