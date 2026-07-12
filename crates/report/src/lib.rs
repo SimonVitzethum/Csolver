@@ -186,6 +186,7 @@ mod tests {
             outcomes: vec![proven],
             truncated: false,
             lock_edges: vec![],
+            race_accesses: vec![],
         };
         ModuleReport {
             module: "m".into(),
@@ -228,6 +229,7 @@ mod tests {
             }],
             truncated: false,
             lock_edges: vec![],
+            race_accesses: vec![],
         };
         let report = ModuleReport {
             module: "m".into(),

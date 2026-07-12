@@ -144,6 +144,9 @@ pub struct SymbolicReport {
     /// pairs (see `lockclass`). Empty unless a lock was acquired while another was held.
     /// Aggregated program-wide for ABBA cycle detection.
     pub lock_edges: Vec<(String, String)>,
+    /// **Shared-memory access records**: `(access-class, is_write, lock-classes held)` per
+    /// access to a shareable location. Aggregated program-wide for the lockset data-race check.
+    pub race_accesses: Vec<(String, bool, Vec<String>)>,
     /// Whether exploration was truncated (then no decisions are reported).
     pub truncated: bool,
 }
@@ -446,6 +449,7 @@ fn discharge_inner(
         prove_cache: HashMap::new(),
         lock_classes: crate::lockclass::resolve_lock_classes(f),
         lock_edges: HashSet::new(),
+        race_accesses: HashSet::new(),
         f,
     };
 
@@ -689,12 +693,15 @@ fn discharge_inner(
     assumptions.sort();
     let mut lock_edges: Vec<(String, String)> = ex.lock_edges.into_iter().collect();
     lock_edges.sort();
+    let mut race_accesses: Vec<(String, bool, Vec<String>)> = ex.race_accesses.into_iter().collect();
+    race_accesses.sort();
 
     SymbolicReport {
         decided,
         mem,
         assumptions,
         lock_edges,
+        race_accesses,
         truncated: false,
     }
 }
@@ -1430,6 +1437,13 @@ struct Explorer<'f> {
     /// pairs observed on some path. Streamed out for whole-program cycle detection (an
     /// A→B here plus a B→A elsewhere is a potential ABBA deadlock).
     lock_edges: HashSet<(String, String)>,
+    /// **Shared-memory access records** for the lockset data-race check (G1): per access to a
+    /// *shareable* location (a global, or an object reached through a parameter — not a stack
+    /// local), the location's class, whether it is a write, and the set of lock *classes* held
+    /// at the access. Streamed whole-program: a location whose accesses share no common lock,
+    /// include a write, and span ≥2 functions is a candidate race (the Eraser lockset signal).
+    /// `(access-class, is_write, sorted lock-classes held)`.
+    race_accesses: HashSet<(String, bool, Vec<String>)>,
     f: &'f Function,
 }
 
@@ -2863,6 +2877,7 @@ impl Explorer<'_> {
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidRead, state);
+                self.record_shared_access(ptr, false, &p, state);
                 let exact_before = state.exact;
                 let (value, origin) = self.load_value(&p, asize, ty, state);
                 match origin {
@@ -2951,6 +2966,7 @@ impl Explorer<'_> {
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidWrite, state);
+                self.record_shared_access(ptr, true, &p, state);
                 let v = self.eval_value(value, state);
                 // Taint through memory: storing a tainted scalar into a region taints the
                 // region, so a value later loaded from it stays tainted (a `user`-tainted
@@ -3604,6 +3620,33 @@ impl Explorer<'_> {
         }
     }
 
+
+    /// Record a **shared-memory access** for the lockset data-race check (G1): if `ptr`
+    /// designates a *shareable* location (a global, or an object reached through a parameter —
+    /// a stack local is thread-local and skipped) with a resolvable access class, note
+    /// `(class, is_write, lock-classes held)`. The whole-program pass then flags a location
+    /// accessed under no common lock, with a write, from ≥2 functions.
+    fn record_shared_access(&mut self, ptr: &Operand, is_write: bool, p: &SymPointer, state: &PathState) {
+        // Sharedness: a global is definitionally shared; a param-derived opaque object may be
+        // shared across threads. A stack/TLS/fresh-heap region is thread-local — skip it.
+        let shared = match &p.prov {
+            Prov::Region(rid) => {
+                matches!(state.regions.get(*rid).map(|r| r.kind), Some(RegionKind::Global))
+            }
+            Prov::Unknown(_, Some(_)) => true,
+            _ => false,
+        };
+        if !shared {
+            return;
+        }
+        let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, ptr) else {
+            return;
+        };
+        let mut lockset: Vec<String> = state.held_classes.values().cloned().collect();
+        lockset.sort();
+        lockset.dedup();
+        self.race_accesses.insert((class, is_write, lockset));
+    }
 
     /// The identity a typestate resource operand is keyed by: a pointer handle by its base
     /// object, a scalar (an `fd`) by its symbolic value. `None` for a pointer with no tracked

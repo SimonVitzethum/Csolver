@@ -36,6 +36,9 @@ pub struct FunctionReport {
     /// pairs (see `csolver_symbolic::lockclass`). Aggregated across the program to detect
     /// ABBA lock-order cycles (an A→B here plus a B→A elsewhere is a potential deadlock).
     pub lock_edges: Vec<(String, String)>,
+    /// **Shared-memory access records**: `(access-class, is_write, lock-classes held)` per
+    /// access to a shareable location. Aggregated program-wide for the lockset data-race check.
+    pub race_accesses: Vec<(String, bool, Vec<String>)>,
 }
 
 impl FunctionReport {
@@ -89,5 +92,25 @@ impl ModuleReport {
             })
             .collect();
         crate::detect_cycles(&edges)
+    }
+
+    /// Candidate data races (lockset / Eraser, bug-finding) among this module's functions.
+    /// Aggregates every function's shared-access records and flags locations with an
+    /// inconsistent lockset. For whole-program detection, aggregate `race_accesses` from every
+    /// module's functions and call [`crate::detect_races`] directly.
+    pub fn data_races(&self) -> Vec<crate::DataRace> {
+        let accesses: Vec<crate::TaggedAccess> = self
+            .functions
+            .iter()
+            .flat_map(|f| {
+                f.race_accesses.iter().map(move |(location, write, lockset)| crate::TaggedAccess {
+                    function: f.function.as_str(),
+                    location,
+                    write: *write,
+                    lockset,
+                })
+            })
+            .collect();
+        crate::detect_races(&accesses)
     }
 }

@@ -422,6 +422,9 @@ struct FileScan {
     /// Lock-order edges `(function, held-class, acquired-class)` seen in this unit —
     /// aggregated program-wide after the scan to detect ABBA lock-order cycles (G6).
     lock_edges: Vec<(String, String, String)>,
+    /// Shared-memory accesses `(function, location-class, is_write, lock-classes)` seen in this
+    /// unit — aggregated program-wide for the lockset data-race check (G1).
+    race_accesses: Vec<(String, String, bool, Vec<String>)>,
     /// Symbolic exploration hit its budget on ≥1 function: the unit is a
     /// candidate for a full-effort *deferred* re-run rather than accepting Unknown.
     truncated: bool,
@@ -758,6 +761,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
     let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut findings: Vec<Finding> = Vec::new();
     let mut lock_edges: Vec<(String, String, String)> = Vec::new();
+    let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
     for fs in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -766,10 +770,12 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
         errored += fs.errored;
         findings.extend(fs.findings);
         lock_edges.extend(fs.lock_edges);
+        race_accesses.extend(fs.race_accesses);
     }
     let mut seen_find = HashSet::new();
     findings.retain(|f| seen_find.insert(finding_key(f)));
     report_lock_cycles(&lock_edges);
+    report_data_races(&race_accesses);
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -806,6 +812,9 @@ fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: &Config) ->
         }
         for (from, to) in &f.lock_edges {
             fs.lock_edges.push((f.function.clone(), from.clone(), to.clone()));
+        }
+        for (loc, w, ls) in &f.race_accesses {
+            fs.race_accesses.push((f.function.clone(), loc.clone(), *w, ls.clone()));
         }
     }
     fs
@@ -920,6 +929,9 @@ fn scan_one_unit(
         }
         for (from, to) in &f.lock_edges {
             fs.lock_edges.push((f.function.clone(), from.clone(), to.clone()));
+        }
+        for (loc, w, ls) in &f.race_accesses {
+            fs.race_accesses.push((f.function.clone(), loc.clone(), *w, ls.clone()));
         }
     }
     fs
@@ -1218,6 +1230,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut findings: Vec<Finding> = Vec::new();
     let mut lock_edges: Vec<(String, String, String)> = Vec::new();
+    let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
     for (_, fs) in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -1226,6 +1239,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
         errored += fs.errored;
         findings.extend(fs.findings);
         lock_edges.extend(fs.lock_edges);
+        race_accesses.extend(fs.race_accesses);
     }
     // De-duplicate the inventory: the same bug in many files (a duplicated / static-inline
     // function) is one finding, not N. Keeps the first (unit-ordered) occurrence.
@@ -1233,6 +1247,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     findings.retain(|f| seen.insert(finding_key(f)));
 
     report_lock_cycles(&lock_edges);
+    report_data_races(&race_accesses);
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -1280,6 +1295,31 @@ fn report_lock_cycles(edges: &[(String, String, String)]) {
     for c in &cycles {
         println!("  cycle: {}", c.classes.join(" <-> "));
         println!("    in functions: {}", c.functions.join(", "));
+    }
+}
+
+/// Report candidate data races (G1, lockset/Eraser) across the whole scan. Aggregates every
+/// unit's shared-memory access records into one program-wide relation and flags locations with
+/// an inconsistent lockset (a write, ≥2 functions, protected on some access but not all). A
+/// bug-finding heuristic (see `csolver_verifier::datarace`) — reported as candidates.
+fn report_data_races(accesses: &[(String, String, bool, Vec<String>)]) {
+    let tagged: Vec<csolver_verifier::TaggedAccess> = accesses
+        .iter()
+        .map(|(f, loc, w, ls)| csolver_verifier::TaggedAccess {
+            function: f,
+            location: loc,
+            write: *w,
+            lockset: ls,
+        })
+        .collect();
+    let races = csolver_verifier::detect_races(&tagged);
+    if races.is_empty() {
+        return;
+    }
+    println!("\n== data races (lockset / Eraser) ({}) [bug-finding] ==", races.len());
+    for r in &races {
+        println!("  location: {}", r.location);
+        println!("    accessed under inconsistent locking in: {}", r.functions.join(", "));
     }
 }
 

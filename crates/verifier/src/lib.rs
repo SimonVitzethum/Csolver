@@ -23,12 +23,14 @@
 //! report is always relative to the checks the frontend emitted.
 
 mod contracts;
+pub mod datarace;
 pub mod lockorder;
 mod mem2reg;
 pub mod precond;
 mod report;
 mod wholeprog;
 
+pub use datarace::{detect_races, DataRace, TaggedAccess};
 pub use lockorder::{detect_cycles, LockOrderCycle, TaggedEdge};
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
 pub use csolver_symbolic::Summary;
@@ -256,6 +258,7 @@ fn verify_module_inner(
             outcomes: vec![ObligationOutcome { obligation, result }],
             truncated: false,
             lock_edges: Vec::new(),
+            race_accesses: Vec::new(),
         });
     }
 
@@ -711,12 +714,17 @@ fn verify_function_with(
         .as_ref()
         .map(|r| r.lock_edges.clone())
         .unwrap_or_default();
+    let race_accesses = symbolic
+        .as_ref()
+        .map(|r| r.race_accesses.clone())
+        .unwrap_or_default();
     FunctionReport {
         function: f.name.clone(),
         verdict,
         outcomes,
         truncated,
         lock_edges,
+        race_accesses,
     }
 }
 

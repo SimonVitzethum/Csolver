@@ -3247,6 +3247,35 @@ define void @f(ptr %kbuf) {
         "an untainted pointer to system() is not a tainted sink");
 }
 
+/// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and
+/// accessed without that lock in another is a candidate race (inconsistent lockset, a write,
+/// two functions). Consistent locking on every access is not flagged (no false positive).
+#[test]
+fn inconsistently_locked_global_is_a_candidate_race() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |reader_body: &str| {
+        let src = format!(
+            "@counter = global i32 0, align 4\n@lk = global i32 0, align 4\n\
+             declare void @spin_lock(ptr)\ndeclare void @spin_unlock(ptr)\n\
+             define void @writer() {{\n  call void @spin_lock(ptr @lk)\n  \
+               store i32 1, ptr @counter, align 4\n  call void @spin_unlock(ptr @lk)\n  ret void\n}}\n\
+             define i32 @reader() {{\n{reader_body}}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "r".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // Reader without the lock → inconsistent lockset → candidate race.
+    let racy = module("  %v = load i32, ptr @counter, align 4\n  ret i32 %v\n");
+    let races = racy.data_races();
+    assert_eq!(races.len(), 1, "an unlocked read of a lock-protected global is a candidate race: {races:?}");
+    assert_eq!(races[0].location, "g:counter@0");
+    assert_eq!(races[0].functions, vec!["reader".to_string(), "writer".to_string()]);
+    // Reader with the same lock → consistent → no race.
+    let safe = module("  call void @spin_lock(ptr @lk)\n  %v = load i32, ptr @counter, align 4\n  \
+                        call void @spin_unlock(ptr @lk)\n  ret i32 %v\n");
+    assert!(safe.data_races().is_empty(), "a consistently-locked global is not flagged");
+}
+
 /// **The remaining typestate/taint classes (TOCTOU G2, refcount G8, leak K, type-confusion H,
 /// secret side-channel L).** All contract-driven on the general typestate + taint engines.
 #[test]
