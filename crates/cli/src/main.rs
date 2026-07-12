@@ -1361,6 +1361,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             RFence => "read-barrier".to_string(),
             Spawn(c) => format!("spawn {c}"),
             Join => "join".to_string(),
+            Free(x) => format!("free {x}"),
         }
     };
     if !violations.is_empty() {
@@ -1371,6 +1372,16 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             for (thread, event) in &v.schedule {
                 println!("      {thread}: {}", ev(event));
             }
+        }
+    }
+    // Cross-thread use-after-free / double-free (a free concurrent with a use/free elsewhere).
+    let uaf = csolver_verifier::find_cross_thread_uaf(&threads);
+    if !uaf.is_empty() {
+        println!("\n== cross-thread use-after-free / double-free ({}) [bug-finding] ==", uaf.len());
+        for w in &uaf {
+            let kind = if w.double_free { "double-free" } else { "use-after-free" };
+            println!("  {kind} of {} : {} frees it, {} concurrently {}s it (disjoint locks)",
+                w.location, w.threads.0, w.threads.1, if w.double_free { "free" } else { "use" });
         }
     }
     // Weak-memory (SC-robustness) bugs via the operational PSO model (subsystem 4) — subsumes

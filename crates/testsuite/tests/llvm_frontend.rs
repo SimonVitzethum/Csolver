@@ -3465,6 +3465,34 @@ fn iriw_is_a_weak_memory_bug() {
     assert!(good.weak_memory_bugs().is_empty(), "full barriers between the reads fix IRIW");
 }
 
+/// **Cross-thread use-after-free.** One function frees an object (`kfree`) while another
+/// concurrently dereferences it, under *disjoint* locks — nothing orders the free before the
+/// use, so it is a cross-thread UAF. A common lock orders them (no finding).
+#[test]
+fn cross_thread_use_after_free_is_detected() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |la: &str, lb: &str| {
+        let src = format!(
+            "@obj = global ptr null, align 8\n@la = global i32 0\n@lb = global i32 0\n\
+             declare void @spin_lock(ptr)\ndeclare void @spin_unlock(ptr)\ndeclare void @kfree(ptr)\n\
+             define void @freer() {{\n  call void @spin_lock(ptr @{la})\n  \
+               %p = load ptr, ptr @obj, align 8\n  call void @kfree(ptr %p)\n  \
+               call void @spin_unlock(ptr @{la})\n  ret void\n}}\n\
+             define i32 @user() {{\n  call void @spin_lock(ptr @{lb})\n  \
+               %p = load ptr, ptr @obj, align 8\n  %v = load i32, ptr %p, align 4\n  \
+               call void @spin_unlock(ptr @{lb})\n  ret i32 %v\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "u".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // Disjoint locks → cross-thread UAF.
+    let racy = module("la", "lb");
+    assert_eq!(racy.cross_thread_uaf().len(), 1, "a concurrent free vs use under disjoint locks is a UAF");
+    assert!(!racy.cross_thread_uaf()[0].double_free);
+    // Same lock → ordered → no finding.
+    assert!(module("la", "la").cross_thread_uaf().is_empty(), "a common lock orders free vs use");
+}
+
 /// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and
 /// accessed without that lock in another is a candidate race (inconsistent lockset, a write,
 /// two functions). Consistent locking on every access is not flagged (no false positive).

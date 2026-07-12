@@ -3117,6 +3117,7 @@ impl Explorer<'_> {
             }
             Inst::Dealloc { ptr, .. } => {
                 let p = self.eval_pointer(ptr, state);
+                self.record_free_event(ptr, &p, state);
                 self.check_dealloc(block, idx, &p, state);
             }
             Inst::Call { dst, callee, args, ret_ty, ret_ref } => {
@@ -3818,6 +3819,34 @@ impl Explorer<'_> {
         self.race_accesses.insert((class, is_write, lockset));
     }
 
+    /// Record a **free** in the interleaving trace (event kind 10) and as a write in the
+    /// lockset relation — so a concurrent free-vs-use (cross-thread use-after-free) or two
+    /// concurrent frees (cross-thread double-free) are found by the interleaving / data-race
+    /// pass. Only for a shareable object (a global or a param-reached heap object).
+    fn record_free_event(&mut self, ptr: &Operand, p: &SymPointer, state: &PathState) {
+        let shared = match &p.prov {
+            Prov::Region(rid) => {
+                matches!(state.regions.get(*rid).map(|r| r.kind), Some(RegionKind::Global))
+            }
+            Prov::Unknown(_, Some(_)) => true,
+            _ => false,
+        };
+        if !shared {
+            return;
+        }
+        let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, ptr) else {
+            return;
+        };
+        let mut lockset: Vec<String> = state.held_classes.values().cloned().collect();
+        lockset.sort();
+        lockset.dedup();
+        if self.race_trace.len() < RACE_TRACE_CAP {
+            self.race_trace.push((10, class.clone()));
+        }
+        // A free is a write to the object (it invalidates its bytes) — feeds the lockset race.
+        self.race_accesses.insert((class, true, lockset));
+    }
+
     /// The identity a typestate resource operand is keyed by: a pointer handle by its base
     /// object, a scalar (an `fd`) by its symbolic value. `None` for a pointer with no tracked
     /// base (then the resource cannot be named — the transition/obligation is skipped, sound).
@@ -4084,6 +4113,11 @@ impl Explorer<'_> {
         match summary.as_ref().and_then(|s| s.frees_arg) {
             Some(k) => match argvals.get(k).and_then(Self::ptr_base_key) {
                 Some(b) => {
+                    // Cross-thread free/use race (a freeing wrapper call, e.g. `kfree`).
+                    if let (Some(op), Some(SymValue::Ptr(pp))) = (args.get(k), argvals.get(k)) {
+                        let pp = pp.clone();
+                        self.record_free_event(op, &pp, state);
+                    }
                     let dup = state.freed_bases.contains(&b);
                     self.record_temporal((block, idx), SafetyProperty::NoDoubleFree, dup, state, "no double free through freeing calls", "re-frees a pointer an earlier freeing call already freed");
                     state.freed_bases.insert(b);

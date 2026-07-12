@@ -33,8 +33,9 @@ mod wholeprog;
 
 pub use datarace::{detect_races, DataRace, TaggedAccess};
 pub use interleave::{
-    find_atomicity_violations, find_weak_memory_bugs, store_buffer_violations, trace_to_thread,
-    weak_memory_nonrobustness, AtomicityWitness, StoreBufferWitness, Thread, WeakMemoryWitness,
+    find_atomicity_violations, find_cross_thread_uaf, find_weak_memory_bugs,
+    store_buffer_violations, trace_to_thread, weak_memory_nonrobustness, AtomicityWitness,
+    FreeUseWitness, StoreBufferWitness, Thread, WeakMemoryWitness,
 };
 pub use lockorder::{detect_cycles, LockOrderCycle, TaggedEdge};
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};

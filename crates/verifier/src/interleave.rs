@@ -58,6 +58,10 @@ pub enum Event {
     /// events execute after the joined children finish (`pthread_join`/`kthread_stop`). Also a
     /// full barrier.
     Join,
+    /// **Free** the object of the given class (`kfree`/`Dealloc`). A concurrent free-vs-access or
+    /// free-vs-free of the same object (disjoint locksets → not ordered) is a cross-thread
+    /// use-after-free / double-free.
+    Free(String),
 }
 
 /// A thread: a name and its ordered event trace.
@@ -101,6 +105,7 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             7 => Event::Spawn(c.clone()),
             8 => Event::Join,
             9 => Event::DepRead(c.clone()),
+            10 => Event::Free(c.clone()),
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -267,6 +272,91 @@ pub fn store_buffer_violations(threads: &[Thread]) -> Vec<StoreBufferWitness> {
         }
     }
     out.sort_by(|x, y| x.locations.cmp(&y.locations));
+    out
+}
+
+/// A witnessed **cross-thread use-after-free / double-free**: one thread frees an object while
+/// another concurrently accesses (UAF) or frees (double-free) it — their locksets are disjoint,
+/// so nothing orders the free before/after the other operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeUseWitness {
+    /// The freed object's class.
+    pub location: String,
+    /// The threads: the one that frees, and the one that concurrently uses/frees.
+    pub threads: (String, String),
+    /// `true` for a double-free (both free), `false` for a use-after-free.
+    pub double_free: bool,
+}
+
+/// A `(class, lockset)` list — an event's location class and the lock classes held at it.
+type ClassLocksets = Vec<(String, std::collections::BTreeSet<String>)>;
+
+/// Per-thread, the `(class, lockset)` of every free and every access (read/write) — the lockset
+/// being the lock classes held at that event (Acquire/Release tracked along the trace).
+fn free_and_access_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
+    let mut held: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut frees = Vec::new();
+    let mut accesses = Vec::new();
+    for e in &t.events {
+        match e {
+            Event::Acquire(l) => {
+                held.insert(l.clone());
+            }
+            Event::Release(l) => {
+                held.remove(l);
+            }
+            Event::Free(x) => frees.push((x.clone(), held.clone())),
+            Event::Read(x) | Event::DepRead(x) | Event::Write(x) => {
+                accesses.push((x.clone(), held.clone()))
+            }
+            _ => {}
+        }
+    }
+    (frees, accesses)
+}
+
+/// Whole-program **cross-thread use-after-free / double-free** search: a free in one thread and a
+/// concurrent access (UAF) or free (double-free) of the same object in another thread, with
+/// **disjoint locksets** (nothing orders them). Bounded by [`MAX_PAIRS`]. A bug-finding
+/// heuristic — like Eraser it does not model refcounts or ownership that may order them.
+pub fn find_cross_thread_uaf(threads: &[Thread]) -> Vec<FreeUseWitness> {
+    let per: Vec<_> = threads.iter().map(free_and_access_locksets).collect();
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
+    let mut checked = 0usize;
+    for i in 0..threads.len() {
+        for j in 0..threads.len() {
+            if i == j || checked >= MAX_PAIRS {
+                continue;
+            }
+            checked += 1;
+            // A free in `i` vs an access in `j`, disjoint locksets → use-after-free.
+            for (fx, fl) in &per[i].0 {
+                for (ax, al) in &per[j].1 {
+                    if fx == ax && fl.is_disjoint(al) && seen.insert((fx.clone(), false)) {
+                        out.push(FreeUseWitness {
+                            location: fx.clone(),
+                            threads: (threads[i].name.clone(), threads[j].name.clone()),
+                            double_free: false,
+                        });
+                    }
+                }
+                // A free in `i` vs a free in `j` (i<j to avoid the mirror), disjoint → double-free.
+                if i < j {
+                    for (gx, gl) in &per[j].0 {
+                        if fx == gx && fl.is_disjoint(gl) && seen.insert((fx.clone(), true)) {
+                            out.push(FreeUseWitness {
+                                location: fx.clone(),
+                                threads: (threads[i].name.clone(), threads[j].name.clone()),
+                                double_free: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.location.cmp(&b.location));
     out
 }
 
@@ -570,6 +660,9 @@ fn op_reachable(
                         "barrier".into()
                     }
                     Event::RFence => "read-barrier".into(),
+                    // A free carries no value effect for the SC-robustness check (cross-thread
+                    // UAF has its own detector, `find_cross_thread_uaf`).
+                    Event::Free(x) => format!("free {x}"),
                     // Spawn the named child: a happens-before edge (it may now run) with release
                     // semantics — the parent's prior writes are made globally visible first, so
                     // the child observes everything the parent did before the spawn.
@@ -810,7 +903,8 @@ fn dfs(
             // A fence is a no-op for the sequentially-consistent lost-update search (the
             // interleaving is already a total order); it matters only for weak memory. Spawn/join
             // are likewise treated as plain steps here (the SC lost-update pattern is unaffected).
-            Event::Fence | Event::WFence | Event::RFence | Event::Spawn(_) | Event::Join => {}
+            Event::Fence | Event::WFence | Event::RFence | Event::Spawn(_) | Event::Join
+            | Event::Free(_) => {}
             Event::Acquire(l) => child.held[t].push(l.clone()),
             Event::Release(l) => child.held[t].retain(|h| h != l),
             Event::Read(x) | Event::DepRead(x) => {
@@ -927,6 +1021,31 @@ mod tests {
         let t1 = thread("t1", vec![Write("x".into()), Fence, Read("y".into())]);
         let t2 = thread("t2", vec![Write("y".into()), Fence, Read("x".into())]);
         assert!(store_buffer_violations(&[t1, t2]).is_empty(), "a barrier between W and R fixes it");
+    }
+
+    // Cross-thread use-after-free: one thread frees an object while another accesses it, with
+    // disjoint locksets (nothing orders them).
+    #[test]
+    fn cross_thread_use_after_free() {
+        let freer = thread("freer", vec![Acquire("a".into()), Free("obj".into()), Release("a".into())]);
+        let user = thread("user", vec![Acquire("b".into()), Read("obj".into()), Release("b".into())]);
+        let v = find_cross_thread_uaf(&[freer, user]);
+        assert_eq!(v.len(), 1, "a concurrent free vs use is a cross-thread UAF");
+        assert!(!v[0].double_free);
+        // Under a common lock the free and use are ordered → no candidate.
+        let f2 = thread("freer", vec![Acquire("L".into()), Free("obj".into()), Release("L".into())]);
+        let u2 = thread("user", vec![Acquire("L".into()), Read("obj".into()), Release("L".into())]);
+        assert!(find_cross_thread_uaf(&[f2, u2]).is_empty(), "a common lock orders free vs use");
+    }
+
+    // Cross-thread double-free: two threads free the same object with disjoint locksets.
+    #[test]
+    fn cross_thread_double_free() {
+        let a = thread("a", vec![Free("obj".into())]);
+        let b = thread("b", vec![Free("obj".into())]);
+        let v = find_cross_thread_uaf(&[a, b]);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].double_free, "two concurrent frees are a double-free");
     }
 
     // A lock release/acquire is also a full barrier → no store-buffer reordering.

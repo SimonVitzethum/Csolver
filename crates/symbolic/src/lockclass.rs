@@ -64,9 +64,29 @@ pub(crate) fn resolve_lock_classes(f: &Function) -> HashMap<RegId, String> {
         }
     }
 
+    // A pointer *loaded* from a nameable location (`p = load &gp`) names the object it points
+    // to — `deref:<class-of-the-source>` — so a `kfree(p)` in one thread and a `*p` in another
+    // match on the same object (cross-thread use-after-free).
+    let mut deref: HashMap<RegId, String> = HashMap::new();
+    let class_str = |root: &Root, off: i128| match root {
+        Root::Struct(t) => format!("{t}@{off}"),
+        Root::Global(n) => format!("g:{n}@{off}"),
+    };
+
     for bb in &f.blocks {
         for inst in &bb.insts {
             match inst {
+                Inst::Load { dst, ptr, .. } => {
+                    match op_class(&roots, ptr) {
+                        Some((root, off)) => {
+                            deref.insert(*dst, format!("deref:{}", class_str(&root, off)));
+                        }
+                        None => {
+                            deref.remove(dst);
+                        }
+                    }
+                    roots.remove(dst);
+                }
                 // A pointer step: propagate the base's root and add this step's
                 // constant byte contribution, or *establish* a struct root when the
                 // element type is itself a struct (the frontend's struct-field gep).
@@ -110,16 +130,13 @@ pub(crate) fn resolve_lock_classes(f: &Function) -> HashMap<RegId, String> {
         }
     }
 
-    roots
-        .into_iter()
-        .map(|(r, (root, off))| {
-            let s = match root {
-                Root::Struct(t) => format!("{t}@{off}"),
-                Root::Global(n) => format!("g:{n}@{off}"),
-            };
-            (r, s)
-        })
-        .collect()
+    let mut out: HashMap<RegId, String> =
+        roots.into_iter().map(|(r, (root, off))| (r, class_str(&root, off))).collect();
+    // A load-derived (deref) class only fills a register the offset analysis did not classify.
+    for (r, s) in deref {
+        out.entry(r).or_insert(s);
+    }
+    out
 }
 
 /// The lock class of a lock-acquire call's pointer argument, given the

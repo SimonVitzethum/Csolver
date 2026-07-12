@@ -146,6 +146,19 @@ impl ModuleReport {
         crate::interleave::store_buffer_violations(&threads)
     }
 
+    /// Candidate **cross-thread use-after-free / double-free** among this module's functions: a
+    /// free in one thread concurrent (disjoint lockset) with an access or free of the same
+    /// object in another. Reuses the interleaving traces (`Free` events).
+    pub fn cross_thread_uaf(&self) -> Vec<crate::FreeUseWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::find_cross_thread_uaf(&threads)
+    }
+
     /// Candidate **weak-memory (SC-robustness) bugs** among this module's functions (subsystem
     /// 4, full operational model): a pair of functions whose concurrent execution under the PSO
     /// store-buffer model can observe a read outcome no sequentially-consistent execution allows
