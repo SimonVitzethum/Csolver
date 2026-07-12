@@ -297,6 +297,63 @@ b:
         assert!(assigns(&opaque).is_empty(), "an unrecognized template is not decoded");
     }
 
+    /// Full register-dataflow arithmetic: an in-place `add`/`sub`/… on a read-write destination is
+    /// decoded to the corresponding `BinOp` over its incoming value and the source — handling both
+    /// the pre-canonical `+r` form and clang's canonical matching-constraint `=r,0,r` form, and both
+    /// AT&T (`src,dst`) and Intel (`dst,src`) dialects. `neg`/`not` decode to their unary identities.
+    #[test]
+    fn inline_asm_arithmetic_dataflow_is_decoded() {
+        use csolver_ir::{BinOp, Inst, RValue};
+        let binop = |src: &str| -> Option<BinOp> {
+            let m = LlvmFrontend
+                .lower(LlvmInput { source: src.into(), name: "m".into() })
+                .expect("lower");
+            m.functions
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .find_map(|i| match i {
+                    Inst::Assign { value: RValue::Bin { op, .. }, .. } => Some(*op),
+                    _ => None,
+                })
+        };
+        // `+r` form, AT&T: `addl $1, $0` → Add.
+        assert_eq!(
+            binop("define i32 @a(i32 %x, i32 %y) {\nb:\n  %z = call i32 asm \"addl $1, $0\", \"+r,r\"(i32 %x, i32 %y)\n  ret i32 %z\n}\n"),
+            Some(BinOp::Add), "`addl` on a +r destination decodes to Add"
+        );
+        // Canonical matching-constraint form: `subl $2, $0`, `=r,0,r` → Sub (dst is the left operand).
+        assert_eq!(
+            binop("define i32 @s(i32 %x, i32 %y) {\nb:\n  %z = call i32 asm \"subl $2, $0\", \"=r,0,r\"(i32 %x, i32 %y)\n  ret i32 %z\n}\n"),
+            Some(BinOp::Sub), "`subl` in the canonical =r,0,r form decodes to Sub"
+        );
+        // Intel dialect: `and $0, $1` (dst first) → And.
+        assert_eq!(
+            binop("define i32 @n(i32 %x, i32 %y) {\nb:\n  %z = call i32 asm inteldialect \"and $0, $1\", \"+r,r\"(i32 %x, i32 %y)\n  ret i32 %z\n}\n"),
+            Some(BinOp::And), "Intel-dialect `and $0,$1` decodes to And"
+        );
+        // Unary `not $0` (`+r`) → Xor (with all-ones).
+        assert_eq!(
+            binop("define i32 @t(i32 %x) {\nb:\n  %z = call i32 asm \"not $0\", \"+r\"(i32 %x)\n  ret i32 %z\n}\n"),
+            Some(BinOp::Xor), "`not` decodes to Xor with all-ones"
+        );
+        // Shift: `shll $1, $0` → Shl.
+        assert_eq!(
+            binop("define i32 @l(i32 %x, i32 %y) {\nb:\n  %z = call i32 asm \"shll $1, $0\", \"+r,r\"(i32 %x, i32 %y)\n  ret i32 %z\n}\n"),
+            Some(BinOp::Shl), "`shll` decodes to Shl"
+        );
+        // Multi-statement template reducing to one real instruction (a leading nop) is decoded.
+        assert_eq!(
+            binop("define i32 @mm(i32 %x, i32 %y) {\nb:\n  %z = call i32 asm \"nop; addl $1, $0\", \"+r,r\"(i32 %x, i32 %y)\n  ret i32 %z\n}\n"),
+            Some(BinOp::Add), "a `nop; addl` template decodes the single real instruction"
+        );
+        // Two real instructions cannot be tracked → stays opaque (no Bin Assign).
+        assert_eq!(
+            binop("define i32 @mm2(i32 %x, i32 %y) {\nb:\n  %z = call i32 asm \"addl $1, $0; addl $1, $0\", \"+r,r\"(i32 %x, i32 %y)\n  ret i32 %z\n}\n"),
+            None, "a genuinely multi-instruction template stays opaque (sound)"
+        );
+    }
+
     /// An indirect call through a loaded function pointer lowers to `Callee::Indirect`
     /// (carrying the dispatch register), NOT an opaque `Symbol` — the prerequisite for
     /// devirtualization to fire on real LLVM/C code (regression: it used to become

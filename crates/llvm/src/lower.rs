@@ -1694,13 +1694,43 @@ fn emit_asm_semantic(
 ) -> Result<bool> {
     let ty = lower_type(ret);
     let width = type_width(ret);
+    // Resolve an argument index to a width-coerced operand.
+    let arg_op = |ctx: &mut Ctx, j: usize| -> Result<Option<Operand>> {
+        Ok(match args.get(j) {
+            Some(a) => Some(ctx.operand(a, width)?),
+            None => None,
+        })
+    };
     for spec in callee.split('|') {
         let value = if spec == "semZ" {
             RValue::Use(Operand::int(width, 0))
         } else if let Some(j) = spec.strip_prefix("semC").and_then(|n| n.parse::<usize>().ok()) {
-            match args.get(j) {
-                Some(a) => RValue::Use(ctx.operand(a, width)?),
+            match arg_op(ctx, j)? {
+                Some(a) => RValue::Use(a),
                 None => continue,
+            }
+        } else if let Some(rest) = spec.strip_prefix("semB") {
+            // `semB<op>:<jd>:<js>` → args[jd] OP args[js].
+            let mut it = rest.splitn(3, ':');
+            let op = it.next().and_then(|s| s.chars().next());
+            let jd = it.next().and_then(|s| s.parse::<usize>().ok());
+            let js = it.next().and_then(|s| s.parse::<usize>().ok());
+            match (op.and_then(asm_binop), jd, js) {
+                (Some(binop), Some(jd), Some(js)) => match (arg_op(ctx, jd)?, arg_op(ctx, js)?) {
+                    (Some(lhs), Some(rhs)) => RValue::Bin { op: binop, lhs, rhs },
+                    _ => continue,
+                },
+                _ => continue,
+            }
+        } else if let Some(rest) = spec.strip_prefix("semN") {
+            // `semNn:<j>` = neg (0 - x); `semNt:<j>` = not (x ^ all-ones).
+            let mut it = rest.splitn(2, ':');
+            let kind = it.next().and_then(|s| s.chars().next());
+            let j = it.next().and_then(|s| s.parse::<usize>().ok());
+            match (kind, j.and_then(|j| arg_op(ctx, j).transpose())) {
+                (Some('n'), Some(x)) => RValue::Bin { op: BinOp::Sub, lhs: Operand::int(width, 0), rhs: x? },
+                (Some('t'), Some(x)) => RValue::Bin { op: BinOp::Xor, lhs: x?, rhs: Operand::int(width, u128::MAX) },
+                _ => continue,
             }
         } else {
             continue;
@@ -1710,6 +1740,22 @@ fn emit_asm_semantic(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// The `BinOp` for an inline-asm semantic binop code letter (see `asm_binop_code` in the parser).
+fn asm_binop(code: char) -> Option<BinOp> {
+    Some(match code {
+        'a' => BinOp::Add,
+        's' => BinOp::Sub,
+        'n' => BinOp::And,
+        'o' => BinOp::Or,
+        'x' => BinOp::Xor,
+        'l' => BinOp::Shl,
+        'r' => BinOp::LShr,
+        'h' => BinOp::AShr,
+        'm' => BinOp::Mul,
+        _ => return None,
+    })
 }
 
 fn emit_inline_asm_mem_ops(
