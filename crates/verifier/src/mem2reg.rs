@@ -26,7 +26,9 @@
 //! could not prove before, it still cannot prove after.
 
 use csolver_cfg::{Cfg, Dominators};
-use csolver_ir::{Const, Function, Inst, Module, Operand, RValue, RegId, Terminator, Type};
+use csolver_ir::{
+    BasicBlock, BlockId, Const, Function, Inst, Module, Operand, RValue, RegId, Terminator, Type,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Promote eligible scalar slots in every function of the module to SSA.
@@ -66,7 +68,65 @@ fn term_mentions(term: &Terminator, a: RegId) -> bool {
     found
 }
 
+/// Redirect one `switch` target through a fresh single-predecessor `Br` block iff the
+/// target has more than one predecessor (a *critical* edge). Reuses one split block per
+/// distinct target within the same switch.
+fn redirect_switch_target(
+    t: &mut BlockId,
+    pred_count: &std::collections::HashMap<BlockId, usize>,
+    splits: &mut std::collections::HashMap<BlockId, BlockId>,
+    new_blocks: &mut Vec<BasicBlock>,
+    next_id: &mut u32,
+) {
+    if pred_count.get(t).copied().unwrap_or(0) <= 1 {
+        return;
+    }
+    let sid = *splits.entry(*t).or_insert_with(|| {
+        let id = BlockId(*next_id);
+        *next_id += 1;
+        new_blocks.push(BasicBlock::new(id, Terminator::Br { target: *t, args: Vec::new() }));
+        id
+    });
+    *t = sid;
+}
+
+/// Split every critical edge out of a `switch` — an edge to a block with more than one
+/// predecessor — by inserting a fresh single-predecessor `Br` block on it. MSIR `Switch`
+/// carries no per-target arguments, so mem2reg cannot place a PHI argument on a switch
+/// edge; the `Br` on the split block can. Semantics-preserving (an unconditional jump to
+/// the original target), and the executor already handles the extra `Br` blocks.
+fn split_critical_switch_edges(f: &mut Function) {
+    use std::collections::{HashMap, HashSet};
+    let mut pred_count: HashMap<BlockId, usize> = HashMap::new();
+    for b in &f.blocks {
+        // Count distinct predecessor *blocks* (two switch cases to the same target are one
+        // predecessor), matching how the CFG counts predecessors.
+        for s in b.term.successors().into_iter().collect::<HashSet<_>>() {
+            *pred_count.entry(s).or_default() += 1;
+        }
+    }
+    let mut next_id = f.blocks.iter().map(|b| b.id.0).max().map_or(0, |m| m + 1);
+    let mut new_blocks: Vec<BasicBlock> = Vec::new();
+    for b in &mut f.blocks {
+        let Terminator::Switch { cases, default, .. } = &mut b.term else { continue };
+        let mut splits: HashMap<BlockId, BlockId> = HashMap::new();
+        for (_, t) in cases.iter_mut() {
+            redirect_switch_target(t, &pred_count, &mut splits, &mut new_blocks, &mut next_id);
+        }
+        redirect_switch_target(default, &pred_count, &mut splits, &mut new_blocks, &mut next_id);
+    }
+    f.blocks.extend(new_blocks);
+}
+
 fn promote_function(f: &mut Function) {
+    // 0. Split critical edges out of `switch`es. MSIR `Switch` carries no per-target
+    //    arguments, so a PHI a promotion needs at a block reachable through a switch edge
+    //    cannot get its argument on that edge — the slot would be dropped (unpromoted),
+    //    which is exactly what left the crypto worker's request-pointer slot spilled and
+    //    broke provenance across the switch. Inserting a single-predecessor `Br` block on
+    //    each such edge lets the PHI argument ride the `Br` (which does carry args).
+    split_critical_switch_edges(f);
+
     // 1. Candidate slots: a single-element scalar `alloca` whose pointer is used
     //    only as the address of a matching-width load/store.
     let mut slots: BTreeMap<RegId, Slot> = BTreeMap::new();
