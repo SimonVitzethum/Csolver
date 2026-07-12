@@ -2245,6 +2245,44 @@ impl Explorer<'_> {
         v
     }
 
+    /// The **cone of influence** of `goal` within `all`: the assumptions transitively reachable
+    /// from `goal`'s variables by shared variables (fixpoint). The result is sorted and deduplicated
+    /// (a canonical, path-independent key for the prove-cache). A constant goal has no variables, so
+    /// no assumption is relevant. See `prove` for why this preserves the entailment on live paths.
+    fn relevant_assumptions(&mut self, goal: ExprId, all: &[ExprId]) -> Vec<ExprId> {
+        let gvars = self.syms(goal);
+        if gvars.is_empty() || all.is_empty() {
+            return Vec::new();
+        }
+        let avars: Vec<std::rc::Rc<[ExprId]>> = all.iter().map(|a| self.syms(*a)).collect();
+        let mut cone: std::collections::BTreeSet<ExprId> = gvars.iter().copied().collect();
+        let mut kept = vec![false; all.len()];
+        loop {
+            let mut changed = false;
+            for i in 0..all.len() {
+                if kept[i] {
+                    continue;
+                }
+                if avars[i].iter().any(|v| cone.contains(v)) {
+                    kept[i] = true;
+                    cone.extend(avars[i].iter().copied());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut out: Vec<ExprId> = all
+            .iter()
+            .zip(kept)
+            .filter_map(|(a, k)| k.then_some(*a))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Whether the edge `from -> to` is a loop back-edge (cut during
     /// exploration). A back-edge targets a loop header that dominates its
     /// source.
@@ -5095,8 +5133,20 @@ impl Explorer<'_> {
     /// to the linear-integer model is `linear-no-overflow` recorded — so a goal
     /// decided bit-precisely yields a `PASS` with one fewer assumption.
     fn prove(&mut self, goal: ExprId, state: &PathState) -> bool {
-        let mut assumptions = state.pathcond.clone();
-        assumptions.extend_from_slice(&state.facts);
+        // **Relevance (cone-of-influence) filter.** Only a path-condition assumption transitively
+        // sharing a variable with `goal` can affect the entailment `assumptions ⊨ goal`; a
+        // disconnected (and, on a live path, satisfiable) assumption cannot change whether `goal`
+        // follows. Keeping only the cone shrinks the query and — by dropping path-specific
+        // irrelevant guards — raises the prove-cache hit rate (the same goal now shares one entry
+        // across paths that differ only in irrelevant guards). Exact on satisfiable paths; on a
+        // contradictory (dead) path it may drop a *vacuous* proof to UNKNOWN — sound (unreachable).
+        let all: Vec<ExprId> = state
+            .pathcond
+            .iter()
+            .chain(state.facts.iter())
+            .copied()
+            .collect();
+        let assumptions = self.relevant_assumptions(goal, &all);
         let key = (assumptions.clone().into_boxed_slice(), goal);
         let method = match self.prove_cache.get(&key) {
             Some(m) => *m,

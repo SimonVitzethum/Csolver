@@ -162,6 +162,34 @@ mod tests {
         );
     }
 
+    /// Exactness anchor for the executor's `prove` cone-of-influence filter: a **transitively
+    /// connected** chain of assumptions must be kept, while a fully **disconnected** assumption can
+    /// be dropped without changing the entailment. `{a<b, b<c} ⊨ a<c` needs both links; adding a
+    /// disconnected `x<y` changes nothing, and dropping it (the filter) preserves the proof.
+    #[test]
+    fn cone_of_influence_keeps_chain_drops_disconnected() {
+        let mut c = ExprCtx::new();
+        let a = c.symbol("a", 32);
+        let b = c.symbol("b", 32);
+        let d = c.symbol("d", 32); // "c" name avoided (shadow); the chain's third link
+        let x = c.symbol("x", 32);
+        let y = c.symbol("y", 32);
+        let ab = c.cmp(CmpOp::Ult, a, b);
+        let bd = c.cmp(CmpOp::Ult, b, d);
+        let xy = c.cmp(CmpOp::Ult, x, y); // disconnected from the goal's variables {a, d}
+        let goal = c.cmp(CmpOp::Ult, a, d);
+        // The transitive chain proves it; the disconnected assumption is irrelevant either way.
+        assert!(prove_implies(&c, &[ab, bd], goal), "the a<b<d chain proves a<d");
+        assert_eq!(
+            prove_implies(&c, &[ab, bd, xy], goal),
+            prove_implies(&c, &[ab, bd], goal),
+            "a disconnected assumption does not change the entailment (safe to drop)"
+        );
+        // Dropping a *needed* link would lose the proof — so the cone must keep transitively
+        // connected assumptions, not just those directly touching the goal.
+        assert!(!prove_implies(&c, &[ab, xy], goal), "without b<d the chain is broken");
+    }
+
     #[test]
     fn proves_guarded_index_without_overflow_assumption() {
         // {0 <=u i, i <u len} ⟹ i <u len  — purely bit-precise.
