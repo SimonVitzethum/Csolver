@@ -203,6 +203,23 @@ impl ModuleReport {
         crate::interleave::find_cross_entry_uaf(&threads)
     }
 
+    /// Candidate **cross-entry (cross-syscall) typestate violations**: an object driven into a
+    /// forbidden protocol state (`closed`/`freed`) via a shared global root in one entry and used
+    /// (with a `require-not` of that state) in another, independently reachable entry — the
+    /// use-after-close/free analogue of [`Self::cross_entry_uaf`] across separate syscalls.
+    pub fn cross_entry_typestate(
+        &self,
+        is_entry: impl Fn(&str) -> bool,
+    ) -> Vec<crate::interleave::CrossEntryTypestateWitness> {
+        let threads: Vec<crate::Thread> = self
+            .functions
+            .iter()
+            .filter(|f| is_entry(&f.function) && !f.race_trace.is_empty())
+            .map(|f| crate::trace_to_thread(&f.function, &f.race_trace))
+            .collect();
+        crate::interleave::find_cross_entry_typestate(&threads)
+    }
+
     /// Candidate **weak-memory (SC-robustness) bugs** among this module's functions (subsystem
     /// 4, full operational model): a pair of functions whose concurrent execution under the PSO
     /// store-buffer model can observe a read outcome no sequentially-consistent execution allows

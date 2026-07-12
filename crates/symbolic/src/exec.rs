@@ -3284,6 +3284,10 @@ impl Explorer<'_> {
                 if let Some(key) = self.res_key(val, state) {
                     state.typestates.insert((key, *protocol), *st);
                 }
+                // Cross-entry (cross-syscall) stream: a typestate transition on a global-rooted
+                // object persists between independent syscall entries (kind 14, `set`). Paired with
+                // a `require-not` of the same state in another entry → cross-entry use-after-state.
+                self.record_global_typestate(0, val, *protocol, *st);
             }
             // Typestate obligation: the resource must (not) be in `state`. A definite match
             // to the forbidden state on this path is refuted (use-after-close, missing-check).
@@ -3305,6 +3309,9 @@ impl Explorer<'_> {
                     "the resource is in a protocol state this operation allows",
                     "the resource is used in a state its protocol forbids (use-after-close / missing-check)",
                 );
+                // Cross-entry stream: a `require`(-not) on a global-rooted object (kind 14, `req`/
+                // `reqnot`) — the "use" side of a cross-syscall use-after-state.
+                self.record_global_typestate(if *negate { 2 } else { 1 }, val, *protocol, *st);
             }
             // Protocol-wide yield (TOCTOU): every resource of `protocol` in state `from`
             // moves to `to` — a `check` invalidated by an intervening yield.
@@ -3913,6 +3920,28 @@ impl Explorer<'_> {
         }
         // A free is a write to the object (it invalidates its bytes) — feeds the lockset race.
         self.race_accesses.insert((class, true, lockset));
+    }
+
+    /// Record a **typestate transition/requirement on a global-rooted object** in the interleaving
+    /// trace (kind 14) for the cross-entry (cross-syscall) analysis. `k`: 0 = set, 1 = require, 2 =
+    /// require-not. Only a global-rooted resource (`g:…` / `deref:…g:…`) is streamed — that is the
+    /// only state that persists between independent syscall entries; a parameter-local resource is
+    /// skipped. The payload encodes `k`, the class, and the interned protocol/state ids, unit-
+    /// separated, for `find_cross_entry_typestate` to parse.
+    fn record_global_typestate(&mut self, k: u8, val: &Operand, protocol: u32, st: u32) {
+        if self.race_trace.len() >= RACE_TRACE_CAP {
+            return;
+        }
+        let Some(class) = crate::lockclass::lock_class_of_arg(&self.lock_classes, val) else {
+            return;
+        };
+        // Global-rooted only: `g:name@off` or any `deref:` chased from one.
+        let core = class.trim_start_matches("deref:");
+        if !core.starts_with("g:") {
+            return;
+        }
+        self.race_trace
+            .push((14, format!("{k}\u{1f}{class}\u{1f}{protocol}\u{1f}{st}")));
     }
 
     /// The identity a typestate resource operand is keyed by: a pointer handle by its base

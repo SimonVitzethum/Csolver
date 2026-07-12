@@ -3664,6 +3664,29 @@ fn cross_entry_syscall_use_after_free_is_detected() {
     );
 }
 
+/// **Cross-syscall use-after-close (typestate).** One entry (`sys_close`) closes the stream held by
+/// a global (`fclose`), another entry (`sys_use`) operates on it (`fflush`, which forbids a closed
+/// handle) — both reaching it through the same global root. Invoking close then use is a
+/// use-after-close *across separate syscalls*: the typestate persists on the global handle, which
+/// the per-function and interprocedural (call-graph) analyses cannot see (there is no call edge).
+#[test]
+fn cross_entry_use_after_close_typestate_is_detected() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let src = "\
+        @stream = global ptr null, align 8\n\
+        declare i32 @fclose(ptr)\ndeclare i32 @fflush(ptr)\n\
+        define void @sys_close() {\n\
+          %p = load ptr, ptr @stream, align 8\n  %r = call i32 @fclose(ptr %p)\n  ret void\n}\n\
+        define void @sys_use() {\n\
+          %p = load ptr, ptr @stream, align 8\n  %r = call i32 @fflush(ptr %p)\n  ret void\n}\n";
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "cs".into() }).expect("lower");
+    let ts = verify_module(&m, &cfg).cross_entry_typestate(|n| n.starts_with("sys_"));
+    assert!(
+        ts.iter().any(|w| w.location.contains("g:stream") && w.entries.0 == "sys_close"),
+        "close-then-use across entries on a shared global stream is a cross-syscall use-after-close: {ts:?}"
+    );
+}
+
 /// **Deferred reclamation beyond RCU.** Hazard pointers and epoch-based reclamation share RCU's
 /// shape: an object retired/protected for lock-free readers must not be plain-`kfree`d until the
 /// safe point (a hazard scan / epoch advance). The same `reclaim` typestate that guards RCU guards

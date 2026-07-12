@@ -75,6 +75,11 @@ pub enum Event {
     /// drop the last reference and free. Concurrent with an unchecked [`Event::RefGet`] it is a
     /// refcount race.
     RefPut(String),
+    /// A **typestate transition/requirement on a global-rooted object** (for the cross-entry /
+    /// cross-syscall analysis). The payload is `k\u{1f}class\u{1f}proto\u{1f}state`, `k` ∈ {0=set,
+    /// 1=require, 2=require-not}. A `set` of a state in one entry paired with a `require-not` of it
+    /// in another is a cross-syscall use-after-state. Inert for every other check.
+    Typestate(String),
 }
 
 /// A thread: a name and its ordered event trace.
@@ -122,6 +127,7 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             11 => Event::Cas(c.clone()),
             12 => Event::RefGet(c.clone()),
             13 => Event::RefPut(c.clone()),
+            14 => Event::Typestate(c.clone()),
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -443,6 +449,14 @@ pub fn find_cross_entry_uaf(entries: &[Thread]) -> Vec<CrossEntryWitness> {
                     Event::Read(x) | Event::DepRead(x) if is_global_rooted(x) => {
                         uses.insert(x.clone());
                     }
+                    // A refcount put on a global object is a *release* — it may drop the last
+                    // reference and free it — so it composes across entries exactly like a free
+                    // (a later use or a second put in another entry is a UAF / double-put). An
+                    // unchecked get is a use of the object.
+                    Event::RefPut(x) if is_global_rooted(x) => frees.push(x.clone()),
+                    Event::RefGet(x) if is_global_rooted(x) => {
+                        uses.insert(x.clone());
+                    }
                     _ => {}
                 }
             }
@@ -477,6 +491,86 @@ pub fn find_cross_entry_uaf(entries: &[Thread]) -> Vec<CrossEntryWitness> {
                         location: fx.clone(),
                         entries: (entries[i].name.clone(), entries[j].name.clone()),
                         double_free: true,
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.location.cmp(&b.location));
+    out
+}
+
+/// A witnessed **cross-entry (cross-syscall) typestate violation**: one entry drives a global-
+/// rooted object into a protocol state (e.g. `closed`/`freed`) and another, independently reachable
+/// entry uses it while forbidding that state (a `require-not`). Invoking the first syscall then the
+/// second is a use-after-close / use-after-free across the object's persistent global handle — the
+/// typestate analogue of [`CrossEntryWitness`], carrying the full protocol/state provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossEntryTypestateWitness {
+    /// The global-rooted object's class.
+    pub location: String,
+    /// The interned protocol id (shared module-wide, so it matches across entries).
+    pub protocol: u32,
+    /// The interned forbidden-state id.
+    pub state: u32,
+    /// The entries: the one that sets the forbidden state, and the one that uses it.
+    pub entries: (String, String),
+}
+
+/// Parse a `Typestate` event payload `k\u{1f}class\u{1f}proto\u{1f}state` → `(k, class, proto,
+/// state)`. `None` on a malformed payload.
+fn parse_typestate(payload: &str) -> Option<(u8, &str, u32, u32)> {
+    let mut it = payload.split('\u{1f}');
+    let k: u8 = it.next()?.parse().ok()?;
+    let class = it.next()?;
+    let proto: u32 = it.next()?.parse().ok()?;
+    let state: u32 = it.next()?.parse().ok()?;
+    Some((k, class, proto, state))
+}
+
+/// Whole-program **cross-entry typestate** search: a `set` of a `(global-object, protocol, state)`
+/// in one entry paired with a `require-not` of the same triple in a *different* entry — invoking the
+/// setter then the user is a cross-syscall use-after-state (use-after-close / use-after-free on the
+/// object's persistent global handle). Restricted to global-rooted objects (streamed as such), so a
+/// parameter-local resource never fires. Bounded by [`MAX_PAIRS`]. A bug-finding heuristic — it does
+/// not model an ordering guard (a re-open/re-check) the second syscall might perform.
+pub fn find_cross_entry_typestate(entries: &[Thread]) -> Vec<CrossEntryTypestateWitness> {
+    // Per entry: the (class, proto, state) it sets, and the ones it requires-not (the use side).
+    type Triple = (String, u32, u32);
+    let (sets, reqnots): (Vec<Vec<Triple>>, Vec<Vec<Triple>>) = entries
+        .iter()
+        .map(|t| {
+            let (mut s, mut r) = (Vec::new(), Vec::new());
+            for e in &t.events {
+                if let Event::Typestate(p) = e {
+                    if let Some((k, class, proto, state)) = parse_typestate(p) {
+                        match k {
+                            0 => s.push((class.to_string(), proto, state)),
+                            2 => r.push((class.to_string(), proto, state)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (s, r)
+        })
+        .unzip();
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<Triple> = std::collections::HashSet::new();
+    let mut checked = 0usize;
+    for i in 0..entries.len() {
+        for j in 0..entries.len() {
+            if i == j || checked >= MAX_PAIRS {
+                continue;
+            }
+            checked += 1;
+            for set in &sets[i] {
+                if reqnots[j].contains(set) && seen.insert(set.clone()) {
+                    out.push(CrossEntryTypestateWitness {
+                        location: set.0.clone(),
+                        protocol: set.1,
+                        state: set.2,
+                        entries: (entries[i].name.clone(), entries[j].name.clone()),
                     });
                 }
             }
@@ -923,6 +1017,9 @@ fn op_reachable(
                     // concurrent-refcount race has its own detector, `find_refcount_races`).
                     Event::RefGet(x) => format!("ref-get {x}"),
                     Event::RefPut(x) => format!("ref-put {x}"),
+                    // A cross-entry typestate marker carries no value effect for the SC search;
+                    // it is consumed as a plain step (it has its own detector).
+                    Event::Typestate(_) => "typestate".into(),
                     // Spawn the named child: a happens-before edge (it may now run) with release
                     // semantics — the parent's prior writes are made globally visible first, so
                     // the child observes everything the parent did before the spawn.
@@ -1165,7 +1262,7 @@ fn dfs(
             // interleaving is already a total order); it matters only for weak memory. Spawn/join
             // are likewise treated as plain steps here (the SC lost-update pattern is unaffected).
             Event::Fence | Event::WFence | Event::RFence | Event::Spawn(_) | Event::Join
-| Event::Free(_) | Event::Cas(_) | Event::RefGet(_) | Event::RefPut(_) => {}
+| Event::Free(_) | Event::Cas(_) | Event::RefGet(_) | Event::RefPut(_) | Event::Typestate(_) => {}
             Event::Acquire(l) => child.held[t].push(l.clone()),
             Event::Release(l) => child.held[t].retain(|h| h != l),
             Event::Read(x) | Event::DepRead(x) => {

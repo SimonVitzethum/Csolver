@@ -1366,6 +1366,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             Cas(x) => format!("cas {x}"),
             RefGet(x) => format!("ref-get {x}"),
             RefPut(x) => format!("ref-put {x}"),
+            Typestate(_) => "typestate".to_string(),
         }
     };
     if !violations.is_empty() {
@@ -1399,6 +1400,18 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             let kind = if w.double_free { "double-free" } else { "use-after-free" };
             println!("  {kind} of {} : entry {} frees it (root left dangling), entry {} later {}s it",
                 w.location, w.entries.0, w.entries.1, if w.double_free { "free" } else { "use" });
+        }
+    }
+    // Cross-entry (cross-syscall) typestate use-after-state: a global object set to a forbidden
+    // state in one entry and used with `require-not` of it in another, independently reachable one.
+    let cross_ts = csolver_verifier::find_cross_entry_typestate(&threads);
+    if !cross_ts.is_empty() {
+        println!("\n== cross-entry (cross-syscall) typestate use-after-state ({}) [bug-finding] ==",
+            cross_ts.len());
+        for w in &cross_ts {
+            println!("  object: {} — entry {} drives it into a forbidden state, entry {} then uses it \
+                (use-after-close / use-after-free across syscalls)",
+                w.location, w.entries.0, w.entries.1);
         }
     }
     // Concurrent refcount race: an unchecked get concurrent with a put of the same object.
