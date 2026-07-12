@@ -3538,6 +3538,35 @@ fn interprocedural_refcount_underflow() {
     );
 }
 
+/// **RCU grace-period violation.** An object published to RCU readers (`rcu_assign_pointer`)
+/// must not be freed with a plain `kfree` until a grace period elapses (`synchronize_rcu`) —
+/// else a concurrent reader dereferences freed memory. A publish-then-free without the grace
+/// period is refused; with `synchronize_rcu` between them it is not.
+#[test]
+fn rcu_grace_period_violation_is_refused() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let verdict = |body: &str| -> Verdict {
+        let src = format!(
+            "@gp = global ptr null, align 8\ndeclare void @rcu_assign_pointer(ptr, ptr)\n\
+             declare void @synchronize_rcu()\ndeclare void @kfree(ptr)\n\
+             define void @f(ptr %old) {{\n{body}  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "r".into() }).expect("lower");
+        verify_module(&m, &cfg).verdict
+    };
+    // Publish then free without a grace period → violation.
+    assert_eq!(
+        verdict("  call void @rcu_assign_pointer(ptr @gp, ptr %old)\n  call void @kfree(ptr %old)\n"),
+        Verdict::Fail, "freeing a still-published RCU object without a grace period is a violation"
+    );
+    // Publish, synchronize_rcu, then free → the grace period makes it safe.
+    assert_ne!(
+        verdict("  call void @rcu_assign_pointer(ptr @gp, ptr %old)\n  \
+                   call void @synchronize_rcu()\n  call void @kfree(ptr %old)\n"),
+        Verdict::Fail, "a grace period before the free is safe"
+    );
+}
+
 /// **Cross-thread use-after-free.** One function frees an object (`kfree`) while another
 /// concurrently dereferences it, under *disjoint* locks — nothing orders the free before the
 /// use, so it is a cross-thread UAF. A common lock orders them (no finding).

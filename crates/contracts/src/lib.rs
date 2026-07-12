@@ -674,6 +674,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("barrier.contract", include_str!("../data/barrier.contract")),
     ("thread.contract", include_str!("../data/thread.contract")),
     ("lifetime.contract", include_str!("../data/lifetime.contract")),
+    ("rcu.contract", include_str!("../data/rcu.contract")),
 ];
 
 #[cfg(test)]
@@ -691,7 +692,14 @@ mod tests {
         );
         assert_eq!(c.lookup("reallocarray").and_then(|c| c.alloc()), Some((&SizeExpr::Product(1, 2), 16)));
         // Deallocators (formerly `dealloc_ptr_arg`).
-        assert_eq!(c.lookup("kfree").unwrap().effects, vec![Effect::Free { ptr: 0 }]);
+        assert_eq!(
+            c.lookup("kfree").unwrap().effects,
+            vec![
+                Effect::Free { ptr: 0 },
+                // RCU grace-period guard (rcu.contract): a plain free of a still-published object.
+                Effect::TypestateRequire { arg: 0, protocol: "rcu".into(), state: "published".into(), negate: true },
+            ]
+        );
         assert_eq!(c.lookup("kmem_cache_free").unwrap().effects, vec![Effect::Free { ptr: 1 }]);
         // User-copies (formerly `user_copy_kernel_arg`).
         assert_eq!(
