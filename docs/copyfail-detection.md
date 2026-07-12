@@ -177,6 +177,28 @@ and validated on a positive/negative pair, but it is the right level: no aliasin
 feature closes it, because the main-crypto aliasing the previous gate checked is genuinely
 absent here.
 
+## Update 2026-07-12 (3) — AAD-copy sink contract added (the correct sink)
+
+Confirmed on the vulnerable `-O1` IR that the CVE sink is
+`crypto_aead_copy_sgl(null_tfm, src=TX-sgl, dst=RX-sgl, len)` — the associated-data
+copy writes the RX scatterlist, which may hold a `foreign` page. Added a contract
+`[crypto_aead_copy_sgl] require arg2 write`: a `foreign` destination provably lacks
+`write` → refused; a non-foreign (patched out-of-place) destination does not fire.
+**Validated sound**: a synthetic AAD copy into a `foreign` dst is refused, into a
+writable dst is not (regression test `aad_copy_to_foreign_destination_is_refused`);
+all differentials SOUND.
+
+**Remaining real-IR gap (single, well-scoped):** on the real `-O1` module the contract
+does not yet fire because the `foreign` label does not reach `dst`. Traced precisely:
+10 objects *are* labelled `foreign` (propagation works), but `dst` is loaded off the
+areq through a **reloaded stack slot** (`%areq`) whose value identity is lost across the
+many intervening calls — `%42` (labelled by `af_alg_get_rsgl`) and `%92` (the dst's base)
+become distinct opaque ids. The fix is **mem2reg promotion of the multi-block `%areq`
+pointer slot** so all its loads are one SSA value (the label then flows through the gep
+chain via taint-on-read). That is a general SSA-promotion improvement, soundness-checked
+by the existing determinism oracle — the last piece to make Copy-Fail fire end-to-end on
+real optimized kernel IR.
+
 ## Validation (soundness-first, mandatory)
 
 Extend the **C differential oracle** with positive controls for the write-capability

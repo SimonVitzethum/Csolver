@@ -3118,6 +3118,41 @@ entry:
         "a distinct dst (patched out-of-place) does not fire — no false FAIL");
 }
 
+/// **The AAD-copy sink (CVE-2026-31431).** The Copy-Fail bug is the in-place copy of the
+/// *associated data*: `crypto_aead_copy_sgl(null_tfm, src, dst, len)` writes `dst`, which
+/// in the vulnerable build is the socket's RX scatterlist and may hold a `foreign`
+/// (read-only, spliced-in) page. The contract requires `dst` (arg2) to grant `write`; a
+/// `foreign` dst provably lacks it → refused. A non-foreign dst (the patched out-of-place
+/// copy, into a fresh writable buffer) does not fire — no false FAIL.
+#[test]
+fn aad_copy_to_foreign_destination_is_refused() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // Vulnerable: the dst was labelled `foreign` (a page spliced in) → refused.
+    let vuln = r#"
+declare void @af_alg_sendpage(ptr, ptr)
+declare i32 @crypto_aead_copy_sgl(ptr, ptr, ptr, i32)
+define void @f(ptr %sk, ptr %tfm, ptr %src, ptr %dst) {
+  call void @af_alg_sendpage(ptr %sk, ptr %dst)
+  %r = call i32 @crypto_aead_copy_sgl(ptr %tfm, ptr %src, ptr %dst, i32 16)
+  ret void
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: vuln.into(), name: "v".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "AAD copy into a foreign destination is refused (Copy-Fail)");
+    // Control: an unlabelled (writable) dst — the patched out-of-place copy — does not fire.
+    let ok = r#"
+declare i32 @crypto_aead_copy_sgl(ptr, ptr, ptr, i32)
+define void @f(ptr %tfm, ptr %src, ptr %dst) {
+  %r = call i32 @crypto_aead_copy_sgl(ptr %tfm, ptr %src, ptr %dst, i32 16)
+  ret void
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ok.into(), name: "o".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "AAD copy into a non-foreign destination does not fire — no false FAIL");
+}
+
 /// **`dereferenceable(N)` sizes a global authoritatively.** A call-site
 /// `dereferenceable(N)` on a bare `@g` operand is clang's byte-size guarantee for the
 /// global (derived from its type), so it corrects a size our own type-layout computation

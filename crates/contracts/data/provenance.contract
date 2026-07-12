@@ -32,8 +32,16 @@ propagate arg0 from arg2
 #   crypto_aead_{encrypt,decrypt}(req)         performs the write → the request's destination
 #                                              must grant `write`. A foreign page that reached
 #                                              it (via the propagations above) is refused.
+# crypto_aead_copy_sgl(null_tfm, src, dst, len) copies the associated data (AAD) from the
+# TX scatterlist (arg1) into the request's RX scatterlist (arg2) using the NULL cipher. In
+# the VULNERABLE build this dst is the socket's RX sgl, which may hold a `foreign`
+# (read-only, spliced-in) page — so the copy WRITES a page it may not own: CVE-2026-31431.
+# Require the destination to grant `write`; a `foreign` dst provably lacks it → refused.
+# The patched build copies the AAD out-of-place into a fresh writable buffer (not the RX
+# sgl), whose dst is not `foreign`, so this never fires there — no false FAIL.
 [crypto_aead_copy_sgl]
 propagate arg2 from arg1
+require arg2 write
 
 [aead_request_set_crypt]
 propagate arg0 from arg2
