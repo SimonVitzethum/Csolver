@@ -255,20 +255,31 @@ pub struct WeakMemoryWitness {
 /// loss, never a false witness).
 const MAX_OP_STATES: u64 = 400_000;
 
-/// The operational state: per-thread **per-event consumed** flags (so reads can be taken out of
-/// program order — ARM-style read reordering — while non-reads and barriers stay ordered),
-/// per-thread **per-location** FIFO store buffers (PSO — each location's buffer drains
-/// independently, so writes to *different* locations may become visible out of order), shared
-/// memory (location → value tag), locks held, and the read observations so far.
+/// An in-flight write that has left its writer's store buffer and is **propagating** to the
+/// other threads' memory views one at a time (non-multi-copy-atomicity — a store reaches
+/// different CPUs at different times, which is what makes >2-thread litmus like IRIW possible).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Pending {
+    writer: usize,
+    loc: String,
+    tag: u32,
+    // delivered[thread] = whether this write has reached that thread's view yet.
+    delivered: Vec<bool>,
+}
+
+/// The operational state. `consumed` gives per-event execution (reads may reorder — ARM R→R);
+/// `bufs` are per-thread per-location FIFO store buffers (PSO W→W reordering); **`views` are
+/// per-thread memory views** and `pending` the in-flight writes still propagating between them
+/// (non-multi-copy-atomicity — enables IRIW/WRC across >2 threads). `held`/`obs` as before.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct OpState {
-    // consumed[thread][event_index] = whether that event has executed.
     consumed: Vec<Vec<bool>>,
-    // buffer[thread][location] = FIFO of value tags not yet flushed to memory.
     bufs: Vec<std::collections::BTreeMap<String, Vec<u32>>>,
-    mem: std::collections::BTreeMap<String, u32>,
+    // views[thread][location] = the value tag that thread currently observes.
+    views: Vec<std::collections::BTreeMap<String, u32>>,
+    // Writes still propagating to other threads' views (weak only).
+    pending: Vec<Pending>,
     held: Vec<Vec<String>>,
-    // read-event global id -> observed value tag.
     obs: std::collections::BTreeMap<u32, u32>,
 }
 
@@ -335,20 +346,34 @@ impl<'a> OpProgram<'a> {
 }
 
 /// The value thread `t` reads for location `x` in `st`: the latest entry in its own store
-/// buffer for `x` (store-to-load forwarding), else the value in memory (0 = initial).
+/// buffer for `x` (store-to-load forwarding), else the value in its own memory view (0 = init).
 fn op_read(st: &OpState, t: usize, x: &str) -> u32 {
     if let Some(buf) = st.bufs[t].get(x) {
         if let Some(&v) = buf.last() {
             return v;
         }
     }
-    st.mem.get(x).copied().unwrap_or(0)
+    st.views[t].get(x).copied().unwrap_or(0)
 }
 
 /// Whether all of thread `t`'s store buffers are empty (needed before a full/write barrier or a
 /// lock op may execute — those drain the buffers).
 fn bufs_empty(st: &OpState, t: usize) -> bool {
     st.bufs[t].values().all(|b| b.is_empty())
+}
+
+/// Whether thread `t` has any write still propagating to other threads' views. A full/write
+/// barrier and a lock op block until this is clear — a conservative full sync that makes the
+/// thread's prior writes globally visible (so a barrier restores multi-copy atomicity).
+fn no_pending_from(st: &OpState, t: usize) -> bool {
+    st.pending.iter().all(|p| p.writer != t)
+}
+
+/// Whether every in-flight write has already reached thread `t`'s view. A **full** barrier
+/// additionally blocks on this, so after it `t`'s view is globally up to date — which is what
+/// makes a full barrier between the two reads fix IRIW (the reader gets a consistent view).
+fn no_pending_to(st: &OpState, t: usize) -> bool {
+    st.pending.iter().all(|p| p.delivered[t])
 }
 
 /// Explore the reachable **terminal read-observations** of the program under the operational
@@ -363,7 +388,8 @@ fn op_reachable(
     let init = OpState {
         consumed: prog.threads.iter().map(|t| vec![false; t.events.len()]).collect(),
         bufs: vec![std::collections::BTreeMap::new(); n],
-        mem: std::collections::BTreeMap::new(),
+        views: vec![std::collections::BTreeMap::new(); n],
+        pending: Vec::new(),
         held: vec![Vec::new(); n],
         obs: std::collections::BTreeMap::new(),
     };
@@ -379,28 +405,55 @@ fn op_reachable(
         if !visited.insert(st.clone()) {
             continue;
         }
-        // Terminal: every event executed and all buffers drained.
-        let done = (0..n).all(|t| st.consumed[t].iter().all(|&c| c) && bufs_empty(&st, t));
+        // Terminal: every event executed, all buffers drained, all writes fully propagated.
+        let done = (0..n).all(|t| st.consumed[t].iter().all(|&c| c) && bufs_empty(&st, t))
+            && st.pending.is_empty();
         if done {
             out.entry(st.obs.clone()).or_insert_with(|| sched.clone());
             continue;
         }
-        // Nondeterministic buffer flushes (weak only): the head of some location's buffer
-        // becomes globally visible.
         if weak {
+            // (a) Nondeterministic buffer flushes: the head of some location's buffer leaves the
+            // buffer, updates the writer's own view, and starts propagating to the others.
             for t in 0..n {
                 let locs: Vec<String> = st.bufs[t].keys().cloned().collect();
                 for x in locs {
                     if st.bufs[t].get(&x).is_some_and(|b| !b.is_empty()) {
                         let mut ns = st.clone();
-                        if let Some(b) = ns.bufs[t].get_mut(&x) {
-                            let v = b.remove(0);
-                            ns.mem.insert(x.clone(), v);
-                        }
+                        let v = ns.bufs[t].get_mut(&x).map(|b| b.remove(0)).unwrap_or(0);
+                        ns.views[t].insert(x.clone(), v);
+                        let mut delivered = vec![false; n];
+                        delivered[t] = true;
+                        ns.pending.push(Pending { writer: t, loc: x.clone(), tag: v, delivered });
                         let mut nsched = sched.clone();
                         nsched.push((t, format!("flush {x}")));
                         stack.push((ns, nsched));
                     }
+                }
+            }
+            // (b) Nondeterministic propagation: an in-flight write reaches another thread's view,
+            // respecting per-writer-per-location FIFO (coherence) — an earlier pending write to
+            // the same (writer, loc) must reach that thread first.
+            for (pi, p) in st.pending.iter().enumerate() {
+                for u in 0..n {
+                    if p.delivered[u] {
+                        continue;
+                    }
+                    let blocked = st.pending[..pi].iter().any(|q| {
+                        q.writer == p.writer && q.loc == p.loc && !q.delivered[u]
+                    });
+                    if blocked {
+                        continue;
+                    }
+                    let mut ns = st.clone();
+                    ns.views[u].insert(p.loc.clone(), p.tag);
+                    ns.pending[pi].delivered[u] = true;
+                    if ns.pending[pi].delivered.iter().all(|&d| d) {
+                        ns.pending.remove(pi);
+                    }
+                    let mut nsched = sched.clone();
+                    nsched.push((u, format!("observe {}", p.loc)));
+                    stack.push((ns, nsched));
                 }
             }
         }
@@ -419,7 +472,10 @@ fn op_reachable(
                         if weak {
                             ns.bufs[t].entry(x.clone()).or_default().push(tag);
                         } else {
-                            ns.mem.insert(x.clone(), tag);
+                            // SC: a write is instantly visible to every thread (multi-copy atomic).
+                            for u in 0..n {
+                                ns.views[u].insert(x.clone(), tag);
+                            }
                         }
                         format!("write {x}")
                     }
@@ -428,11 +484,18 @@ fn op_reachable(
                         ns.obs.insert(prog.read_id[t][i], v);
                         format!("read {x} -> {v}")
                     }
-                    // A full or write barrier drains this thread's store buffers: it may only
-                    // fire once they are empty (the flush steps above do the draining). A read
-                    // barrier carries no buffer effect but (as a non-read) orders reads across it.
+                    // A full or write barrier drains this thread's store buffers AND blocks until
+                    // its prior writes have fully propagated (conservative full sync — restores
+                    // multi-copy atomicity, so a barrier fixes the litmus). A read barrier orders
+                    // reads across it (via `takeable`) and needs no buffer/propagation effect.
                     Event::Fence | Event::WFence => {
-                        if !bufs_empty(&st, t) {
+                        // Both drain the buffer and require this thread's writes to be globally
+                        // propagated; a **full** barrier also requires this thread's view to be
+                        // fully up to date (no write still owed to it) — fixing IRIW-style reads.
+                        if !bufs_empty(&st, t) || !no_pending_from(&st, t) {
+                            continue;
+                        }
+                        if matches!(ev, Event::Fence) && !no_pending_to(&st, t) {
                             continue;
                         }
                         "barrier".into()
@@ -440,14 +503,17 @@ fn op_reachable(
                     Event::RFence => "read-barrier".into(),
                     // A lock op is a full barrier and enforces mutual exclusion.
                     Event::Acquire(l) => {
-                        if (0..n).any(|o| o != t && st.held[o].contains(l)) || !bufs_empty(&st, t) {
+                        if (0..n).any(|o| o != t && st.held[o].contains(l))
+                            || !bufs_empty(&st, t)
+                            || !no_pending_from(&st, t)
+                        {
                             continue;
                         }
                         ns.held[t].push(l.clone());
                         format!("acquire {l}")
                     }
                     Event::Release(l) => {
-                        if !bufs_empty(&st, t) {
+                        if !bufs_empty(&st, t) || !no_pending_from(&st, t) {
                             continue;
                         }
                         ns.held[t].retain(|h| h != l);
@@ -495,39 +561,81 @@ pub fn weak_memory_nonrobustness(threads: &[Thread]) -> Option<WeakMemoryWitness
     })
 }
 
-/// Whole-program weak-memory search: check every pair of threads sharing a written location for
-/// non-SC-robustness under the operational model. Bounded by [`MAX_PAIRS`].
+/// Largest thread group checked as a single simultaneous weak-memory product — >2-thread litmus
+/// (IRIW needs 4) are found, while the (expensive) product stays bounded.
+const MAX_GROUP: usize = 4;
+
+/// Whole-program weak-memory search. Threads that (transitively) share a location where at least
+/// one writes form a **connected group**; a group of 2..=[`MAX_GROUP`] threads is checked as one
+/// simultaneous product (so a >2-thread litmus like IRIW is caught), a larger group is checked
+/// pairwise as a fallback. Bounded by [`MAX_PAIRS`].
 pub fn find_weak_memory_bugs(threads: &[Thread]) -> Vec<WeakMemoryWitness> {
+    let n = threads.len();
+    let touched: Vec<_> = threads.iter().map(|t| t.touched()).collect();
+    let written: Vec<_> = threads.iter().map(|t| t.written()).collect();
+    let shares = |i: usize, j: usize| {
+        written[i].iter().any(|w| touched[j].contains(w))
+            || written[j].iter().any(|w| touched[i].contains(w))
+    };
+    // Union-find over the "shares a written location" relation → connected groups.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut c = x;
+        while parent[c] != r {
+            let next = parent[c];
+            parent[c] = r;
+            c = next;
+        }
+        r
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if shares(i, j) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+
     let mut out = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut checked = 0usize;
-    for i in 0..threads.len() {
-        let wi = threads[i].written();
-        let ti = threads[i].touched();
-        for j in (i + 1)..threads.len() {
-            let tj = threads[j].touched();
-            let wj = threads[j].written();
-            let shares = wi.iter().any(|w| tj.contains(w)) || wj.iter().any(|w| ti.contains(w));
-            if !shares {
-                continue;
-            }
-            if checked >= MAX_PAIRS {
-                return out;
-            }
-            checked += 1;
-            let key = if threads[i].name <= threads[j].name {
-                (threads[i].name.clone(), threads[j].name.clone())
-            } else {
-                (threads[j].name.clone(), threads[i].name.clone())
-            };
-            if !seen.insert(key) {
-                continue;
-            }
-            if let Some(w) = weak_memory_nonrobustness(&[
-                clone_thread(&threads[i]),
-                clone_thread(&threads[j]),
-            ]) {
+    for group in groups.values() {
+        if group.len() < 2 || checked >= MAX_PAIRS {
+            continue;
+        }
+        checked += 1;
+        if group.len() <= MAX_GROUP {
+            // Check the whole group as one simultaneous product.
+            let ts: Vec<Thread> = group.iter().map(|&i| clone_thread(&threads[i])).collect();
+            if let Some(w) = weak_memory_nonrobustness(&ts) {
                 out.push(w);
+            }
+        } else {
+            // Too large for a full product — fall back to pairwise within the group.
+            for a in 0..group.len() {
+                for b in (a + 1)..group.len() {
+                    if !shares(group[a], group[b]) {
+                        continue;
+                    }
+                    if let Some(w) = weak_memory_nonrobustness(&[
+                        clone_thread(&threads[group[a]]),
+                        clone_thread(&threads[group[b]]),
+                    ]) {
+                        out.push(w);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -767,5 +875,30 @@ mod tests {
         let consumer = thread("consumer", vec![Read("flag".into()), RFence, Read("data".into())]);
         assert!(weak_memory_nonrobustness(&[producer, consumer]).is_none(),
             "smp_wmb + smp_rmb restore robustness");
+    }
+
+    // IRIW (Independent Reads of Independent Writes) — a **4-thread** litmus that needs
+    // non-multi-copy-atomicity: two writers to x and y, two readers seeing them in opposite
+    // orders. No pair of threads exhibits it; the whole product does.
+    #[test]
+    fn operational_iriw_is_non_robust() {
+        let w1 = thread("w1", vec![Write("x".into())]);
+        let w2 = thread("w2", vec![Write("y".into())]);
+        let r1 = thread("r1", vec![Read("x".into()), Read("y".into())]);
+        let r2 = thread("r2", vec![Read("y".into()), Read("x".into())]);
+        assert!(weak_memory_nonrobustness(&[w1, w2, r1, r2]).is_some(),
+            "IRIW is not SC-robust under non-multi-copy-atomicity");
+    }
+
+    // IRIW with full barriers between the readers' two reads is robust (the barriers force a
+    // consistent global view).
+    #[test]
+    fn operational_iriw_with_barriers_is_robust() {
+        let w1 = thread("w1", vec![Write("x".into())]);
+        let w2 = thread("w2", vec![Write("y".into())]);
+        let r1 = thread("r1", vec![Read("x".into()), Fence, Read("y".into())]);
+        let r2 = thread("r2", vec![Read("y".into()), Fence, Read("x".into())]);
+        assert!(weak_memory_nonrobustness(&[w1, w2, r1, r2]).is_none(),
+            "IRIW with full barriers between the reads is robust");
     }
 }

@@ -3359,6 +3359,35 @@ fn message_passing_without_wmb_is_a_weak_memory_bug() {
     assert!(good.weak_memory_bugs().is_empty(), "smp_wmb + smp_rmb fix the publish protocol");
 }
 
+/// **IRIW — Independent Reads of Independent Writes (operational weak memory, >2 threads).** A
+/// **four-thread** litmus needing non-multi-copy-atomicity: two writers to `x` and `y`, two
+/// readers observing them in opposite orders. No pair exhibits it — the whole-program group
+/// product does. Full barriers between each reader's two reads restore robustness.
+#[test]
+fn iriw_is_a_weak_memory_bug() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |rbar: &str| {
+        let src = format!(
+            "@x = global i32 0, align 4\n@y = global i32 0, align 4\ndeclare void @smp_mb()\n\
+             define void @w1() {{\n  store i32 1, ptr @x, align 4\n  ret void\n}}\n\
+             define void @w2() {{\n  store i32 1, ptr @y, align 4\n  ret void\n}}\n\
+             define i32 @r1() {{\n  %a = load i32, ptr @x, align 4\n{rbar}  \
+               %b = load i32, ptr @y, align 4\n  ret i32 %b\n}}\n\
+             define i32 @r2() {{\n  %a = load i32, ptr @y, align 4\n{rbar}  \
+               %b = load i32, ptr @x, align 4\n  ret i32 %b\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "iriw".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // No barriers → IRIW is observable (non-SC-robust) — a 4-thread group product finds it.
+    let bad = module("");
+    assert_eq!(bad.weak_memory_bugs().len(), 1, "IRIW is not SC-robust under non-MCA");
+    assert_eq!(bad.weak_memory_bugs()[0].threads.len(), 4, "the witness spans all four threads");
+    // A full barrier between each reader's two reads restores a consistent global view.
+    let good = module("  call void @smp_mb()\n");
+    assert!(good.weak_memory_bugs().is_empty(), "full barriers between the reads fix IRIW");
+}
+
 /// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and
 /// accessed without that lock in another is a candidate race (inconsistent lockset, a write,
 /// two functions). Consistent locking on every access is not flagged (no false positive).
