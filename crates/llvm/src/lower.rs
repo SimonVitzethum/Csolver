@@ -44,7 +44,19 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
         } else {
             lower_type(&g.ty).size_bytes(&LAYOUT)
         };
-        if let Some(size) = size.filter(|s| *s > 0) {
+        // A `dereferenceable(N)` a call site asserts on this bare global is an
+        // authoritative byte-size bound (clang derives it from the operand's type), so it
+        // corrects a size our own type-layout computation gets wrong — e.g. a 1-byte
+        // packed-struct discrepancy that would otherwise refute an exactly-sized `memcpy`
+        // into the global. Sound: it only ever *raises* the size (`max`), never shrinks it.
+        let hint = m.deref_hints.get(&g.name).copied();
+        let size = match (size.filter(|s| *s > 0), hint) {
+            (Some(s), Some(h)) => Some(s.max(h)),
+            (Some(s), None) => Some(s),
+            (None, Some(h)) => Some(h),
+            (None, None) => None,
+        };
+        if let Some(size) = size {
             module.globals.insert(
                 g.name.clone(),
                 csolver_ir::GlobalDef { size, align: g.align.max(1), writable: g.writable },

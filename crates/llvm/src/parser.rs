@@ -28,6 +28,10 @@ pub struct LModule {
     /// The debug-info type graph (`!DI…`), for recovering opaque-pointer pointee
     /// types. Empty when the module carries no debug info.
     pub(crate) debuginfo: crate::debuginfo::DebugInfo,
+    /// Per global-symbol, the largest `dereferenceable(N)` a bare `@g` use asserts —
+    /// an authoritative lower bound on the global's byte size (clang emits it from the
+    /// type), used to correct a size the type-layout computation gets wrong.
+    pub(crate) deref_hints: std::collections::HashMap<String, u64>,
 }
 
 /// A parsed global definition.
@@ -379,6 +383,7 @@ pub fn parse_module(src: &str) -> Result<LModule> {
         pos: 0,
         types: HashMap::new(),
         meta_ints: scan_meta_ints(src),
+        deref_hints: HashMap::new(),
     };
     // Pre-scan for `%"name" = type <T>` definitions: a definition may lexically
     // follow its first use, so the table must be complete before any function
@@ -425,6 +430,7 @@ pub fn parse_module(src: &str) -> Result<LModule> {
         unanalyzed,
         globals,
         debuginfo,
+        deref_hints: std::mem::take(&mut p.deref_hints),
     })
 }
 
@@ -440,6 +446,12 @@ struct Parser {
     /// instruction's `!align !N` reference can be resolved to its value `V` while
     /// the instruction is parsed (the node may lexically follow the use).
     meta_ints: HashMap<u32, u64>,
+    /// Per global-symbol, the largest `dereferenceable(N)` any use asserts on a
+    /// **bare** `@g` operand. Clang emits it from the operand's *type* size, so it is
+    /// an authoritative lower bound on the global's byte size — used to correct a
+    /// size our own type-layout computation gets wrong (e.g. a 1-byte packed-struct
+    /// discrepancy). Sound: it can only *raise* a global's size.
+    deref_hints: HashMap<String, u64>,
 }
 
 /// Pre-scan single-integer metadata nodes (`!126 = !{i64 8}`) into a map from
@@ -889,7 +901,8 @@ impl Parser {
     /// Skip a call argument's attributes up to its operand. Crucially, `align
     /// N` is skipped as a *pair* (so the alignment value `N` is not mistaken for
     /// the operand), and parenthesized attributes are skipped balanced.
-    fn skip_arg_attrs(&mut self) -> Result<()> {
+    fn skip_arg_attrs(&mut self) -> Result<Option<u64>> {
+        let mut deref = None;
         loop {
             match self.peek() {
                 // The operand: a register, global, integer/float, or aggregate const.
@@ -933,11 +946,22 @@ impl Parser {
                         self.pos += 1;
                     }
                 }
+                // `dereferenceable(N)`: capture N — an authoritative byte-size bound on
+                // this operand. (`dereferenceable_or_null` is deliberately excluded: it
+                // permits a null pointer, so it is not a size guarantee.)
+                Tok::Word(w) if w == "dereferenceable" => {
+                    self.pos += 1;
+                    if matches!(self.peek(), Tok::Punct('(')) {
+                        if let Ok(n) = self.paren_u64() {
+                            deref = Some(deref.map_or(n, |d: u64| d.max(n)));
+                        }
+                    }
+                }
                 Tok::Punct('(') => self.skip_balanced('(', ')')?,
                 _ => self.pos += 1,
             }
         }
-        Ok(())
+        Ok(deref)
     }
 
     /// Parse `( N )` and return `N`.
@@ -1959,8 +1983,17 @@ impl Parser {
                     args.push(LValue::Undef);
                 } else {
                     let _ty = self.ltype()?;
-                    self.skip_arg_attrs()?;
-                    args.push(self.value()?);
+                    let deref = self.skip_arg_attrs()?;
+                    let v = self.value()?;
+                    // A `dereferenceable(N)` on a bare `@g` operand is an authoritative
+                    // lower bound on that global's size (clang derives it from the type).
+                    if let (Some(n), LValue::Global(name)) = (deref, &v) {
+                        self.deref_hints
+                            .entry(name.clone())
+                            .and_modify(|m| *m = (*m).max(n))
+                            .or_insert(n);
+                    }
+                    args.push(v);
                 }
                 if matches!(self.peek(), Tok::Punct(',')) {
                     self.pos += 1;

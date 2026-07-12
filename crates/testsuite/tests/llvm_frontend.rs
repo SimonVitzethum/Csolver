@@ -3118,6 +3118,35 @@ entry:
         "a distinct dst (patched out-of-place) does not fire — no false FAIL");
 }
 
+/// **`dereferenceable(N)` sizes a global authoritatively.** A call-site
+/// `dereferenceable(N)` on a bare `@g` operand is clang's byte-size guarantee for the
+/// global (derived from its type), so it corrects a size our own type-layout computation
+/// gets wrong (e.g. a 1-byte packed-struct discrepancy that would otherwise refute an
+/// exactly-sized `memcpy` into the global). Here the global's *declared* type is 1 byte,
+/// yet a `memcpy` of 8 asserts `dereferenceable(8)` — with the hint the copy is in bounds;
+/// without any hint an over-sized copy is (soundly) refuted.
+#[test]
+fn dereferenceable_hint_sizes_a_global() {
+    let with_hint = r#"
+@g = external global i8
+@s = internal constant [8 x i8] zeroinitializer
+define void @f() {
+  call void @llvm.memcpy.p0.p0.i64(ptr dereferenceable(8) @g, ptr @s, i64 8, i1 false)
+  ret void
+}
+declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+"#;
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let m = LlvmFrontend.lower(LlvmInput { source: with_hint.into(), name: "h".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "dereferenceable(8) sizes @g to 8 bytes → the 8-byte memcpy is in bounds");
+    // Control: no dereferenceable hint, a 1-byte-typed global, an 8-byte copy → refuted.
+    let no_hint = with_hint.replace("dereferenceable(8) ", "");
+    let m = LlvmFrontend.lower(LlvmInput { source: no_hint, name: "n".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Fail,
+        "without a hint an 8-byte copy into a 1-byte global is refuted");
+}
+
 /// **Read-consistency on an opaque object's fields.** The real crypto worker reads
 /// `req->src` and `req->dst` off an *opaque* request (a call result reached through an
 /// alloca round-trip), not a stack `alloca` whose stores forward. Two reads of the same
