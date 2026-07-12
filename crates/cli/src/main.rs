@@ -712,8 +712,9 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
     }
     eprintln!("  {} modules, {} attacker entries", modules.len(), entry_fns.len());
 
-    // For each entry: BFS the reachable module set (bounded), link, verify closed-world.
-    const MAX_REACH: usize = 600;
+    // For each entry: BFS the reachable module set, link, verify closed-world. The traversal is
+    // bounded by the number of modules that exist (it can reach no more) — no artificial cap.
+    let max_reach = modules.len();
     let cfg = Config { closed_world: true, entry_patterns: Some(entry_patterns.to_vec()), ..config.clone() };
     let entry_next = std::sync::atomic::AtomicUsize::new(0);
     let entry_done = std::sync::atomic::AtomicUsize::new(0);
@@ -735,7 +736,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
                 let mut work = vec![m0];
                 seen.insert(m0);
                 while let Some(mi) = work.pop() {
-                    if seen.len() >= MAX_REACH {
+                    if seen.len() >= max_reach {
                         break;
                     }
                     for callee in &calls[mi] {
