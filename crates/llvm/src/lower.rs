@@ -744,10 +744,20 @@ fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<BasicBlock> {
             // asm's memory operand is caught — then the base call (clean name) for its clobber.
             if callee.starts_with("<inline asm") && callee.contains('|') {
                 emit_inline_asm_mem_ops(ctx, &mut insts, callee, args)?;
+                // Register-dataflow semantic (`|semC<j>` copy / `|semZ` zero): bind the output
+                // register to the provable value instead of havoc-ing it (see `asm_reg_semantic`).
+                // Emitted only when there is an output register; the base call still runs (with no
+                // `dst`) so any memory clobber is still modelled.
+                let sem_bound = if let Some(d) = dst.as_deref() {
+                    emit_asm_semantic(ctx, &mut insts, callee, args, d, ret)?
+                } else {
+                    false
+                };
                 let base: String = callee.split('|').next().unwrap_or(callee).to_string();
                 let call_args = args.iter().map(|a| ctx.operand(a, 64)).collect::<Result<Vec<_>>>()?;
                 insts.push(Inst::Call {
-                    dst: dst.as_deref().map(|d| ctx.reg(d)).transpose()?,
+                    // The output is bound by the semantic Assign above — don't re-havoc it here.
+                    dst: if sem_bound { None } else { dst.as_deref().map(|d| ctx.reg(d)).transpose()? },
                     callee: Callee::Symbol(base),
                     args: call_args,
                     ret_ty: lower_type(ret),
@@ -1669,6 +1679,39 @@ fn resolve_callee(ctx: &Ctx, callee: &str) -> Callee {
 /// name (`|w<i>` = written, `|r<i>` = read). A byte Load/Store through the pointer argument
 /// checks it is non-null, live, in-bounds and (for a write) writable — catching a UAF / OOB /
 /// null-deref committed *through* the asm's declared memory operand.
+/// Bind an inline-asm output register to its **register-dataflow semantic** (from the `|sem…`
+/// suffix the parser attached — see `asm_reg_semantic`): `|semZ` → the output is `0`; `|semC<j>`
+/// → the output is a copy of argument `j`. Emits an `Inst::Assign` and returns `true` when a
+/// semantic was applied (so the caller suppresses the havoc binding), `false` otherwise. Both
+/// idioms are always-correct, so this only ever *adds* precision to a previously opaque value.
+fn emit_asm_semantic(
+    ctx: &mut Ctx,
+    insts: &mut Vec<Inst>,
+    callee: &str,
+    args: &[LValue],
+    dst: &str,
+    ret: &LType,
+) -> Result<bool> {
+    let ty = lower_type(ret);
+    let width = type_width(ret);
+    for spec in callee.split('|') {
+        let value = if spec == "semZ" {
+            RValue::Use(Operand::int(width, 0))
+        } else if let Some(j) = spec.strip_prefix("semC").and_then(|n| n.parse::<usize>().ok()) {
+            match args.get(j) {
+                Some(a) => RValue::Use(ctx.operand(a, width)?),
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        let d = ctx.reg(dst)?;
+        insts.push(Inst::Assign { dst: d, ty, value });
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn emit_inline_asm_mem_ops(
     ctx: &mut Ctx,
     insts: &mut Vec<Inst>,

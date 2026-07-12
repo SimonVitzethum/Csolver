@@ -1939,9 +1939,12 @@ impl Parser {
                 self.pos += 1;
             }
             // The template and constraint strings (each a quoted `Word`), separated
-            // by a comma; tolerate either being absent.
-            if matches!(self.peek(), Tok::Word(_)) {
-                self.pos += 1; // template (not needed to decide the memory effect)
+            // by a comma; tolerate either being absent. The template text is kept for the
+            // register-dataflow semantic decode (below).
+            let mut template = String::new();
+            if let Tok::Word(t) = self.peek() {
+                template = t.clone();
+                self.pos += 1;
             }
             let mut constraints = String::new();
             if matches!(self.peek(), Tok::Punct(',')) {
@@ -1969,6 +1972,14 @@ impl Parser {
             };
             for (arg, is_write) in asm_memory_operands(&constraints) {
                 name.push_str(&format!("|{}{arg}", if is_write { 'w' } else { 'r' }));
+            }
+            // Register-dataflow semantic decode: for a recognized single-instruction template
+            // whose output is a *provable* function of its inputs (a copy/`mov`, or a `xor r,r`
+            // zero idiom), append `|sem…` so the lowering binds the output register to that value
+            // instead of an opaque havoc. Only unambiguous, always-correct idioms are recognized;
+            // anything else stays havoc'd (sound). See `asm_reg_semantic`.
+            if let Some(sem) = asm_reg_semantic(&template, &constraints) {
+                name.push_str(&sem);
             }
             name
         } else {
@@ -2117,6 +2128,94 @@ fn asm_memory_operands(constraints: &str) -> Vec<(usize, bool)> {
         arg += 1;
     }
     ops
+}
+
+/// The operand-index → source map of an inline-asm constraint string, in template-reference order
+/// (`$0`, `$1`, …). Each register **output** (`=r`/`=&r`, no memory) maps to the call's *return*
+/// (`OperandSrc::Ret`); every other operand — a memory output, or an input — consumes a call
+/// argument in order (`OperandSrc::Arg(j)`). Mirrors LLVM's argument packing, so `$k` resolves to
+/// the right SSA value. Clobbers (`~{…}`) consume nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OperandSrc {
+    Ret,
+    Arg(usize),
+}
+fn asm_operand_sources(constraints: &str) -> Vec<OperandSrc> {
+    let mut out = Vec::new();
+    let mut arg = 0usize;
+    for tok in constraints.split(',') {
+        let t = tok.trim();
+        if t.is_empty() || t.starts_with('~') {
+            continue;
+        }
+        let is_output = t.starts_with('=') || t.starts_with('+');
+        let is_reg_output = is_output && !t.contains('*') && !t.contains('m');
+        if is_reg_output {
+            out.push(OperandSrc::Ret);
+        } else {
+            out.push(OperandSrc::Arg(arg));
+            arg += 1;
+        }
+    }
+    out
+}
+
+/// Extract the operand index from a template token that references one: `$0`, `${1:w}`, … → the
+/// number. A hardcoded register (`%rax`), a `$$`-escaped literal dollar, or anything else → `None`.
+fn asm_operand_index(tok: &str) -> Option<usize> {
+    let rest = tok.trim().strip_prefix('$')?;
+    // `$$` is an escaped literal dollar (an AT&T immediate), not an operand reference.
+    let digits: String = rest.trim_start_matches('{').chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Recognize a **register-dataflow semantic** for a single-instruction inline-asm template whose
+/// output register is a *provable* function of its operands, and encode it as a `|sem…` suffix the
+/// lowering consumes. Only two always-correct idioms are recognized — a plain `mov` copy
+/// (`|semC<j>`: the output is a copy of argument `j`) and a `xor r,r` / `sub r,r` self-zero
+/// (`|semZ`: the output is `0`) — so binding the output to the modeled value can never introduce a
+/// wrong result (soundness is preserved). Any other template returns `None` and stays opaquely
+/// havoc'd. AT&T syntax: operands are `src, dst` (destination last); a byte/word-extending move
+/// (`movz*`/`movs*`) is *not* a pure copy and is deliberately excluded.
+fn asm_reg_semantic(template: &str, constraints: &str) -> Option<String> {
+    let t = template.trim();
+    // Single instruction only: bail on any statement separator (real newline or its `\0A`
+    // escape, or `;`). A tab merely separates mnemonic from operands, so it is allowed.
+    if t.is_empty() || t.contains('\n') || t.contains(';') || t.contains("\\0A") {
+        return None;
+    }
+    let t = t.replace('\t', " ");
+    let (mnem, rest) = t.split_once(' ')?;
+    let ops: Vec<&str> = rest.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if ops.len() != 2 {
+        return None;
+    }
+    let srcs = asm_operand_sources(constraints);
+    let src_of = |k: usize| srcs.get(k).copied();
+    let m = mnem.trim();
+    // Zero idiom: `xor $K, $K` (or `sub`) with both operands the same output register → 0.
+    let is_zero_mnem = matches!(m, "xor" | "xorl" | "xorq" | "xorw" | "xorb" | "sub" | "subl" | "subq");
+    if is_zero_mnem {
+        let (a, b) = (asm_operand_index(ops[0])?, asm_operand_index(ops[1])?);
+        if a == b && src_of(a) == Some(OperandSrc::Ret) {
+            return Some("|semZ".to_string());
+        }
+        return None;
+    }
+    // Plain copy: `mov $S, $D`, output `$D` = the return, source `$S` = argument `j`.
+    let is_copy_mnem = matches!(m, "mov" | "movl" | "movq" | "movw" | "movb" | "movabs" | "movabsq");
+    if is_copy_mnem {
+        let (s, d) = (asm_operand_index(ops[0])?, asm_operand_index(ops[1])?);
+        if src_of(d) == Some(OperandSrc::Ret) {
+            if let Some(OperandSrc::Arg(j)) = src_of(s) {
+                return Some(format!("|semC{j}"));
+            }
+        }
+    }
+    None
 }
 
 fn asm_may_write_memory(constraints: &str) -> bool {

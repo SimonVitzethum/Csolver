@@ -257,6 +257,46 @@ b:
         assert_eq!(names.iter().filter(|n| **n == "<inline asm>").count(), 2, "{names:?}");
     }
 
+    /// Register-dataflow semantic decode: a plain `mov $1, $0` copies its input to the output
+    /// register (an `Assign`, not an opaque havoc call), and a `xor $0, $0` zeroes it. A template
+    /// that is not a recognized pure-value idiom stays a havoc call (no `Assign` bound).
+    #[test]
+    fn inline_asm_register_dataflow_is_decoded() {
+        use csolver_ir::{Inst, Operand, RValue};
+        let lower = |src: &str| {
+            LlvmFrontend
+                .lower(LlvmInput { source: src.into(), name: "m".into() })
+                .expect("lower")
+        };
+        let assigns = |m: &csolver_ir::Module| -> Vec<RValue> {
+            m.functions
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| match i {
+                    Inst::Assign { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Copy: the output is bound to a copy of the input argument.
+        let copy = lower("define i32 @f(i32 %x) {\nb:\n  %y = call i32 asm \"movl $1, $0\", \"=r,r\"(i32 %x)\n  ret i32 %y\n}\n");
+        assert!(
+            assigns(&copy).iter().any(|v| matches!(v, RValue::Use(Operand::Reg(_)))),
+            "`movl $1,$0` binds the output to a copy of its input"
+        );
+        // Zero idiom: the output is bound to the constant 0.
+        let zero = lower("define i64 @g() {\nb:\n  %z = call i64 asm \"xor $0, $0\", \"=r\"()\n  ret i64 %z\n}\n");
+        assert!(
+            assigns(&zero).iter().any(|v| matches!(v,
+                RValue::Use(Operand::Const(csolver_ir::Const::Int(bv))) if bv.is_zero())),
+            "`xor $0,$0` binds the output to 0: {:?}", assigns(&zero)
+        );
+        // Unrecognized template: no semantic Assign (stays an opaque havoc call).
+        let opaque = lower("define i32 @h(i32 %x) {\nb:\n  %y = call i32 asm \"frobnicate $1, $0\", \"=r,r\"(i32 %x)\n  ret i32 %y\n}\n");
+        assert!(assigns(&opaque).is_empty(), "an unrecognized template is not decoded");
+    }
+
     /// An indirect call through a loaded function pointer lowers to `Callee::Indirect`
     /// (carrying the dispatch register), NOT an opaque `Symbol` — the prerequisite for
     /// devirtualization to fire on real LLVM/C code (regression: it used to become

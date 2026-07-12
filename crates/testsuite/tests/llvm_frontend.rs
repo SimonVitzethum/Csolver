@@ -3567,6 +3567,27 @@ fn rcu_grace_period_violation_is_refused() {
     );
 }
 
+/// **Inline-asm register dataflow reaches a proof.** A `xor $0, $0` zero idiom binds the output to
+/// a provable `0`; used as an index into a 4-element global array it is in bounds, so the load
+/// proves — whereas an opaque (havoc'd) asm output would leave the index unknown. This exercises
+/// the semantic decode end-to-end: the modeled value flows into the bounds obligation.
+#[test]
+fn inline_asm_semantic_value_proves_bounds() {
+    let cfg = Config::default(); // strict (not bug-finding): an opaque index would stay UNKNOWN
+    let src = "\
+        @arr = global [4 x i32] zeroinitializer, align 16\n\
+        define i32 @f() {\n\
+          %i = call i64 asm \"xor $0, $0\", \"=r\"()\n\
+          %p = getelementptr inbounds [4 x i32], ptr @arr, i64 0, i64 %i\n\
+          %v = load i32, ptr %p, align 4\n  ret i32 %v\n}\n";
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "a".into() }).expect("lower");
+    assert_eq!(
+        verify_module(&m, &cfg).verdict,
+        Verdict::Pass,
+        "the `xor`-zeroed index is provably 0, so the array load is in bounds"
+    );
+}
+
 /// **Concurrent reference-count race.** One thread does an *unchecked* get (`sock_hold`) on a
 /// shared object while another concurrently does a put (`sock_put`) that may drop the last
 /// reference — with disjoint locks, nothing orders the get before the final put, so the get can
