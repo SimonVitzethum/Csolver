@@ -185,6 +185,7 @@ mod tests {
             verdict: Verdict::Pass,
             outcomes: vec![proven],
             truncated: false,
+            lock_edges: vec![],
         };
         ModuleReport {
             module: "m".into(),
@@ -226,6 +227,7 @@ mod tests {
                 result: csolver_core::ObligationResult::Refuted(cx),
             }],
             truncated: false,
+            lock_edges: vec![],
         };
         let report = ModuleReport {
             module: "m".into(),

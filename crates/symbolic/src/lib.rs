@@ -22,6 +22,7 @@
 //!   reasoning over registers. Symbolic pointers/heaps are the next increment.
 
 mod exec;
+mod lockclass;
 mod summary;
 
 pub use exec::{

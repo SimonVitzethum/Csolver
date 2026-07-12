@@ -32,6 +32,10 @@ pub struct FunctionReport {
     /// resource limit, not genuine undecidability. Lets a scan *defer* a
     /// budget-limited unit for a full-effort re-run instead of accepting Unknown.
     pub truncated: bool,
+    /// **Lock-order edges** observed in this function: `(held-class, acquired-class)`
+    /// pairs (see `csolver_symbolic::lockclass`). Aggregated across the program to detect
+    /// ABBA lock-order cycles (an A→B here plus a B→A elsewhere is a potential deadlock).
+    pub lock_edges: Vec<(String, String)>,
 }
 
 impl FunctionReport {
@@ -66,5 +70,24 @@ impl ModuleReport {
     /// Whether any function's symbolic exploration was truncated at its budget.
     pub fn any_truncated(&self) -> bool {
         self.functions.iter().any(|f| f.truncated)
+    }
+
+    /// ABBA lock-order cycles among this module's functions (bug-finding). Aggregates
+    /// every function's lock-order edges and reports the strongly-connected cycles. For
+    /// whole-program detection across files, aggregate `lock_edges` from every module's
+    /// functions and call [`crate::detect_cycles`] directly.
+    pub fn lock_order_cycles(&self) -> Vec<crate::LockOrderCycle> {
+        let edges: Vec<crate::TaggedEdge> = self
+            .functions
+            .iter()
+            .flat_map(|f| {
+                f.lock_edges.iter().map(move |(from, to)| crate::TaggedEdge {
+                    function: f.function.as_str(),
+                    from,
+                    to,
+                })
+            })
+            .collect();
+        crate::detect_cycles(&edges)
     }
 }

@@ -3190,6 +3190,54 @@ fn sleep_in_atomic_context_is_refused() {
     );
 }
 
+/// **ABBA lock-order cycle (G6).** Two functions acquire two locks (two fields of the
+/// same struct type, so two stable cross-function *classes*) in the **opposite order**:
+/// `f` takes field-0 then field-1, `g` takes field-1 then field-0. The whole-program
+/// lock-order graph then has edges `S@0→S@8` and `S@8→S@0` — a 2-cycle, a potential ABBA
+/// deadlock. Distinct objects (`%x`/`%y`) are used so the base identities differ (no AA
+/// self-deadlock false positive). A consistent order (both `f`-style) has no cycle.
+#[test]
+fn abba_lock_order_cycle_is_detected() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |gbody: &str| -> csolver_verifier::ModuleReport {
+        let src = format!(
+            "%s = type {{ i64, i64 }}\n\
+             declare void @spin_lock(ptr)\n\
+             declare void @spin_unlock(ptr)\n\
+             define void @f(ptr %x, ptr %y) {{\n\
+               %a = getelementptr %s, ptr %x, i32 0, i32 0\n\
+               %b = getelementptr %s, ptr %y, i32 0, i32 1\n\
+               call void @spin_lock(ptr %a)\n\
+               call void @spin_lock(ptr %b)\n\
+               call void @spin_unlock(ptr %b)\n\
+               call void @spin_unlock(ptr %a)\n\
+               ret void\n\
+             }}\n\
+             define void @g(ptr %x, ptr %y) {{\n{gbody}  ret void\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "lo".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // Opposite order in g → ABBA cycle.
+    let abba = module(
+        "  %b = getelementptr %s, ptr %y, i32 0, i32 1\n  \
+           %a = getelementptr %s, ptr %x, i32 0, i32 0\n  \
+           call void @spin_lock(ptr %b)\n  call void @spin_lock(ptr %a)\n  \
+           call void @spin_unlock(ptr %a)\n  call void @spin_unlock(ptr %b)\n",
+    );
+    let cycles = abba.lock_order_cycles();
+    assert_eq!(cycles.len(), 1, "an opposite lock-acquire order is an ABBA cycle: {cycles:?}");
+    assert_eq!(cycles[0].classes.len(), 2, "the cycle has two lock classes");
+    // Same order in g → no cycle.
+    let consistent = module(
+        "  %a = getelementptr %s, ptr %x, i32 0, i32 0\n  \
+           %b = getelementptr %s, ptr %y, i32 0, i32 1\n  \
+           call void @spin_lock(ptr %a)\n  call void @spin_lock(ptr %b)\n  \
+           call void @spin_unlock(ptr %b)\n  call void @spin_unlock(ptr %a)\n",
+    );
+    assert!(consistent.lock_order_cycles().is_empty(), "a consistent lock order is not a cycle");
+}
+
 /// **A loop-guarded foreign write is refused, not left spurious-UNKNOWN.** The AAD copy
 /// in the real crypto worker sits behind a `br` whose condition is loop-carried; such a
 /// condition can reach the executor wider than `i1`, and using it directly as a boolean

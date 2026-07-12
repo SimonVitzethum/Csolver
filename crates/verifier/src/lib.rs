@@ -23,11 +23,13 @@
 //! report is always relative to the checks the frontend emitted.
 
 mod contracts;
+pub mod lockorder;
 mod mem2reg;
 pub mod precond;
 mod report;
 mod wholeprog;
 
+pub use lockorder::{detect_cycles, LockOrderCycle, TaggedEdge};
 pub use report::{FunctionReport, ModuleReport, ObligationOutcome};
 pub use csolver_symbolic::Summary;
 pub use wholeprog::{ProgramFacts, WholeProgramContext, WholeProgramFacts};
@@ -253,6 +255,7 @@ fn verify_module_inner(
             verdict: Verdict::Unknown,
             outcomes: vec![ObligationOutcome { obligation, result }],
             truncated: false,
+            lock_edges: Vec::new(),
         });
     }
 
@@ -701,11 +704,16 @@ fn verify_function_with(
     }
 
     let verdict = Verdict::combine_all(outcomes.iter().map(ObligationOutcome::verdict));
+    let lock_edges = symbolic
+        .as_ref()
+        .map(|r| r.lock_edges.clone())
+        .unwrap_or_default();
     FunctionReport {
         function: f.name.clone(),
         verdict,
         outcomes,
         truncated,
+        lock_edges,
     }
 }
 

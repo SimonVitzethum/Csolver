@@ -140,6 +140,10 @@ pub struct SymbolicReport {
     pub mem: HashMap<(BlockId, usize, SafetyProperty), MemDecision>,
     /// Named assumptions the proofs depend on.
     pub assumptions: Vec<String>,
+    /// **Lock-order edges** observed in this function: `(held-class, acquired-class)`
+    /// pairs (see `lockclass`). Empty unless a lock was acquired while another was held.
+    /// Aggregated program-wide for ABBA cycle detection.
+    pub lock_edges: Vec<(String, String)>,
     /// Whether exploration was truncated (then no decisions are reported).
     pub truncated: bool,
 }
@@ -427,6 +431,8 @@ fn discharge_inner(
         global_rids: HashMap::new(),
         global_fnptrs: HashMap::new(),
         prove_cache: HashMap::new(),
+        lock_classes: crate::lockclass::resolve_lock_classes(f),
+        lock_edges: HashSet::new(),
         f,
     };
 
@@ -622,6 +628,7 @@ fn discharge_inner(
         fn_ptrs: HashMap::new(),
         locks_held: HashSet::new(),
         spin_held: HashSet::new(),
+        held_classes: HashMap::new(),
         user_fetches: HashSet::new(),
         freed_bases: HashSet::new(),
         exact: true,
@@ -664,11 +671,14 @@ fn discharge_inner(
         .collect();
     let mut assumptions: Vec<String> = ex.assumptions.into_iter().map(String::from).collect();
     assumptions.sort();
+    let mut lock_edges: Vec<(String, String)> = ex.lock_edges.into_iter().collect();
+    lock_edges.sort();
 
     SymbolicReport {
         decided,
         mem,
         assumptions,
+        lock_edges,
         truncated: false,
     }
 }
@@ -1208,6 +1218,12 @@ struct PathState {
     /// blocking call while this is non-empty is a sleep-in-atomic bug. Meet-joined at merges
     /// like `locks_held`, and conservatively dropped when the lock base is passed to any call.
     spin_held: HashSet<RefBase>,
+    /// **Lock class held per lock base** on this path — the static cross-function name
+    /// (see `lockclass`) of every lock currently held, keyed by its runtime base. Used to
+    /// emit lock-order edges (held-class → newly-acquired-class) for ABBA cycle detection.
+    /// Meet-joined at merges (only a lock held on every incoming path stays), and dropped
+    /// alongside `locks_held`/`spin_held` when the base is passed to any call.
+    held_classes: HashMap<RefBase, String>,
     /// **User-memory addresses fetched** on this path, by `(source base, concrete byte
     /// offset)` — one entry per `copy_from_user`/`get_user` from a concrete user address.
     /// Re-fetching an address already here is a **double-fetch** (a TOCTOU on adversary-
@@ -1360,6 +1376,14 @@ struct Explorer<'f> {
     /// path condition) then skip re-bit-blasting. The `linear-no-overflow` side
     /// effect is re-applied on a hit.
     prove_cache: HashMap<(Box<[ExprId]>, ExprId), Option<ProofMethod>>,
+    /// Static **lock-class map** for this function: register → the cross-function name
+    /// of the lock it designates (see `lockclass`). Consulted at each lock-acquire to
+    /// name the acquired lock for ABBA lock-order edges.
+    lock_classes: HashMap<RegId, String>,
+    /// **Lock-order edges** collected on this function: `(held-class, then-acquired-class)`
+    /// pairs observed on some path. Streamed out for whole-program cycle detection (an
+    /// A→B here plus a B→A elsewhere is a potential ABBA deadlock).
+    lock_edges: HashSet<(String, String)>,
     f: &'f Function,
 }
 
@@ -1802,6 +1826,14 @@ impl Explorer<'_> {
             .copied()
             .filter(|b| edges.iter().all(|e| e.pred_state.spin_held.contains(b)))
             .collect();
+        // Same meet for held lock classes: keep a base's class only if held (with the
+        // same class) on every incoming path.
+        let held_classes: HashMap<RefBase, String> = first
+            .held_classes
+            .iter()
+            .filter(|(b, c)| edges.iter().all(|e| e.pred_state.held_classes.get(b) == Some(*c)))
+            .map(|(b, c)| (*b, c.clone()))
+            .collect();
         // Same meet for freed bases: a base counts as freed after the join only if it was
         // freed on every incoming path, so a re-free is flagged only when it is a definite
         // double-free on all paths.
@@ -1835,6 +1867,7 @@ impl Explorer<'_> {
             fn_ptrs,
             locks_held,
             spin_held,
+            held_classes,
             user_fetches,
             freed_bases,
             exact: false,
@@ -3362,6 +3395,21 @@ impl Explorer<'_> {
             self.record(block, idx, SafetyProperty::SleepInAtomic, true, "no sleeping call while a spinlock is held", "");
         }
         if LOCK_ACQUIRE.contains(&name) {
+            // Lock-order edges (ABBA, G6): name the acquired lock's *class* from its
+            // pointer argument, and for every distinct lock class already held on this
+            // path emit an ordered edge (held → acquired). A B→A edge somewhere else in
+            // the program then closes an ABBA cycle. The base's class is recorded below,
+            // so a further nested acquire sees this lock as a predecessor.
+            let newclass = args
+                .first()
+                .and_then(|a| crate::lockclass::lock_class_of_arg(&self.lock_classes, a));
+            if let Some(nc) = &newclass {
+                for held in state.held_classes.values() {
+                    if held != nc {
+                        self.lock_edges.insert((held.clone(), nc.clone()));
+                    }
+                }
+            }
             match base {
                 // Re-acquiring a lock already held on this path: a definite AA deadlock.
                 Some(b) if state.locks_held.contains(&b) => {
@@ -3386,6 +3434,11 @@ impl Explorer<'_> {
                 // never fabricates a deadlock; it only omits the check). Sound.
                 None => self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", ""),
             }
+            // Record this lock's class against its base so a nested acquire emits an edge
+            // from it, and a matched release drops it.
+            if let (Some(b), Some(nc)) = (base, newclass) {
+                state.held_classes.insert(b, nc);
+            }
             // A **spinning** lock also enters atomic context — track it separately, so a
             // later blocking call is caught (a sleepable `mutex`/`down` is not tracked here).
             if SPIN_ACQUIRE.contains(&name) {
@@ -3405,6 +3458,7 @@ impl Explorer<'_> {
                 if let Some(b) = Self::ptr_base_key(&self.eval_value(a, state)) {
                     state.locks_held.remove(&b);
                     state.spin_held.remove(&b);
+                    state.held_classes.remove(&b);
                 }
             }
             self.record(block, idx, SafetyProperty::DataRace, true, "no lock re-acquired while held", "");

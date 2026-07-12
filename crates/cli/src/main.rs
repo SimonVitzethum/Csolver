@@ -419,6 +419,9 @@ struct FileScan {
     dropped: u64,
     errored: u64,
     findings: Vec<Finding>,
+    /// Lock-order edges `(function, held-class, acquired-class)` seen in this unit —
+    /// aggregated program-wide after the scan to detect ABBA lock-order cycles (G6).
+    lock_edges: Vec<(String, String, String)>,
     /// Symbolic exploration hit its budget on ≥1 function: the unit is a
     /// candidate for a full-effort *deferred* re-run rather than accepting Unknown.
     truncated: bool,
@@ -754,6 +757,7 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
     let all = agg.into_inner().unwrap_or_else(|p| p.into_inner());
     let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut findings: Vec<Finding> = Vec::new();
+    let mut lock_edges: Vec<(String, String, String)> = Vec::new();
     for fs in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -761,9 +765,11 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
         dropped += fs.dropped;
         errored += fs.errored;
         findings.extend(fs.findings);
+        lock_edges.extend(fs.lock_edges);
     }
     let mut seen_find = HashSet::new();
     findings.retain(|f| seen_find.insert(finding_key(f)));
+    report_lock_cycles(&lock_edges);
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -797,6 +803,9 @@ fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: &Config) ->
                     }
                 }
             }
+        }
+        for (from, to) in &f.lock_edges {
+            fs.lock_edges.push((f.function.clone(), from.clone(), to.clone()));
         }
     }
     fs
@@ -908,6 +917,9 @@ fn scan_one_unit(
                     }
                 }
             }
+        }
+        for (from, to) in &f.lock_edges {
+            fs.lock_edges.push((f.function.clone(), from.clone(), to.clone()));
         }
     }
     fs
@@ -1205,6 +1217,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     all.sort_by_key(|(i, _)| *i);
     let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut findings: Vec<Finding> = Vec::new();
+    let mut lock_edges: Vec<(String, String, String)> = Vec::new();
     for (_, fs) in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -1212,12 +1225,14 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
         dropped += fs.dropped;
         errored += fs.errored;
         findings.extend(fs.findings);
+        lock_edges.extend(fs.lock_edges);
     }
     // De-duplicate the inventory: the same bug in many files (a duplicated / static-inline
     // function) is one finding, not N. Keeps the first (unit-ordered) occurrence.
     let mut seen: std::collections::HashSet<FindingKey> = std::collections::HashSet::new();
     findings.retain(|f| seen.insert(finding_key(f)));
 
+    report_lock_cycles(&lock_edges);
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -1245,6 +1260,26 @@ fn stream_findings(
         }
         let n = found.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         eprintln!("  [FOUND #{n}] {}::{}  [{}]  witness: {}", b.file, b.function, b.property, b.witness);
+    }
+}
+
+/// Report ABBA lock-order cycles (G6) across the whole scan. Aggregates every unit's
+/// lock-order edges into one program-wide graph and prints each strongly-connected cycle.
+/// A bug-finding heuristic (see `csolver_verifier::lockorder`): a cycle is a *candidate*
+/// deadlock (a consistent hierarchy broken by `_nested`/`trylock` is not distinguished).
+fn report_lock_cycles(edges: &[(String, String, String)]) {
+    let tagged: Vec<csolver_verifier::TaggedEdge> = edges
+        .iter()
+        .map(|(f, from, to)| csolver_verifier::TaggedEdge { function: f, from, to })
+        .collect();
+    let cycles = csolver_verifier::detect_cycles(&tagged);
+    if cycles.is_empty() {
+        return;
+    }
+    println!("\n== ABBA lock-order cycles ({}) [bug-finding] ==", cycles.len());
+    for c in &cycles {
+        println!("  cycle: {}", c.classes.join(" <-> "));
+        println!("    in functions: {}", c.functions.join(", "));
     }
 }
 
