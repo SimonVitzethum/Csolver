@@ -477,6 +477,7 @@ fn discharge_inner(
         lock_classes: crate::lockclass::resolve_lock_classes(f),
         lock_edges: HashSet::new(),
         race_accesses: HashSet::new(),
+        load_derived: load_derived_regs(f),
         race_trace: Vec::new(),
         f,
     };
@@ -945,6 +946,58 @@ impl ScalarPtrCause {
 /// `eval_pointer` scalar fallback. Two passes: first an `is_ptr` map over every
 /// defined register, then the cause, using it to tell offset-on-a-pointer
 /// (`PtrArith`, recoverable) from pure integer arithmetic (`IntArith`, ambiguous).
+/// The registers whose value is **derived from a load** — a load result, or anything computed
+/// from a load-derived register (through arithmetic, casts, or pointer offsets). Used by the
+/// weak-memory model: a read whose *address* is load-derived is address-dependent on the earlier
+/// load (the `rcu_dereference` pointer-chase), so it does not reorder. A fixpoint over the
+/// function; over-approximating is safe (it only *removes* reorderings — never a false race).
+fn load_derived_regs(f: &Function) -> HashSet<RegId> {
+    let mut derived: HashSet<RegId> = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let (dst, from_load) = match inst {
+                    Inst::Load { dst, .. } => (Some(*dst), true),
+                    Inst::Assign { dst, value, .. } => {
+                        let dep = rvalue_regs(value).into_iter().any(|r| derived.contains(&r));
+                        (Some(*dst), dep)
+                    }
+                    Inst::PtrOffset { dst, base, index, .. } => {
+                        let dep = [base, index]
+                            .into_iter()
+                            .filter_map(|o| o.as_reg())
+                            .any(|r| derived.contains(&r));
+                        (Some(*dst), dep)
+                    }
+                    Inst::FieldPtr { dst, base, .. } => {
+                        (Some(*dst), base.as_reg().is_some_and(|r| derived.contains(&r)))
+                    }
+                    _ => (None, false),
+                };
+                if let Some(d) = dst {
+                    if from_load && derived.insert(d) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    derived
+}
+
+/// The register operands of an r-value.
+fn rvalue_regs(v: &RValue) -> Vec<RegId> {
+    let ops: Vec<&Operand> = match v {
+        RValue::Use(o) => vec![o],
+        RValue::Bin { lhs, rhs, .. } | RValue::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
+        RValue::Cast { operand, .. } => vec![operand],
+        RValue::Select { cond, then_val, else_val } => vec![cond, then_val, else_val],
+    };
+    ops.into_iter().filter_map(|o| o.as_reg()).collect()
+}
+
 fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
     let mut is_ptr: HashMap<RegId, bool> = HashMap::new();
     let mut note = |r: &RegId, p: bool| {
@@ -1484,6 +1537,9 @@ struct Explorer<'f> {
     /// include a write, and span ≥2 functions is a candidate race (the Eraser lockset signal).
     /// `(access-class, is_write, sorted lock-classes held)`.
     race_accesses: HashSet<(String, bool, Vec<String>)>,
+    /// Registers whose value is derived from a load (see [`load_derived_regs`]): a read through
+    /// such a pointer is **address-dependent** and recorded as a non-reordering `DepRead`.
+    load_derived: HashSet<RegId>,
     /// **Ordered event trace** for the two-thread interleaving check (subsystem 4): the
     /// sequence of lock acquires/releases and shared reads/writes in execution order, as
     /// `(kind, class)` with kind `0`=acquire, `1`=release, `2`=read, `3`=write. Consumed by
@@ -3746,10 +3802,18 @@ impl Explorer<'_> {
         let mut lockset: Vec<String> = state.held_classes.values().cloned().collect();
         lockset.sort();
         lockset.dedup();
-        // Ordered trace for the interleaving check (read=2, write=3), bounded so a huge
-        // function does not grow an unbounded trace.
+        // Ordered trace for the interleaving check (read=2, dependent-read=9, write=3), bounded
+        // so a huge function does not grow an unbounded trace. A read through a load-derived
+        // pointer is address-dependent (`rcu_dereference`-style) and does not reorder.
         if self.race_trace.len() < RACE_TRACE_CAP {
-            self.race_trace.push((if is_write { 3 } else { 2 }, class.clone()));
+            let kind = if is_write {
+                3
+            } else if matches!(ptr, Operand::Reg(r) if self.load_derived.contains(r)) {
+                9
+            } else {
+                2
+            };
+            self.race_trace.push((kind, class.clone()));
         }
         self.race_accesses.insert((class, is_write, lockset));
     }

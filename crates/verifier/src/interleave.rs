@@ -34,6 +34,11 @@ pub enum Event {
     Release(String),
     /// Read the shared location of the given class.
     Read(String),
+    /// A read whose **address depends on a prior read's value** (`p = load gp; x = load p->f` —
+    /// the classic `rcu_dereference` pointer-chase). The address/data dependency orders it after
+    /// the read it depends on, so it does **not** reorder (no `smp_rmb` needed) — modelled by
+    /// treating it as non-reorderable while still observing a value.
+    DepRead(String),
     /// Write the shared location of the given class.
     Write(String),
     /// A full **memory barrier** (`smp_mb`/`mb`): orders this thread's prior writes before its
@@ -95,6 +100,7 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             6 => Event::RFence,
             7 => Event::Spawn(c.clone()),
             8 => Event::Join,
+            9 => Event::DepRead(c.clone()),
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -119,11 +125,24 @@ impl Thread {
         self.events
             .iter()
             .filter_map(|e| match e {
-                Event::Read(x) | Event::Write(x) => Some(x.as_str()),
+                Event::Read(x) | Event::DepRead(x) | Event::Write(x) => Some(x.as_str()),
                 _ => None,
             })
             .collect()
     }
+}
+
+/// The set of function names that are **spawned** anywhere in the program (a `Spawn` target) —
+/// concrete evidence they run concurrently, possibly in several threads at once.
+fn spawned_names(threads: &[Thread]) -> std::collections::HashSet<String> {
+    threads
+        .iter()
+        .flat_map(|t| t.events.iter())
+        .filter_map(|e| match e {
+            Event::Spawn(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whole-program atomicity search: over all thread traces, check every pair that shares a
@@ -133,11 +152,23 @@ pub fn find_atomicity_violations(threads: &[Thread]) -> Vec<AtomicityWitness> {
     let mut out: Vec<AtomicityWitness> = Vec::new();
     let mut seen_loc: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut pairs = 0usize;
+    let spawned = spawned_names(threads);
     for i in 0..threads.len() {
         let ti_written = threads[i].written();
         let ti_touched = threads[i].touched();
         if ti_written.is_empty() && ti_touched.is_empty() {
             continue;
+        }
+        // Self-concurrency: a function that is *spawned* somewhere may run in several threads at
+        // once — so it races with a second instance of itself (an unlocked `counter++` loses
+        // updates). Check it against a renamed copy.
+        if !ti_written.is_empty() && spawned.contains(&threads[i].name) {
+            let copy = Thread { name: format!("{}#2", threads[i].name), events: threads[i].events.clone() };
+            if let Some(w) = atomicity_violation(&threads[i], &copy) {
+                if seen_loc.insert(w.location.clone()) {
+                    out.push(w);
+                }
+            }
         }
         for j in (i + 1)..threads.len() {
             // Only pair threads sharing a location that at least one of them writes.
@@ -195,7 +226,7 @@ fn buffered_write_read_pairs(t: &Thread) -> std::collections::BTreeSet<(String, 
             match later {
                 // Any barrier or thread-sync stops the reordering window for this write.
                 Event::Fence | Event::Acquire(_) | Event::Release(_) | Event::Spawn(_) | Event::Join => break,
-                Event::Read(y) if y != x => {
+Event::Read(y) | Event::DepRead(y) if y != x => {
                     pairs.insert((x.clone(), y.clone()));
                 }
                 _ => {}
@@ -302,14 +333,18 @@ fn takeable(events: &[Event], consumed: &[bool], i: usize, reorder: bool) -> boo
     if consumed[i] {
         return false;
     }
-    let is_read = matches!(events[i], Event::Read(_));
+    // Only a *plain* read reorders; an address-dependent read (`DepRead`) is ordered after
+    // everything before it (its address needs the prior read's value).
+    let cur_reorderable = reorder && matches!(events[i], Event::Read(_));
     for (j, e) in events.iter().enumerate().take(i) {
         if consumed[j] {
             continue;
         }
-        // An earlier unconsumed non-read always blocks; an earlier unconsumed read blocks unless
-        // this event is a read taken under reordering.
-        if !(matches!(e, Event::Read(_)) && is_read && reorder) {
+        // An earlier unconsumed read (plain or dependent) does not block a reorderable read;
+        // anything else (a non-read, or any earlier event when this one is not a reorderable
+        // read) blocks.
+        let earlier_is_read = matches!(e, Event::Read(_) | Event::DepRead(_));
+        if !(earlier_is_read && cur_reorderable) {
             return false;
         }
     }
@@ -350,7 +385,7 @@ impl<'a> OpProgram<'a> {
                         wt[i] = next_tag;
                         next_tag += 1;
                     }
-                    Event::Read(_) => {
+                    Event::Read(_) | Event::DepRead(_) => {
                         rd[i] = next_read;
                         next_read += 1;
                     }
@@ -513,7 +548,7 @@ fn op_reachable(
                         }
                         format!("write {x}")
                     }
-                    Event::Read(x) => {
+                    Event::Read(x) | Event::DepRead(x) => {
                         let v = op_read(&st, t, x);
                         ns.obs.insert(prog.read_id[t][i], v);
                         format!("read {x} -> {v}")
@@ -670,8 +705,19 @@ pub fn find_weak_memory_bugs(threads: &[Thread]) -> Vec<WeakMemoryWitness> {
         groups.entry(r).or_default().push(i);
     }
 
+    let spawned = spawned_names(threads);
     let mut out = Vec::new();
     let mut checked = 0usize;
+    // Self-concurrency: a *spawned* function may run in several threads at once, so check each
+    // such writer against a second instance of itself (unbounded thread count).
+    for (i, t) in threads.iter().enumerate() {
+        if !written[i].is_empty() && spawned.contains(&t.name) {
+            let copy = Thread { name: format!("{}#2", t.name), events: t.events.clone() };
+            if let Some(w) = weak_memory_nonrobustness(&[clone_thread(t), copy]) {
+                out.push(w);
+            }
+        }
+    }
     for group in groups.values() {
         if group.len() < 2 || checked >= MAX_PAIRS {
             continue;
@@ -767,7 +813,7 @@ fn dfs(
             Event::Fence | Event::WFence | Event::RFence | Event::Spawn(_) | Event::Join => {}
             Event::Acquire(l) => child.held[t].push(l.clone()),
             Event::Release(l) => child.held[t].retain(|h| h != l),
-            Event::Read(x) => {
+            Event::Read(x) | Event::DepRead(x) => {
                 if !child.pending[t].contains(x) {
                     child.pending[t].push(x.clone());
                 }
@@ -984,6 +1030,22 @@ mod tests {
             "a spawned-then-joined child is ordered by happens-before — no race");
     }
 
+    // Address dependency (rcu_dereference pointer-chase): the consumer's second read depends on
+    // the first read's value (its address), so it does NOT reorder — a write barrier on the
+    // producer alone makes the publish robust (no read barrier needed on the consumer).
+    #[test]
+    fn address_dependency_orders_the_dependent_read() {
+        let prod = || thread("producer", vec![Write("obj".into()), WFence, Write("gp".into())]);
+        // consumer: p = read gp; v = read *p  (the second is address-dependent → DepRead).
+        let consumer = thread("consumer", vec![Read("gp".into()), DepRead("obj".into())]);
+        assert!(weak_memory_nonrobustness(&[prod(), consumer]).is_none(),
+            "an address-dependent read is ordered — smp_wmb alone suffices (rcu_dereference)");
+        // Contrast: a plain (non-dependent) second read still needs a read barrier.
+        let plain = thread("consumer", vec![Read("gp".into()), Read("obj".into())]);
+        assert!(weak_memory_nonrobustness(&[prod(), plain]).is_some(),
+            "a non-dependent second read can still reorder — needs smp_rmb");
+    }
+
     // The child observes the parent's pre-spawn writes (release/acquire of thread creation).
     #[test]
     fn spawned_child_sees_parent_prior_writes() {
@@ -993,5 +1055,18 @@ mod tests {
         // matching SC → robust (no anomaly).
         assert!(weak_memory_nonrobustness(&[parent, child]).is_none(),
             "the child sees the parent's pre-spawn write (thread-create HB)");
+    }
+
+    // Self-concurrency: a *spawned* worker doing an unlocked read-modify-write races with a
+    // second instance of itself (lost update). A worker that is never spawned is not flagged.
+    #[test]
+    fn spawned_self_concurrent_rmw_is_an_atomicity_violation() {
+        let spawner = thread("main", vec![Spawn("worker".into()), Spawn("worker".into())]);
+        let worker = thread("worker", vec![Read("counter".into()), Write("counter".into())]);
+        let v = find_atomicity_violations(&[spawner, worker]);
+        assert_eq!(v.len(), 1, "a spawned unlocked RMW loses updates against itself");
+        // The same worker, never spawned, is not self-checked (no evidence of concurrency).
+        let lone = thread("worker", vec![Read("counter".into()), Write("counter".into())]);
+        assert!(find_atomicity_violations(&[lone]).is_empty(), "an un-spawned function is not self-raced");
     }
 }

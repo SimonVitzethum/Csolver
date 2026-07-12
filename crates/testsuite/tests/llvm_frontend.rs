@@ -3406,6 +3406,36 @@ define i32 @a(ptr %t, ptr %attr, ptr %arg) {
         "a spawned-then-joined child is ordered by happens-before — no weak-memory bug");
 }
 
+/// **Address dependency (`rcu_dereference` pointer-chase, operational weak memory).** A
+/// consumer that reads a published pointer and then dereferences it (`p = load gp; v = load *p`)
+/// has an **address dependency** — the second load is ordered after the first, so a write
+/// barrier on the producer alone makes the publish robust (no read barrier needed). A consumer
+/// reading a *separate* location still needs a read barrier.
+#[test]
+fn address_dependency_needs_no_read_barrier() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    // Pointer-chase consumer: `%p = load @gp; %v = load %p` — the second load is address-dependent.
+    let dep = r#"
+@gp = global ptr null, align 8
+@obj = global i32 0, align 4
+declare void @smp_wmb()
+define void @producer() {
+  store i32 42, ptr @obj, align 4
+  call void @smp_wmb()
+  store ptr @obj, ptr @gp, align 8
+  ret void
+}
+define i32 @consumer() {
+  %p = load ptr, ptr @gp, align 8
+  %v = load i32, ptr %p, align 4
+  ret i32 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: dep.into(), name: "d".into() }).expect("lower");
+    assert!(verify_module(&m, &cfg).weak_memory_bugs().is_empty(),
+        "an address-dependent consumer read is ordered — smp_wmb alone suffices");
+}
+
 /// **IRIW — Independent Reads of Independent Writes (operational weak memory, >2 threads).** A
 /// **four-thread** litmus needing non-multi-copy-atomicity: two writers to `x` and `y`, two
 /// readers observing them in opposite orders. No pair exhibits it — the whole-program group

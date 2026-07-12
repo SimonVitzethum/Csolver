@@ -1354,6 +1354,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
             Acquire(l) => format!("acquire {l}"),
             Release(l) => format!("release {l}"),
             Read(x) => format!("read {x}"),
+            DepRead(x) => format!("read {x} (addr-dep)"),
             Write(x) => format!("write {x}"),
             Fence => "barrier".to_string(),
             WFence => "write-barrier".to_string(),
