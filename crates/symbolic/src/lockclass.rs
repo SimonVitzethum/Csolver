@@ -23,8 +23,37 @@
 //! The result is a pure function of the function's IR — no execution — so it is
 //! computed once at explorer construction and consulted at each lock-acquire call.
 
-use csolver_ir::{CastOp, Const, DataLayout, Function, Inst, Operand, RValue, RegId, Type};
+use csolver_ir::{Callee, CastOp, Const, DataLayout, Function, Inst, Operand, RValue, RegId, Type};
 use std::collections::HashMap;
+
+/// A **cross-syscall container lookup**: a call that fetches an object from a persistent kernel
+/// container indexed by a (syscall-controlled) key. Its result names the object as loaded from the
+/// container (arg 0), so a free/use of it in two independent syscall entries composes on the same
+/// root — the object survives between syscalls via the container. The root is global-rooted (and so
+/// visible to the cross-syscall detectors) only when the container itself is a global — the sound
+/// gate: a per-object idr/xarray does not persist as shared program state.
+fn container_lookup(name: &str) -> bool {
+    matches!(
+        name,
+        "idr_find" | "idr_get_next" | "idr_get_next_ul" | "xa_load" | "xa_find" | "xa_find_after"
+            | "radix_tree_lookup" | "radix_tree_lookup_slot" | "mtree_load" | "mt_find"
+            | "rhashtable_lookup" | "rhashtable_lookup_fast" | "rhltable_lookup" | "assoc_array_find"
+    )
+}
+
+/// A **file-table lookup** (`fget`/`fdget`/…): fetches a `struct file` from the current task's file
+/// table by a userspace fd. It has no container *argument* (the table is `current->files`), so its
+/// result is rooted at a synthetic global — the process file table, a persistent shared root across
+/// syscalls. `None` if `name` is not such a lookup.
+fn fdtable_lookup_class(name: &str) -> Option<String> {
+    matches!(
+        name,
+        "fget" | "fget_raw" | "fget_task" | "fget_pos" | "__fget" | "__fget_files" | "fdget"
+            | "fdget_raw" | "fdget_pos" | "lookup_fd_rcu" | "files_lookup_fd_rcu"
+            | "close_fd_get_file" | "fcheck_files" | "lookup_fdget_rcu"
+    )
+    .then(|| "deref:g:@files@0".to_string())
+}
 
 /// The root a lock-pointer's access path starts from.
 #[derive(Clone)]
@@ -125,6 +154,19 @@ pub(crate) fn resolve_lock_classes(f: &Function) -> HashMap<RegId, String> {
                         roots.remove(dst);
                     }
                 },
+                // A cross-syscall container/file-table lookup: name its result as an object loaded
+                // from the persistent container (fd table / idr / xarray / …), so a free/use of it
+                // in two independent syscall entries composes on the same root (cross-syscall UAF).
+                Inst::Call { dst: Some(d), callee: Callee::Symbol(name), args, .. } => {
+                    if let Some(cls) = fdtable_lookup_class(name) {
+                        deref.insert(*d, cls);
+                    } else if container_lookup(name) {
+                        if let Some((root, off)) = args.first().and_then(|a| op_class(&roots, a)) {
+                            deref.insert(*d, format!("deref:{}", class_str(&root, off)));
+                        }
+                    }
+                    roots.remove(d);
+                }
                 _ => {}
             }
         }

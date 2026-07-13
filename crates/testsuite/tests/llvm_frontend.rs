@@ -3622,6 +3622,50 @@ fn concurrent_refcount_race_is_detected() {
     );
 }
 
+/// **Cross-syscall UAF through a container lookup (fd table / global idr).** The shared object is
+/// not a bare global but is fetched from a persistent kernel container keyed by a syscall argument:
+/// `fget(fd)` (the process file table) and `idr_find(&global_idr, id)`. One entry frees the looked-up
+/// object, another dereferences its lookup — the object survives between the two syscalls via the
+/// container, so it composes on the same root (`deref:g:@files@0` / `deref:g:my_idr@0`).
+#[test]
+fn cross_entry_uaf_through_fdtable_and_idr_lookup() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let uaf_locations = |src: String| -> Vec<String> {
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "cl".into() }).expect("lower");
+        verify_module(&m, &cfg)
+            .cross_entry_uaf(|n| n.starts_with("sys_"))
+            .into_iter()
+            .map(|w| w.location)
+            .collect()
+    };
+    // fd table: `fget(fd)` in two entries — one frees the file, the other reads it.
+    let fd = uaf_locations(
+        "declare ptr @fget(i32)\ndeclare void @kfree(ptr)\n\
+         define void @sys_close(i32 %fd) {\n  %f = call ptr @fget(i32 %fd)\n  \
+           call void @kfree(ptr %f)\n  ret void\n}\n\
+         define i32 @sys_read(i32 %fd) {\n  %f = call ptr @fget(i32 %fd)\n  \
+           %v = load i32, ptr %f, align 4\n  ret i32 %v\n}\n"
+            .into(),
+    );
+    assert!(
+        fd.iter().any(|l| l.contains("@files")),
+        "fget(fd) object freed in one entry and used in another is a cross-syscall UAF: {fd:?}"
+    );
+    // Global idr: `idr_find(&my_idr, id)` — the container is a global, so it persists across syscalls.
+    let idr = uaf_locations(
+        "@my_idr = global i8 0\ndeclare ptr @idr_find(ptr, i32)\ndeclare void @kfree(ptr)\n\
+         define void @sys_del(i32 %id) {\n  %o = call ptr @idr_find(ptr @my_idr, i32 %id)\n  \
+           call void @kfree(ptr %o)\n  ret void\n}\n\
+         define i32 @sys_get(i32 %id) {\n  %o = call ptr @idr_find(ptr @my_idr, i32 %id)\n  \
+           %v = load i32, ptr %o, align 4\n  ret i32 %v\n}\n"
+            .into(),
+    );
+    assert!(
+        idr.iter().any(|l| l.contains("my_idr")),
+        "idr_find on a GLOBAL idr composes across syscalls: {idr:?}"
+    );
+}
+
 /// **Cross-syscall (cross-entry) use-after-free.** Two entry points with *no common caller* — a
 /// `close` that frees the object held by a global and a `read` that dereferences that same global —
 /// compose into a use-after-free: the attacker invokes `close` then `read`, and the global still

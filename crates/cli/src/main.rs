@@ -780,9 +780,49 @@ fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[String]) -> Res
     }
     let mut seen_find = HashSet::new();
     findings.retain(|f| seen_find.insert(finding_key(f)));
+    // Concurrency oracle: the set of functions that can run concurrently — those in a module
+    // reachable (over the complete closed-world call graph) from an attacker entry or a spawned
+    // thread. A function outside it is single-threaded and cannot race, so the concurrent-* detectors
+    // skip it. Module-granular (a module counts if ANY part is reachable) → a sound over-
+    // approximation, so no genuinely-concurrent function is dropped.
+    let concurrent_fns: HashSet<String> = {
+        let mut name_to_module: HashMap<&str, usize> = HashMap::new();
+        for (mi, (_, m)) in modules.iter().enumerate() {
+            for f in &m.functions {
+                name_to_module.insert(f.name.as_str(), mi);
+            }
+        }
+        let mut reach: HashSet<usize> = entry_fns.iter().map(|(mi, _)| *mi).collect();
+        for (_, tr) in &race_traces {
+            for (k, child) in tr {
+                if *k == 7 {
+                    if let Some(&mi) = name_to_module.get(child.as_str()) {
+                        reach.insert(mi);
+                    }
+                }
+            }
+        }
+        let mut work: Vec<usize> = reach.iter().copied().collect();
+        while let Some(mi) = work.pop() {
+            for callee in &calls[mi] {
+                if let Some(&tgt) = def_of.get(callee) {
+                    if reach.insert(tgt) {
+                        work.push(tgt);
+                    }
+                }
+            }
+        }
+        modules
+            .iter()
+            .enumerate()
+            .filter(|(mi, _)| reach.contains(mi))
+            .flat_map(|(_, (_, m))| m.functions.iter().map(|f| f.name.clone()))
+            .collect()
+    };
+
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses);
-    report_atomicity(&race_traces);
+    report_atomicity(&race_traces, entry_patterns, Some(&concurrent_fns));
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -1263,7 +1303,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
 
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses);
-    report_atomicity(&race_traces);
+    report_atomicity(&race_traces, config.entry_patterns.as_deref().unwrap_or(&[]), None);
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }
 
@@ -1344,12 +1384,39 @@ fn report_data_races(accesses: &[(String, String, bool, Vec<String>)]) {
 /// scan. Pairs functions whose event traces share a written location and searches for a valid
 /// interleaving that interrupts a split-critical-section read-modify-write — a lost update the
 /// lockset pass cannot see. Prints the interleaving witness. A bug-finding heuristic.
-fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
-    let threads: Vec<csolver_verifier::Thread> = traces
+fn report_atomicity(
+    traces: &[(String, Vec<(u8, String)>)],
+    entry_patterns: &[String],
+    concurrent: Option<&std::collections::HashSet<String>>,
+) {
+    // **Concurrency oracle.** A function can race only if it runs in a concurrent context. When a
+    // sound concurrent-function set is supplied (computed over the complete closed-world call graph:
+    // functions reachable from an attacker entry or a spawned thread), the *concurrent* detectors
+    // only pair functions in it — a function that is single-threaded-reachable cannot participate in
+    // a race, so excluding it removes false positives without losing a genuinely-concurrent one (the
+    // set is a sound over-approximation). With no set (partial graph / no evidence), all threads are
+    // paired (the heuristic default) — never dropping a real race.
+    let conc_threads: Vec<csolver_verifier::Thread> = match concurrent {
+        Some(set) => traces
+            .iter()
+            .filter(|(name, _)| set.contains(name))
+            .map(|(name, tr)| csolver_verifier::trace_to_thread(name, tr))
+            .collect(),
+        None => traces
+            .iter()
+            .map(|(name, tr)| csolver_verifier::trace_to_thread(name, tr))
+            .collect(),
+    };
+    // Cross-*syscall* composition is only valid between attacker-reachable ENTRY points (separate
+    // syscall handlers). When entry patterns are configured, restrict the cross-entry detectors to
+    // matching functions — a genuine sequential composition of two independent entries, not any two
+    // internal helpers. With no patterns, fall back to all traces (the heuristic default).
+    let entry_threads: Vec<csolver_verifier::Thread> = traces
         .iter()
+        .filter(|(name, _)| entry_patterns.is_empty() || csolver_verifier::matches_entry(name, entry_patterns))
         .map(|(name, tr)| csolver_verifier::trace_to_thread(name, tr))
         .collect();
-    let violations = csolver_verifier::find_atomicity_violations(&threads);
+    let violations = csolver_verifier::find_atomicity_violations(&conc_threads);
     let ev = |e: &csolver_verifier::interleave::Event| -> String {
         use csolver_verifier::interleave::Event::*;
         match e {
@@ -1381,7 +1448,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
         }
     }
     // Cross-thread use-after-free / double-free (a free concurrent with a use/free elsewhere).
-    let uaf = csolver_verifier::find_cross_thread_uaf(&threads);
+    let uaf = csolver_verifier::find_cross_thread_uaf(&conc_threads);
     if !uaf.is_empty() {
         println!("\n== cross-thread use-after-free / double-free ({}) [bug-finding] ==", uaf.len());
         for w in &uaf {
@@ -1393,7 +1460,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
     // Cross-entry (cross-syscall) use-after-free: a free of a global-rooted object in one entry and
     // a dereference/free of it in another, sequentially composable entry (no common caller). Runs
     // over every trace; the global-root restriction keeps it to persistent shared state.
-    let cross_entry = csolver_verifier::find_cross_entry_uaf(&threads);
+    let cross_entry = csolver_verifier::find_cross_entry_uaf(&entry_threads);
     if !cross_entry.is_empty() {
         println!("\n== cross-entry (cross-syscall) use-after-free / double-free ({}) [bug-finding] ==",
             cross_entry.len());
@@ -1405,7 +1472,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
     }
     // Cross-entry (cross-syscall) typestate use-after-state: a global object set to a forbidden
     // state in one entry and used with `require-not` of it in another, independently reachable one.
-    let cross_ts = csolver_verifier::find_cross_entry_typestate(&threads);
+    let cross_ts = csolver_verifier::find_cross_entry_typestate(&entry_threads);
     if !cross_ts.is_empty() {
         println!("\n== cross-entry (cross-syscall) typestate use-after-state ({}) [bug-finding] ==",
             cross_ts.len());
@@ -1416,7 +1483,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
         }
     }
     // Concurrent refcount race: an unchecked get concurrent with a put of the same object.
-    let rc = csolver_verifier::find_refcount_races(&threads);
+    let rc = csolver_verifier::find_refcount_races(&conc_threads);
     if !rc.is_empty() {
         println!("\n== concurrent reference-count races ({}) [bug-finding] ==", rc.len());
         for w in &rc {
@@ -1426,7 +1493,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
         }
     }
     // ABA: a compare-and-swap concurrent with a modification of the same location.
-    let aba = csolver_verifier::find_aba(&threads);
+    let aba = csolver_verifier::find_aba(&conc_threads);
     if !aba.is_empty() {
         println!("\n== ABA problems ({}) [bug-finding] ==", aba.len());
         for w in &aba {
@@ -1436,7 +1503,7 @@ fn report_atomicity(traces: &[(String, Vec<(u8, String)>)]) {
     }
     // Weak-memory (SC-robustness) bugs via the operational PSO model (subsystem 4) — subsumes
     // the store-buffer and message-passing litmus, with a concrete non-SC schedule as witness.
-    let wm = csolver_verifier::find_weak_memory_bugs(&threads);
+    let wm = csolver_verifier::find_weak_memory_bugs(&conc_threads);
     if !wm.is_empty() {
         println!("\n== weak-memory (SC-robustness) bugs ({}) [bug-finding] ==", wm.len());
         for w in &wm {
