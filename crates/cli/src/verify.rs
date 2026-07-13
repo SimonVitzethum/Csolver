@@ -95,10 +95,15 @@ pub(crate) fn verify_path(
 /// architecture is not decodable or the object has no sized function symbols.
 pub(crate) fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module> {
     use std::collections::HashMap;
-    let image = csolver_elf::load(bytes)?;
+    // Any supported object format (ELF / PE-Windows / Mach-O-macOS) → the common Image,
+    // then the SAME per-architecture decode + verify. Relocations are ELF-specific (a
+    // PE/Mach-O image carries none in `relocations`), so the RIP-relative global
+    // resolution below simply finds nothing there and those accesses stay opaque —
+    // sound, and everything else (stack/register/param reasoning) is unchanged.
+    let image = csolver_elf::load_object(bytes)?;
     if !matches!(image.machine, csolver_elf::EM_X86_64 | csolver_elf::EM_AARCH64) {
         return Err(csolver_core::Error::unsupported(format!(
-            "ELF e_machine {} is not decodable (only x86-64 and AArch64)",
+            "object machine {} is not decodable (only x86-64 and AArch64)",
             image.machine
         )));
     }
@@ -303,14 +308,17 @@ pub(crate) fn detect_level(path: &Path) -> Result<SourceLevel, String> {
         Some("ll") => Ok(SourceLevel::Llvm),
         Some("mir") => Ok(SourceLevel::Mir),
         Some("s" | "asm" | "S") => Ok(SourceLevel::Asm),
+        // A Windows import library / object may be `.lib`/`.obj`; macOS `.dylib`/`.o`.
+        // These and any extensionless binary are sniffed by magic below.
         _ => {
-            // Sniff the ELF magic number.
+            // Sniff the object-file magic (ELF / PE-Windows / Mach-O-macOS). `SourceLevel::Elf`
+            // now names the whole binary path (the loader dispatches on the real format).
             let magic = read_magic(path)?;
-            if magic == [0x7f, b'E', b'L', b'F'] {
+            if csolver_elf::detect_format(&magic).is_some() {
                 Ok(SourceLevel::Elf)
             } else {
                 Err(format!(
-                    "cannot determine input type of {} (expected .ll, .s, an ELF binary, or a crate dir)",
+                    "cannot determine input type of {} (expected .ll, .s, or an ELF/PE/Mach-O binary, or a crate dir)",
                     path.display()
                 ))
             }

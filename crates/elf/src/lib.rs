@@ -1,21 +1,33 @@
-//! # csolver-elf — object-file loader (pure Rust, no external crates)
+//! # csolver-elf — multi-format object-file loader (pure Rust, no external crates)
 //!
-//! A from-scratch ELF64 reader: it parses the header, the section table,
-//! program headers, the symbol table, and relocations, exposing exactly the
-//! context the assembly frontend and the memory model need — sections (with
-//! permissions and where their bytes live), symbols (functions and their code),
-//! and program segments. This is the entry point for verifying a *compiled
-//! binary* with no source: load the image, locate a function, hand its bytes to
-//! the decoder.
+//! A from-scratch reader for the three mainstream object formats — **ELF** (Linux),
+//! **PE/COFF** (Windows), and **Mach-O** (macOS/iOS) — behind one format-agnostic
+//! entry point, [`load_object`], which sniffs the leading magic and dispatches. Each
+//! parser produces the same [`Image`]: sections (with permissions and where their bytes
+//! live), symbols (functions and their code), and — for ELF — segments, relocations,
+//! dynamic info and DWARF. So verifying a *compiled binary with no source* — a Linux
+//! `.o`, a Windows `.dll`, a macOS Mach-O — runs the SAME decode + verify pipeline; only
+//! the front matter (headers, symbol/export discovery) differs per OS.
 //!
 //! ## Scope
 //!
-//! ELF64, little-endian (x86-64 / AArch64). Parsing is **bounds-checked
-//! throughout** — a truncated or malformed image yields [`csolver_core::Error`],
-//! never a panic, because the loader is the trust boundary between an untrusted
-//! file and the analysis. PE / Mach-O, DWARF debug info, and the PLT/GOT are
-//! later increments; this layer already lets the pipeline enumerate functions,
-//! recover their machine code, and parse relocation metadata.
+//! 64-bit little-endian x86-64 / AArch64 (the architectures the decoders handle) across
+//! all three formats. Parsing is **bounds-checked throughout** — a truncated or malformed
+//! image yields [`csolver_core::Error`], never a panic, because the loader is the trust
+//! boundary between an untrusted file and the analysis.
+//!
+//! * **ELF** (`load`, [`mod@dwarf`]): header, sections, program headers, symbols,
+//!   relocations (x86-64/AArch64), dynamic section, GNU/SysV hash, versioning, notes,
+//!   and a focused DWARF `.debug_info` reader (pointer-parameter pointee sizes).
+//! * **PE/COFF** ([`mod@pe`]): DOS/PE/COFF/optional headers, sections, the COFF symbol
+//!   table (objects) and the export directory (linked `.exe`/`.dll`/`.sys`).
+//! * **Mach-O** ([`mod@macho`]): the 64-bit header (or the x86-64/arm64 slice of a fat
+//!   binary), `LC_SEGMENT_64` sections and the `LC_SYMTAB` symbol table.
+//!
+//! Not covered (lower value for the kernel/systems focus): 32-bit / big-endian variants,
+//! PE base-relocation and Mach-O relocation application (so RIP-relative globals resolve
+//! only for ELF's per-symbol relocations), PDB / `.debug_line` / CFI, and compressed
+//! debug sections.
 
 use csolver_core::{Error, RegionKind, Result};
 use std::convert::TryFrom;
@@ -25,6 +37,8 @@ use std::convert::TryFrom;
 mod aux;
 mod consts;
 mod load;
+pub mod macho;
+pub mod pe;
 mod reloc;
 mod types;
 #[cfg(test)]
@@ -47,6 +61,45 @@ use consts::*;
 /// A focused DWARF `.debug_info` reader for recovering pointer-parameter pointee sizes.
 pub mod dwarf;
 pub use dwarf::parameter_pointee_sizes;
+
+/// The object-file format of a byte image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// ELF (Linux / BSD / bare-metal).
+    Elf,
+    /// PE/COFF (Windows `.exe`/`.dll`/`.sys`/`.obj`).
+    Pe,
+    /// Mach-O (macOS / iOS), thin or universal.
+    MachO,
+}
+
+/// Sniff the object-file format from the leading magic bytes.
+pub fn detect_format(bytes: &[u8]) -> Option<Format> {
+    if bytes.starts_with(&[0x7f, b'E', b'L', b'F']) {
+        Some(Format::Elf)
+    } else if pe::is_pe(bytes) {
+        Some(Format::Pe)
+    } else if macho::is_macho(bytes) {
+        Some(Format::MachO)
+    } else {
+        None
+    }
+}
+
+/// Load ANY supported object file (ELF / PE / Mach-O) into the common [`Image`],
+/// dispatching on the leading magic. This is the format-agnostic entry point the
+/// binary-verification pipeline uses — the assembly frontend then decodes a function
+/// the same way regardless of which OS produced it.
+pub fn load_object(bytes: &[u8]) -> Result<Image> {
+    match detect_format(bytes) {
+        Some(Format::Elf) => load(bytes),
+        Some(Format::Pe) => pe::load(bytes),
+        Some(Format::MachO) => macho::load(bytes),
+        None => Err(Error::unsupported(
+            "unrecognized object file (expected ELF, PE/COFF, or Mach-O magic)",
+        )),
+    }
+}
 
 // --- Load an ELF64 (little-endian) object image from raw bytes --------------
 
