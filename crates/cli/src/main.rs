@@ -432,6 +432,15 @@ struct FileScan {
     /// whole-program call graph so the concurrency oracle can compute which functions are reachable
     /// from a concurrent context (an entry or a spawned thread) in `--whole-program`/scan_dir mode.
     call_edges: Vec<(String, Vec<String>)>,
+    /// Address-taken facts for the concurrency oracle's **indirect-call safety** (scan_dir).
+    /// `defined_fns` = functions DEFINED in this unit; `addr_taken` = symbols whose ADDRESS is
+    /// taken (a `Const::Symbol` operand — a candidate indirect-call target); `indirect_callers` =
+    /// functions containing a `Callee::Indirect` call. If a concurrent function can reach an
+    /// indirect call, every address-taken function is a potential concurrent target and must join
+    /// the oracle's seed (else a handler reached only through a fn-pointer is wrongly excluded).
+    defined_fns: Vec<String>,
+    addr_taken: Vec<String>,
+    indirect_callers: Vec<String>,
     /// Symbolic exploration hit its budget on ≥1 function: the unit is a
     /// candidate for a full-effort *deferred* re-run rather than accepting Unknown.
     truncated: bool,
@@ -946,23 +955,29 @@ fn scan_one_unit(
     // the group holds ALL callers (closed-world) would be unsound on a partial merge (a
     // caller in another subsystem could violate a synthesized contract → false PASS).
     fs.dropped = module.unanalyzed.len() as u64;
-    // Collect this unit's direct-call edges for the whole-program concurrency oracle (scan_dir).
+    // Collect this unit's direct-call edges for the whole-program concurrency oracle (scan_dir),
+    // plus the address-taken facts that make the oracle safe against indirect calls.
     {
         use csolver_ir::{Callee, Inst};
         for f in &module.functions {
-            let callees: Vec<String> = f
-                .blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .filter_map(|i| match i {
-                    Inst::Call { callee: Callee::Symbol(name), .. } => Some(name.clone()),
-                    _ => None,
-                })
-                .collect();
+            fs.defined_fns.push(f.name.clone());
+            let mut callees: Vec<String> = Vec::new();
+            let mut has_indirect = false;
+            for i in f.blocks.iter().flat_map(|b| &b.insts) {
+                match i {
+                    Inst::Call { callee: Callee::Symbol(name), .. } => callees.push(name.clone()),
+                    Inst::Call { callee: Callee::Indirect(_), .. } => has_indirect = true,
+                    _ => {}
+                }
+            }
+            if has_indirect {
+                fs.indirect_callers.push(f.name.clone());
+            }
             if !callees.is_empty() {
                 fs.call_edges.push((f.name.clone(), callees));
             }
         }
+        fs.addr_taken.extend(csolver_verifier::address_taken_names(&module));
     }
     // Whole-program (2b): a cross-file `Callee::Symbol(name)` with no in-unit definition
     // resolves to the program-wide callee summary instead of an opaque havoc, and an
@@ -1308,6 +1323,9 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
     let mut race_traces: Vec<(String, Vec<(u8, String)>)> = Vec::new();
     let mut call_edges: Vec<(String, Vec<String>)> = Vec::new();
+    let mut defined_fns: Vec<String> = Vec::new();
+    let mut addr_taken: Vec<String> = Vec::new();
+    let mut indirect_callers: Vec<String> = Vec::new();
     for (_, fs) in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -1319,6 +1337,9 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
         race_accesses.extend(fs.race_accesses);
         race_traces.extend(fs.race_traces);
         call_edges.extend(fs.call_edges);
+        defined_fns.extend(fs.defined_fns);
+        addr_taken.extend(fs.addr_taken);
+        indirect_callers.extend(fs.indirect_callers);
     }
     // De-duplicate the inventory: the same bug in many files (a duplicated / static-inline
     // function) is one finding, not N. Keeps the first (unit-ordered) occurrence.
@@ -1331,7 +1352,14 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     // thread / registered IRQ-work-timer handler (a `spawn` trace event). A function outside it is
     // single-threaded-reachable and cannot race, so the concurrent-* detectors skip it. Empty seed
     // (no entries, no spawn evidence) ⇒ `None` ⇒ pair-all, never dropping a real race.
-    let concurrent = whole_program_concurrent(&call_edges, &race_traces, entry_patterns);
+    let concurrent = whole_program_concurrent(
+        &call_edges,
+        &race_traces,
+        entry_patterns,
+        &defined_fns,
+        &addr_taken,
+        &indirect_callers,
+    );
 
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses);
@@ -1350,6 +1378,9 @@ fn whole_program_concurrent(
     call_edges: &[(String, Vec<String>)],
     race_traces: &[(String, Vec<(u8, String)>)],
     entry_patterns: &[String],
+    defined_fns: &[String],
+    addr_taken: &[String],
+    indirect_callers: &[String],
 ) -> Option<std::collections::HashSet<String>> {
     use std::collections::{HashMap, HashSet};
     let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -1373,8 +1404,25 @@ fn whole_program_concurrent(
     if reach.is_empty() {
         return None; // no concurrency evidence — do not restrict (pair-all)
     }
+    // Address-taken functions are the possible targets of any indirect call. Precompute the set so
+    // the closure below can, on first reaching an indirect-call site, admit all of them at once.
+    let defined: HashSet<&str> = defined_fns.iter().map(String::as_str).collect();
+    let indirect_set: HashSet<&str> = indirect_callers.iter().map(String::as_str).collect();
+    let addr_fns: Vec<&str> =
+        addr_taken.iter().map(String::as_str).filter(|s| defined.contains(s)).collect();
+    let mut indirect_admitted = false;
     let mut work: Vec<String> = reach.iter().cloned().collect();
     while let Some(f) = work.pop() {
+        // Reaching a concurrent function that performs an indirect call means the call could
+        // dispatch to any address-taken function; admit them all once (sound over-approximation).
+        if !indirect_admitted && indirect_set.contains(f.as_str()) {
+            indirect_admitted = true;
+            for &g in &addr_fns {
+                if reach.insert(g.to_string()) {
+                    work.push(g.to_string());
+                }
+            }
+        }
         if let Some(callees) = edges.get(f.as_str()) {
             for &c in callees {
                 if reach.insert(c.to_string()) {
@@ -1838,7 +1886,8 @@ mod tests {
         ];
         let no_traces: Vec<(String, Vec<(u8, String)>)> = vec![];
         let entries = vec!["sys_*".to_string()];
-        let set = whole_program_concurrent(&edges, &no_traces, &entries).expect("seed non-empty");
+        let set = whole_program_concurrent(&edges, &no_traces, &entries, &[], &[], &[])
+            .expect("seed non-empty");
         assert!(set.contains("sys_read") && set.contains("helper_a") && set.contains("helper_b"),
             "the entry and its transitive callees are concurrent: {set:?}");
         assert!(!set.contains("init_only") && !set.contains("cold"),
@@ -1849,11 +1898,52 @@ mod tests {
             &[("worker".to_string(), vec!["helper_b".to_string()])],
             &traces,
             &[],
+            &[],
+            &[],
+            &[],
         )
         .expect("spawn seed");
         assert!(via_spawn.contains("worker") && via_spawn.contains("helper_b"));
         // No entries and no spawn evidence ⇒ None (the oracle does not restrict).
-        assert!(whole_program_concurrent(&edges, &no_traces, &[]).is_none());
+        assert!(whole_program_concurrent(&edges, &no_traces, &[], &[], &[], &[]).is_none());
+    }
+
+    /// Indirect-call safety: a handler reachable ONLY through a stored function pointer (an
+    /// indirect call) must still be admitted as concurrent when a concurrent function performs
+    /// that indirect call. `dispatch` (concurrent, reached from the entry) does an indirect call;
+    /// `handler` is address-taken but has no direct edge into the concurrent closure — it must
+    /// nonetheless join the reach set. `unrelated` is address-taken but the indirect call would be
+    /// admitted regardless; a NON-address-taken cold function stays excluded.
+    #[test]
+    fn whole_program_oracle_admits_indirect_targets() {
+        let edges = vec![
+            ("sys_ioctl".to_string(), vec!["dispatch".to_string()]),
+            ("init_only".to_string(), vec!["cold".to_string()]),
+        ];
+        let no_traces: Vec<(String, Vec<(u8, String)>)> = vec![];
+        let entries = vec!["sys_*".to_string()];
+        let defined = vec![
+            "sys_ioctl".to_string(),
+            "dispatch".to_string(),
+            "handler".to_string(),
+            "init_only".to_string(),
+            "cold".to_string(),
+        ];
+        let addr_taken = vec!["handler".to_string()]; // fn-pointer stored somewhere
+        let indirect = vec!["dispatch".to_string()]; // dispatch does an indirect call
+        let set = whole_program_concurrent(
+            &edges, &no_traces, &entries, &defined, &addr_taken, &indirect,
+        )
+        .expect("seed non-empty");
+        assert!(set.contains("dispatch"), "direct closure: {set:?}");
+        assert!(set.contains("handler"), "address-taken indirect target admitted: {set:?}");
+        assert!(!set.contains("cold"), "non-address-taken cold fn stays excluded: {set:?}");
+        // Without any indirect-call site reached, the address-taken fn is NOT admitted.
+        let set2 = whole_program_concurrent(
+            &edges, &no_traces, &entries, &defined, &addr_taken, &[],
+        )
+        .expect("seed");
+        assert!(!set2.contains("handler"), "no indirect call reached ⇒ not admitted: {set2:?}");
     }
 
     /// The coverage report must *name* functions that were not analyzed rather than

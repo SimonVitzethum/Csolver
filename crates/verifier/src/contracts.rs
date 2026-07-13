@@ -1816,7 +1816,7 @@ fn local_defs(
 /// Every function name whose address escapes into a value position
 /// (`Const::Symbol` in any instruction or terminator operand). Such a function
 /// can be called indirectly, so its call sites are *not* all known.
-fn address_taken_names(module: &Module) -> HashSet<String> {
+pub fn address_taken_names(module: &Module) -> HashSet<String> {
     let mut names = HashSet::new();
     let mut op = |o: &Operand| {
         if let Operand::Const(Const::Symbol(s)) | Operand::Const(Const::SymbolOffset(s, _)) = o {

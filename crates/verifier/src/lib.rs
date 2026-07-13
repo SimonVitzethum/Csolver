@@ -23,6 +23,7 @@
 //! report is always relative to the checks the frontend emitted.
 
 mod contracts;
+pub use contracts::address_taken_names;
 pub mod datarace;
 pub mod interleave;
 pub mod lockorder;
