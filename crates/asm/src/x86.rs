@@ -82,7 +82,14 @@ fn decode_cfg(code: &[u8], resolve: RelocResolver) -> csolver_core::Result<Vec<D
         let mut pos = start;
         let mut flags: Option<(Operand, Operand)> = None;
         while pos < code.len() && !decoded.contains_key(&pos) {
-            let d = decode_one(code, pos, &mut flags, resolve)?;
+            // Any decode failure — an unsupported opcode OR a sub-construct the precise
+            // decoder declines (group-1 imm-to-memory, …) — falls back to the typed
+            // decoder for the instruction length + a conservative havoc, so one unmodeled
+            // instruction does not drop the whole (reachable) function.
+            let d = match decode_one(code, pos, &mut flags, resolve) {
+                Ok(d) => d,
+                Err(e) => lower::bridge_unmodeled(code, pos, e)?,
+            };
             let (next, ctrl) = (d.next, d.ctrl);
             decoded.insert(pos, DecodedInsn { offset: pos, next, insts: d.insts, ctrl });
             match ctrl {

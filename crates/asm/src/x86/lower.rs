@@ -882,10 +882,10 @@ pub(crate) fn decode_one(
                         done(insts, mem.next)
                     }
                 }
-                _ => bridge_unmodeled(code, pos, CoreError::unsupported(format!("x86: unsupported opcode 0f {op2:#04x}"))),
+                _ => Err(CoreError::unsupported(format!("x86: unsupported opcode 0f {op2:#04x}"))),
             }
         }
-        other => bridge_unmodeled(code, pos, CoreError::unsupported(format!("x86: unsupported opcode {other:#04x}"))),
+        other => Err(CoreError::unsupported(format!("x86: unsupported opcode {other:#04x}"))),
     }
 }
 
@@ -899,7 +899,7 @@ pub(crate) fn decode_one(
 /// the surrounding instructions keep their obligations while nothing this one did is
 /// assumed safe. A control-flow instruction (Call/Jmp/Jcc/Ret/Syscall/Int3) must NOT be
 /// skipped — a wrong CFG could be unsound — so it re-raises the original error (drop).
-fn bridge_unmodeled(code: &[u8], pos: usize, err: CoreError) -> csolver_core::Result<Decoded> {
+pub(super) fn bridge_unmodeled(code: &[u8], pos: usize, err: CoreError) -> csolver_core::Result<Decoded> {
     match decode_instruction(code, pos) {
         Ok(d) if d.length > 0 && !is_control_flow(&d.instruction) => {
             let mut insts = vec![Inst::Call {
