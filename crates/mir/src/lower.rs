@@ -12,8 +12,8 @@ use crate::parser::{BinKind, MBlock, MConst, MStmt, MTerm, MType, MirBody, Opera
 use csolver_core::{Error, Result};
 use crate::parser::CalleeSpec;
 use csolver_ir::{
-    BasicBlock, BinOp, BlockId, Callee, CmpOp, Const, DataLayout, FuncId, Function, Inst, Module,
-    Operand as IrOp, PtrContract, RValue, RefResult, RegId, SizeSpec, Terminator, Type,
+    BasicBlock, BinOp, BlockId, Callee, CmpOp, Const, DataLayout, FuncId, Function, Inst, MemKind,
+    Module, Operand as IrOp, PtrContract, RValue, RefResult, RegId, SizeSpec, Terminator, Type,
 };
 use std::collections::HashMap;
 

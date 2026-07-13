@@ -65,6 +65,18 @@ impl Ctx {
                     },
                     _ => None,
                 };
+                // `core::intrinsics::copy_nonoverlapping` / `copy` / `write_bytes` (the
+                // primitives behind `ptr::copy*`, `slice::copy_from_slice`, `write_bytes`):
+                // model as a bounds-/liveness-checked `MemIntrinsic` instead of an opaque
+                // call that would silently drop the effect. `copy_nonoverlapping` is `Copy`,
+                // so it additionally gets the source/destination **overlap** obligation — the
+                // concrete Rust aliasing UB (`copy_nonoverlapping` with overlapping ranges).
+                if let CalleeSpec::Named(n) = callee {
+                    if let Some(mi) = self.mem_intrinsic_for(n, args, out) {
+                        out.push(mi);
+                        return Ok(self.call_edges(*target, *unwind));
+                    }
+                }
                 out.push(Inst::Call {
                     dst: ir_dst,
                     callee: ir_callee,
@@ -348,6 +360,53 @@ impl Ctx {
             MType::Ref(inner, _) | MType::Ptr(inner, _) => Some(mtype_to_ir(inner)),
             _ => None,
         }
+    }
+
+    /// The local id an operand copies/moves from (`None` for a constant).
+    fn operand_local(op: &Operand) -> Option<u32> {
+        match op {
+            Operand::Copy(Place::Local(n)) | Operand::Move(Place::Local(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Recognise a `core::intrinsics` bulk-memory primitive and build its modelling
+    /// [`Inst::MemIntrinsic`]. `copy_nonoverlapping(src, dst, count)` → `Copy` (which
+    /// additionally carries the source/destination overlap obligation — the concrete
+    /// Rust aliasing UB), `copy(src, dst, count)` → `Move` (overlap allowed),
+    /// `write_bytes(dst, val, count)` → `Set`. The byte length is `count *
+    /// size_of::<T>()`, `T` recovered from the pointer argument's pointee type; if the
+    /// element size is unknown, returns `None` (the caller emits the generic call).
+    fn mem_intrinsic_for(&mut self, name: &str, args: &[Operand], out: &mut Vec<Inst>) -> Option<Inst> {
+        // (kind, dst arg index, src arg index or None, count arg index, pointer arg for elem size)
+        let (kind, dst_i, src_i, count_i, ptr_i) = match name {
+            "copy_nonoverlapping" => (MemKind::Copy, 1usize, Some(0usize), 2usize, 0usize),
+            "copy" => (MemKind::Move, 1, Some(0), 2, 0),
+            "write_bytes" => (MemKind::Set, 0, None, 2, 0),
+            _ => return None,
+        };
+        if args.len() <= dst_i.max(count_i).max(ptr_i) {
+            return None;
+        }
+        // Element size from the pointer argument's pointee (`*const T`/`*mut T`).
+        let elem = Self::operand_local(&args[ptr_i]).and_then(|p| self.deref_elem(p))?;
+        let size = elem.size_bytes(&LAYOUT).filter(|&s| s > 0)?;
+        // len = count * size_of::<T>() (bytes); no multiply when the element is a byte.
+        let count = self.operand_value(&args[count_i], out);
+        let len = if size == 1 {
+            count
+        } else {
+            let tmp = self.fresh();
+            out.push(Inst::Assign {
+                dst: tmp,
+                ty: Type::int(64),
+                value: RValue::Bin { op: BinOp::Mul, lhs: count, rhs: IrOp::int(64, size as u128), flags: Default::default() },
+            });
+            IrOp::Reg(tmp)
+        };
+        let dst = self.operand_value(&args[dst_i], out);
+        let src = src_i.map(|i| self.operand_value(&args[i], out));
+        Some(Inst::MemIntrinsic { kind, dst, src, len })
     }
 
     /// The constant length `N` of the array `place` refers to (`&[T; N]`).

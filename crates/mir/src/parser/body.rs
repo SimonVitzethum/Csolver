@@ -336,8 +336,11 @@ impl Parser {
             });
         }
         let _ = self.eat_word("const");
-        // Consume the path up to the argument `(`, keeping the last identifier
-        // (the function name) and balancing `<…>` / `[…]` in qualified paths.
+        // Consume the path up to the argument `(`, keeping the last identifier at
+        // depth 0 (the **function name**) — NOT a name inside a `::<…>` turbofish
+        // (the generic type argument), balancing `<…>` / `[…]` in qualified paths.
+        // (Previously the last identifier overall was kept, so `copy_nonoverlapping::<u8>`
+        // was mis-named `u8`, losing the intrinsic — see the memcpy-intrinsic lowering.)
         let mut last = String::new();
         let mut depth = 0i32;
         loop {
@@ -346,7 +349,7 @@ impl Parser {
                 Tok::Eof => break,
                 Tok::Punct('<') | Tok::Punct('[') => depth += 1,
                 Tok::Punct('>') | Tok::Punct(']') => depth -= 1,
-                Tok::Word(w) => last = w.clone(),
+                Tok::Word(w) if depth == 0 => last = w.clone(),
                 _ => {}
             }
             self.pos += 1;

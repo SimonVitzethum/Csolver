@@ -440,3 +440,37 @@ fn first_of(_1: &[u8]) -> u8 {
         .any(|i| matches!(i, csolver_ir::Inst::PtrOffset { .. }));
     assert!(has_offset, "the constant index is a real element access");
 }
+
+/// `core::intrinsics::copy_nonoverlapping::<u8>` must lower to a modelled, checked
+/// `MemIntrinsic { kind: Copy }` (bounds/liveness/validity + the source/destination
+/// overlap obligation — the concrete Rust aliasing UB), NOT an opaque call that would
+/// silently drop the effect.
+const COPY_NONOVERLAPPING: &str = r#"
+fn cp(_1: *const u8, _2: *mut u8, _3: usize) -> () {
+    let mut _0: ();
+    bb0: {
+        _0 = copy_nonoverlapping::<u8>(copy _1, copy _2, copy _3) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        return;
+    }
+}
+"#;
+
+#[test]
+fn copy_nonoverlapping_lowers_to_a_checked_memcpy() {
+    use csolver_ir::{Inst, MemKind};
+    let module = lower(COPY_NONOVERLAPPING, "cp");
+    assert!(module.unanalyzed.is_empty(), "lowers, not dropped: {:?}", module.unanalyzed);
+    let insts: Vec<&Inst> = module.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| &b.insts).collect();
+    assert!(
+        insts.iter().any(|i| matches!(i, Inst::MemIntrinsic { kind: MemKind::Copy, .. })),
+        "copy_nonoverlapping is a MemIntrinsic(Copy), not an opaque call: {insts:?}"
+    );
+    // Its NoForbiddenOverlap obligation is enumerated for the copy.
+    let report = verify_module(&module, &Config::default());
+    assert!(
+        report.functions[0].outcomes.iter().any(|o| o.obligation.property == SafetyProperty::NoForbiddenOverlap),
+        "the copy carries a no-overlap obligation"
+    );
+}
