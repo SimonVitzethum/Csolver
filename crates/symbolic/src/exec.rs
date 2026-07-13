@@ -76,6 +76,12 @@ const LOCK_ACQUIRE: &[&str] = &[
     // double `write_seqlock` (AA), or an ABBA against another lock is then caught for free.
     "write_seqlock", "write_seqlock_irq", "write_seqlock_bh", "write_seqlock_irqsave",
     "raw_write_seqlock", "__write_seqlock",
+    // Userspace POSIX threads: the lock is arg0 exactly as in the kernel model, so lockset
+    // race detection, AA self-deadlock and ABBA lock-order all work on pthread code. `*_trylock`
+    // is excluded (it may fail). Unlocks need no list (a call handed a held lock's base drops it).
+    "pthread_mutex_lock", "pthread_mutex_timedlock",
+    "pthread_rwlock_rdlock", "pthread_rwlock_wrlock", "pthread_rwlock_timedrdlock",
+    "pthread_rwlock_timedwrlock", "pthread_spin_lock",
 ];
 
 /// **Spinning** lock acquisitions — those that enter **atomic context** (preemption off),
@@ -90,6 +96,10 @@ const SPIN_ACQUIRE: &[&str] = &[
     "_raw_read_lock", "_raw_write_lock",
     "write_seqlock", "write_seqlock_irq", "write_seqlock_bh", "write_seqlock_irqsave",
     "raw_write_seqlock", "__write_seqlock",
+    // A userspace `pthread_spin_lock` spins (busy-wait) exactly like a kernel spinlock — holding
+    // it across a blocking call is the same anti-pattern. `pthread_mutex`/`rwlock` block/sleep and
+    // are NOT atomic context, so they stay out of this list (as `mutex_lock`/`down` do).
+    "pthread_spin_lock",
 ];
 
 /// RCU read-side critical-section entry/exit. A shared **read** inside an RCU read-side section
@@ -6061,6 +6071,44 @@ mod tests {
             .mem_decision(BlockId(0), 2, SafetyProperty::DataRace)
             .expect("DataRace obligation at the second lock");
         assert!(d.refutation.is_some(), "re-acquiring a held lock must be flagged: {d:?}");
+    }
+
+    #[test]
+    fn pthread_mutex_double_lock_is_a_deadlock() {
+        // Userspace: re-acquiring the same `pthread_mutex_t` on a path is an AA self-deadlock,
+        // detected exactly as the kernel spinlock case (the lock is arg0).
+        let l = RegId(0);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Alloc {
+            dst: l,
+            region: RegionKind::Stack,
+            elem: Type::int(32),
+            count: Operand::int(64, 1),
+            align: 4,
+        });
+        let lock = |b: &mut BasicBlock| b.insts.push(Inst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Symbol("pthread_mutex_lock".into()),
+            args: vec![Operand::Reg(l)],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        });
+        lock(&mut bb0);
+        lock(&mut bb0);
+        let f = Function {
+            id: FuncId(0),
+            name: "dl".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+        let r = discharge_with(&f, limits);
+        let d = r
+            .mem_decision(BlockId(0), 2, SafetyProperty::DataRace)
+            .expect("DataRace obligation at the second pthread_mutex_lock");
+        assert!(d.refutation.is_some(), "re-acquiring a held pthread_mutex must be flagged: {d:?}");
     }
 
     #[test]

@@ -523,6 +523,11 @@ fn ll_defs_and_global_refs(source: &str) -> (Vec<String>, Vec<String>) {
 /// `--auto-entries` — a complete kernel attacker surface with **no hand-written `--entries` file**.
 fn derive_auto_entries(dir: &Path, extra: Option<&[String]>) -> Vec<String> {
     let mut pats: Vec<String> = SYSCALL_ENTRY_PREFIXES.iter().map(|s| s.to_string()).collect();
+    // Userspace program entries: `main` receives attacker-controlled argv/argc; a libFuzzer
+    // harness receives attacker bytes. Universally-valid entries (inert in a kernel tree that has
+    // neither), so `--auto-entries`/`--reachable` also seed correctly on a userspace program — not
+    // just the kernel. A userspace *library*'s exported API is covered by the all-external default.
+    pats.extend(USERSPACE_ENTRY_PATTERNS.iter().map(|s| s.to_string()));
     if let Some(e) = extra {
         pats.extend(e.iter().cloned());
     }
@@ -531,6 +536,11 @@ fn derive_auto_entries(dir: &Path, extra: Option<&[String]>) -> Vec<String> {
     pats.extend(handlers);
     pats
 }
+
+/// Universal userspace program entry points — the attacker-reachable roots of an executable or a
+/// fuzz harness (argv/stdin/fuzzer bytes). Unioned into the auto-derived entry set so a userspace
+/// scan needs no hand-written list either.
+const USERSPACE_ENTRY_PATTERNS: &[&str] = &["main", "LLVMFuzzerTestOneInput"];
 
 /// **Devirtualisation by ops-struct-initialiser analysis.** Scan every `.ll` under `dir` for
 /// the function pointers stored in its global constant initialisers, keeping only those that

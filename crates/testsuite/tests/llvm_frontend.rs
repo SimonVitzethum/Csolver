@@ -3796,6 +3796,34 @@ fn cross_thread_use_after_free_is_detected() {
     assert!(module("la", "la").cross_thread_uaf().is_empty(), "a common lock orders free vs use");
 }
 
+/// **Userspace pthread data race (G1), lockset / Eraser.** The same Eraser lockset check works on
+/// POSIX-threads code: a global written under a `pthread_mutex` in one function and read without
+/// it in another is a candidate race; reading under the same mutex is consistent → not flagged.
+/// This is the userspace-repurposing counterpart of the kernel `spin_lock` case.
+#[test]
+fn inconsistently_locked_global_is_a_race_with_pthread_mutex() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |reader_body: &str| {
+        let src = format!(
+            "@counter = global i32 0, align 4\n@lk = global i64 0, align 8\n\
+             declare void @pthread_mutex_lock(ptr)\ndeclare void @pthread_mutex_unlock(ptr)\n\
+             define void @writer() {{\n  call void @pthread_mutex_lock(ptr @lk)\n  \
+               store i32 1, ptr @counter, align 4\n  call void @pthread_mutex_unlock(ptr @lk)\n  ret void\n}}\n\
+             define i32 @reader() {{\n{reader_body}}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "pt".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    let racy = module("  %v = load i32, ptr @counter, align 4\n  ret i32 %v\n");
+    let races = racy.data_races();
+    assert_eq!(races.len(), 1, "an unlocked read of a pthread_mutex-protected global is a race: {races:?}");
+    assert_eq!(races[0].location, "g:counter@0");
+    // Reader taking the same pthread_mutex → consistent lockset → no race.
+    let safe = module("  call void @pthread_mutex_lock(ptr @lk)\n  %v = load i32, ptr @counter, align 4\n  \
+                        call void @pthread_mutex_unlock(ptr @lk)\n  ret i32 %v\n");
+    assert!(safe.data_races().is_empty(), "a consistently pthread_mutex-locked global is not flagged");
+}
+
 /// **Data race (G1), lockset / Eraser.** A global written under a lock in one function and
 /// accessed without that lock in another is a candidate race (inconsistent lockset, a write,
 /// two functions). Consistent locking on every access is not flagged (no false positive).
