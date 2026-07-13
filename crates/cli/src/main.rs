@@ -63,7 +63,7 @@ USAGE:
                                     opaque havoc — cross-module precision at a few GB, no
                                     giant linked module. Combine with --cross-file to also
                                     link within each directory.
-                                    --reachable <needs --entries>: link, per attacker
+                                    --reachable: link, per attacker
                                     entry, the transitive set of .ll it can reach through
                                     the call graph into ONE whole-program module analysed
                                     closed-world — so a caller's scalar validation flows
@@ -182,23 +182,22 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             // ops-struct initialisers (devirtualisation). Covers all attacker-reachable APIs
             // without a hand-written list, and merges with any `--entries` patterns given.
             let entry_patterns = if auto_entries {
-                let mut pats: Vec<String> = SYSCALL_ENTRY_PREFIXES.iter().map(|s| s.to_string()).collect();
-                if let Some(extra) = &entry_patterns {
-                    pats.extend(extra.iter().cloned());
-                }
-                let handlers = discover_ops_handlers(Path::new(dir));
-                eprintln!("--auto-entries: {} ops-struct handlers discovered", handlers.len());
-                pats.extend(handlers);
-                Some(pats)
+                Some(derive_auto_entries(Path::new(dir), entry_patterns.as_deref()))
             } else {
                 entry_patterns
             };
-            let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns: entry_patterns.clone(), ..Config::default() };
             if reachable {
-                let pats = entry_patterns
-                    .ok_or("`--reachable` requires `--entries <file>` (the entry points to link from)")?;
+                // `--reachable` needs a set of link-from entries. A hand-written `--entries` file is
+                // NOT required: if none is given, derive the attacker surface automatically (the same
+                // syscall + ops-handler set as `--auto-entries`), so `--reachable` works standalone.
+                let pats = entry_patterns.unwrap_or_else(|| {
+                    eprintln!("--reachable: no --entries given — deriving the attacker surface automatically");
+                    derive_auto_entries(Path::new(dir), None)
+                });
+                let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns: Some(pats.clone()), ..Config::default() };
                 scan_reachable(Path::new(dir), &config, &pats)
             } else {
+                let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns, ..Config::default() };
                 scan_dir(Path::new(dir), &config, cross_file, whole_program)
             }
         }
@@ -516,6 +515,21 @@ fn ll_defs_and_global_refs(source: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (defined, refs)
+}
+
+/// Derive the attacker-entry set automatically for a directory scan: the precise syscall-wrapper
+/// prefixes UNION the registered indirect handlers discovered in ops-struct initialisers
+/// ([`discover_ops_handlers`]), plus any explicit `extra` patterns. This is the whole point of
+/// `--auto-entries` — a complete kernel attacker surface with **no hand-written `--entries` file**.
+fn derive_auto_entries(dir: &Path, extra: Option<&[String]>) -> Vec<String> {
+    let mut pats: Vec<String> = SYSCALL_ENTRY_PREFIXES.iter().map(|s| s.to_string()).collect();
+    if let Some(e) = extra {
+        pats.extend(e.iter().cloned());
+    }
+    let handlers = discover_ops_handlers(dir);
+    eprintln!("--auto-entries: {} ops-struct handlers discovered", handlers.len());
+    pats.extend(handlers);
+    pats
 }
 
 /// **Devirtualisation by ops-struct-initialiser analysis.** Scan every `.ll` under `dir` for
