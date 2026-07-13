@@ -420,3 +420,4 @@ fn const_expr_bitcast_fn_pointer_is_recovered_for_devirt() {
     }));
     assert!(has, "the bitcast-wrapped @handler is recovered as a fn-ptr field: {:?}", m.global_fn_ptrs);
 }
+

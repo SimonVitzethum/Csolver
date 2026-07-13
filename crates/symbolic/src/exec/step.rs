@@ -371,6 +371,24 @@ impl Explorer<'_> {
                     }
                 }
             }
+            // `llvm.lifetime.start/end(ptr)`: the slot's live range. `end` marks the
+            // pointed-to region **dead** (a later access before a new `start` is a
+            // use-after-scope, caught by the existing NoUseAfterFree/NoDanglingDeref
+            // checks); `start` re-lives it. Only a tracked region transitions; an opaque
+            // pointer is ignored. Meet-joined at merges, so a partial end never false-FAILs.
+            Inst::Intrinsic { name, args, .. } if name.starts_with("llvm.lifetime.") => {
+                if let Some(p) = args.first() {
+                    if let Prov::Region(rid) = self.eval_pointer(p, state).prov {
+                        if let Some(r) = state.regions.get_mut(rid) {
+                            r.state = if name.contains("lifetime.end") {
+                                LifetimeState::Freed
+                            } else {
+                                LifetimeState::Live
+                            };
+                        }
+                    }
+                }
+            }
             Inst::Intrinsic { dst: Some(d), .. } => {
                 let s = self.fresh_scalar(PTR_WIDTH);
                 state.env.insert(*d, SymValue::Scalar(s));

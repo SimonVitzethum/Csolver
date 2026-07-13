@@ -349,6 +349,13 @@ pub(crate) fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                     ty: Type::int(64),
                     value: RValue::Use(Operand::Const(Const::Undef)),
                 }
+            } else if callee.starts_with("llvm.lifetime.") {
+                // `llvm.lifetime.start/end(i64 size, ptr p)`: the slot's live range. Keep
+                // the pointer argument so the executor can transition the region's
+                // lifetime (end → dead, start → live) and catch a use-after-scope. Other
+                // no-op intrinsics stay argument-free.
+                let ptr = args.last().and_then(|a| ctx.operand(a, 64).ok());
+                Inst::Intrinsic { dst, name: callee.clone(), args: ptr.into_iter().collect() }
             } else if is_noop_intrinsic(callee) {
                 // Modelled as a no-op (does not touch caller-visible memory).
                 Inst::Intrinsic { dst, name: callee.clone(), args: Vec::new() }

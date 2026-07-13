@@ -484,3 +484,16 @@ define void @f(ptr %kbuf) {
     assert_ne!(verdict("clean", clean), Verdict::Fail,
         "an untainted pointer to system() is not a tainted sink");
 }
+
+/// **Use-after-scope (`llvm.lifetime.end`).** A load from a stack slot AFTER its
+/// `lifetime.end` (before any new `lifetime.start`) is UB — the slot is dead. Refuted;
+/// a re-`start`ed lifetime is safe again (no false FAIL).
+#[test]
+fn use_after_scope_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |s: &str| LlvmFrontend.lower(LlvmInput { source: s.into(), name: "u".into() }).expect("lower");
+    let bad = lower("define i32 @f() {\ne:\n  %p = alloca i32, align 4\n  store i32 1, ptr %p, align 4\n  call void @llvm.lifetime.end.p0(i64 4, ptr %p)\n  %v = load i32, ptr %p, align 4\n  ret i32 %v\n}\ndeclare void @llvm.lifetime.end.p0(i64, ptr)\n");
+    assert_eq!(verify_module(&bad, &cfg).verdict, Verdict::Fail, "load after lifetime.end is use-after-scope");
+    let ok = lower("define i32 @g() {\ne:\n  %p = alloca i32, align 4\n  call void @llvm.lifetime.end.p0(i64 4, ptr %p)\n  call void @llvm.lifetime.start.p0(i64 4, ptr %p)\n  store i32 1, ptr %p, align 4\n  %v = load i32, ptr %p, align 4\n  ret i32 %v\n}\ndeclare void @llvm.lifetime.end.p0(i64, ptr)\ndeclare void @llvm.lifetime.start.p0(i64, ptr)\n");
+    assert_ne!(verify_module(&ok, &cfg).verdict, Verdict::Fail, "a re-started lifetime is safe");
+}
