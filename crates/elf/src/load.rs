@@ -58,12 +58,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
     let shoff_us = u64_to_usize(shoff, "section-header table offset")?;
     // Read all available section headers, bounded by the file size.
     // First pass: determine the actual section count.
-    let max_shnum = if shentsize > 0 {
-        let remaining = bytes.len().saturating_sub(shoff_us);
-        remaining / shentsize
-    } else {
-        0
-    };
+    let max_shnum = bytes.len().saturating_sub(shoff_us).checked_div(shentsize).unwrap_or(0);
     let shnum = if shnum_raw == 0 {
         // Actual count is in sh_info of section 0 — but only if section 0 exists.
         // Without section headers, treat as 0 (no sections).
@@ -161,11 +156,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
         } else {
             sym_hdr.entsize.max(SYM_ENTRY_LEN)
         };
-        let count = if entsize > 0 {
-            (symtab.len() as u64 / entsize) as usize
-        } else {
-            0
-        };
+        let count = (symtab.len() as u64).checked_div(entsize).unwrap_or(0) as usize;
         for i in 0..count.min(100_000) {
             // SAFETY: i * entsize could overflow usize on adversarial input.
             // Use checked arithmetic.
@@ -251,11 +242,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
         if hdr.sh_type == SHT_RELA {
             let rel_data = section_bytes(bytes, hdr)?;
             let rel_entsize = if hdr.entsize == 0 { RELA_ENTRY_LEN } else { hdr.entsize };
-            let count = if rel_entsize > 0 {
-                (rel_data.len() as u64 / rel_entsize) as usize
-            } else {
-                0
-            };
+            let count = (rel_data.len() as u64).checked_div(rel_entsize).unwrap_or(0) as usize;
             let mut rels = Vec::with_capacity(count.min(100_000));
             for i in 0..count.min(100_000) {
                 let base = i
@@ -276,11 +263,7 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
             // REL format: 8-byte entries (offset + info), no explicit addend.
             let rel_data = section_bytes(bytes, hdr)?;
             let rel_entsize = if hdr.entsize == 0 { REL_ENTRY_LEN } else { hdr.entsize };
-            let count = if rel_entsize > 0 {
-                (rel_data.len() as u64 / rel_entsize) as usize
-            } else {
-                0
-            };
+            let count = (rel_data.len() as u64).checked_div(rel_entsize).unwrap_or(0) as usize;
             let mut rels = Vec::with_capacity(count.min(100_000));
             for i in 0..count.min(100_000) {
                 let base = i

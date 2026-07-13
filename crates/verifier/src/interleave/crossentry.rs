@@ -82,11 +82,7 @@ pub(crate) fn simulate_root(events: &[Event], root: &str, start: RootLife) -> (R
                 st = RootLife::Dangling;
             }
             Some(RootEff::Clear) => st = RootLife::Live,
-            Some(RootEff::Use) => {
-                if st == RootLife::Dangling {
-                    uaf = true;
-                }
-            }
+            Some(RootEff::Use) => uaf |= st == RootLife::Dangling,
             None => {}
         }
     }
