@@ -23,6 +23,13 @@ pub(crate) fn verify_path(
     {
         return verify_iso(path, json, bug_finding, assume_valid_params);
     }
+    // A WIM image (`.wim`/`.esd` or the `MSWIM` magic): a *container* holding a
+    // deduplicated pool of file resources — decompress each and verify the object files.
+    if matches!(path.extension().and_then(|e| e.to_str()), Some("wim") | Some("esd"))
+        || read_head(path, 208).is_ok_and(|h| csolver_elf::wim::is_wim(&h))
+    {
+        return verify_wim(path, json, bug_finding, assume_valid_params);
+    }
     let level = detect_level(path)?;
     // LLVM/MIR are mature; an ELF object is decoded via `csolver-asm` (x86-64 /
     // AArch64) and verified; the textual `.s` frontend is still a stub (reports its
@@ -199,6 +206,71 @@ fn verify_iso(path: &Path, json: bool, bug_finding: bool, assume_valid_params: b
             path.display(),
             files.len(),
             analyzed
+        );
+        for l in &lines {
+            eprintln!("{l}");
+        }
+    }
+    let worst = if any_fail {
+        Verdict::Fail
+    } else if any_unknown {
+        Verdict::Unknown
+    } else {
+        Verdict::Pass
+    };
+    Ok(verdict_code(worst))
+}
+
+/// Verify every **object file inside a WIM image** — a Windows imaging container
+/// (`install.wim` / `boot.wim`). Its file contents live as a deduplicated pool of
+/// resources: decompress each (XPRESS chunks; a raw chunk is copied; LZX/LZMS resources
+/// are reported as not-decoded, never fabricated) and, for each whose bytes carry an
+/// ELF / PE / Mach-O magic, decode and verify it. The exit code is the worst verdict.
+fn verify_wim(path: &Path, json: bool, bug_finding: bool, assume_valid_params: bool) -> Result<ExitCode, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let resources = csolver_elf::wim::data_resources(&bytes).map_err(|e| e.to_string())?;
+    let (mut any_fail, mut any_unknown, mut analyzed, mut skipped_compressed) = (false, false, 0usize, 0usize);
+    let mut lines: Vec<String> = Vec::new();
+    for (i, entry) in resources.iter().enumerate() {
+        let blob = match csolver_elf::wim::extract(&bytes, entry) {
+            Ok(b) => b,
+            Err(_) => {
+                // LZX/LZMS or a malformed resource — cannot read its bytes, so cannot verify.
+                skipped_compressed += 1;
+                continue;
+            }
+        };
+        if csolver_elf::detect_format(&blob).is_none() {
+            continue; // not an object file — a data file / registry hive / etc.
+        }
+        analyzed += 1;
+        let label = format!("resource #{i} ({} bytes)", blob.len());
+        match lower_elf(&blob) {
+            Ok(module) => {
+                let config = Config {
+                    level: SourceLevel::Elf,
+                    bug_finding,
+                    assume_valid_params,
+                    ..Config::default()
+                };
+                let report = verify_module(&module, &config);
+                match report.verdict {
+                    Verdict::Fail => any_fail = true,
+                    Verdict::Unknown => any_unknown = true,
+                    Verdict::Pass => {}
+                }
+                lines.push(format!("  {:<44} {:?}  ({} fn)", label, report.verdict, module.functions.len()));
+            }
+            Err(e) => lines.push(format!("  {label:<44} not analyzed: {e}")),
+        }
+    }
+    if !json {
+        eprintln!(
+            "WIM {}: {} resource(s), {} object file(s) analysed, {} compressed resource(s) skipped",
+            path.display(),
+            resources.len(),
+            analyzed,
+            skipped_compressed
         );
         for l in &lines {
             eprintln!("{l}");

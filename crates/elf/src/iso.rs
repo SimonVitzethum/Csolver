@@ -9,8 +9,8 @@
 //!
 //! Joliet (UTF-16BE long names) is preferred when present; otherwise the plain ISO 9660
 //! names are used. Bounds-checked throughout — a malformed image yields [`Error`], never
-//! a panic (an ISO is untrusted input). Rock Ridge, El Torito boot catalogs, and nested
-//! archives (`install.wim`) are out of scope.
+//! a panic (an ISO is untrusted input). Rock Ridge and El Torito boot catalogs are out of
+//! scope here; a nested `install.wim` is handled by [`crate::wim`].
 
 use super::*;
 use crate::reloc::read_u32;

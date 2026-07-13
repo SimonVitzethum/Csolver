@@ -38,6 +38,7 @@ mod aux;
 mod consts;
 pub mod iso;
 mod load;
+pub mod wim;
 pub mod macho;
 pub mod pe;
 mod reloc;
