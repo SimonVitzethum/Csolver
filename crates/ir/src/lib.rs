@@ -30,6 +30,7 @@ pub mod frontend;
 pub mod func;
 pub mod id;
 pub mod inst;
+mod ops;
 pub mod ty;
 
 pub use frontend::Frontend;
