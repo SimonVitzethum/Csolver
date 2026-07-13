@@ -410,44 +410,64 @@ pub fn find_cross_thread_uaf(threads: &[Thread]) -> Vec<FreeUseWitness> {
     let per: Vec<_> = threads.iter().map(free_and_access_locksets).collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
+    // A free in `pa` (thread `na`) vs an access (UAF) or, when `do_double_free`, a free
+    // (double-free) in `pb` (thread `nb`), disjoint locksets and not lifetime-ordered.
+    let check = |pa: &(ClassLocksets, ClassLocksets),
+                     na: &str,
+                     pb: &(ClassLocksets, ClassLocksets),
+                     nb: &str,
+                     do_double_free: bool,
+                     out: &mut Vec<FreeUseWitness>,
+                     seen: &mut std::collections::HashSet<(String, bool)>| {
+        for f in &pa.0 {
+            for a in &pb.1 {
+                if f.0 == a.0
+                    && f.1.is_disjoint(&a.1)
+                    && !lifetime_ordered(f, na, a, nb)
+                    && seen.insert((f.0.clone(), false))
+                {
+                    out.push(FreeUseWitness {
+                        location: f.0.clone(),
+                        threads: (na.to_string(), nb.to_string()),
+                        double_free: false,
+                    });
+                }
+            }
+            if do_double_free {
+                for g in &pb.0 {
+                    if f.0 == g.0
+                        && f.1.is_disjoint(&g.1)
+                        && !lifetime_ordered(f, na, g, nb)
+                        && seen.insert((f.0.clone(), true))
+                    {
+                        out.push(FreeUseWitness {
+                            location: f.0.clone(),
+                            threads: (na.to_string(), nb.to_string()),
+                            double_free: true,
+                        });
+                    }
+                }
+            }
+        }
+    };
     for i in 0..threads.len() {
         for j in 0..threads.len() {
             if i == j {
                 continue;
             }
-            let (ni, nj) = (threads[i].name.as_str(), threads[j].name.as_str());
-            // A free in `i` vs an access in `j`, disjoint locksets and not lifetime-ordered → UAF.
-            for f in &per[i].0 {
-                for a in &per[j].1 {
-                    if f.0 == a.0
-                        && f.1.is_disjoint(&a.1)
-                        && !lifetime_ordered(f, ni, a, nj)
-                        && seen.insert((f.0.clone(), false))
-                    {
-                        out.push(FreeUseWitness {
-                            location: f.0.clone(),
-                            threads: (threads[i].name.clone(), threads[j].name.clone()),
-                            double_free: false,
-                        });
-                    }
-                }
-                // A free in `i` vs a free in `j` (i<j to avoid the mirror), disjoint → double-free.
-                if i < j {
-                    for g in &per[j].0 {
-                        if f.0 == g.0
-                            && f.1.is_disjoint(&g.1)
-                            && !lifetime_ordered(f, ni, g, nj)
-                            && seen.insert((f.0.clone(), true))
-                        {
-                            out.push(FreeUseWitness {
-                                location: f.0.clone(),
-                                threads: (threads[i].name.clone(), threads[j].name.clone()),
-                                double_free: true,
-                            });
-                        }
-                    }
-                }
-            }
+            // Double-free only for `i < j` (avoid the mirror); UAF for every ordered pair.
+            check(&per[i], &threads[i].name, &per[j], &threads[j].name, i < j, &mut out, &mut seen);
+        }
+    }
+    // Self-concurrency: a *spawned* function may run in several threads at once, so a free in one
+    // instance racing an access/free of the same object in a second instance is a cross-thread
+    // UAF / **double-free by the same handler** (the double-close race). Check it against a renamed
+    // clone of itself — the same self-concurrency the atomicity/weak-memory passes already model.
+    let spawned = spawned_names(threads);
+    for i in 0..threads.len() {
+        if !per[i].0.is_empty() && spawned.contains(&threads[i].name) {
+            let self2 = format!("{}#2", threads[i].name);
+            check(&per[i], &threads[i].name, &per[i], &self2, true, &mut out, &mut seen);
         }
     }
     out.sort_by(|a, b| a.location.cmp(&b.location));
@@ -686,26 +706,42 @@ pub fn find_aba(threads: &[Thread]) -> Vec<AbaWitness> {
     let per: Vec<_> = threads.iter().map(cas_and_mod_locksets).collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A CAS in `pa` (thread `na`) vs a concurrent modification in `pb` (thread `nb`).
+    let check = |pa: &(ClassLocksets, ClassLocksets),
+                     na: &str,
+                     pb: &(ClassLocksets, ClassLocksets),
+                     nb: &str,
+                     out: &mut Vec<AbaWitness>,
+                     seen: &mut std::collections::HashSet<String>| {
+        for c in &pa.0 {
+            for m in &pb.1 {
+                if c.0 == m.0
+                    && c.1.is_disjoint(&m.1)
+                    && !lifetime_ordered(c, na, m, nb)
+                    && seen.insert(c.0.clone())
+                {
+                    out.push(AbaWitness {
+                        location: c.0.clone(),
+                        threads: (na.to_string(), nb.to_string()),
+                    });
+                }
+            }
+        }
+    };
     for i in 0..threads.len() {
         for j in 0..threads.len() {
             if i == j {
                 continue;
             }
-            let (ni, nj) = (threads[i].name.as_str(), threads[j].name.as_str());
-            for c in &per[i].0 {
-                for m in &per[j].1 {
-                    if c.0 == m.0
-                        && c.1.is_disjoint(&m.1)
-                        && !lifetime_ordered(c, ni, m, nj)
-                        && seen.insert(c.0.clone())
-                    {
-                        out.push(AbaWitness {
-                            location: c.0.clone(),
-                            threads: (threads[i].name.clone(), threads[j].name.clone()),
-                        });
-                    }
-                }
-            }
+            check(&per[i], &threads[i].name, &per[j], &threads[j].name, &mut out, &mut seen);
+        }
+    }
+    // Self-concurrency: a spawned function's CAS racing a second instance's modification.
+    let spawned = spawned_names(threads);
+    for i in 0..threads.len() {
+        if !per[i].0.is_empty() && spawned.contains(&threads[i].name) {
+            let self2 = format!("{}#2", threads[i].name);
+            check(&per[i], &threads[i].name, &per[i], &self2, &mut out, &mut seen);
         }
     }
     out.sort_by(|a, b| a.location.cmp(&b.location));
@@ -751,26 +787,42 @@ pub fn find_refcount_races(threads: &[Thread]) -> Vec<RefcountRaceWitness> {
     let per: Vec<_> = threads.iter().map(get_and_put_locksets).collect();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // An unchecked get in `pa` (thread `na`) vs a concurrent put in `pb` (thread `nb`).
+    let check = |pa: &(ClassLocksets, ClassLocksets),
+                     na: &str,
+                     pb: &(ClassLocksets, ClassLocksets),
+                     nb: &str,
+                     out: &mut Vec<RefcountRaceWitness>,
+                     seen: &mut std::collections::HashSet<String>| {
+        for g in &pa.0 {
+            for p in &pb.1 {
+                if g.0 == p.0
+                    && g.1.is_disjoint(&p.1)
+                    && !lifetime_ordered(g, na, p, nb)
+                    && seen.insert(g.0.clone())
+                {
+                    out.push(RefcountRaceWitness {
+                        location: g.0.clone(),
+                        threads: (na.to_string(), nb.to_string()),
+                    });
+                }
+            }
+        }
+    };
     for i in 0..threads.len() {
         for j in 0..threads.len() {
             if i == j {
                 continue;
             }
-            let (ni, nj) = (threads[i].name.as_str(), threads[j].name.as_str());
-            for g in &per[i].0 {
-                for p in &per[j].1 {
-                    if g.0 == p.0
-                        && g.1.is_disjoint(&p.1)
-                        && !lifetime_ordered(g, ni, p, nj)
-                        && seen.insert(g.0.clone())
-                    {
-                        out.push(RefcountRaceWitness {
-                            location: g.0.clone(),
-                            threads: (threads[i].name.clone(), threads[j].name.clone()),
-                        });
-                    }
-                }
-            }
+            check(&per[i], &threads[i].name, &per[j], &threads[j].name, &mut out, &mut seen);
+        }
+    }
+    // Self-concurrency: a spawned function's unchecked get racing a second instance's put.
+    let spawned = spawned_names(threads);
+    for i in 0..threads.len() {
+        if !per[i].0.is_empty() && spawned.contains(&threads[i].name) {
+            let self2 = format!("{}#2", threads[i].name);
+            check(&per[i], &threads[i].name, &per[i], &self2, &mut out, &mut seen);
         }
     }
     out.sort_by(|a, b| a.location.cmp(&b.location));
@@ -1602,6 +1654,43 @@ mod tests {
         let v = find_cross_thread_uaf(&[a, b]);
         assert_eq!(v.len(), 1);
         assert!(v[0].double_free, "two concurrent frees are a double-free");
+    }
+
+    // Self-concurrency: a *spawned* handler that frees a shared object races a second instance of
+    // itself — the double-close / double-free-by-the-same-handler race. Only detectable by pairing
+    // the handler against a clone of itself (the gap the three lockset detectors previously had).
+    #[test]
+    fn spawned_handler_races_itself_double_free() {
+        let spawner = thread("main", vec![Spawn("handler".into()), Spawn("handler".into())]);
+        let handler = thread("handler", vec![Free("obj".into())]);
+        let v = find_cross_thread_uaf(&[spawner, handler]);
+        assert!(
+            v.iter().any(|w| w.double_free && w.location == "obj"),
+            "two instances of a spawned free-ing handler are a double-free: {v:?}"
+        );
+        // A handler that is never spawned is not self-raced (no concurrency evidence).
+        let lone = thread("handler", vec![Free("obj".into())]);
+        assert!(find_cross_thread_uaf(&[lone]).is_empty(), "an un-spawned handler is not self-raced");
+        // Two instances that both free under the SAME lock are serialized → not a race.
+        let sp = thread("main", vec![Spawn("h".into())]);
+        let locked = thread("h", vec![Acquire("L".into()), Free("obj".into()), Release("L".into())]);
+        assert!(
+            find_cross_thread_uaf(&[sp, locked]).is_empty(),
+            "a common lock serializes the two instances"
+        );
+    }
+
+    // Self-concurrency also closes the refcount-race gap: a spawned handler's unchecked get racing
+    // a second instance's put on the same object.
+    #[test]
+    fn spawned_handler_races_itself_refcount() {
+        let spawner = thread("main", vec![Spawn("h".into())]);
+        let handler = thread("h", vec![RefGet("sk".into()), RefPut("sk".into())]);
+        let v = find_refcount_races(&[spawner, handler]);
+        assert!(
+            v.iter().any(|w| w.location == "sk"),
+            "a spawned handler's get races a second instance's put: {v:?}"
+        );
     }
 
     // Thread-lifetime happens-before: a parent that frees an object only AFTER `Join`-ing the
