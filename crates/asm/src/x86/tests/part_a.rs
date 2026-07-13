@@ -538,3 +538,16 @@ fn recursive_descent_skips_unreachable_trailing_bytes() {
     assert!(m.unanalyzed.is_empty(), "unreachable trailing bytes must not drop the function: {:?}", m.unanalyzed);
     assert_eq!(m.functions.len(), 1);
 }
+
+#[test]
+fn direct_call_decodes_as_opaque_and_continues() {
+    use csolver_ir::{Callee, Inst};
+    // `call rel32 (e8 ..); xor eax,eax (31 c0); ret (c3)` — a function with a call must
+    // DECODE (opaque call + fall-through), not drop or stop at the call.
+    let m = decode_function("f", &[0xe8, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3]);
+    assert!(m.unanalyzed.is_empty(), "a call must not drop the function: {:?}", m.unanalyzed);
+    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
+    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(_), .. })), "call → opaque Inst::Call");
+    // The post-call `xor eax,eax` is still analysed (fall-through past the call).
+    assert!(insts.iter().any(|i| matches!(i, Inst::Assign { .. })), "instructions after the call are decoded");
+}

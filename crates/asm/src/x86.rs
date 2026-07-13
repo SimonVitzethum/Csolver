@@ -16,7 +16,7 @@
 
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use csolver_core::{Error as CoreError, RegionKind};
-use csolver_ir::{BinOp, CastOp, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
+use csolver_ir::{BinOp, Callee, CastOp, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
 
 /// Decode an x86-64 function from its machine bytes into a one-function
 /// [`Module`], reconstructing its control-flow graph (branches/loops). On any

@@ -94,6 +94,58 @@ pub(crate) fn verify_path(
     }
 }
 
+/// Heuristic function discovery for a **stripped** x86-64 image: scan each executable
+/// section for function prologues — `endbr64` (F3 0F 1E FA, opens CET-built functions)
+/// and `push rbp; mov rbp, rsp` (55 48 89 E5) — and synthesize a function at each
+/// (sized to the next candidate or the section end; recursive-descent decode stops at
+/// its `ret`, so the overshoot is harmless). Deduped against existing symbol addresses.
+/// Sound: a spurious start only produces an UNKNOWN function.
+fn discover_x86_functions(image: &csolver_elf::Image, bytes: &[u8]) -> Vec<csolver_elf::Symbol> {
+    const MAX_DISCOVERED: usize = 20_000;
+    let known: std::collections::HashSet<u64> = image.symbols.iter().map(|s| s.address).collect();
+    let mut out: Vec<csolver_elf::Symbol> = Vec::new();
+    for (si, sec) in image.sections.iter().enumerate() {
+        if !sec.executable || !sec.has_data || sec.size == 0 {
+            continue;
+        }
+        let start = sec.file_offset as usize;
+        let end = (start + sec.size as usize).min(bytes.len());
+        let Some(data) = bytes.get(start..end) else { continue };
+        // Collect candidate offsets (section-relative) at a prologue pattern.
+        let mut starts: Vec<u64> = Vec::new();
+        let mut i = 0usize;
+        while i + 4 <= data.len() {
+            let endbr = data[i..i + 4] == [0xf3, 0x0f, 0x1e, 0xfa];
+            let frame = data[i..i + 4] == [0x55, 0x48, 0x89, 0xe5];
+            if endbr || frame {
+                starts.push(sec.address + i as u64);
+                i += 4;
+            } else {
+                i += 1;
+            }
+            if starts.len() >= MAX_DISCOVERED {
+                break;
+            }
+        }
+        // Size each candidate to the next one (or the section end).
+        for k in 0..starts.len() {
+            let addr = starts[k];
+            if known.contains(&addr) {
+                continue;
+            }
+            let next = starts.get(k + 1).copied().unwrap_or(sec.address + sec.size);
+            out.push(csolver_elf::Symbol {
+                name: format!("fn_{addr:x}"),
+                address: addr,
+                size: next.saturating_sub(addr),
+                is_function: true,
+                section_index: si as u16,
+            });
+        }
+    }
+    out
+}
+
 /// Read the first `n` bytes of `path` (for a magic sniff that needs more than the
 /// 4-byte header — e.g. ISO 9660's `CD001` at offset 0x8001).
 fn read_head(path: &Path, n: usize) -> Result<Vec<u8>, String> {
@@ -175,12 +227,21 @@ pub(crate) fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module
     // PE/Mach-O image carries none in `relocations`), so the RIP-relative global
     // resolution below simply finds nothing there and those accesses stay opaque —
     // sound, and everything else (stack/register/param reasoning) is unchanged.
-    let image = csolver_elf::load_object(bytes)?;
+    let mut image = csolver_elf::load_object(bytes)?;
     if !matches!(image.machine, csolver_elf::EM_X86_64 | csolver_elf::EM_AARCH64) {
         return Err(csolver_core::Error::unsupported(format!(
             "object machine {} is not decodable (only x86-64 and AArch64)",
             image.machine
         )));
+    }
+    // Stripped binary (no symbol table, no exports — only maybe an entry point):
+    // discover functions heuristically by scanning executable sections for x86-64
+    // prologues (`endbr64`, `push rbp; mov rbp, rsp`). Each candidate is decoded
+    // independently (recursive descent stops at its `ret`), so a spurious start only
+    // yields an UNKNOWN function, never a false PASS of another.
+    if image.functions().count() <= 1 && image.machine == csolver_elf::EM_X86_64 {
+        let discovered = discover_x86_functions(&image, bytes);
+        image.symbols.extend(discovered);
     }
     // The offset a PC-relative relocation addresses *within* its target symbol:
     // `addend + 4` (the disp32 is measured from the end of its own 4 bytes). Only

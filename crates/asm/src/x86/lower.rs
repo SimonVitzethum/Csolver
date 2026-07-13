@@ -259,6 +259,14 @@ pub(crate) fn decode_one(
             let np = p + 1;
             Ok(Decoded { insts: vec![], next: np, ctrl: Ctrl::Jmp(branch_target(np, rel)?) })
         }
+        // call rel32: an OPAQUE call that returns and falls through — havocs caller-saved
+        // registers + rax, so analysis continues past it instead of dropping the whole
+        // function (real functions almost always contain calls). The target offset is
+        // recorded for stripped-binary function discovery (see `call_targets`).
+        0xe8 => {
+            let _rel = read_imm(code, p, 4)? as u32 as i32 as i64;
+            Ok(Decoded { insts: vec![opaque_call()], next: p + 4, ctrl: Ctrl::Fall })
+        }
         0xe9 => {
             let rel = read_imm(code, p, 4)? as u32 as i32 as i64;
             let np = p + 4;
@@ -687,8 +695,8 @@ pub(crate) fn decode_one(
                     }],
                     p,
                 ),
-                2 => Ok(Decoded { insts: vec![], next: p, ctrl: Ctrl::Ret }), // call reg → model as ret (conservative)
-                4 => Ok(Decoded { insts: vec![], next: p, ctrl: Ctrl::Ret }), // jmp reg → model as ret (conservative)
+                2 => Ok(Decoded { insts: vec![opaque_call()], next: p, ctrl: Ctrl::Fall }), // call r/m: opaque call, fall through
+                4 => Ok(Decoded { insts: vec![], next: p, ctrl: Ctrl::Ret }), // jmp reg (tail/switch) → stop (conservative)
                 _ => Err(CoreError::unsupported(format!("x86: unsupported group-5 /digit {}", m.reg & 7))),
             }
         }
@@ -899,6 +907,18 @@ pub(crate) fn decode_one(
 /// the surrounding instructions keep their obligations while nothing this one did is
 /// assumed safe. A control-flow instruction (Call/Jmp/Jcc/Ret/Syscall/Int3) must NOT be
 /// skipped — a wrong CFG could be unsound — so it re-raises the original error (drop).
+/// An opaque call: havocs the heap and binds rax (reg 0) to an unknown result. Used for
+/// `call rel32`/`call r/m` so analysis continues past a call instead of dropping.
+fn opaque_call() -> Inst {
+    Inst::Call {
+        dst: Some(reg(0)),
+        callee: Callee::Symbol("<x86 call>".into()),
+        args: vec![],
+        ret_ty: Type::int(64),
+        ret_ref: None,
+    }
+}
+
 pub(super) fn bridge_unmodeled(code: &[u8], pos: usize, err: CoreError) -> csolver_core::Result<Decoded> {
     match decode_instruction(code, pos) {
         Ok(d) if d.length > 0 && !is_control_flow(&d.instruction) => {
