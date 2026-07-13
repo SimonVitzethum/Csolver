@@ -9,7 +9,7 @@
 //! comparison/connective nodes keep boolean structure explicit for the solver.
 
 use csolver_core::BitVector;
-use std::collections::HashMap;
+use csolver_core::{FxHashMap, FxHashSet};
 
 /// A handle to an interned expression node within an [`ExprCtx`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -156,7 +156,7 @@ const BOOL_WIDTH: u32 = 1;
 pub struct ExprCtx {
     nodes: Vec<Node>,
     widths: Vec<u32>,
-    intern: HashMap<Node, ExprId>,
+    intern: FxHashMap<Node, ExprId>,
 }
 
 impl ExprCtx {
@@ -192,7 +192,7 @@ impl ExprCtx {
     pub fn symbols_of(&self, root: ExprId) -> Vec<ExprId> {
         let mut set = Vec::new();
         let mut stack = vec![root];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = FxHashSet::default();
         while let Some(x) = stack.pop() {
             if !seen.insert(x) {
                 continue;

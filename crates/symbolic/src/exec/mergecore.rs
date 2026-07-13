@@ -73,11 +73,11 @@ impl Explorer<'_> {
         // Opaque-pointer labels survive the join by the same **meet** as regions/facts: an id
         // keeps a label only if every incoming edge has it — sound (never attributed to a path
         // that did not set it), and an entry-seed (set before any branch) survives on all paths.
-        let opaque_labels: HashMap<u32, HashSet<u32>> = first
+        let opaque_labels: FxHashMap<u32, FxHashSet<u32>> = first
             .opaque_labels
             .iter()
             .filter_map(|(id, labels)| {
-                let common: HashSet<u32> = labels
+                let common: FxHashSet<u32> = labels
                     .iter()
                     .copied()
                     .filter(|l| {
@@ -94,11 +94,11 @@ impl Explorer<'_> {
         // only if every incoming edge has it — so a sink refutes only on a *definitely*-tainted
         // value (no false FAIL under a partly-tainted phi). Under-taints (a value tainted on one
         // branch only is dropped) — sound, recall-only loss.
-        let tainted: HashMap<RegId, HashSet<u32>> = first
+        let tainted: FxHashMap<RegId, FxHashSet<u32>> = first
             .tainted
             .iter()
             .filter_map(|(reg, labels)| {
-                let common: HashSet<u32> = labels
+                let common: FxHashSet<u32> = labels
                     .iter()
                     .copied()
                     .filter(|l| {
@@ -115,7 +115,7 @@ impl Explorer<'_> {
         // state only if every incoming edge agrees on the *same* state — so a require refutes
         // only on a resource *definitely* in the forbidden state (no false FAIL under a partial
         // state; a disagreement drops the entry, conservatively "unknown").
-        let typestates: HashMap<(ResKey, u32), u32> = first
+        let typestates: FxHashMap<(ResKey, u32), u32> = first
             .typestates
             .iter()
             .filter(|(k, st)| edges.iter().all(|e| e.pred_state.typestates.get(k) == Some(*st)))
@@ -123,7 +123,7 @@ impl Explorer<'_> {
             .collect();
         // Refcounts survive the join by the same meet: keep a count only if every incoming
         // edge agrees, so an underflow refutes only when the count is definite.
-        let refcounts: HashMap<(ResKey, u32), i64> = first
+        let refcounts: FxHashMap<(ResKey, u32), i64> = first
             .refcounts
             .iter()
             .filter(|(k, c)| edges.iter().all(|e| e.pred_state.refcounts.get(k) == Some(*c)))
@@ -133,7 +133,7 @@ impl Explorer<'_> {
         // a read-side section on every path); per-CPU ids survive by intersection (meet).
         let rcu_depth = edges.iter().map(|e| e.pred_state.rcu_depth).min().unwrap_or(0);
         let irq_off = edges.iter().map(|e| e.pred_state.irq_off).min().unwrap_or(0);
-        let percpu: HashSet<u32> = first
+        let percpu: FxHashSet<u32> = first
             .percpu
             .iter()
             .copied()
@@ -144,7 +144,7 @@ impl Explorer<'_> {
         // a register keeps its target only if every incoming edge resolved it to
         // the *same* function (an SSA value dominating the merge does; a phi does
         // not appear here). Sound — a disagreement drops back to opaque dispatch.
-        let fn_ptrs: HashMap<RegId, FuncId> = first
+        let fn_ptrs: FxHashMap<RegId, FuncId> = first
             .fn_ptrs
             .iter()
             .filter(|(r, fid)| edges.iter().all(|e| e.pred_state.fn_ptrs.get(r) == Some(fid)))
@@ -154,13 +154,13 @@ impl Explorer<'_> {
         // A lock counts as held after the join only if held on *every* incoming edge
         // (meet), so a subsequent re-acquire is flagged only when it is a definite
         // double-lock on all paths — sound (a partial hold never fabricates one).
-        let locks_held: HashSet<RefBase> = first
+        let locks_held: FxHashSet<RefBase> = first
             .locks_held
             .iter()
             .copied()
             .filter(|b| edges.iter().all(|e| e.pred_state.locks_held.contains(b)))
             .collect();
-        let spin_held: HashSet<RefBase> = first
+        let spin_held: FxHashSet<RefBase> = first
             .spin_held
             .iter()
             .copied()
@@ -168,7 +168,7 @@ impl Explorer<'_> {
             .collect();
         // Same meet for held lock classes: keep a base's class only if held (with the
         // same class) on every incoming path.
-        let held_classes: HashMap<RefBase, String> = first
+        let held_classes: FxHashMap<RefBase, String> = first
             .held_classes
             .iter()
             .filter(|(b, c)| edges.iter().all(|e| e.pred_state.held_classes.get(b) == Some(*c)))
@@ -177,7 +177,7 @@ impl Explorer<'_> {
         // Same meet for freed bases: a base counts as freed after the join only if it was
         // freed on every incoming path, so a re-free is flagged only when it is a definite
         // double-free on all paths.
-        let freed_bases: HashSet<RefBase> = first
+        let freed_bases: FxHashSet<RefBase> = first
             .freed_bases
             .iter()
             .copied()
@@ -186,7 +186,7 @@ impl Explorer<'_> {
         // Same meet for fetched user addresses: an address counts as fetched after the
         // join only if fetched on every incoming path, so a re-fetch is flagged as a
         // double-fetch only when it is definite on all paths.
-        let user_fetches: HashSet<(RefBase, u128)> = first
+        let user_fetches: FxHashSet<(RefBase, u128)> = first
             .user_fetches
             .iter()
             .copied()
@@ -201,8 +201,8 @@ impl Explorer<'_> {
             pathcond,
             facts,
             heap: Vec::new(),
-            unwritten_reads: HashMap::new(),
-            ref_regions: HashMap::new(),
+            unwritten_reads: FxHashMap::default(),
+            ref_regions: FxHashMap::default(),
             opaque_labels,
             tainted,
             typestates,

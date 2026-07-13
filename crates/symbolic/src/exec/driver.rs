@@ -188,8 +188,8 @@ pub(crate) fn discharge_inner(
         scalar_ptr_cause: classify_scalar_ptr_defs(f),
         global_rids: HashMap::new(),
         global_fnptrs: HashMap::new(),
-        prove_cache: HashMap::new(),
-        sym_memo: HashMap::new(),
+        prove_cache: FxHashMap::default(),
+        sym_memo: FxHashMap::default(),
         lock_classes: crate::lockclass::resolve_lock_classes(f),
         lock_edges: HashSet::new(),
         race_accesses: HashSet::new(),
@@ -198,7 +198,7 @@ pub(crate) fn discharge_inner(
         f,
     };
 
-    let mut env: HashMap<RegId, SymValue> = HashMap::new();
+    let mut env: FxHashMap<RegId, SymValue> = FxHashMap::default();
     let mut regions: Vec<SymRegion> = Vec::new();
     let mut facts: Vec<ExprId> = Vec::new();
     // Pass 1: every parameter without a pointer contract (so length parameters
@@ -294,7 +294,7 @@ pub(crate) fn discharge_inner(
             sentinel: c.sentinel,
             user_controlled: false,
             assumed: false,
-            prov_labels: HashSet::new(),
+            prov_labels: FxHashSet::default(),
         });
         env.insert(
             *reg,
@@ -329,7 +329,7 @@ pub(crate) fn discharge_inner(
                 sentinel: None,
                 user_controlled: false,
                 assumed: false,
-                prov_labels: HashSet::new(),
+                prov_labels: FxHashSet::default(),
             });
             let palign = fc.pointee.align.max(1) as u64;
             let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
@@ -375,7 +375,7 @@ pub(crate) fn discharge_inner(
             sentinel: None,
             user_controlled: false,
             assumed: false,
-            prov_labels: HashSet::new(),
+            prov_labels: FxHashSet::default(),
         });
         // A constant ops-struct/vtable global carries a devirtualisation table:
         // record it against the region id so a field load can resolve its target.
@@ -391,21 +391,21 @@ pub(crate) fn discharge_inner(
         pathcond: Vec::new(),
         facts,
         heap: initial_heap,
-        unwritten_reads: HashMap::new(),
-        ref_regions: HashMap::new(),
-            opaque_labels: HashMap::new(),
-        tainted: HashMap::new(),
-        typestates: HashMap::new(),
-        refcounts: HashMap::new(),
+        unwritten_reads: FxHashMap::default(),
+        ref_regions: FxHashMap::default(),
+        opaque_labels: FxHashMap::default(),
+        tainted: FxHashMap::default(),
+        typestates: FxHashMap::default(),
+        refcounts: FxHashMap::default(),
         rcu_depth: 0,
         irq_off: 0,
-        percpu: HashSet::new(),
-        fn_ptrs: HashMap::new(),
-        locks_held: HashSet::new(),
-        spin_held: HashSet::new(),
-        held_classes: HashMap::new(),
-        user_fetches: HashSet::new(),
-        freed_bases: HashSet::new(),
+        percpu: FxHashSet::default(),
+        fn_ptrs: FxHashMap::default(),
+        locks_held: FxHashSet::default(),
+        spin_held: FxHashSet::default(),
+        held_classes: FxHashMap::default(),
+        user_fetches: FxHashSet::default(),
+        freed_bases: FxHashSet::default(),
         exact: true,
     };
     ex.run_merged(state);

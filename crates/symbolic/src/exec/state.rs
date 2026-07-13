@@ -24,7 +24,7 @@ pub(crate) struct StoreRecord {
 
 #[derive(Clone)]
 pub(crate) struct PathState {
-    pub(crate) env: HashMap<RegId, SymValue>,
+    pub(crate) env: FxHashMap<RegId, SymValue>,
     pub(crate) regions: Vec<SymRegion>,
     pub(crate) pathcond: Vec<ExprId>,
     pub(crate) facts: Vec<ExprId>,
@@ -37,14 +37,14 @@ pub(crate) struct PathState {
     /// consulted only in `load_value`'s unwritten fallback (a store always wins first).
     /// Cleared on every heap havoc (an opaque call may have written the location), so it can
     /// never return a stale post-write value — sound.
-    pub(crate) unwritten_reads: HashMap<(usize, u128, u32), SymValue>,
+    pub(crate) unwritten_reads: FxHashMap<(usize, u128, u32), SymValue>,
     /// **Materialised-field region identity**: the region a `RefWitness` materialised for a
     /// raw-pointer field at `(base region, concrete offset)`, so two loads of the *same* field
     /// yield the *same* tracked region (an in-place `src == dst` through field loads is then
     /// recognised). Keyed by the base's identity — a materialised region or an opaque
     /// provenance id — and the field offset. Cleared on every heap havoc (a call may have
     /// reassigned the field) — sound.
-    pub(crate) ref_regions: HashMap<(RefBase, u128), usize>,
+    pub(crate) ref_regions: FxHashMap<(RefBase, u128), usize>,
     /// Provenance labels attached to an **opaque pointer** by its provenance identity
     /// (`Prov::Unknown`'s id — see there), which flows through `gep`/copy so a field address
     /// off a labelled object carries the object's labels. A raw-pointer parameter is opaque
@@ -53,7 +53,7 @@ pub(crate) struct PathState {
     /// (`CapRequire`/`CapRequireIfAlias`), never null-deref, bounds, liveness, or permissions —
     /// so it cannot introduce a false PASS. Persistent (a fact about the SSA value, not memory),
     /// so not cleared on havoc.
-    pub(crate) opaque_labels: HashMap<u32, HashSet<u32>>,
+    pub(crate) opaque_labels: FxHashMap<u32, FxHashSet<u32>>,
     /// **Scalar taint labels** per SSA register (the directional taint lattice, G6-family J/F/D):
     /// interned taint-label ids a register's value carries, sourced by a `taint-source` contract
     /// or a load from a labelled region, propagated through arithmetic/casts, checked by a
@@ -61,7 +61,7 @@ pub(crate) struct PathState {
     /// reuses `prov_labels`; this map is the scalar complement. Meet-joined at merges (a value is
     /// "definitely tainted" only if tainted on every incoming path — no false FAIL under a
     /// partly-tainted phi). A fact about the SSA value, not memory (not cleared on havoc).
-    pub(crate) tainted: HashMap<RegId, HashSet<u32>>,
+    pub(crate) tainted: FxHashMap<RegId, FxHashSet<u32>>,
     /// **Typestate per resource per protocol** (the generalised protocol tracker, roadmap #4):
     /// `(resource identity, protocol id) → current state id`. Advanced by `Inst::TypestateSet`
     /// transitions and checked by `Inst::TypestateRequire` obligations (both contract-driven).
@@ -69,12 +69,12 @@ pub(crate) struct PathState {
     /// protocol. Meet-joined at merges (a resource is "definitely in state S" only if it is S
     /// on every incoming path — so a require refutes with no false FAIL under a partial state).
     /// A fact about the resource, not memory (not cleared on havoc).
-    pub(crate) typestates: HashMap<(ResKey, u32), u32>,
+    pub(crate) typestates: FxHashMap<(ResKey, u32), u32>,
     /// **Reference counts per resource per protocol** (G8): `(resource, protocol) → count`.
     /// Raised by an `inc` and lowered by a `dec` (`Inst::Refcount`); a `dec` below zero is an
     /// underflow (premature free → UAF). Meet-joined at merges (kept only if all incoming
     /// paths agree on the count — so an underflow refutes only when definite; no false FAIL).
-    pub(crate) refcounts: HashMap<(ResKey, u32), i64>,
+    pub(crate) refcounts: FxHashMap<(ResKey, u32), i64>,
     /// **RCU read-side nesting depth** on this path (data-race hardening): a shared *read* while
     /// this is > 0 is inside an RCU read-side critical section and race-free by the RCU contract,
     /// so excluded from the data-race pass. Meet-joined (min) at merges — an access counts as
@@ -88,41 +88,41 @@ pub(crate) struct PathState {
     /// **Per-CPU pointer identities** on this path (data-race hardening): opaque-pointer ids
     /// returned by a per-CPU accessor (`this_cpu_ptr`/…). Accesses through them are thread-local
     /// (not shared), so excluded from the data-race pass. Meet-joined at merges.
-    pub(crate) percpu: HashSet<u32>,
+    pub(crate) percpu: FxHashSet<u32>,
     /// **Resolved function-pointer values**: a register holding a function address
     /// devirtualised from a constant ops-struct load (see `global_fnptrs`) maps to
     /// its target `FuncId`, so an indirect call through that register is analysed
     /// with the callee's summary rather than an opaque havoc. Persistent (a fact
     /// about the SSA value, not memory).
-    pub(crate) fn_ptrs: HashMap<RegId, FuncId>,
+    pub(crate) fn_ptrs: FxHashMap<RegId, FuncId>,
     /// **Locks held** on this path, by the identity of the lock pointer's base object
     /// (`spin_lock`/`mutex_lock`/… acquired and not yet released). Re-acquiring a base
     /// already here is an AA self-deadlock. Structural per-path state (not memory), so
     /// not cleared on a heap havoc; joined by meet at control-flow merges.
-    pub(crate) locks_held: HashSet<RefBase>,
+    pub(crate) locks_held: FxHashSet<RefBase>,
     /// **Spinning locks held** on this path (the atomic-context subset of `locks_held`:
     /// `spin_lock`/`read_lock`/`write_lock` families, not sleepable `mutex`/`down`). A
     /// blocking call while this is non-empty is a sleep-in-atomic bug. Meet-joined at merges
     /// like `locks_held`, and conservatively dropped when the lock base is passed to any call.
-    pub(crate) spin_held: HashSet<RefBase>,
+    pub(crate) spin_held: FxHashSet<RefBase>,
     /// **Lock class held per lock base** on this path — the static cross-function name
     /// (see `lockclass`) of every lock currently held, keyed by its runtime base. Used to
     /// emit lock-order edges (held-class → newly-acquired-class) for ABBA cycle detection.
     /// Meet-joined at merges (only a lock held on every incoming path stays), and dropped
     /// alongside `locks_held`/`spin_held` when the base is passed to any call.
-    pub(crate) held_classes: HashMap<RefBase, String>,
+    pub(crate) held_classes: FxHashMap<RefBase, String>,
     /// **User-memory addresses fetched** on this path, by `(source base, concrete byte
     /// offset)` — one entry per `copy_from_user`/`get_user` from a concrete user address.
     /// Re-fetching an address already here is a **double-fetch** (a TOCTOU on adversary-
     /// controlled user memory). Structural per-path state (not cleared on a heap havoc);
     /// joined by meet at merges, so a re-fetch is flagged only when the first fetch is
     /// definite on every incoming path — sound (a partial fetch never fabricates one).
-    pub(crate) user_fetches: HashSet<(RefBase, u128)>,
+    pub(crate) user_fetches: FxHashSet<(RefBase, u128)>,
     /// **Bases freed by an attributed freeing call** (`Summary.frees_arg`) on this path —
     /// so a second freeing-wrapper call on the same pointer is a definite double-free
     /// (which the coarse `frees` region havoc cannot attribute). Joined by meet at merges
     /// (only a base freed on *every* incoming path counts). Structural, not memory.
-    pub(crate) freed_bases: HashSet<RefBase>,
+    pub(crate) freed_bases: FxHashSet<RefBase>,
     /// Whether this path is *exact*: no over-approximation (loop-header havoc,
     /// opaque call, or non-determined load) has been introduced. A symbolic
     /// **refutation** (sound `FAIL` + counterexample) is only emitted on an
@@ -267,11 +267,11 @@ pub(crate) struct Explorer<'f> {
     /// Repeated identical bounds/alias queries (loops, many accesses under one
     /// path condition) then skip re-bit-blasting. The `linear-no-overflow` side
     /// effect is re-applied on a hit.
-    pub(crate) prove_cache: HashMap<(Box<[ExprId]>, ExprId), Option<ProofMethod>>,
+    pub(crate) prove_cache: FxHashMap<(Box<[ExprId]>, ExprId), Option<ProofMethod>>,
     /// Memoized **variable set** (sorted `Sym` ids) of an expression, keyed by its interned id
     /// (immutable, so the cache is stable). Powers the relevance pre-filter in `branch_infeasible`,
     /// which skips the full path-condition query when a branch condition shares no variable with it.
-    pub(crate) sym_memo: HashMap<ExprId, std::rc::Rc<[ExprId]>>,
+    pub(crate) sym_memo: FxHashMap<ExprId, std::rc::Rc<[ExprId]>>,
     /// Static **lock-class map** for this function: register → the cross-function name
     /// of the lock it designates (see `lockclass`). Consulted at each lock-acquire to
     /// name the acquired lock for ABBA lock-order edges.

@@ -185,7 +185,7 @@ pub(crate) struct SymRegion {
     /// Empty = unlabelled, which grants every capability (the sound default). An
     /// [`Inst::CapRequire`] refutes iff **some** label in the set provably lacks the cap —
     /// a container is only as capable as its least-capable member.
-    pub(crate) prov_labels: HashSet<u32>,
+    pub(crate) prov_labels: FxHashSet<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

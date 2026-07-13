@@ -51,7 +51,7 @@ impl Explorer<'_> {
             let cfg = self.analysis.cfg();
             cfg.reverse_postorder().into_iter().map(|n| cfg.block_id(n)).collect()
         };
-        let mut incoming: HashMap<BlockId, Vec<EdgeState>> = HashMap::new();
+        let mut incoming: FxHashMap<BlockId, Vec<EdgeState>> = FxHashMap::default();
         incoming.insert(
             self.f.entry,
             vec![EdgeState { pred_state: entry_state, guard: None, args: Vec::new() }],
@@ -104,7 +104,7 @@ impl Explorer<'_> {
         block: BlockId,
         b: &BasicBlock,
         state: PathState,
-        incoming: &mut HashMap<BlockId, Vec<EdgeState>>,
+        incoming: &mut FxHashMap<BlockId, Vec<EdgeState>>,
     ) {
         match &b.term {
             Terminator::Return(Some(o)) => {

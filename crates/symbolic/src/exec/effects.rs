@@ -133,11 +133,11 @@ impl Explorer<'_> {
     /// The provenance labels attached to a pointer operand: a materialised region's own
     /// labels, or — for an **opaque pointer** — the labels on its provenance identity
     /// (`Prov::Unknown`'s id, which flows through `gep`/copy). Unifies both channels.
-    pub(crate) fn ptr_labels(&mut self, ptr: &Operand, state: &PathState) -> HashSet<u32> {
+    pub(crate) fn ptr_labels(&mut self, ptr: &Operand, state: &PathState) -> FxHashSet<u32> {
         match self.eval_pointer(ptr, state).prov {
             Prov::Region(rid) => state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default(),
             Prov::Unknown(_, Some(id)) => state.opaque_labels.get(&id).cloned().unwrap_or_default(),
-            _ => HashSet::new(),
+            _ => FxHashSet::default(),
         }
     }
 
@@ -162,14 +162,14 @@ impl Explorer<'_> {
     /// The taint labels an r-value's result carries: the **union** of its register operands'
     /// scalar taint (a `tainted` length + 1 is still tainted; a cast/compare of a tainted
     /// value is tainted). Constants are untainted. The propagation rule of the taint lattice.
-    pub(crate) fn rvalue_taint(&self, rv: &RValue, state: &PathState) -> HashSet<u32> {
+    pub(crate) fn rvalue_taint(&self, rv: &RValue, state: &PathState) -> FxHashSet<u32> {
         let ops: Vec<&Operand> = match rv {
             RValue::Use(o) => vec![o],
             RValue::Bin { lhs, rhs, .. } | RValue::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
             RValue::Cast { operand, .. } => vec![operand],
             RValue::Select { cond, then_val, else_val } => vec![cond, then_val, else_val],
         };
-        let mut t = HashSet::new();
+        let mut t = FxHashSet::default();
         for o in ops {
             if let Operand::Reg(r) = o {
                 if let Some(s) = state.tainted.get(r) {
@@ -399,7 +399,7 @@ impl Explorer<'_> {
                 state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default()
             }
             Prov::Unknown(_, Some(id)) => state.opaque_labels.get(&id).cloned().unwrap_or_default(),
-            _ => HashSet::new(),
+            _ => FxHashSet::default(),
         };
         self.labels_lack_cap(&labels, cap)
     }
@@ -433,7 +433,7 @@ impl Explorer<'_> {
 
     /// Whether `labels` contains one that the provenance lattice proves does **not** grant
     /// `cap` (a label absent from the lattice grants everything — the sound default).
-    pub(crate) fn labels_lack_cap(&self, labels: &HashSet<u32>, cap: u32) -> bool {
+    pub(crate) fn labels_lack_cap(&self, labels: &FxHashSet<u32>, cap: u32) -> bool {
         labels
             .iter()
             .any(|l| self.prov_grants.get(l).is_some_and(|caps| !caps.contains(&cap)))

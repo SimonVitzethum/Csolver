@@ -122,7 +122,7 @@ impl Explorer<'_> {
                     sentinel: None,
                     user_controlled: false,
                     assumed,
-                    prov_labels: HashSet::new(),
+                    prov_labels: FxHashSet::default(),
                 });
                 // Bug-finding: an attacker-controlled `count * sizeof(T)` size that can
                 // wrap the pointer width under-allocates — a heap overflow at the root.
@@ -260,7 +260,7 @@ impl Explorer<'_> {
                         Prov::Unknown(_, Some(id)) => {
                             state.opaque_labels.get(&id).cloned().unwrap_or_default()
                         }
-                        _ => HashSet::new(),
+                        _ => FxHashSet::default(),
                     };
                     if !src_labels.is_empty() {
                         match &value {
@@ -302,7 +302,7 @@ impl Explorer<'_> {
                         Prov::Unknown(_, Some(id)) => {
                             state.opaque_labels.get(&id).cloned().unwrap_or_default()
                         }
-                        _ => HashSet::new(),
+                        _ => FxHashSet::default(),
                     };
                     if !src_labels.is_empty() {
                         state.tainted.entry(*dst).or_default().extend(src_labels);

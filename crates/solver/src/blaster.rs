@@ -7,7 +7,7 @@ pub struct Blaster<'c> {
     ctx: &'c ExprCtx,
     /// The CNF being built.
     pub cnf: Cnf,
-    memo: HashMap<ExprId, Vec<Lit>>,
+    memo: FxHashMap<ExprId, Vec<Lit>>,
     /// Each named symbol encountered, with its width and bit literals (LSB
     /// first) — so a SAT model can be read back into concrete symbol values.
     syms: Vec<(String, u32, Vec<Lit>)>,
@@ -19,7 +19,7 @@ impl<'c> Blaster<'c> {
         Blaster {
             ctx,
             cnf: Cnf::default(),
-            memo: HashMap::new(),
+            memo: FxHashMap::default(),
             syms: Vec::new(),
         }
     }

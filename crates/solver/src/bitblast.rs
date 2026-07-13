@@ -20,7 +20,7 @@
 
 use crate::expr::{BvOp, CmpOp, ExprCtx, ExprId, Node};
 use crate::sat::Lit;
-use std::collections::HashMap;
+use csolver_core::FxHashMap;
 
 /// The widest bit-vector we bit-blast. Memory-safety quantities are `i1`..`i64`;
 /// capping keeps every query bounded.

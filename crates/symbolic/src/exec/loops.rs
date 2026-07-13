@@ -112,7 +112,7 @@ impl Explorer<'_> {
                         Prov::Unknown(_, Some(id)) => {
                             state.opaque_labels.get(&id).cloned().unwrap_or_default()
                         }
-                        _ => HashSet::new(),
+                        _ => FxHashSet::default(),
                     };
                     let offset = self.ctx.int(PTR_WIDTH, 0);
                     let id = self.prov_ids;

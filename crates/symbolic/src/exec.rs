@@ -28,6 +28,10 @@ use csolver_solver::{
     bitprecise, prove_implies_method, BvOp, CmpOp as SCmp, ExprCtx, ExprId, Node, ProofMethod,
 };
 use std::collections::{HashMap, HashSet};
+// Fast, deterministic hasher for the hot internal maps (per-path `PathState`, proof
+// caches, the merge worklist). The public `discharge_*` API keeps `std` `HashMap`
+// parameters, so both names are in scope. Verdict-neutral (see `csolver_core::hash`).
+use csolver_core::{FxHashMap, FxHashSet};
 
 const PTR_WIDTH: u32 = 64;
 const LAYOUT: DataLayout = DataLayout::LP64;

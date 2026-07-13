@@ -408,7 +408,7 @@ impl Explorer<'_> {
             sentinel: None,
             user_controlled: false,
             assumed,
-            prov_labels: HashSet::new(),
+            prov_labels: FxHashSet::default(),
         });
         rid
     }

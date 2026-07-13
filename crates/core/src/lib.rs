@@ -25,6 +25,7 @@
 //! they may only contribute obligations and their results.
 
 pub mod error;
+pub mod hash;
 pub mod location;
 pub mod obligation;
 pub mod proof;
@@ -34,6 +35,7 @@ pub mod value;
 pub mod verdict;
 
 pub use error::{Error, Result};
+pub use hash::{FxBuildHasher, FxHashMap, FxHashSet};
 pub use location::{Location, SourceLevel, Span};
 pub use region::RegionKind;
 pub use obligation::{
