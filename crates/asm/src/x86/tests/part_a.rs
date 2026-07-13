@@ -497,3 +497,34 @@ fn typed_lea_indexed() {
     };
     assert_eq!(d.instruction, Instruction::Lea(Reg::RAX, Width::Q, expected_mem));
 }
+
+#[test]
+fn unmodeled_opcode_bridges_instead_of_dropping() {
+    use csolver_ir::{Callee, Inst};
+    // `addps xmm0, xmm1` (0f 58 c1) is decoded by the rich typed decoder but not by
+    // the byte→MSIR decoder. Sandwiched before `ret`, the function used to drop whole;
+    // now it decodes: the unmodeled instruction becomes an opaque call + register havoc.
+    let m = decode_function("f", &[0x0f, 0x58, 0xc1, 0xc3]);
+    assert!(m.unanalyzed.is_empty(), "bridged, not dropped: {:?}", m.unanalyzed);
+    let has_havoc_call = m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "<x86 unmodeled>"));
+    assert!(has_havoc_call, "the unmodeled instruction is an opaque havoc call");
+}
+
+#[test]
+fn unmodeled_control_flow_still_drops() {
+    // A control-flow opcode the byte decoder does not handle must NOT be skipped as a
+    // havoc (a wrong CFG could be unsound). `jmp r/m` indirect (ff /4) — if unmodeled,
+    // it re-raises rather than bridging. (ff e0 = jmp rax.)
+    let m = decode_function("f", &[0xff, 0xe0]);
+    // Either handled precisely OR dropped — but never silently havoc'd as data-processing.
+    let bridged = m.functions.first().is_some_and(|f| {
+        f.blocks.iter().flat_map(|b| &b.insts).any(
+            |i| matches!(i, csolver_ir::Inst::Call { callee: csolver_ir::Callee::Symbol(s), .. } if s == "<x86 unmodeled>"),
+        )
+    });
+    assert!(!bridged, "control-flow must not be bridged as a data havoc");
+}
