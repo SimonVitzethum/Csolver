@@ -54,7 +54,7 @@ pub fn parameter_pointee_sizes(image: &Image, file: &[u8]) -> HashMap<String, Ve
 
 /// `slot offset → addend` for the relocations patching the named section (the DWARF
 /// string-offset slots are relocated in a `.o`; empty for a linked image).
-fn section_addends(image: &Image, name: &str) -> HashMap<u64, i64> {
+pub(crate) fn section_addends(image: &Image, name: &str) -> HashMap<u64, i64> {
     let Some(idx) = image.sections.iter().position(|s| s.name == name) else {
         return HashMap::new();
     };

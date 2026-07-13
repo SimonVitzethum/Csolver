@@ -63,6 +63,10 @@ use consts::*;
 pub mod dwarf;
 pub use dwarf::parameter_pointee_sizes;
 
+/// A focused DWARF `.debug_line` reader (instruction address → source line).
+pub mod dwarf_line;
+pub use dwarf_line::{line_at, line_rows};
+
 /// The object-file format of a byte image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
