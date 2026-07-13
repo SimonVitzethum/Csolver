@@ -252,6 +252,28 @@ e:
         assert!(kinds.contains(&2), "an `*_acquire` call is a read barrier (kind 2): {kinds:?}");
     }
 
+    /// `rcu_assign_pointer` is an `smp_store_release` publish: it lowers to a **write barrier**
+    /// (kind 1) so the producer's prior data stores are ordered before the pointer is published
+    /// (the message-passing producer side) — the weak-memory pass then does not demand an `smp_wmb`.
+    #[test]
+    fn rcu_assign_pointer_lowers_to_a_write_barrier() {
+        use csolver_ir::Inst;
+        let src = "\
+            declare void @rcu_assign_pointer(ptr, ptr)\n\
+            define void @publish(ptr %gp, ptr %obj) {\nb:\n\
+              call void @rcu_assign_pointer(ptr %gp, ptr %obj)\n  ret void\n}\n";
+        let m = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let has_wbarrier = m
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Barrier { kind: 1 }));
+        assert!(has_wbarrier, "rcu_assign_pointer publishes with release (write-barrier) ordering");
+    }
+
     /// Register-only inline asm (`rdtsc`, no memory clobber) lowers to the
     /// non-clobbering `<inline asm nomem>` marker; a memory-clobbering asm (`mfence`
     /// with `~{memory}`) keeps the havoc-ing `<inline asm>` marker.

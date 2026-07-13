@@ -7,8 +7,15 @@
 # point clears it program-wide; a plain free requires it NOT be `deferred` (see free.contract).
 
 # --- RCU / SRCU publish --------------------------------------------------------------------
+# `rcu_assign_pointer` is an `smp_store_release`: it orders every prior store before the pointer
+# becomes visible to readers (the producer side of the message-passing idiom `W(data); publish`).
+# Even though the call is opaque (no store event of its own), the release is a **write barrier** at
+# that program point — so a consumer that observes the published pointer observes the prior data
+# writes, and the weak-memory pass does not falsely demand an `smp_wmb`. Sound (release genuinely
+# orders prior writes; it only removes a reordering that cannot happen, never hides a real bug).
 [rcu_assign_pointer rcu_replace_pointer srcu_assign_pointer]
 typestate-set arg1 reclaim deferred
+barrier write
 
 # --- Hazard pointers: publishing a node others may still be scanning --------------------------
 [hazptr_protect hazard_pointer_set hp_protect llist_add]
