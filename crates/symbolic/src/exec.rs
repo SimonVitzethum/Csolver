@@ -685,7 +685,11 @@ fn discharge_inner(
         regions.push(SymRegion {
             kind: RegionKind::Global,
             size,
-            base_align: 1,
+            // A global's base address is aligned to its declared `align`, so a
+            // masked/guarded offset from it can be proved aligned (see
+            // `check_access`). Unspecified alignment is 1 (proofs then fall back,
+            // never assume).
+            base_align: (g.align as u64).max(1),
             state: LifetimeState::Live,
             perms: Permissions { read: true, write: g.writable, exec: false },
             contract: Some(GLOBAL_MEMORY),
@@ -1730,7 +1734,10 @@ impl Explorer<'_> {
         incoming: &mut HashMap<BlockId, Vec<EdgeState>>,
     ) {
         match &b.term {
-            Terminator::Return(_) | Terminator::Unreachable => {}
+            Terminator::Return(Some(o)) => {
+                self.check_return(block, o, &state);
+            }
+            Terminator::Return(None) | Terminator::Unreachable => {}
             Terminator::Br { target, args } => {
                 if !self.is_back_edge(block, *target) {
                     incoming.entry(*target).or_default().push(EdgeState {
@@ -5526,6 +5533,44 @@ impl Explorer<'_> {
 
     /// Record a memory obligation decided as [`Decision`] (carrying a refutation
     /// model when definitely violated).
+    /// A `return` of a pointer into this frame's own stack is a dangling return:
+    /// the storage dies the instant the frame is torn down, so the caller holds a
+    /// pointer to freed stack (use-after-return). Recorded at the terminator slot
+    /// (`insts.len()`), bug-finding-only. A stack region can only be a local
+    /// `alloca` of this function whose address escaped (an un-promoted alloca), so
+    /// a stack-provenance return is a definite defect — no interprocedural analysis
+    /// needed. Params/heap (`Region(Heap)`) and globals are never flagged.
+    fn check_return(&mut self, block: BlockId, op: &Operand, state: &PathState) {
+        let idx = self.f.block(block).map_or(0, |b| b.insts.len());
+        if let SymValue::Ptr(p) = self.eval_value(op, state) {
+            if self.points_into_frame_stack(&p, state) {
+                self.record_temporal(
+                    (block, idx),
+                    SafetyProperty::NoDanglingDeref,
+                    true,
+                    state,
+                    "does not return a pointer into this frame's stack",
+                    "returns a pointer into a local stack allocation (dangling after return)",
+                );
+            }
+        }
+    }
+
+    /// Whether `p`'s provenance resolves to a stack region of the current frame
+    /// (directly, or on either arm of a `select`/PHI join).
+    fn points_into_frame_stack(&self, p: &SymPointer, state: &PathState) -> bool {
+        match &p.prov {
+            Prov::Region(rid) => {
+                matches!(state.regions.get(*rid).map(|r| r.kind), Some(RegionKind::Stack))
+            }
+            Prov::Select { then_ptr, else_ptr, .. } => {
+                self.points_into_frame_stack(then_ptr, state)
+                    || self.points_into_frame_stack(else_ptr, state)
+            }
+            _ => false,
+        }
+    }
+
     fn record_mem(
         &mut self,
         block: BlockId,

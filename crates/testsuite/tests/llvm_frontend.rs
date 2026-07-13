@@ -3013,6 +3013,25 @@ fn arithmetic_overflow_is_flagged() {
     assert_ne!(verify_module(&konst, &cfg).verdict, Verdict::Fail, "add nsw of small constants is safe");
 }
 
+/// **Dangling return / use-after-return (`NoDanglingDeref`).** A function that returns the
+/// address of one of its own `alloca` locals hands the caller a pointer into a frame that dies
+/// on return. Refuted with a witness (bug-finding). Returning a parameter or heap pointer, and
+/// returning a non-pointer, are safe (no false FAIL).
+#[test]
+fn dangling_stack_return_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |src: &str| LlvmFrontend.lower(LlvmInput { source: src.into(), name: "r".into() }).expect("lower");
+    // return &local → dangling.
+    let bad = lower("define ptr @f() {\nb:\n  %p = alloca i32, align 4\n  ret ptr %p\n}\n");
+    assert_eq!(verify_module(&bad, &cfg).verdict, Verdict::Fail, "returning the address of a local is a dangling return");
+    // return a parameter pointer → fine (the caller owns it).
+    let param = lower("define ptr @g(ptr %x) {\nb:\n  ret ptr %x\n}\n");
+    assert_ne!(verify_module(&param, &cfg).verdict, Verdict::Fail, "returning a parameter pointer is safe");
+    // return a scalar → not a pointer, nothing to flag.
+    let scalar = lower("define i32 @h() {\nb:\n  ret i32 7\n}\n");
+    assert_ne!(verify_module(&scalar, &cfg).verdict, Verdict::Fail, "returning a scalar is safe");
+}
+
 /// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the
 /// request's destination to grant `write` — which `foreign` does not → FAIL. This exercises
 /// `label`/`propagate`/`require` (data/provenance.contract) end to end through real API names.

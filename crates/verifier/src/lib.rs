@@ -53,6 +53,7 @@ use csolver_core::{
 };
 use csolver_ir::{
     Condition, Const, FieldContract, FuncId, Function, Inst, Module, Operand, PtrContract, SizeSpec,
+    Terminator,
 };
 use csolver_symbolic::{
     discharge_function, discharge_with_scalars, summarize_module, SymOutcome, SymbolicReport,
@@ -719,6 +720,36 @@ fn verify_function_with(
                 };
                 outcomes.push(ObligationOutcome { obligation, result });
             }
+        }
+        // Terminator-level obligation: a `return` of a pointer into this frame's
+        // own stack is a dangling return (use-after-return in the making). The
+        // executor records it at the terminator slot (`insts.len()`); enumerate it
+        // here so the recorded decision is actually read. Bug-finding-only, like
+        // the other report-only classes — strict `verify` never raises it.
+        if config.bug_finding && matches!(block.term, Terminator::Return(Some(_))) {
+            let property = SafetyProperty::NoDanglingDeref;
+            let index = block.insts.len();
+            let id = ObligationId(*next_id);
+            *next_id += 1;
+            let location = Location::level_only(config.level)
+                .in_function(f.name.as_str())
+                .at_instruction(index as u32);
+            let decision = symbolic
+                .as_ref()
+                .and_then(|r| r.mem_decision(block.id, index, property));
+            let predicate = decision
+                .map(|d| d.predicate.clone())
+                .unwrap_or_else(|| property.describe().to_string());
+            let obligation = ProofObligation::new(id, property, location, predicate.clone());
+            let result = match decision {
+                Some(d) if d.proven => proven_by_symbolic_memory(&predicate, &sym_assumptions),
+                Some(d) => match &d.refutation {
+                    Some(model) => refuted_by_symbolic(property, &predicate, model.clone()),
+                    None => open_memory(property, &predicate, &d.residual),
+                },
+                None => open_memory(property, &predicate, not_analyzed_reason(&symbolic)),
+            };
+            outcomes.push(ObligationOutcome { obligation, result });
         }
     }
 
