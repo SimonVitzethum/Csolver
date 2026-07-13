@@ -224,6 +224,34 @@ e:
         assert!(has_select, "select must lower to RValue::Select, not an opaque value");
     }
 
+    /// Acquire/release atomic helpers, when they appear as out-of-line calls, lower to the
+    /// corresponding weak-memory barrier: a `*_release` to a write barrier (orders prior stores
+    /// before it), a `*_acquire` to a read barrier (orders subsequent loads after it).
+    #[test]
+    fn acquire_release_atomics_lower_to_barriers() {
+        use csolver_ir::Inst;
+        let src = "\
+            declare void @atomic_set_release(ptr, i32)\ndeclare i32 @smp_load_acquire(ptr)\n\
+            define void @f(ptr %p) {\nb:\n\
+              call void @atomic_set_release(ptr %p, i32 1)\n\
+              %v = call i32 @smp_load_acquire(ptr %p)\n  ret void\n}\n";
+        let m = LlvmFrontend
+            .lower(LlvmInput { source: src.into(), name: "m".into() })
+            .expect("lower");
+        let kinds: Vec<u8> = m
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Barrier { kind } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert!(kinds.contains(&1), "a `*_release` call is a write barrier (kind 1): {kinds:?}");
+        assert!(kinds.contains(&2), "an `*_acquire` call is a read barrier (kind 2): {kinds:?}");
+    }
+
     /// Register-only inline asm (`rdtsc`, no memory clobber) lowers to the
     /// non-clobbering `<inline asm nomem>` marker; a memory-clobbering asm (`mfence`
     /// with `~{memory}`) keeps the havoc-ing `<inline asm>` marker.
