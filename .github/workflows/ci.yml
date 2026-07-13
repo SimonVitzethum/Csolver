@@ -1,6 +1,13 @@
-# CI: the same bar every local commit is held to — full test suite, zero
-# clippy warnings (including test targets), and a formatting check.
-# No external dependencies, so plain `cargo` on stable is the whole matrix.
+# CI: the same bar every local commit is held to — full test suite and zero
+# clippy warnings (including test targets). No external dependencies, so plain
+# `cargo` is the whole matrix.
+#
+# The Rust toolchain is PINNED to an exact version rather than a floating
+# `stable`, because `-D warnings` turns every *new* clippy lint a newer stable
+# ships into a hard CI failure on unchanged code (a "lint drift" that broke CI
+# before). Pin here == run `cargo +<this version> clippy --workspace
+# --all-targets -- -D warnings` locally before pushing, and bump this line
+# deliberately (fixing any new lints in the same commit).
 name: CI
 
 on:
@@ -10,14 +17,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.96.0"
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Test (workspace)
