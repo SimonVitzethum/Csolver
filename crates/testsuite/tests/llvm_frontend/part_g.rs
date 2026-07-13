@@ -497,3 +497,18 @@ fn use_after_scope_is_flagged() {
     let ok = lower("define i32 @g() {\ne:\n  %p = alloca i32, align 4\n  call void @llvm.lifetime.end.p0(i64 4, ptr %p)\n  call void @llvm.lifetime.start.p0(i64 4, ptr %p)\n  store i32 1, ptr %p, align 4\n  %v = load i32, ptr %p, align 4\n  ret i32 %v\n}\ndeclare void @llvm.lifetime.end.p0(i64, ptr)\ndeclare void @llvm.lifetime.start.p0(i64, ptr)\n");
     assert_ne!(verify_module(&ok, &cfg).verdict, Verdict::Fail, "a re-started lifetime is safe");
 }
+
+/// **Type confusion (H)** via the contract-driven `objtype` typestate: an object stamped
+/// one type (`init_as_reply`) then used at an operation requiring another
+/// (`handle_request` needs `objtype request`) is refuted. This is the sound, extensible
+/// form (new type protocols = contract lines); a raw memory type-lattice would false-FAIL
+/// legal transmute/union punning.
+#[test]
+fn type_confusion_via_objtype_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |s: &str| LlvmFrontend.lower(LlvmInput { source: s.into(), name: "t".into() }).expect("lower");
+    let bad = lower("define void @f(ptr %o) {\nb:\n  call void @init_as_reply(ptr %o)\n  call void @handle_request(ptr %o)\n  ret void\n}\ndeclare void @init_as_reply(ptr)\ndeclare void @handle_request(ptr)\n");
+    assert_eq!(verify_module(&bad, &cfg).verdict, Verdict::Fail, "wrong object type at a typed op is confusion");
+    let ok = lower("define void @g(ptr %o) {\nb:\n  call void @init_as_request(ptr %o)\n  call void @handle_request(ptr %o)\n  ret void\n}\ndeclare void @init_as_request(ptr)\ndeclare void @handle_request(ptr)\n");
+    assert_ne!(verify_module(&ok, &cfg).verdict, Verdict::Fail, "matching type is safe");
+}
