@@ -208,6 +208,25 @@ pub enum LCast {
     Bitcast,
 }
 
+/// The memory-ordering of an atomic access (LLVM `load atomic`/`store atomic`).
+/// Only the acquire/release/seq_cst distinction matters here — it is lowered into
+/// the weak-memory fence the ordering guarantees (a release orders prior writes
+/// before the store, an acquire orders later reads after the load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LOrdering {
+    /// Non-atomic, or `unordered`/`monotonic` (no synchronising order).
+    #[default]
+    None,
+    /// `acquire` — on a load, orders subsequent reads after it.
+    Acquire,
+    /// `release` — on a store, orders prior writes before it.
+    Release,
+    /// `acq_rel` — both (an RMW).
+    AcqRel,
+    /// `seq_cst` — a full barrier.
+    SeqCst,
+}
+
 /// A parsed straight-line instruction.
 #[derive(Debug, Clone)]
 pub enum LInst {
@@ -222,6 +241,8 @@ pub enum LInst {
         align_meta: Option<u32>,
         /// `atomic`/`volatile` — a race-free access (excluded from the data-race pass).
         atomic: bool,
+        /// The atomic memory-ordering (for the weak-memory fence lowering).
+        ordering: LOrdering,
     },
     /// `store ty v, ptr p[, align n]`.
     Store {
@@ -231,6 +252,8 @@ pub enum LInst {
         align: u32,
         /// `atomic`/`volatile` — a race-free access (excluded from the data-race pass).
         atomic: bool,
+        /// The atomic memory-ordering (for the weak-memory fence lowering).
+        ordering: LOrdering,
     },
     /// `dst = getelementptr [inbounds] elem, ptr base, i.. index`.
     Gep {

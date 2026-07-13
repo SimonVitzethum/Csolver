@@ -44,7 +44,7 @@ impl Parser {
                 self.expect_punct(',')?;
                 let _pty = self.ltype()?;
                 let ptr = self.value()?;
-                self.skip_atomic_ordering();
+                let ordering = self.parse_atomic_ordering();
                 let align = self.maybe_align().unwrap_or(0);
                 // `!align !N` metadata states the *loaded pointer's* alignment — an
                 // LLVM guarantee independent of the pointee type, so it is recorded
@@ -57,6 +57,7 @@ impl Parser {
                     align,
                     align_meta,
                     atomic,
+                    ordering,
                 }
             }
             "store" => {
@@ -66,7 +67,7 @@ impl Parser {
                 self.expect_punct(',')?;
                 let _pty = self.ltype()?;
                 let ptr = self.value()?;
-                self.skip_atomic_ordering();
+                let ordering = self.parse_atomic_ordering();
                 let align = self.maybe_align().unwrap_or(0);
                 LInst::Store {
                     ty,
@@ -74,6 +75,7 @@ impl Parser {
                     ptr,
                     align,
                     atomic,
+                    ordering,
                 }
             }
             "getelementptr" => self.gep(need_dst()?)?,
@@ -166,7 +168,7 @@ impl Parser {
                 self.expect_punct(',')?;
                 let ty = self.ltype()?;
                 let _val = self.value()?;
-                self.skip_atomic_ordering();
+                self.parse_atomic_ordering();
                 LInst::AtomicRmw {
                     dst: need_dst()?,
                     ty,
@@ -184,7 +186,7 @@ impl Parser {
                 self.expect_punct(',')?;
                 let _nty = self.ltype()?;
                 let _new = self.value()?;
-                self.skip_atomic_ordering(); // consumes both orderings
+                self.parse_atomic_ordering(); // consumes both orderings
                 LInst::AtomicRmw {
                     dst: need_dst()?,
                     ty,

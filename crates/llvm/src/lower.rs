@@ -6,7 +6,7 @@
 //! exactly the block-argument SSA form MSIR uses.
 
 use crate::parser::{
-    LBin, LBlock, LCast, LFunc, LInst, LModule, LPred, LTerm, LType, LValue,
+    LBin, LBlock, LCast, LFunc, LInst, LModule, LOrdering, LPred, LTerm, LType, LValue,
 };
 use csolver_contracts::{ApiContract, Contracts, Effect, Fill, ReadSink, SizeExpr, RET_ARG};
 use csolver_core::{BitVector, Error, RegionKind, Result};

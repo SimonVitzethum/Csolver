@@ -73,6 +73,29 @@ pub(crate) fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<Basi
             insts.extend(out);
             continue;
         }
+        // An **atomic load-acquire / store-release** (inlined `smp_load_acquire` /
+        // `smp_store_release`, or any `load atomic acquire` / `store atomic release` /
+        // `seq_cst`): the ordering the acquire/release guarantees is emitted as the
+        // matching weak-memory barrier, so the message-passing idiom is seen as ordered
+        // and the weak-memory pass does not falsely flag a missing barrier. A **release**
+        // orders prior stores before the store (a write barrier *before* it); an
+        // **acquire** orders later loads after the load (a read barrier *after* it);
+        // `seq_cst`/`acq_rel` is a full barrier. (`Inst::Barrier` kind: 0 full, 1 write,
+        // 2 read — see `crates/contracts`.) The load/store itself is emitted as usual, so
+        // its memory-safety obligations are unchanged; only the fence is added.
+        match inst {
+            LInst::Store { ordering: ord @ (LOrdering::Release | LOrdering::AcqRel | LOrdering::SeqCst), .. } => {
+                insts.push(Inst::Barrier { kind: if *ord == LOrdering::SeqCst { 0 } else { 1 } });
+                insts.push(lower_inst(ctx, inst)?);
+                continue;
+            }
+            LInst::Load { ordering: ord @ (LOrdering::Acquire | LOrdering::AcqRel | LOrdering::SeqCst), .. } => {
+                insts.push(lower_inst(ctx, inst)?);
+                insts.push(Inst::Barrier { kind: if *ord == LOrdering::SeqCst { 0 } else { 2 } });
+                continue;
+            }
+            _ => {}
+        }
                 // A `load ptr` that reads a *reference field* of a DWARF-typed struct
         // (see `dwarf_field_loads`): keep the load (it checks the field access),
         // then materialise its result as a valid reference — the loaded pointer
@@ -229,7 +252,7 @@ pub(crate) fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
             align: align_or(*align, ty),
             volatile: *atomic,
         },
-        LInst::Store { ty, val, ptr, align, atomic } => Inst::Store {
+        LInst::Store { ty, val, ptr, align, atomic, .. } => Inst::Store {
             ty: lower_type(ty),
             ptr: ctx.operand(ptr, 64)?,
             value: ctx.operand(val, type_width(ty))?,

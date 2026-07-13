@@ -190,6 +190,41 @@ fn acquire_release_atomics_lower_to_barriers() {
     assert!(kinds.contains(&2), "an `*_acquire` call is a read barrier (kind 2): {kinds:?}");
 }
 
+#[test]
+fn inlined_atomic_ordering_lowers_to_barriers() {
+    use csolver_ir::Inst;
+    // The INLINED message-passing idiom: `store atomic release` (producer publish) and
+    // `load atomic acquire` (consumer). The ordering keyword used to be discarded; now
+    // each emits the fence it guarantees (release → write barrier BEFORE the store,
+    // acquire → read barrier AFTER the load, seq_cst → full), so the weak-memory pass
+    // sees the ordering instead of falsely flagging a missing barrier.
+    let src = "\
+        define void @f(ptr %p, ptr %q) {\nb:\n\
+          store atomic i32 1, ptr %p release, align 4\n\
+          %v = load atomic i32, ptr %q acquire, align 4\n\
+          store atomic i32 2, ptr %p seq_cst, align 4\n  ret void\n}\n";
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("lower");
+    let seq: Vec<&Inst> = m
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .collect();
+    let kinds: Vec<u8> = seq.iter().filter_map(|i| match i {
+        Inst::Barrier { kind } => Some(*kind),
+        _ => None,
+    }).collect();
+    assert!(kinds.contains(&1), "release store → write barrier (kind 1): {kinds:?}");
+    assert!(kinds.contains(&2), "acquire load → read barrier (kind 2): {kinds:?}");
+    assert!(kinds.contains(&0), "seq_cst store → full barrier (kind 0): {kinds:?}");
+    // A release write barrier precedes its store; an acquire read barrier follows its load.
+    let bpos = seq.iter().position(|i| matches!(i, Inst::Barrier { kind: 1 })).unwrap();
+    let spos = seq.iter().position(|i| matches!(i, Inst::Store { .. })).unwrap();
+    assert!(bpos < spos, "write barrier is emitted before the release store");
+}
+
 /// `rcu_assign_pointer` is an `smp_store_release` publish: it lowers to a **write barrier**
 /// (kind 1) so the producer's prior data stores are ordered before the pointer is published
 /// (the message-passing producer side) — the weak-memory pass then does not demand an `smp_wmb`.

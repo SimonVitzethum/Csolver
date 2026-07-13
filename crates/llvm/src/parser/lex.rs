@@ -258,17 +258,28 @@ impl Parser {
         atomic
     }
 
-    /// Skip an atomic access's trailing `syncscope("…")` and ordering keyword
-    /// (`load atomic i32, ptr %p seq_cst, align 4`).
-    pub(crate) fn skip_atomic_ordering(&mut self) {
+    /// Parse an atomic access's trailing `syncscope("…")` and ordering keyword
+    /// (`load atomic i32, ptr %p seq_cst, align 4`), returning the ordering so the
+    /// lowering can emit the fence it guarantees.
+    pub(crate) fn parse_atomic_ordering(&mut self) -> LOrdering {
         if self.eat_word("syncscope") && matches!(self.peek(), Tok::Punct('(')) {
             let _ = self.skip_balanced('(', ')');
         }
-        while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(),
-            "unordered" | "monotonic" | "acquire" | "release" | "acq_rel" | "seq_cst"))
-        {
+        let mut ord = LOrdering::None;
+        while let Tok::Word(w) = self.peek() {
+            let next = match w.as_str() {
+                "acquire" => LOrdering::Acquire,
+                "release" => LOrdering::Release,
+                "acq_rel" => LOrdering::AcqRel,
+                "seq_cst" => LOrdering::SeqCst,
+                "unordered" | "monotonic" => LOrdering::None,
+                _ => break,
+            };
+            // Keep the strongest ordering seen (an access carries exactly one).
+            ord = next;
             self.pos += 1;
         }
+        ord
     }
 
     /// Try the folded constant-gep form `( T , ptr @g , iN K )` with the
