@@ -76,6 +76,20 @@ pub enum BinOp {
     AShr,
 }
 
+/// Overflow flags on a binary arithmetic op, carried from the frontend
+/// (LLVM `nsw`/`nuw`). When either is set the producer has declared the
+/// operation must not wrap, so the verifier raises an overflow obligation
+/// (bug-finding only). The default — both clear — means wrapping is allowed
+/// and no obligation is raised, so every non-arithmetic frontend can leave
+/// it at `Default` soundly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WrapFlags {
+    /// `nsw` — signed overflow is undefined behaviour.
+    pub nsw: bool,
+    /// `nuw` — unsigned overflow is undefined behaviour.
+    pub nuw: bool,
+}
+
 /// Integer comparison predicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
@@ -132,6 +146,10 @@ pub enum RValue {
         lhs: Operand,
         /// Right operand.
         rhs: Operand,
+        /// Overflow flags carried from the frontend (`add nsw`/`add nuw`/…).
+        /// Default is wrapping (no obligation); set only where the producer
+        /// documents the operation as overflow-free.
+        flags: WrapFlags,
     },
     /// A comparison producing an `i1`.
     Cmp {
@@ -651,6 +669,17 @@ impl Inst {
                 value: RValue::Bin { op: BinOp::Shl | BinOp::LShr | BinOp::AShr, .. },
                 ..
             } => &[NoShiftOverflow],
+            // An `nsw`/`nuw`-flagged add/sub/mul carries the no-overflow obligation
+            // (bug-finding only). Unflagged arithmetic wraps and raises nothing.
+            Inst::Assign {
+                value:
+                    RValue::Bin {
+                        op: BinOp::Add | BinOp::Sub | BinOp::Mul,
+                        flags,
+                        ..
+                    },
+                ..
+            } if flags.nsw || flags.nuw => &[NoArithOverflow],
             _ => &[],
         }
     }

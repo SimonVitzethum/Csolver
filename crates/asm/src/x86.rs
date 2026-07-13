@@ -167,7 +167,7 @@ fn decode_one(
             let value = if op == 0x31 && m.rm == m.reg {
                 RValue::Use(Operand::int(width, 0))
             } else {
-                RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(src) }
+                RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(src) , flags: Default::default() }
             };
             done(vec![Inst::Assign { dst, ty, value }], p)
         }
@@ -189,7 +189,7 @@ fn decode_one(
                 let value = if op == 0x33 && m.rm == m.reg {
                     RValue::Use(Operand::int(width, 0))
                 } else {
-                    RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(reg(m.rm)) }
+                    RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(reg(m.rm)) , flags: Default::default() }
                 };
                 done(vec![Inst::Assign { dst, ty, value }], p)
             } else {
@@ -200,7 +200,7 @@ fn decode_one(
                 insts.push(Inst::Assign {
                     dst,
                     ty,
-                    value: RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(loaded) },
+                    value: RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(loaded) , flags: Default::default() },
                 });
                 done(insts, mem.next)
             }
@@ -543,6 +543,7 @@ fn decode_one(
                         op: BinOp::AShr,
                         lhs: Operand::Reg(reg(0)),
                         rhs: Operand::int(width, shift_bits as u128),
+                    flags: Default::default(),
                     },
                 }],
                 p,
@@ -622,6 +623,7 @@ fn decode_one(
                         op: bin_op,
                         lhs: Operand::Reg(target),
                         rhs: Operand::int(width, count),
+                    flags: Default::default(),
                     },
                 }],
                 p,
@@ -648,6 +650,7 @@ fn decode_one(
                                 op: BinOp::Xor,
                                 lhs: Operand::Reg(target),
                                 rhs: Operand::int(w, (1u128 << w) - 1),
+                            flags: Default::default(),
                             },
                         }],
                         p,
@@ -663,6 +666,7 @@ fn decode_one(
                                 op: BinOp::Sub,
                                 lhs: Operand::int(w, 0),
                                 rhs: Operand::Reg(target),
+                            flags: Default::default(),
                             },
                         }],
                         p,
@@ -689,6 +693,7 @@ fn decode_one(
                                 op: BinOp::Xor,
                                 lhs: Operand::Reg(target),
                                 rhs: Operand::int(width, (1u128 << width) - 1),
+                            flags: Default::default(),
                             },
                         }],
                         p,
@@ -704,6 +709,7 @@ fn decode_one(
                                 op: BinOp::Sub,
                                 lhs: Operand::int(width, 0),
                                 rhs: Operand::Reg(target),
+                            flags: Default::default(),
                             },
                         }],
                         p,
@@ -733,6 +739,7 @@ fn decode_one(
                         op: bin_op,
                         lhs: Operand::Reg(target),
                         rhs: Operand::int(8, 1),
+                    flags: Default::default(),
                     },
                 }],
                 p,
@@ -751,7 +758,7 @@ fn decode_one(
                     vec![Inst::Assign {
                         dst: target,
                         ty,
-                        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(target), rhs: Operand::int(width, 1) },
+                        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(target), rhs: Operand::int(width, 1) , flags: Default::default() },
                     }],
                     p,
                 ),
@@ -759,7 +766,7 @@ fn decode_one(
                     vec![Inst::Assign {
                         dst: target,
                         ty,
-                        value: RValue::Bin { op: BinOp::Sub, lhs: Operand::Reg(target), rhs: Operand::int(width, 1) },
+                        value: RValue::Bin { op: BinOp::Sub, lhs: Operand::Reg(target), rhs: Operand::int(width, 1) , flags: Default::default() },
                     }],
                     p,
                 ),
@@ -984,7 +991,7 @@ fn add_imm(target: RegId, ty: Type, op: BinOp, imm: u128, width: u32) -> Inst {
     Inst::Assign {
         dst: target,
         ty,
-        value: RValue::Bin { op, lhs: Operand::Reg(target), rhs: Operand::int(width, imm) },
+        value: RValue::Bin { op, lhs: Operand::Reg(target), rhs: Operand::int(width, imm) , flags: Default::default() },
     }
 }
 

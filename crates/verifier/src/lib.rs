@@ -689,6 +689,7 @@ fn verify_function_with(
                         | SafetyProperty::SecretDependent
                         | SafetyProperty::NoDivByZero
                         | SafetyProperty::NoShiftOverflow
+                        | SafetyProperty::NoArithOverflow
                 ) && !config.bug_finding
                 {
                     continue;

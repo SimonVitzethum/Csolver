@@ -829,7 +829,7 @@ fn assign(dst: RegId, value: RValue) -> Inst {
 /// MIR frontend are over `usize`.
 fn bin_rvalue(kind: BinKind, lhs: IrOp, rhs: IrOp) -> Option<RValue> {
     let cmp = |op| Some(RValue::Cmp { op, lhs: lhs.clone(), rhs: rhs.clone() });
-    let bin = |op| Some(RValue::Bin { op, lhs: lhs.clone(), rhs: rhs.clone() });
+    let bin = |op| Some(RValue::Bin { op, lhs: lhs.clone(), rhs: rhs.clone() , flags: Default::default() });
     match kind {
         BinKind::Lt => cmp(CmpOp::Ult),
         BinKind::Le => cmp(CmpOp::Ule),

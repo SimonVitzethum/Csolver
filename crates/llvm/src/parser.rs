@@ -260,6 +260,10 @@ pub enum LInst {
         ty: LType,
         a: LValue,
         b: LValue,
+        /// `nsw` flag was present (signed no-wrap).
+        nsw: bool,
+        /// `nuw` flag was present (unsigned no-wrap).
+        nuw: bool,
     },
     /// `dst = icmp pred ty a, b`.
     Icmp {
@@ -1809,9 +1813,16 @@ impl Parser {
             }
             other => {
                 if let Some(bop) = bin_op(other) {
-                    // Skip flags like `nuw`, `nsw`, `exact`, `disjoint`.
-                    while matches!(self.peek(), Tok::Word(w) if matches!(w.as_str(), "nuw" | "nsw" | "exact" | "disjoint"))
-                    {
+                    // Capture the no-wrap flags (`nsw`/`nuw`); skip `exact`/`disjoint`
+                    // which carry no memory-safety obligation here.
+                    let (mut nsw, mut nuw) = (false, false);
+                    while let Tok::Word(w) = self.peek() {
+                        match w.as_str() {
+                            "nsw" => nsw = true,
+                            "nuw" => nuw = true,
+                            "exact" | "disjoint" => {}
+                            _ => break,
+                        }
                         self.pos += 1;
                     }
                     let ty = self.ltype()?;
@@ -1824,6 +1835,8 @@ impl Parser {
                         ty,
                         a,
                         b,
+                        nsw,
+                        nuw,
                     }
                 } else if let Some(cop) = cast_op(other) {
                     // Skip cast flags (`trunc nuw`, `trunc nsw`, `zext nneg`).

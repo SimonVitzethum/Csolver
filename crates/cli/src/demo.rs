@@ -204,6 +204,7 @@ fn loop_array_store() -> Function {
             op: csolver_ir::BinOp::Add,
             lhs: Operand::Reg(j),
             rhs: Operand::int(64, 1),
+            flags: Default::default(),
         },
     });
 

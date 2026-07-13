@@ -40,5 +40,6 @@ pub use func::{
 pub use id::{BlockId, FuncId, RegId};
 pub use inst::{
     BinOp, Callee, CastOp, CmpOp, Condition, Const, Inst, MemKind, Operand, RValue, RefResult,
+    WrapFlags,
 };
 pub use ty::{DataLayout, Type};

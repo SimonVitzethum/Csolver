@@ -132,7 +132,7 @@ impl Ctx {
                 }
                 None => z.forget(di),
             },
-            Inst::Assign { value: RValue::Bin { op: op @ (BinOp::Add | BinOp::Sub), lhs: Operand::Reg(a), rhs: Operand::Const(Const::Int(bv)) }, .. } => {
+            Inst::Assign { value: RValue::Bin { op: op @ (BinOp::Add | BinOp::Sub), lhs: Operand::Reg(a), rhs: Operand::Const(Const::Int(bv)), .. }, .. } => {
                 let mut c = bv.signed();
                 if *op == BinOp::Sub {
                     c = -c;
@@ -363,12 +363,12 @@ mod tests {
         bb2.insts.push(Inst::Assign {
             dst: ni,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) },
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) , flags: Default::default() },
         });
         bb2.insts.push(Inst::Assign {
             dst: nj,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) },
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) , flags: Default::default() },
         });
 
         let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));

@@ -300,7 +300,7 @@ fn self_increment(
                 continue;
             }
             if let Inst::Assign {
-                value: RValue::Bin { op: op @ (BinOp::Add | BinOp::Sub), lhs: Operand::Reg(a), rhs: Operand::Const(Const::Int(bv)) },
+                value: RValue::Bin { op: op @ (BinOp::Add | BinOp::Sub), lhs: Operand::Reg(a), rhs: Operand::Const(Const::Int(bv)), .. },
                 ..
             } = inst
             {
@@ -409,7 +409,7 @@ mod tests {
         bb2.insts.push(Inst::Assign {
             dst: ni,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) },
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) , flags: Default::default() },
         });
         let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
         Function {

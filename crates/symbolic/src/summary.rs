@@ -857,7 +857,7 @@ fn ret_of_fn(f: &Function) -> RetSummary {
 fn eval_rvalue(rv: &RValue, env: &HashMap<RegId, AbsVal>) -> AbsVal {
     match rv {
         RValue::Use(op) => eval_operand(op, env),
-        RValue::Bin { op, lhs, rhs } => {
+        RValue::Bin { op, lhs, rhs, .. } => {
             match (eval_operand(lhs, env), eval_operand(rhs, env)) {
                 (AbsVal::Scalar(a), AbsVal::Scalar(b)) => {
                     let r = match op {

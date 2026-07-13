@@ -380,6 +380,7 @@ pub fn loop_array_store() -> Function {
             op: csolver_ir::BinOp::Add,
             lhs: Operand::Reg(j),
             rhs: Operand::int(64, 1),
+        flags: Default::default(),
         },
     });
 
@@ -461,12 +462,12 @@ pub fn relational_loop() -> Function {
     bb2.insts.push(Inst::Assign {
         dst: ni,
         ty: Type::int(64),
-        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) },
+        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) , flags: Default::default() },
     });
     bb2.insts.push(Inst::Assign {
         dst: nj,
         ty: Type::int(64),
-        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) },
+        value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) , flags: Default::default() },
     });
 
     let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
@@ -706,6 +707,7 @@ fn eq_exit_loop_to(exit: u128) -> Function {
             op: csolver_ir::BinOp::Add,
             lhs: Operand::Reg(i),
             rhs: Operand::int(64, 1),
+        flags: Default::default(),
         },
     });
 
@@ -972,6 +974,7 @@ pub fn masked_index_store() -> Function {
             op: BinOp::And,
             lhs: Operand::Reg(x),
             rhs: Operand::int(64, 7),
+        flags: Default::default(),
         },
     });
     bb0.insts.push(Inst::PtrOffset {
@@ -1020,6 +1023,7 @@ pub fn oob_mask_check() -> Function {
             op: BinOp::Or,
             lhs: Operand::Reg(x),
             rhs: Operand::int(64, 8),
+        flags: Default::default(),
         },
     });
     bb0.insts.push(Inst::SafetyCheck {

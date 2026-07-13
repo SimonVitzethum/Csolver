@@ -21,7 +21,7 @@ use crate::summary::{Affine, ProvTransfer, RetSummary, Summary};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FieldContract,
     FuncId, Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RefResult, RegId,
-    SizeSpec, Terminator, Type,
+    SizeSpec, Terminator, Type, WrapFlags,
 };
 use csolver_memory::{AliasResult, LifetimeState, Permissions};
 use csolver_solver::{
@@ -1127,7 +1127,7 @@ fn classify_scalar_ptr_defs(f: &Function) -> HashMap<RegId, ScalarPtrCause> {
                             Const::Int(_) => ScalarPtrCause::ConstInt,
                             Const::Null => ScalarPtrCause::ConstNull,
                         },
-                        RValue::Bin { op, lhs, rhs } => match op {
+                        RValue::Bin { op, lhs, rhs, .. } => match op {
                             BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::LShr
                             | BinOp::AShr => ScalarPtrCause::BitMask,
                             _ if op_is_ptr(lhs) || op_is_ptr(rhs) => ScalarPtrCause::PtrArith,
@@ -2640,7 +2640,7 @@ impl Explorer<'_> {
             let Some(arg) = args.get(pos) else { continue };
             if self.is_back_edge(pred, header) {
                 if let Operand::Reg(m) = arg {
-                    if let Some(Inst::Assign { value: RValue::Bin { op: BinOp::Add, lhs, rhs }, .. }) =
+                    if let Some(Inst::Assign { value: RValue::Bin { op: BinOp::Add, lhs, rhs, .. }, .. }) =
                         def.get(&resolve_copy(*m, &def))
                     {
                         let one = |o: &Operand| matches!(o, Operand::Const(Const::Int(bv)) if bv.unsigned() == 1);
@@ -2738,7 +2738,7 @@ impl Explorer<'_> {
                 if self.is_back_edge(pred, header) {
                     // back-edge arg must be `n + 1`.
                     if let Operand::Reg(m) = arg {
-                        if let Some(Inst::Assign { value: RValue::Bin { op: BinOp::Add, lhs, rhs }, .. }) =
+                        if let Some(Inst::Assign { value: RValue::Bin { op: BinOp::Add, lhs, rhs, .. }, .. }) =
                             def.get(&resolve_copy(*m, &def))
                         {
                             let one = |o: &Operand| matches!(o, Operand::Const(Const::Int(bv)) if bv.unsigned() == 1);
@@ -3008,7 +3008,32 @@ impl Explorer<'_> {
                 // (a zero divisor is UB / a hardware trap). Refuted with a witness when the divisor
                 // can be zero on the path (the `decide` gate keeps it sound: a genuine-input divisor
                 // in bug-finding mode, or a definite zero on an exact path in strict mode).
-                if let RValue::Bin { op, rhs, .. } = value {
+                if let RValue::Bin { op, lhs, rhs, flags } = value {
+                    // `nsw`/`nuw`-flagged add/sub/mul must not wrap (UB in C / poison in
+                    // LLVM). Only the flagged form carries an obligation — plain wrapping
+                    // arithmetic raises nothing. The no-overflow goal is built with
+                    // same-width sign predicates (signed add/sub) and a double-width
+                    // zero-extended product (unsigned mul); signed mul would need a
+                    // sign-extend the expr layer doesn't expose, so it is conservatively
+                    // left unchecked (a missed bug, never a false FAIL).
+                    if (flags.nsw || flags.nuw)
+                        && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    {
+                        let a = self.eval_scalar(lhs, state);
+                        let b = self.eval_scalar(rhs, state);
+                        if let Some(goal) = self.arith_no_overflow(*op, a, b, *flags) {
+                            let decision =
+                                self.decide(&[goal], state, RefuteMode::Possible, &[]);
+                            self.record_mem(
+                                block,
+                                idx,
+                                SafetyProperty::NoArithOverflow,
+                                decision,
+                                "the arithmetic does not overflow",
+                                "the operation may overflow (signed/unsigned wrap is undefined behaviour)",
+                            );
+                        }
+                    }
                     if matches!(op, BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem) {
                         let d = self.eval_scalar(rhs, state);
                         let zero = self.ctx.int(self.ctx.width(d), 0);
@@ -5670,10 +5695,87 @@ impl Explorer<'_> {
         }
     }
 
+    /// Build the "does not overflow" goal for an `nsw`/`nuw`-flagged `add`/`sub`/`mul`
+    /// on operands `a`, `b`. Returns `None` when the case is not modelled (signed
+    /// multiply — no sign-extend primitive — so it is soundly left unchecked). When
+    /// both flags are set the goal is the conjunction of the signed and unsigned
+    /// conditions.
+    fn arith_no_overflow(
+        &mut self,
+        op: BinOp,
+        a: ExprId,
+        b: ExprId,
+        flags: WrapFlags,
+    ) -> Option<ExprId> {
+        let w = self.ctx.width(a);
+        let zero = self.ctx.int(w, 0);
+        let mut goals: Vec<ExprId> = Vec::new();
+        if flags.nsw {
+            // Signed: overflow iff the operand signs and the result sign disagree in
+            // the characteristic way. sign(x) := x <s 0.
+            let sa = self.ctx.cmp(SCmp::Slt, a, zero);
+            let sb = self.ctx.cmp(SCmp::Slt, b, zero);
+            match op {
+                BinOp::Add => {
+                    let s = self.ctx.bin(BvOp::Add, a, b);
+                    let ss = self.ctx.cmp(SCmp::Slt, s, zero);
+                    // overflow = (sa == sb) && (ss != sa)
+                    let same = self.ctx.cmp(SCmp::Eq, sa, sb);
+                    let s_eq_a = self.ctx.cmp(SCmp::Eq, ss, sa);
+                    let diff = self.ctx.not(s_eq_a);
+                    let ovf = self.ctx.and(vec![same, diff]);
+                    goals.push(self.ctx.not(ovf));
+                }
+                BinOp::Sub => {
+                    let s = self.ctx.bin(BvOp::Sub, a, b);
+                    let ss = self.ctx.cmp(SCmp::Slt, s, zero);
+                    // overflow = (sa != sb) && (ss != sa)
+                    let same_ab = self.ctx.cmp(SCmp::Eq, sa, sb);
+                    let diff_ab = self.ctx.not(same_ab);
+                    let s_eq_a = self.ctx.cmp(SCmp::Eq, ss, sa);
+                    let diff_s = self.ctx.not(s_eq_a);
+                    let ovf = self.ctx.and(vec![diff_ab, diff_s]);
+                    goals.push(self.ctx.not(ovf));
+                }
+                // Signed multiply needs a sign-extend to a double width; not modelled.
+                BinOp::Mul => {}
+                _ => {}
+            }
+        }
+        if flags.nuw {
+            match op {
+                BinOp::Add => {
+                    // no overflow = (a + b) >=u a
+                    let s = self.ctx.bin(BvOp::Add, a, b);
+                    goals.push(self.ctx.cmp(SCmp::Uge, s, a));
+                }
+                BinOp::Sub => {
+                    // no borrow = a >=u b
+                    goals.push(self.ctx.cmp(SCmp::Uge, a, b));
+                }
+                BinOp::Mul => {
+                    // no overflow = zext(a*b, 2w) == zext(a,2w) * zext(b,2w)
+                    let pw = self.ctx.bin(BvOp::Mul, a, b);
+                    let pw2 = self.ctx.zext(pw, w * 2);
+                    let za = self.ctx.zext(a, w * 2);
+                    let zb = self.ctx.zext(b, w * 2);
+                    let full = self.ctx.bin(BvOp::Mul, za, zb);
+                    goals.push(self.ctx.cmp(SCmp::Eq, pw2, full));
+                }
+                _ => {}
+            }
+        }
+        match goals.len() {
+            0 => None,
+            1 => Some(goals[0]),
+            _ => Some(self.ctx.and(goals)),
+        }
+    }
+
     fn eval_rvalue(&mut self, rv: &RValue, state: &PathState) -> SymValue {
         match rv {
             RValue::Use(op) => self.eval_value(op, state),
-            RValue::Bin { op, lhs, rhs } => {
+            RValue::Bin { op, lhs, rhs, .. } => {
                 let a = self.eval_scalar(lhs, state);
                 let b = self.eval_scalar(rhs, state);
                 SymValue::Scalar(self.ctx.bin(map_binop(*op), a, b))
@@ -5931,7 +6033,7 @@ mod tests {
         bb0.insts.push(Inst::Assign {
             dst: j,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Or, lhs: Operand::Reg(x), rhs: Operand::int(64, 8) },
+            value: RValue::Bin { op: BinOp::Or, lhs: Operand::Reg(x), rhs: Operand::int(64, 8) , flags: Default::default() },
         });
         bb0.insts.push(Inst::SafetyCheck {
             property: SafetyProperty::InBounds,
@@ -5981,7 +6083,7 @@ mod tests {
         bb0.insts.push(Inst::Assign {
             dst: m,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(i), rhs: Operand::int(64, 12) },
+            value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(i), rhs: Operand::int(64, 12) , flags: Default::default() },
         });
         // q = buf + m (i8 stride = byte offset)
         bb0.insts.push(Inst::PtrOffset {
@@ -7342,7 +7444,7 @@ mod tests {
             hb.insts.push(Inst::Assign {
                 dst: tmask,
                 ty: Type::int(64),
-                value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(sel), rhs: Operand::int(64, 1u128 << i) },
+                value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(sel), rhs: Operand::int(64, 1u128 << i) , flags: Default::default() },
             });
             hb.insts.push(Inst::Assign {
                 dst: creg,
@@ -7564,6 +7666,7 @@ mod tests {
                 op: BinOp::Add,
                 lhs: Operand::Reg(j),
                 rhs: Operand::int(64, 1),
+            flags: Default::default(),
             },
         });
 
@@ -7732,7 +7835,7 @@ mod tests {
         bb2.insts.push(Inst::Assign {
             dst: nj,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) },
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) , flags: Default::default() },
         });
         let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));
         let f = Function {

@@ -2991,6 +2991,28 @@ fn shift_overflow_is_flagged() {
     assert_ne!(verify_module(&guarded, &cfg).verdict, Verdict::Fail, "a shift guarded < width is safe");
 }
 
+/// **Signed/unsigned arithmetic overflow (`NoArithOverflow`).** An `add nsw`/`nuw` (or
+/// `sub`/`mul`) on an unguarded attacker-reachable parameter can wrap → UB, refuted with a
+/// witness. Only the `nsw`/`nuw`-flagged form carries the obligation: plain wrapping `add`
+/// raises nothing. A bounded/guarded operand is safe (no false FAIL).
+#[test]
+fn arithmetic_overflow_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |src: &str| LlvmFrontend.lower(LlvmInput { source: src.into(), name: "o".into() }).expect("lower");
+    // add nsw of two unguarded i32 params → can overflow → FAIL.
+    let sadd = lower("define i32 @a(i32 %a, i32 %b) {\nb:\n  %q = add nsw i32 %a, %b\n  ret i32 %q\n}\n");
+    assert_eq!(verify_module(&sadd, &cfg).verdict, Verdict::Fail, "add nsw of two unguarded params can overflow");
+    // mul nuw of two unguarded params → can overflow → FAIL.
+    let umul = lower("define i32 @m(i32 %a, i32 %b) {\nb:\n  %q = mul nuw i32 %a, %b\n  ret i32 %q\n}\n");
+    assert_eq!(verify_module(&umul, &cfg).verdict, Verdict::Fail, "mul nuw of two unguarded params can overflow");
+    // The SAME add without a no-wrap flag wraps legally → no obligation, no FAIL.
+    let wrap = lower("define i32 @w(i32 %a, i32 %b) {\nb:\n  %q = add i32 %a, %b\n  ret i32 %q\n}\n");
+    assert_ne!(verify_module(&wrap, &cfg).verdict, Verdict::Fail, "plain wrapping add carries no obligation");
+    // add nsw of small constants cannot overflow → safe.
+    let konst = lower("define i32 @k(i32 %a) {\nb:\n  %q = add nsw i32 1, 2\n  ret i32 %q\n}\n");
+    assert_ne!(verify_module(&konst, &cfg).verdict, Verdict::Fail, "add nsw of small constants is safe");
+}
+
 /// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the
 /// request's destination to grant `write` — which `foreign` does not → FAIL. This exercises
 /// `label`/`propagate`/`require` (data/provenance.contract) end to end through real API names.

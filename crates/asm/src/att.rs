@@ -197,7 +197,7 @@ fn lower_insn(
             Ok(fall(vec![Inst::Assign {
                 dst: d,
                 ty: Type::int(width),
-                value: RValue::Bin { op: bin, lhs: Operand::Reg(d), rhs: Operand::int(width, 1) },
+                value: RValue::Bin { op: bin, lhs: Operand::Reg(d), rhs: Operand::int(width, 1) , flags: Default::default() },
             }]))
         }
         _ if base.starts_with("cmov") => {
@@ -263,7 +263,7 @@ fn lower_alu(bin: BinOp, ops: &[&str], off: usize, width: u32) -> Result<Vec<Ins
     }
     let src = operand_value(ops, 0, off, width)?;
     let mut insts = src.pre;
-    insts.push(Inst::Assign { dst: d, ty, value: RValue::Bin { op: bin, lhs: Operand::Reg(d), rhs: src.value } });
+    insts.push(Inst::Assign { dst: d, ty, value: RValue::Bin { op: bin, lhs: Operand::Reg(d), rhs: src.value , flags: Default::default() } });
     Ok(insts)
 }
 

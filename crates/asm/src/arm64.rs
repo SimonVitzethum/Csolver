@@ -165,6 +165,7 @@ fn decode_one(
                     op: BinOp::Or,
                     lhs: Operand::Reg(reg(rd)),
                     rhs: Operand::int(width, val),
+                flags: Default::default(),
                 },
             }]);
         }
@@ -211,7 +212,7 @@ fn decode_one(
         return fall(vec![Inst::Assign {
             dst: reg(rd),
             ty,
-            value: RValue::Bin { op, lhs: Operand::Reg(reg(rn)), rhs: Operand::int(width, imm as u128) },
+            value: RValue::Bin { op, lhs: Operand::Reg(reg(rn)), rhs: Operand::int(width, imm as u128) , flags: Default::default() },
         }]);
     }
 

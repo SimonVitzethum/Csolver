@@ -499,7 +499,7 @@ fn apply_inst(inst: &Inst, state: &mut IntervalState) {
 fn eval_rvalue(rv: &RValue, state: &IntervalState) -> Interval {
     match rv {
         RValue::Use(op) => eval_operand(op, state),
-        RValue::Bin { op, lhs, rhs } => {
+        RValue::Bin { op, lhs, rhs, .. } => {
             let a = eval_operand(lhs, state);
             let b = eval_operand(rhs, state);
             match op {
@@ -568,6 +568,7 @@ mod tests {
                 op: BinOp::Add,
                 lhs: Operand::Reg(r0),
                 rhs: Operand::int(64, 4),
+            flags: Default::default(),
             },
         });
         let f = Function {
@@ -640,6 +641,7 @@ mod tests {
                 op: BinOp::Add,
                 lhs: Operand::Reg(i2),
                 rhs: Operand::int(64, 1),
+            flags: Default::default(),
             },
         });
 
@@ -789,7 +791,7 @@ mod tests {
         bb1.insts.push(Inst::Assign {
             dst: n1,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) },
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(i), rhs: Operand::int(64, 1) , flags: Default::default() },
         });
 
         let mut bb2 = BasicBlock::new(
@@ -815,7 +817,7 @@ mod tests {
         bb2.insts.push(Inst::Assign {
             dst: n2,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) },
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::Reg(j), rhs: Operand::int(64, 1) , flags: Default::default() },
         });
 
         let bb3 = BasicBlock::new(BlockId(3), Terminator::Return(None));

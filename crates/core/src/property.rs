@@ -101,6 +101,13 @@ pub enum SafetyProperty {
     /// must be less than the operand's bit width. Shifting by ≥ the width is undefined behaviour in
     /// C/LLVM (a poison value). Refuted with a witness when the shift amount can reach the width.
     NoShiftOverflow,
+    /// No **signed/unsigned arithmetic overflow**: an `add`/`sub`/`mul` the frontend has
+    /// marked `nsw`/`nuw` must not wrap. In C signed overflow (and any LLVM `nsw`/`nuw`
+    /// operation) is undefined behaviour. Only raised when the producer declared the
+    /// no-wrap flag — plain wrapping arithmetic carries no obligation. Refuted with a
+    /// witness when the operands can drive the result past the type's range on the path
+    /// (bug-finding: genuine input with no bounding guard).
+    NoArithOverflow,
     /// No **blocking/sleeping call in atomic context**: a call that may sleep
     /// (`mutex_lock`/`kmalloc(GFP_KERNEL)`/`schedule`/`msleep`/`down`/…) must not run while a
     /// **spinlock is held** (or IRQs/preemption are disabled) — it deadlocks or corrupts the
@@ -139,6 +146,7 @@ impl SafetyProperty {
             SafetyProperty::SecretDependent => "secret_dependent",
             SafetyProperty::NoDivByZero => "no_div_by_zero",
             SafetyProperty::NoShiftOverflow => "no_shift_overflow",
+            SafetyProperty::NoArithOverflow => "no_arith_overflow",
         }
     }
 
@@ -170,6 +178,7 @@ impl SafetyProperty {
             SafetyProperty::SecretDependent => "no secret-dependent branch or memory index",
             SafetyProperty::NoDivByZero => "divisor of a division/modulo is non-zero",
             SafetyProperty::NoShiftOverflow => "shift amount is less than the bit width",
+            SafetyProperty::NoArithOverflow => "nsw/nuw arithmetic does not overflow",
         }
     }
 
@@ -202,6 +211,7 @@ impl SafetyProperty {
             SecretDependent,
             NoDivByZero,
             NoShiftOverflow,
+            NoArithOverflow,
         ]
     }
 }

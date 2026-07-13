@@ -865,13 +865,14 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
             index: ctx.operand(index, 64)?,
             elem: lower_type(elem),
         },
-        LInst::Bin { dst, op, ty, a, b } => Inst::Assign {
+        LInst::Bin { dst, op, ty, a, b, nsw, nuw } => Inst::Assign {
             dst: ctx.reg(dst)?,
             ty: lower_type(ty),
             value: RValue::Bin {
                 op: lower_bin(*op),
                 lhs: ctx.operand(a, type_width(ty))?,
                 rhs: ctx.operand(b, type_width(ty))?,
+                flags: csolver_ir::WrapFlags { nsw: *nsw, nuw: *nuw },
             },
         },
         LInst::Icmp { dst, pred, ty, a, b } => Inst::Assign {
@@ -927,6 +928,7 @@ fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                         op: *op,
                         lhs: ctx.operand(a, 64)?,
                         rhs: ctx.operand(b, 64)?,
+                    flags: Default::default(),
                     },
                 },
                 None => Inst::Assign {
@@ -1717,7 +1719,7 @@ fn emit_asm_semantic(
             let js = it.next().and_then(|s| s.parse::<usize>().ok());
             match (op.and_then(asm_binop), jd, js) {
                 (Some(binop), Some(jd), Some(js)) => match (arg_op(ctx, jd)?, arg_op(ctx, js)?) {
-                    (Some(lhs), Some(rhs)) => RValue::Bin { op: binop, lhs, rhs },
+                    (Some(lhs), Some(rhs)) => RValue::Bin { op: binop, lhs, rhs , flags: Default::default() },
                     _ => continue,
                 },
                 _ => continue,
@@ -1728,8 +1730,8 @@ fn emit_asm_semantic(
             let kind = it.next().and_then(|s| s.chars().next());
             let j = it.next().and_then(|s| s.parse::<usize>().ok());
             match (kind, j.and_then(|j| arg_op(ctx, j).transpose())) {
-                (Some('n'), Some(x)) => RValue::Bin { op: BinOp::Sub, lhs: Operand::int(width, 0), rhs: x? },
-                (Some('t'), Some(x)) => RValue::Bin { op: BinOp::Xor, lhs: x?, rhs: Operand::int(width, u128::MAX) },
+                (Some('n'), Some(x)) => RValue::Bin { op: BinOp::Sub, lhs: Operand::int(width, 0), rhs: x? , flags: Default::default() },
+                (Some('t'), Some(x)) => RValue::Bin { op: BinOp::Xor, lhs: x?, rhs: Operand::int(width, u128::MAX) , flags: Default::default() },
                 _ => continue,
             }
         } else {
@@ -1813,7 +1815,7 @@ fn size_operand(
                 insts.push(Inst::Assign {
                     dst: tmp,
                     ty: Type::int(64),
-                    value: RValue::Bin { op: BinOp::Mul, lhs, rhs },
+                    value: RValue::Bin { op: BinOp::Mul, lhs, rhs , flags: Default::default() },
                 });
                 Some(Operand::Reg(tmp))
             }
