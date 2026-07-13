@@ -146,6 +146,9 @@ pub enum Node {
     /// Zero-extend `val` to a wider bit width (the node's own width). The high bits
     /// are zero, so numerically the value is unchanged (unsigned).
     Zext(ExprId),
+    /// Sign-extend `val` to a wider bit width (the node's own width). The high bits
+    /// replicate `val`'s top (sign) bit, so the two's-complement value is unchanged.
+    Sext(ExprId),
 }
 
 /// The boolean width sentinel.
@@ -200,7 +203,7 @@ impl ExprCtx {
             match self.node(x) {
                 Node::Sym { .. } => set.push(x),
                 Node::Const(_) | Node::Bool(_) => {}
-                Node::Not(a) | Node::Zext(a) => stack.push(*a),
+                Node::Not(a) | Node::Zext(a) | Node::Sext(a) => stack.push(*a),
                 Node::Bin { a, b, .. } | Node::Cmp { a, b, .. } => {
                     stack.push(*a);
                     stack.push(*b);
@@ -264,6 +267,20 @@ impl ExprCtx {
             return self.int(to, bv.unsigned());
         }
         self.intern(Node::Zext(val), to)
+    }
+
+    /// Sign-extend `val` to `to` bits (the high bits replicate the sign bit).
+    /// Identity if already `to` bits or wider. A constant is folded via its signed value.
+    pub fn sext(&mut self, val: ExprId, to: u32) -> ExprId {
+        let w = self.width(val);
+        if w >= to {
+            return val;
+        }
+        if let Node::Const(bv) = self.node(val) {
+            // The signed value re-encoded at the wider width is the sign-extension.
+            return self.int(to, bv.signed() as u128);
+        }
+        self.intern(Node::Sext(val), to)
     }
 
     /// An integer constant of the given width.

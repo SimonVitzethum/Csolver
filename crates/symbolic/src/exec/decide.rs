@@ -72,7 +72,7 @@ impl Explorer<'_> {
                     stack.push(*t);
                     stack.push(*e);
                 }
-                Node::Zext(v) => stack.push(*v),
+                Node::Zext(v) | Node::Sext(v) => stack.push(*v),
             }
         }
         false
@@ -113,7 +113,7 @@ impl Explorer<'_> {
                     stack.push(*t);
                     stack.push(*e);
                 }
-                Node::Zext(v) => stack.push(*v),
+                Node::Zext(v) | Node::Sext(v) => stack.push(*v),
             }
         }
         true
@@ -141,7 +141,7 @@ impl Explorer<'_> {
                     }
                 }
                 Node::Const(_) | Node::Bool(_) => {}
-                Node::Not(a) | Node::Zext(a) => stack.push(*a),
+                Node::Not(a) | Node::Zext(a) | Node::Sext(a) => stack.push(*a),
                 Node::Bin { a, b, .. } | Node::Cmp { a, b, .. } => {
                     stack.push(*a);
                     stack.push(*b);

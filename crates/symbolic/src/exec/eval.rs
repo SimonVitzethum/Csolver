@@ -169,8 +169,16 @@ impl Explorer<'_> {
                     let ovf = self.ctx.and(vec![diff_ab, diff_s]);
                     goals.push(self.ctx.not(ovf));
                 }
-                // Signed multiply needs a sign-extend to a double width; not modelled.
-                BinOp::Mul => {}
+                BinOp::Mul => {
+                    // no overflow = sext(a*b, 2w) == sext(a,2w) * sext(b,2w): the w-bit
+                    // signed product, sign-extended, equals the exact double-width product.
+                    let pw = self.ctx.bin(BvOp::Mul, a, b);
+                    let pw2 = self.ctx.sext(pw, w * 2);
+                    let sa2 = self.ctx.sext(a, w * 2);
+                    let sb2 = self.ctx.sext(b, w * 2);
+                    let full = self.ctx.bin(BvOp::Mul, sa2, sb2);
+                    goals.push(self.ctx.cmp(SCmp::Eq, pw2, full));
+                }
                 _ => {}
             }
         }

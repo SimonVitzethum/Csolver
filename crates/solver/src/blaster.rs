@@ -138,6 +138,16 @@ impl<'c> Blaster<'c> {
                 }
                 bits
             }
+            Node::Sext(val) => {
+                // Low bits are the operand's; high bits replicate its top (sign) bit.
+                let bits = self.encode(val)?;
+                let sign = *bits.last()?;
+                let mut out = bits;
+                while (out.len() as u32) < width {
+                    out.push(sign);
+                }
+                out
+            }
         };
         self.memo.insert(id, bits.clone());
         Some(bits)

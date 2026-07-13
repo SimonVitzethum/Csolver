@@ -150,6 +150,13 @@ fn arithmetic_overflow_is_flagged() {
     // mul nuw of two unguarded params → can overflow → FAIL.
     let umul = lower("define i32 @m(i32 %a, i32 %b) {\nb:\n  %q = mul nuw i32 %a, %b\n  ret i32 %q\n}\n");
     assert_eq!(verify_module(&umul, &cfg).verdict, Verdict::Fail, "mul nuw of two unguarded params can overflow");
+    // mul NSW (signed) of two unguarded params → can overflow → FAIL (needs the double-width
+    // sign-extended product check — previously unchecked).
+    let smul = lower("define i32 @sm(i32 %a, i32 %b) {\nb:\n  %q = mul nsw i32 %a, %b\n  ret i32 %q\n}\n");
+    assert_eq!(verify_module(&smul, &cfg).verdict, Verdict::Fail, "mul nsw of two unguarded params can overflow");
+    // mul nsw of small constants cannot overflow → safe (no false FAIL).
+    let smulk = lower("define i32 @smk(i32 %a) {\nb:\n  %q = mul nsw i32 3, 5\n  ret i32 %q\n}\n");
+    assert_ne!(verify_module(&smulk, &cfg).verdict, Verdict::Fail, "mul nsw of small constants is safe");
     // The SAME add without a no-wrap flag wraps legally → no obligation, no FAIL.
     let wrap = lower("define i32 @w(i32 %a, i32 %b) {\nb:\n  %q = add i32 %a, %b\n  ret i32 %q\n}\n");
     assert_ne!(verify_module(&wrap, &cfg).verdict, Verdict::Fail, "plain wrapping add carries no obligation");
