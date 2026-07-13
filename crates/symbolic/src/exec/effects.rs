@@ -71,6 +71,39 @@ impl Explorer<'_> {
             self.record(block, idx, ValidRead, src_r, "source is readable", "source is not readable");
         }
 
+        // **No forbidden overlap** (`memcpy` only — `memmove` is the overlapping form).
+        // `memcpy` is UB if the source and destination byte ranges overlap. Only decidable
+        // when both pointers share the SAME base object (same region id, or the same opaque
+        // provenance): then the offsets `d`, `s` are comparable and the ranges `[d, d+len)`
+        // and `[s, s+len)` overlap iff neither ends at or before the other begins. We prove
+        // *no overlap* = `(d + len <=s s) OR (s + len <=s d)`; a refutation is a concrete
+        // aliasing `memcpy(p+i, p+j, n)` with `|i-j| < n`. Different bases (or an opaque
+        // destination/source) cannot be shown to overlap → recorded proven (no false FAIL).
+        if matches!(kind, MemKind::Copy) {
+            let same_base = match (&src, Self::ptr_base_key(&SymValue::Ptr(dst.clone()))) {
+                (Some(sp), Some(db)) => {
+                    Self::ptr_base_key(&SymValue::Ptr(sp.clone())) == Some(db)
+                }
+                _ => false,
+            };
+            match (same_base, &src) {
+                (true, Some(sp)) => {
+                    let end_d = self.ctx.bin(BvOp::Add, dst.offset, len_e);
+                    let end_s = self.ctx.bin(BvOp::Add, sp.offset, len_e);
+                    // d + len <= s  (dst ends before src begins) OR  s + len <= d.
+                    let d_before_s = self.ctx.cmp(SCmp::Sle, end_d, sp.offset);
+                    let s_before_d = self.ctx.cmp(SCmp::Sle, end_s, dst.offset);
+                    let no_overlap = self.ctx.or(vec![d_before_s, s_before_d]);
+                    // Refute overlap only under the region's no-wrap premise, so the witness
+                    // offsets are genuine (a wrapped `d+len` cannot fake a non-overlap either).
+                    let extra: Vec<ExprId> = dst_region_nowrap(&dst, state).map(|(_, nw)| nw).into_iter().collect();
+                    let decision = self.decide(&[no_overlap], state, RefuteMode::Possible, &extra);
+                    self.record_mem(block, idx, NoForbiddenOverlap, decision, "memcpy source and destination do not overlap", "the memcpy source and destination ranges overlap (use memmove)");
+                }
+                _ => self.record(block, idx, NoForbiddenOverlap, true, "memcpy source and destination do not overlap", ""),
+            }
+        }
+
         // Surface the assumptions the touched regions rest on.
         if dst_nn && src_nn && dst_live && src_live {
             for f in [dst_facts, src_facts].into_iter().flatten() {

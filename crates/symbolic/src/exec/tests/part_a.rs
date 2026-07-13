@@ -233,6 +233,42 @@ fn memcpy_transfers_initialization() {
     );
 }
 
+/// `memcpy` within ONE buffer at overlapping (`gap < len`) vs. disjoint (`gap >= len`)
+/// offsets. Overlap is UB for `memcpy` (that is what `memmove` is for).
+fn same_buffer_memcpy(gap: u128, len: u128, use_move: bool) -> Function {
+    let buf = RegId(0);
+    let dstp = RegId(1);
+    let srcp = RegId(2);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc { dst: buf, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 64), align: 1 });
+    // dst = buf + 0, src = buf + gap (same base object).
+    bb0.insts.push(Inst::PtrOffset { dst: dstp, base: Operand::Reg(buf), index: Operand::int(64, 0), elem: Type::int(8) });
+    bb0.insts.push(Inst::PtrOffset { dst: srcp, base: Operand::Reg(buf), index: Operand::int(64, gap), elem: Type::int(8) });
+    bb0.insts.push(Inst::MemIntrinsic {
+        kind: if use_move { MemKind::Move } else { MemKind::Copy },
+        dst: Operand::Reg(dstp),
+        src: Some(Operand::Reg(srcp)),
+        len: Operand::int(64, len),
+    });
+    Function { id: FuncId(0), name: "cp".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) }
+}
+
+#[test]
+fn memcpy_overlap_is_refuted_disjoint_and_memmove_are_not() {
+    let mi = 3; // the MemIntrinsic index
+    // Overlapping memcpy (gap 4 < len 8) → a definite forbidden overlap, refuted.
+    let r = discharge_function(&same_buffer_memcpy(4, 8, false));
+    let d = r.mem_decision(BlockId(0), mi, SafetyProperty::NoForbiddenOverlap).expect("overlap obligation");
+    assert!(!d.proven && d.refutation.is_some(), "overlapping memcpy is refuted: {d:?}");
+    // Disjoint memcpy (gap 8 >= len 8) → proven no overlap.
+    let r = discharge_function(&same_buffer_memcpy(8, 8, false));
+    let d = r.mem_decision(BlockId(0), mi, SafetyProperty::NoForbiddenOverlap).expect("overlap obligation");
+    assert!(d.proven, "disjoint memcpy has no overlap: {d:?}");
+    // memmove permits overlap → carries no such obligation.
+    let r = discharge_function(&same_buffer_memcpy(4, 8, true));
+    assert!(r.mem_decision(BlockId(0), mi, SafetyProperty::NoForbiddenOverlap).is_none(), "memmove has no overlap obligation");
+}
+
 /// Allocate an 8-byte kernel buffer, optionally initialize it, then `copy_to_user`
 /// (a `UserDrain`) its bytes. Copying the uninitialized buffer is an information
 /// leak (`NoInfoLeak` refuted); initializing it first must clear the leak.

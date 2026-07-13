@@ -403,7 +403,13 @@ impl Inst {
                 // A `copy_from_user` also carries the double-fetch obligation (bug-finding
                 // only): re-reading the same user address on one path is a TOCTOU race.
                 MemKind::UserFill => &[NoNullDeref, NoUseAfterFree, InBounds, ValidWrite, DoubleFetch],
-                MemKind::Copy | MemKind::Move => {
+                // `memcpy` additionally requires the source and destination ranges NOT
+                // to overlap (overlap is UB — that is what `memmove` is for). `memmove`
+                // permits overlap, so it carries no such obligation.
+                MemKind::Copy => {
+                    &[NoNullDeref, NoUseAfterFree, InBounds, ValidRead, ValidWrite, NoForbiddenOverlap]
+                }
+                MemKind::Move => {
                     &[NoNullDeref, NoUseAfterFree, InBounds, ValidRead, ValidWrite]
                 }
                 MemKind::UserDrain => {
