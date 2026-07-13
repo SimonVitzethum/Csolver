@@ -176,11 +176,10 @@ impl Solver {
         for ci in 0..self.clauses.len() {
             match self.clauses[ci].len() {
                 0 => return SatResult::Unsat,
-                1 => {
-                    if !self.enqueue(self.clauses[ci][0], Some(ci)) {
-                        return SatResult::Unsat;
-                    }
-                }
+                // A unit clause seeds propagation; a conflict enqueueing it is level-0 UNSAT.
+                // (The guard runs `enqueue` for the side effect; a successful enqueue falls
+                // through to the no-op arm.)
+                1 if !self.enqueue(self.clauses[ci][0], Some(ci)) => return SatResult::Unsat,
                 _ => {}
             }
         }
