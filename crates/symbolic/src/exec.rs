@@ -601,6 +601,7 @@ fn discharge_inner(
         regions.push(SymRegion {
             kind: RegionKind::Heap,
             size,
+            base_align: 1,
             state: LifetimeState::Live,
             perms: Permissions {
                 read: c.readable,
@@ -638,6 +639,7 @@ fn discharge_inner(
             regions.push(SymRegion {
                 kind: RegionKind::Heap,
                 size: psize_e,
+                base_align: 1,
                 state: LifetimeState::Live,
                 perms: Permissions {
                     read: fc.pointee.readable,
@@ -683,6 +685,7 @@ fn discharge_inner(
         regions.push(SymRegion {
             kind: RegionKind::Global,
             size,
+            base_align: 1,
             state: LifetimeState::Live,
             perms: Permissions { read: true, write: g.writable, exec: false },
             contract: Some(GLOBAL_MEMORY),
@@ -1250,6 +1253,10 @@ struct SymPointer {
 struct SymRegion {
     kind: RegionKind,
     size: ExprId,
+    /// The region base's **guaranteed** alignment (a sound under-approximation — powers of two).
+    /// The base address is `≡ 0 (mod base_align)`, so an access at a symbolic offset is aligned to
+    /// `A` when `base_align ≥ A` and the offset is provably `≡ 0 (mod A)` (see `check_access`).
+    base_align: u64,
     state: LifetimeState,
     perms: Permissions,
     /// If this region models a caller-guaranteed pointer parameter, the named
@@ -3061,6 +3068,7 @@ impl Explorer<'_> {
                 state.regions.push(SymRegion {
                     kind: *region,
                     size,
+                    base_align: (*align as u64).max(1),
                     state: LifetimeState::Live,
                     perms,
                     contract: None,
@@ -4565,6 +4573,7 @@ impl Explorer<'_> {
         state.regions.push(SymRegion {
             kind: RegionKind::Global,
             size: size_e,
+            base_align: 1,
             state: LifetimeState::Live,
             perms: Permissions { read: true, write: writable, exec: false },
             contract: Some(VALID_REFERENCE),
@@ -4693,6 +4702,7 @@ impl Explorer<'_> {
         let contract = region.contract;
         let size_nowrap = region.size_nowrap;
         let region_assumed = region.assumed;
+        let base_align = region.base_align;
 
         // Use-after-free: on an exact path a `Freed` region was definitely
         // deallocated, so the access is a certain UAF — refuted with a witness.
@@ -4721,8 +4731,23 @@ impl Explorer<'_> {
         let decision = self.decide(&conjuncts, state, mode, &extra);
         self.record_mem(block, idx, InBounds, decision, "access stays within the allocation", "could not prove the access stays in bounds");
 
-        // Alignment (concrete).
-        let aligned = aalign <= 1 || p.align.is_multiple_of(aalign);
+        // Alignment. First the concrete guarantee (`p.align` is the gcd-folded alignment through
+        // pointer arithmetic). When that does not establish it, fall back to a **symbolic proof**:
+        // if the region base is at least `aalign`-aligned, the address is aligned iff the offset is,
+        // so prove `offset ≡ 0 (mod aalign)` (i.e. `offset & (aalign-1) == 0`) under the path. This
+        // decides masked (`p & ~7`) and guarded (`if (off % 8 == 0)`) offsets the gcd cannot see.
+        // Proof-only: a genuinely unaligned access (common and legal in packed/network code) is left
+        // UNKNOWN, never refuted — no false FAIL.
+        let aligned = aalign <= 1
+            || p.align.is_multiple_of(aalign)
+            || (aalign.is_power_of_two() && base_align >= aalign && {
+                let w = self.ctx.width(p.offset);
+                let mask = self.ctx.int(w, (aalign - 1) as u128);
+                let masked = self.ctx.bin(BvOp::And, p.offset, mask);
+                let zero = self.ctx.int(w, 0);
+                let goal = self.ctx.cmp(SCmp::Eq, masked, zero);
+                self.prove(goal, state)
+            });
         self.record(block, idx, Alignment, aligned, "address meets the required alignment", "could not prove the required alignment");
 
         // Permission. A write into a region that provably lacks write permission is a
@@ -5932,6 +5957,65 @@ mod tests {
             }
             other => panic!("expected Refuted, got {other:?}"),
         }
+    }
+
+    /// Symbolic alignment proof: a load at a **masked** (aligned) offset from an aligned base is
+    /// proved aligned even though `gcd` cannot see the mask. `base_align` (the alloc alignment)
+    /// gates it: an under-aligned base leaves it unproven (sound, never a false PASS).
+    fn masked_offset_load(base_align: u32) -> Function {
+        let i = RegId(0);
+        let buf = RegId(1);
+        let m = RegId(2);
+        let q = RegId(3);
+        let v = RegId(4);
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        // buf = alloc [64 x i8], align base_align
+        bb0.insts.push(Inst::Alloc {
+            dst: buf,
+            region: RegionKind::Heap,
+            elem: Type::int(8),
+            count: Operand::int(64, 64),
+            align: base_align,
+        });
+        // m = i & 12  → m ∈ {0,4,8,12}: 4-aligned and in bounds.
+        bb0.insts.push(Inst::Assign {
+            dst: m,
+            ty: Type::int(64),
+            value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(i), rhs: Operand::int(64, 12) },
+        });
+        // q = buf + m (i8 stride = byte offset)
+        bb0.insts.push(Inst::PtrOffset {
+            dst: q,
+            base: Operand::Reg(buf),
+            index: Operand::Reg(m),
+            elem: Type::int(8),
+        });
+        // v = load i32 from q, align 4
+        bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(q), align: 4, volatile: false });
+        Function {
+            id: FuncId(0),
+            name: "masked".into(),
+            params: vec![(i, Type::int(64))],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn masked_offset_from_aligned_base_is_proved_aligned() {
+        // Base 16-aligned, offset masked to 4-aligned → the load (idx 3) is proved 4-aligned.
+        let r = discharge_function(&masked_offset_load(16));
+        let d = r
+            .mem_decision(BlockId(0), 3, SafetyProperty::Alignment)
+            .expect("Alignment obligation for the load");
+        assert!(d.proven, "a masked offset from an aligned base is proved aligned: {d:?}");
+        // Under-aligned base (align 2 < 4): the symbolic proof is gated off → not proven (sound).
+        let r2 = discharge_function(&masked_offset_load(2));
+        let d2 = r2
+            .mem_decision(BlockId(0), 3, SafetyProperty::Alignment)
+            .expect("Alignment obligation");
+        assert!(!d2.proven, "an under-aligned base leaves alignment unproven (no false PASS): {d2:?}");
     }
 
     /// `uninit()`: `buf = alloc i32*4; v = load buf` — read before any write.
