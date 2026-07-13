@@ -1552,6 +1552,7 @@ fn report_atomicity(
             Read(x) => format!("read {x}"),
             DepRead(x) => format!("read {x} (addr-dep)"),
             Write(x) => format!("write {x}"),
+            Rmw(x) => format!("read-modify-write {x}"),
             Fence => "barrier".to_string(),
             WFence => "write-barrier".to_string(),
             RFence => "read-barrier".to_string(),

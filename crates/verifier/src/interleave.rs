@@ -41,6 +41,12 @@ pub enum Event {
     DepRead(String),
     /// Write the shared location of the given class.
     Write(String),
+    /// A **read-modify-write** store — a write whose stored value derives from a load (`x = x + 1`).
+    /// It is a write for every purpose (data-race, UAF, weak-memory, ABA all treat it as one), but
+    /// the atomicity check additionally uses it to distinguish a genuine dependent RMW from an
+    /// independent overwrite (`x = 5`): only a dependent closing write is a *lost update*, so a
+    /// plain [`Event::Write`] interrupts another thread's RMW but does not itself realise one.
+    Rmw(String),
     /// A full **memory barrier** (`smp_mb`/`mb`): orders this thread's prior writes before its
     /// subsequent reads (drains the store buffers) — the only barrier that fixes the
     /// store-buffer (W→R) reordering. A lock acquire/release is also a full barrier.
@@ -157,6 +163,7 @@ pub fn trace_to_thread(name: &str, trace: &[(u8, String)]) -> Thread {
             12 => Event::RefGet(c.clone()),
             13 => Event::RefPut(c.clone()),
             14 => Event::Typestate(c.clone()),
+            15 => Event::Rmw(c.clone()),
             _ => Event::Write(c.clone()),
         })
         .collect();
@@ -170,7 +177,7 @@ impl Thread {
         self.events
             .iter()
             .filter_map(|e| match e {
-                Event::Write(x) => Some(x.as_str()),
+                Event::Write(x) | Event::Rmw(x) => Some(x.as_str()),
                 _ => None,
             })
             .collect()
@@ -181,7 +188,7 @@ impl Thread {
         self.events
             .iter()
             .filter_map(|e| match e {
-                Event::Read(x) | Event::DepRead(x) | Event::Write(x) => Some(x.as_str()),
+                Event::Read(x) | Event::DepRead(x) | Event::Write(x) | Event::Rmw(x) => Some(x.as_str()),
                 _ => None,
             })
             .collect()
@@ -272,7 +279,7 @@ fn buffered_write_read_pairs(t: &Thread) -> std::collections::BTreeSet<(String, 
     let mut pairs = std::collections::BTreeSet::new();
     // For each write, scan forward to reads until a barrier is hit.
     for (i, ev) in t.events.iter().enumerate() {
-        let Event::Write(x) = ev else { continue };
+        let (Event::Write(x) | Event::Rmw(x)) = ev else { continue };
         for later in &t.events[i + 1..] {
             match later {
                 // Any barrier or thread-sync stops the reordering window for this write.
@@ -388,7 +395,7 @@ fn free_and_access_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
         }
         match e {
             Event::Free(x) => frees.push(lt.snap(x)),
-            Event::Read(x) | Event::DepRead(x) | Event::Write(x) => accesses.push(lt.snap(x)),
+            Event::Read(x) | Event::DepRead(x) | Event::Write(x) | Event::Rmw(x) => accesses.push(lt.snap(x)),
             _ => {}
         }
     }
@@ -507,7 +514,7 @@ pub fn find_cross_entry_uaf(entries: &[Thread]) -> Vec<CrossEntryWitness> {
             for e in &t.events {
                 match e {
                     Event::Free(x) if is_global_rooted(x) => frees.push(x.clone()),
-                    Event::Write(x) if is_global_rooted(x) => {
+                    Event::Write(x) | Event::Rmw(x) if is_global_rooted(x) => {
                         writes_slot.insert(x.clone());
                         uses.insert(x.clone());
                     }
@@ -664,7 +671,7 @@ fn cas_and_mod_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
         }
         match e {
             Event::Cas(x) => cas.push(lt.snap(x)),
-            Event::Write(x) | Event::Free(x) => modif.push(lt.snap(x)),
+            Event::Write(x) | Event::Rmw(x) | Event::Free(x) => modif.push(lt.snap(x)),
             _ => {}
         }
     }
@@ -876,7 +883,7 @@ impl<'a> OpProgram<'a> {
             let mut sp = vec![None; t.events.len()];
             for (i, e) in t.events.iter().enumerate() {
                 match e {
-                    Event::Write(_) => {
+                    Event::Write(_) | Event::Rmw(_) => {
                         wt[i] = next_tag;
                         next_tag += 1;
                     }
@@ -1031,7 +1038,7 @@ fn op_reachable(
                 let ev = &events[i];
                 let mut ns = st.clone();
                 let step: String = match ev {
-                    Event::Write(x) => {
+                    Event::Write(x) | Event::Rmw(x) => {
                         let tag = prog.write_tag[t][i];
                         if weak {
                             ns.bufs[t].entry(x.clone()).or_default().push(tag);
@@ -1184,12 +1191,12 @@ fn has_reorder_window(t: &Thread) -> bool {
     for (q, eq) in ev.iter().enumerate() {
         match eq {
             // A write may be delayed past a *later* write (W→W) or read (W→R) on another location.
-            Event::Write(yq) => {
+            Event::Write(yq) | Event::Rmw(yq) => {
                 for ep in ev[..q].iter().rev() {
                     if is_full(ep) || matches!(ep, Event::WFence) {
                         break;
                     }
-                    if matches!(ep, Event::Write(xp) if xp != yq) {
+                    if matches!(ep, Event::Write(xp) | Event::Rmw(xp) if xp != yq) {
                         return true;
                     }
                 }
@@ -1201,7 +1208,7 @@ fn has_reorder_window(t: &Thread) -> bool {
                     if is_full(ep) {
                         break;
                     }
-                    if matches!(ep, Event::Write(xp) if xp != yq) {
+                    if matches!(ep, Event::Write(xp) | Event::Rmw(xp) if xp != yq) {
                         return true;
                     }
                 }
@@ -1407,13 +1414,13 @@ fn dfs(
                     child.pending[t].push(x.clone());
                 }
             }
-            Event::Write(x) => {
-                // A write by `t` interrupts an open RMW of the OTHER thread on the same loc.
+            Event::Rmw(x) => {
+                // A read-modify-write by `t` interrupts an open RMW of the OTHER thread on `x`.
                 if child.pending[other].contains(x) && !child.interrupted[other].contains(x) {
                     child.interrupted[other].push(x.clone());
                 }
-                // If `t` itself had an open, already-interrupted RMW on `x`, this dependent
-                // write is the lost update — the atomicity violation is realised.
+                // If `t` itself had an open, already-interrupted RMW on `x`, this *dependent*
+                // (load-derived) write is the lost update — the atomicity violation is realised.
                 let lost = child.interrupted[t].contains(x);
                 child.pending[t].retain(|p| p != x);
                 child.interrupted[t].retain(|p| p != x);
@@ -1427,6 +1434,23 @@ fn dfs(
                             .collect(),
                     });
                 }
+                if let Some(w) = dfs(traces, names, &mut child, schedule, budget) {
+                    return Some(w);
+                }
+                schedule.pop();
+                continue;
+            }
+            Event::Write(x) => {
+                // A *plain* (independent) write interrupts the OTHER thread's open RMW — it changed
+                // `x` under them — but it is NOT itself a lost update: its stored value does not
+                // depend on a prior read of `x` (an `x = const` overwrite, not `x = x + 1`), so
+                // nothing was computed from stale data. It just closes `t`'s own RMW window.
+                if child.pending[other].contains(x) && !child.interrupted[other].contains(x) {
+                    child.interrupted[other].push(x.clone());
+                }
+                child.pending[t].retain(|p| p != x);
+                child.interrupted[t].retain(|p| p != x);
+                schedule.push((t, ev.clone()));
                 if let Some(w) = dfs(traces, names, &mut child, schedule, budget) {
                     return Some(w);
                 }
@@ -1458,13 +1482,13 @@ mod tests {
     fn split_critical_section_rmw_is_an_atomicity_violation() {
         let a = thread("A", vec![
             Acquire("L".into()), Read("x".into()), Release("L".into()),
-            Acquire("L".into()), Write("x".into()), Release("L".into()),
+            Acquire("L".into()), Rmw("x".into()), Release("L".into()),
         ]);
         let b = thread("B", vec![Acquire("L".into()), Write("x".into()), Release("L".into())]);
         let w = atomicity_violation(&a, &b).expect("a split-CS RMW is an atomicity violation");
         assert_eq!(w.location, "x");
-        // The witness must contain B's write between A's read and A's write.
-        let a_writes = w.schedule.iter().position(|(n, e)| n == "A" && matches!(e, Write(_))).unwrap();
+        // The witness must contain B's write between A's read and A's dependent (Rmw) write.
+        let a_writes = w.schedule.iter().position(|(n, e)| n == "A" && matches!(e, Rmw(_))).unwrap();
         let b_writes = w.schedule.iter().position(|(n, e)| n == "B" && matches!(e, Write(_))).unwrap();
         let a_reads = w.schedule.iter().position(|(n, e)| n == "A" && matches!(e, Read(_))).unwrap();
         assert!(a_reads < b_writes && b_writes < a_writes, "witness realises R_A < W_B < W_A");
@@ -1475,7 +1499,7 @@ mod tests {
     #[test]
     fn continuously_locked_rmw_is_safe() {
         let a = thread("A", vec![
-            Acquire("L".into()), Read("x".into()), Write("x".into()), Release("L".into()),
+            Acquire("L".into()), Read("x".into()), Rmw("x".into()), Release("L".into()),
         ]);
         let b = thread("B", vec![Acquire("L".into()), Write("x".into()), Release("L".into())]);
         assert!(atomicity_violation(&a, &b).is_none(), "a continuously-locked RMW is atomic");
@@ -1486,16 +1510,41 @@ mod tests {
     #[test]
     fn disjoint_locks_allow_interruption() {
         let a = thread("A", vec![
-            Acquire("La".into()), Read("x".into()), Write("x".into()), Release("La".into()),
+            Acquire("La".into()), Read("x".into()), Rmw("x".into()), Release("La".into()),
         ]);
         let b = thread("B", vec![Acquire("Lb".into()), Write("x".into()), Release("Lb".into())]);
         assert!(atomicity_violation(&a, &b).is_some(), "disjoint locks do not order the RMW");
     }
 
+    // Dependent-RMW precision: `R(x) … W(x)` where the closing write is INDEPENDENT of the read
+    // (a plain `Write` = `x = const`, not `x = x+1`) is NOT a lost update — nothing was computed
+    // from stale data. Only a dependent `Rmw` closing write realises the violation.
+    #[test]
+    fn independent_write_after_read_is_not_a_lost_update() {
+        // A reads x then unconditionally overwrites it with a constant (plain Write); B writes x
+        // in between (disjoint locks). No value was derived from the read → no atomicity violation.
+        let a = thread("A", vec![
+            Acquire("La".into()), Read("x".into()), Write("x".into()), Release("La".into()),
+        ]);
+        let b = thread("B", vec![Acquire("Lb".into()), Write("x".into()), Release("Lb".into())]);
+        assert!(
+            atomicity_violation(&a, &b).is_none(),
+            "an independent (constant) overwrite is not a lost update"
+        );
+        // The SAME shape with a dependent Rmw closing write IS a violation (control).
+        let a2 = thread("A", vec![
+            Acquire("La".into()), Read("x".into()), Rmw("x".into()), Release("La".into()),
+        ]);
+        assert!(
+            atomicity_violation(&a2, &b).is_some(),
+            "a dependent read-modify-write IS a lost update"
+        );
+    }
+
     // No conflicting write from B → no violation.
     #[test]
     fn no_conflicting_write_is_safe() {
-        let a = thread("A", vec![Read("x".into()), Write("x".into())]);
+        let a = thread("A", vec![Read("x".into()), Rmw("x".into())]);
         let b = thread("B", vec![Read("x".into())]); // B only reads
         assert!(atomicity_violation(&a, &b).is_none(), "a read-only other thread cannot cause a lost update");
     }
@@ -1726,11 +1775,11 @@ mod tests {
     #[test]
     fn spawned_self_concurrent_rmw_is_an_atomicity_violation() {
         let spawner = thread("main", vec![Spawn("worker".into()), Spawn("worker".into())]);
-        let worker = thread("worker", vec![Read("counter".into()), Write("counter".into())]);
+        let worker = thread("worker", vec![Read("counter".into()), Rmw("counter".into())]);
         let v = find_atomicity_violations(&[spawner, worker]);
         assert_eq!(v.len(), 1, "a spawned unlocked RMW loses updates against itself");
         // The same worker, never spawned, is not self-checked (no evidence of concurrency).
-        let lone = thread("worker", vec![Read("counter".into()), Write("counter".into())]);
+        let lone = thread("worker", vec![Read("counter".into()), Rmw("counter".into())]);
         assert!(find_atomicity_violations(&[lone]).is_empty(), "an un-spawned function is not self-raced");
     }
 }

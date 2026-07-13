@@ -3216,7 +3216,12 @@ impl Explorer<'_> {
                 // An atomic/volatile write (`WRITE_ONCE`/`atomic_set`) is race-free by
                 // construction — excluded from the data-race pass.
                 if !*volatile {
-                    self.record_shared_access(ptr, true, &p, state);
+                    // A store whose stored *value* derives from a load is a genuine
+                    // read-modify-write (`x = x + 1`) — flag it so the atomicity check treats
+                    // only dependent writes as lost-update candidates (an independent `x = 5`
+                    // overwrite is not a lost update). See `record_shared_access`.
+                    let rmw = matches!(value, Operand::Reg(r) if self.load_derived.contains(r));
+                    self.record_shared_access_kind(ptr, true, rmw, &p, state);
                 }
                 let v = self.eval_value(value, state);
                 // Taint through memory: storing a tainted scalar into a region taints the
@@ -3943,6 +3948,13 @@ impl Explorer<'_> {
     /// `(class, is_write, lock-classes held)`. The whole-program pass then flags a location
     /// accessed under no common lock, with a write, from ≥2 functions.
     fn record_shared_access(&mut self, ptr: &Operand, is_write: bool, p: &SymPointer, state: &PathState) {
+        self.record_shared_access_kind(ptr, is_write, false, p, state);
+    }
+
+    /// Like [`Self::record_shared_access`] but with `rmw` = whether a write's stored value is
+    /// load-derived (a genuine read-modify-write). A dependent write is trace kind 15 (`Rmw`);
+    /// a plain write stays kind 3. Reads ignore `rmw`.
+    fn record_shared_access_kind(&mut self, ptr: &Operand, is_write: bool, rmw: bool, p: &SymPointer, state: &PathState) {
         // Hardening: a shared **read** inside an RCU read-side critical section is race-free by
         // the RCU contract — exclude it (writers are still checked).
         if !is_write && state.rcu_depth > 0 {
@@ -3978,7 +3990,11 @@ impl Explorer<'_> {
         // pointer is address-dependent (`rcu_dereference`-style) and does not reorder.
         if self.race_trace.len() < self.race_trace_cap {
             let kind = if is_write {
-                3
+                if rmw {
+                    15
+                } else {
+                    3
+                }
             } else if matches!(ptr, Operand::Reg(r) if self.load_derived.contains(r)) {
                 9
             } else {

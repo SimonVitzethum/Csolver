@@ -3291,8 +3291,10 @@ define void @resetter() {
     use csolver_verifier::interleave::Event;
     let sched = &v[0].schedule;
     let inc_read = sched.iter().position(|(n, e)| n == "incrementer" && matches!(e, Event::Read(_))).unwrap();
+    // The resetter's `counter = 0` is an *independent* (constant) write → plain `Write`; the
+    // incrementer's `counter = t + 1` derives from the load → a dependent `Rmw` (the lost update).
     let res_write = sched.iter().position(|(n, e)| n == "resetter" && matches!(e, Event::Write(_))).unwrap();
-    let inc_write = sched.iter().position(|(n, e)| n == "incrementer" && matches!(e, Event::Write(_))).unwrap();
+    let inc_write = sched.iter().position(|(n, e)| n == "incrementer" && matches!(e, Event::Rmw(_))).unwrap();
     assert!(inc_read < res_write && res_write < inc_write, "witness realises read < foreign-write < write");
 }
 
