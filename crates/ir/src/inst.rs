@@ -646,6 +646,11 @@ impl Inst {
                     },
                 ..
             } => &[NoDivByZero],
+            // A shift carries the shift-amount-in-range obligation (bug-finding only).
+            Inst::Assign {
+                value: RValue::Bin { op: BinOp::Shl | BinOp::LShr | BinOp::AShr, .. },
+                ..
+            } => &[NoShiftOverflow],
             _ => &[],
         }
     }

@@ -3016,6 +3016,23 @@ impl Explorer<'_> {
                             "the divisor may be zero (division by zero)",
                         );
                     }
+                    // Shift past the bit width is UB (a poison value): the shift amount must be
+                    // strictly less than the operand width. Refuted when it can reach the width.
+                    if matches!(op, BinOp::Shl | BinOp::LShr | BinOp::AShr) {
+                        let amt = self.eval_scalar(rhs, state);
+                        let w = self.ctx.width(amt);
+                        let width_c = self.ctx.int(w, w as u128);
+                        let in_range = self.ctx.cmp(SCmp::Ult, amt, width_c);
+                        let decision = self.decide(&[in_range], state, RefuteMode::Possible, &[]);
+                        self.record_mem(
+                            block,
+                            idx,
+                            SafetyProperty::NoShiftOverflow,
+                            decision,
+                            "shift amount is less than the bit width",
+                            "the shift amount may reach or exceed the bit width (undefined behaviour)",
+                        );
+                    }
                 }
                 // Taint propagation: the result carries the union of its operands' taint.
                 let t = self.rvalue_taint(value, state);

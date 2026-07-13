@@ -2970,6 +2970,27 @@ fn division_by_zero_is_flagged() {
     assert_ne!(verify_module(&guarded, &cfg).verdict, Verdict::Fail, "a divisor guarded != 0 is safe");
 }
 
+/// **Shift past the bit width (`NoShiftOverflow`).** A `<<`/`>>` by an unguarded parameter can
+/// reach or exceed the operand width → UB (poison). A constant in-range shift, and a shift guarded
+/// `< width` on the path, are safe.
+#[test]
+fn shift_overflow_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |src: &str| LlvmFrontend.lower(LlvmInput { source: src.into(), name: "s".into() }).expect("lower");
+    // shl by an unguarded i32 parameter (can be >= 32) → FAIL.
+    let racy = lower("define i32 @shlp(i32 %a, i32 %b) {\nb:\n  %q = shl i32 %a, %b\n  ret i32 %q\n}\n");
+    assert_eq!(verify_module(&racy, &cfg).verdict, Verdict::Fail, "a shift by an unguarded param can exceed the width");
+    // A constant in-range shift is safe.
+    let konst = lower("define i32 @shlc(i32 %a) {\nb:\n  %q = shl i32 %a, 3\n  ret i32 %q\n}\n");
+    assert_ne!(verify_module(&konst, &cfg).verdict, Verdict::Fail, "a constant in-range shift is safe");
+    // A shift guarded < 32 on the path is safe (no false FAIL).
+    let guarded = lower(
+        "define i32 @shlg(i32 %a, i32 %b) {\nentry:\n  %ok = icmp ult i32 %b, 32\n  \
+         br i1 %ok, label %do, label %skip\ndo:\n  %q = shl i32 %a, %b\n  ret i32 %q\nskip:\n  ret i32 0\n}\n",
+    );
+    assert_ne!(verify_module(&guarded, &cfg).verdict, Verdict::Fail, "a shift guarded < width is safe");
+}
+
 /// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the
 /// request's destination to grant `write` — which `foreign` does not → FAIL. This exercises
 /// `label`/`propagate`/`require` (data/provenance.contract) end to end through real API names.
