@@ -402,3 +402,21 @@ b:
         .any(|i| matches!(i, csolver_ir::Inst::Call { callee: csolver_ir::Callee::Indirect(_), .. }));
     assert!(has_indirect, "an indirect call must lower to Callee::Indirect, not an opaque Symbol");
 }
+
+#[test]
+fn const_expr_bitcast_fn_pointer_is_recovered_for_devirt() {
+    // A constant ops-struct holding a function pointer wrapped in a `bitcast` const-expr
+    // (a common vtable/ops-table shape) must keep the `@handler` symbol so an indirect
+    // call loaded from it can devirtualise — not be dropped as an opaque constant.
+    let src = "\
+        @ops = constant { ptr } { ptr bitcast (ptr @handler to ptr) }\n\
+        define void @handler() {\nb:\n  ret void\n}\n";
+    let m = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "m".into() })
+        .expect("lower");
+    // The module's global function-pointer table records @handler at the field offset.
+    let has = m.global_fn_ptrs.values().any(|fields| fields.iter().any(|(_, fid)| {
+        m.functions.iter().any(|f| f.id == *fid && f.name == "handler")
+    }));
+    assert!(has, "the bitcast-wrapped @handler is recovered as a fn-ptr field: {:?}", m.global_fn_ptrs);
+}

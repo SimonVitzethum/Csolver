@@ -200,6 +200,7 @@ impl Parser {
                 if !matches!(w.as_str(), "null" | "undef" | "poison" | "true" | "false") =>
             {
                 let is_gep = w == "getelementptr";
+                let is_ptr_cast = matches!(w.as_str(), "bitcast" | "inttoptr");
                 let mut j = self.pos;
                 while matches!(self.toks.get(j), Some(Tok::Word(_))) {
                     j += 1;
@@ -209,13 +210,24 @@ impl Parser {
                     // The folded global-displacement form —
                     // `getelementptr inbounds (T, ptr @g, iN K)` — keeps its
                     // base symbol and offset, so a load/store through it can be
-                    // checked against the global's region. Any other constant
-                    // expression is consumed opaquely.
+                    // checked against the global's region.
                     if is_gep {
                         if let Some(v) = self.try_const_gep() {
                             return Ok(v);
                         }
                     }
+                    // A pointer-identity cast of a symbol address — `bitcast (ptr @f to
+                    // ptr)` / `inttoptr (… @f …)` — IS that symbol's address (the cast is a
+                    // no-op on the pointer). Recover the inner `@symbol` so a function
+                    // pointer stored in a constant table (a vtable / ops-struct field) is
+                    // devirtualisable, instead of the opaque `Undef` the body would give.
+                    if is_ptr_cast {
+                        if let Some(sym) = self.first_global_in_balanced() {
+                            self.skip_balanced('(', ')')?;
+                            return Ok(LValue::Global(sym));
+                        }
+                    }
+                    // Any other constant expression is consumed opaquely.
                     self.skip_balanced('(', ')')?;
                     return Ok(LValue::Undef);
                 }
@@ -286,6 +298,29 @@ impl Parser {
     /// opening paren as the next token. On success the group is consumed; on
     /// any mismatch the position is restored (`None`) so the caller can skip
     /// the group opaquely.
+    /// The first `@symbol` token inside the balanced `(…)` group starting at the current
+    /// position (which must be at the opening `(`), WITHOUT consuming any tokens. Used to
+    /// recover the symbol of a pointer-identity const-expr cast (`bitcast`/`inttoptr`).
+    pub(crate) fn first_global_in_balanced(&self) -> Option<String> {
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::Punct('(') => depth += 1,
+                Tok::Punct(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return None;
+                    }
+                }
+                Tok::Global(s) => return Some(s.clone()),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     pub(crate) fn try_const_gep(&mut self) -> Option<LValue> {
         let start = self.pos;
         let mut attempt = || -> Option<LValue> {
