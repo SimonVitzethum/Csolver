@@ -637,6 +637,15 @@ impl Inst {
             // already freed (`NoDoubleFree`); a lock-acquiring call must not re-acquire a
             // held lock (`DataRace`, bug-finding only).
             Inst::Call { .. } => &[NoDoubleFree, DataRace, SleepInAtomic, TypestateViolation],
+            // A division or modulo carries the divisor-non-zero obligation (bug-finding only).
+            Inst::Assign {
+                value:
+                    RValue::Bin {
+                        op: BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem,
+                        ..
+                    },
+                ..
+            } => &[NoDivByZero],
             _ => &[],
         }
     }

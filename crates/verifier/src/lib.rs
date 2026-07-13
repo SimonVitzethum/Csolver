@@ -687,6 +687,7 @@ fn verify_function_with(
                         | SafetyProperty::TaintedSink
                         | SafetyProperty::TypestateViolation
                         | SafetyProperty::SecretDependent
+                        | SafetyProperty::NoDivByZero
                 ) && !config.bug_finding
                 {
                     continue;

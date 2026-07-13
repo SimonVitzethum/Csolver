@@ -2997,6 +2997,26 @@ impl Explorer<'_> {
                     _ => self.eval_rvalue(value, state),
                 };
                 state.env.insert(*dst, v);
+                // Division / modulo by zero: the divisor of a `/` or `%` must be provably non-zero
+                // (a zero divisor is UB / a hardware trap). Refuted with a witness when the divisor
+                // can be zero on the path (the `decide` gate keeps it sound: a genuine-input divisor
+                // in bug-finding mode, or a definite zero on an exact path in strict mode).
+                if let RValue::Bin { op, rhs, .. } = value {
+                    if matches!(op, BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem) {
+                        let d = self.eval_scalar(rhs, state);
+                        let zero = self.ctx.int(self.ctx.width(d), 0);
+                        let nonzero = self.ctx.cmp(SCmp::Ne, d, zero);
+                        let decision = self.decide(&[nonzero], state, RefuteMode::Possible, &[]);
+                        self.record_mem(
+                            block,
+                            idx,
+                            SafetyProperty::NoDivByZero,
+                            decision,
+                            "divisor is non-zero",
+                            "the divisor may be zero (division by zero)",
+                        );
+                    }
+                }
                 // Taint propagation: the result carries the union of its operands' taint.
                 let t = self.rvalue_taint(value, state);
                 if t.is_empty() {

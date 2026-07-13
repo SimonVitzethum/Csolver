@@ -2946,6 +2946,30 @@ entry:
 /// End-to-end provenance/capability enforcement through the **file-driven contracts**, on a
 /// faithful reproduction of the CVE-2026-31431 "Copy Fail" AEAD in-place chain: a page is
 /// labelled `foreign` by `af_alg_sendpage`, its provenance flows through `crypto_aead_copy_sgl`
+/// **Division / modulo by zero (`NoDivByZero`).** A `/` or `%` whose divisor is an unguarded
+/// attacker-reachable parameter can be zero → UB, refuted with a witness. A constant non-zero
+/// divisor, and a divisor guarded non-zero on the path, are safe (no false FAIL).
+#[test]
+fn division_by_zero_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |src: &str| LlvmFrontend.lower(LlvmInput { source: src.into(), name: "d".into() }).expect("lower");
+    // sdiv by an unguarded parameter → the divisor can be zero → FAIL.
+    let racy = lower("define i32 @divp(i32 %a, i32 %b) {\nb:\n  %q = sdiv i32 %a, %b\n  ret i32 %q\n}\n");
+    assert_eq!(verify_module(&racy, &cfg).verdict, Verdict::Fail, "division by an unguarded param can be zero");
+    // urem by the same → also flagged (modulo by zero is UB too).
+    let rem = lower("define i32 @remp(i32 %a, i32 %b) {\nb:\n  %q = urem i32 %a, %b\n  ret i32 %q\n}\n");
+    assert_eq!(verify_module(&rem, &cfg).verdict, Verdict::Fail, "modulo by an unguarded param can be zero");
+    // A constant non-zero divisor is safe.
+    let konst = lower("define i32 @divc(i32 %a) {\nb:\n  %q = sdiv i32 %a, 2\n  ret i32 %q\n}\n");
+    assert_ne!(verify_module(&konst, &cfg).verdict, Verdict::Fail, "division by a non-zero constant is safe");
+    // A divisor guarded non-zero on the path is safe (no false FAIL).
+    let guarded = lower(
+        "define i32 @divg(i32 %a, i32 %b) {\nentry:\n  %nz = icmp ne i32 %b, 0\n  \
+         br i1 %nz, label %do, label %skip\ndo:\n  %q = sdiv i32 %a, %b\n  ret i32 %q\nskip:\n  ret i32 0\n}\n",
+    );
+    assert_ne!(verify_module(&guarded, &cfg).verdict, Verdict::Fail, "a divisor guarded != 0 is safe");
+}
+
 /// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the
 /// request's destination to grant `write` — which `foreign` does not → FAIL. This exercises
 /// `label`/`propagate`/`require` (data/provenance.contract) end to end through real API names.

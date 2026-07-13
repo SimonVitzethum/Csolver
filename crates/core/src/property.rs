@@ -92,6 +92,11 @@ pub enum SafetyProperty {
     /// condition or a `gep` index. A bug-finding-only obligation, refuted only when the
     /// deciding value is definitely secret-tainted on the path.
     SecretDependent,
+    /// No **division (or modulo) by zero**: the divisor of a `/`/`%` (`UDiv`/`SDiv`/`URem`/`SRem`)
+    /// must be provably non-zero. A zero divisor is undefined behaviour (a hardware trap on most
+    /// targets). Refuted with a witness when the divisor can be zero on the path (bug-finding: a
+    /// genuine-input divisor with no non-zero guard; strict: only on an exact path).
+    NoDivByZero,
     /// No **blocking/sleeping call in atomic context**: a call that may sleep
     /// (`mutex_lock`/`kmalloc(GFP_KERNEL)`/`schedule`/`msleep`/`down`/…) must not run while a
     /// **spinlock is held** (or IRQs/preemption are disabled) — it deadlocks or corrupts the
@@ -128,6 +133,7 @@ impl SafetyProperty {
             SafetyProperty::TaintedSink => "tainted_sink",
             SafetyProperty::TypestateViolation => "typestate_violation",
             SafetyProperty::SecretDependent => "secret_dependent",
+            SafetyProperty::NoDivByZero => "no_div_by_zero",
         }
     }
 
@@ -157,6 +163,7 @@ impl SafetyProperty {
             SafetyProperty::TaintedSink => "no tainted value reaches an unsafe sink",
             SafetyProperty::TypestateViolation => "no resource is used in a forbidden protocol state",
             SafetyProperty::SecretDependent => "no secret-dependent branch or memory index",
+            SafetyProperty::NoDivByZero => "divisor of a division/modulo is non-zero",
         }
     }
 
@@ -187,6 +194,7 @@ impl SafetyProperty {
             TaintedSink,
             TypestateViolation,
             SecretDependent,
+            NoDivByZero,
         ]
     }
 }
