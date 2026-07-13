@@ -23,7 +23,7 @@
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use crate::x86::{cc_cmpop, reg, temp_reg, MemOperand};
 use csolver_core::{Error, RegionKind, Result};
-use csolver_ir::{BinOp, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
+use csolver_ir::{BinOp, Callee, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
 
 /// One parsed textual operand, in a syntax-independent form. Widths are in bits.
 pub(crate) enum TextOp {
@@ -205,8 +205,40 @@ fn lower_insn(
             let d = reg_of(op_at(&ops, 1)?)?;
             Ok(fall(vec![Inst::Assign { dst: d, ty: Type::int(width), value: RValue::Use(Operand::Const(Const::Undef)) }]))
         }
+        // push/pop: a callee-saved register spill/restore. The saved value always
+        // lands on valid stack, so **not** modelling the store/load is sound (we
+        // never claim an access safe that isn't) and avoids poisoning the frame
+        // pointer: a `push` region flowing into `mov rbp, rsp` would make every
+        // `[rbp - k]` local provably out of that tiny region — a false bug. `push`
+        // is therefore a no-op; `pop` havocs its destination (its value is unknown
+        // after an unmodelled load). Precise stack checking still applies to the
+        // `sub rsp, N` frame (rsp-relative accesses), the common optimized shape.
+        "push" => Ok(fall(vec![])),
+        "pop" => {
+            let d = reg_of(op_at(&ops, 0)?)?;
+            Ok(fall(vec![Inst::Assign { dst: d, ty: Type::int(64), value: RValue::Use(Operand::Const(Const::Undef)) }]))
+        }
+        // `leave` = `mov rsp, rbp; pop rbp` — havoc rbp; rsp is re-established by the
+        // caller's frame (or the next prologue). Sound (the restore is always valid).
+        "leave" => Ok(fall(vec![Inst::Assign { dst: reg(5), ty: Type::int(64), value: RValue::Use(Operand::Const(Const::Undef)) }])),
+        // call: an opaque call that returns and falls through (havocs caller-saved
+        // state and rax), so analysis continues past it — strictly more than the
+        // byte decoder's conservative stop. A direct `call sym` names the symbol; a
+        // register/`*`-indirect target is an indirect call.
+        "call" => Ok(fall(vec![lower_call(op_at(&ops, 0)?)])),
         _ => Err(Error::unsupported(format!("asm: mnemonic `{mnem}`"))),
     }
+}
+
+/// Lower a `call` to an opaque `Inst::Call` binding rax: a direct symbol target,
+/// or an indirect call through a register / `*`-dereferenced operand.
+fn lower_call(op: &TextOp) -> Inst {
+    let callee = match op {
+        TextOp::Label(name) => Callee::Symbol(name.trim_start_matches('*').to_string()),
+        TextOp::Reg(n) => Callee::Indirect(Operand::Reg(reg(*n))),
+        _ => Callee::Symbol("<indirect>".to_string()),
+    };
+    Inst::Call { dst: Some(reg(0)), callee, args: Vec::new(), ret_ty: Type::int(64), ret_ref: None }
 }
 
 /// A parsed operand's MSIR value plus any address-computing insts.

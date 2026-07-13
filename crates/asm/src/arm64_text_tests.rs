@@ -98,11 +98,15 @@ fn indexed_load_with_lsl_scale() {
 }
 
 #[test]
-fn bl_stops_analysis_soundly() {
-    // A bl (call) is modelled as a return: analysis stops rather than guessing.
-    let src = "f:\n\tbl\thelper\n\tret\n";
+fn bl_is_an_opaque_call_and_analysis_continues() {
+    // `bl helper` returns and falls through — an Inst::Call binding x0, not a stop.
+    let src = "f:\n\tmov\tx0, #1\n\tbl\thelper\n\tadd\tx0, x0, #2\n\tret\n";
     let m = decode(src);
-    assert!(m.unanalyzed.is_empty(), "decodes (bl → Ret): {:?}", m.unanalyzed);
+    assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+    let insts = insts_of(&m);
+    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: csolver_ir::Callee::Symbol(s), .. } if s == "helper")));
+    // The post-call `add` is still lowered (analysis did not stop at the call).
+    assert!(insts.iter().filter(|i| matches!(i, Inst::Assign { .. })).count() >= 2);
 }
 
 #[test]

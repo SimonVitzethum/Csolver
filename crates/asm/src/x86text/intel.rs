@@ -18,6 +18,18 @@ pub(super) fn parse(mnem: &str, rest: &str) -> Result<(String, u32, Vec<TextOp>)
     if base.starts_with('j') && base.len() >= 2 {
         return Ok((base, 64, vec![TextOp::Label(rest.trim().to_string())]));
     }
+    // `call`: a register, a `[mem]` indirect target, or a direct symbol.
+    if base == "call" {
+        let t = rest.trim();
+        let op = if let Some((n, _)) = reg_token(t) {
+            TextOp::Reg(n)
+        } else if t.contains('[') {
+            parse_mem(t).map(TextOp::Mem).unwrap_or_else(|| TextOp::Label(t.to_string()))
+        } else {
+            TextOp::Label(t.to_string())
+        };
+        return Ok((base, 64, vec![op]));
+    }
     let toks = split_operands(rest);
     // Width: an explicit `ptr` size keyword wins; else the widest register operand.
     let mut width = 0u32;

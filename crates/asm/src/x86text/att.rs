@@ -14,6 +14,18 @@ pub(super) fn parse(mnem: &str, rest: &str) -> Result<(String, u32, Vec<TextOp>)
     if base.starts_with('j') && base.len() >= 2 {
         return Ok((base.to_string(), width, vec![TextOp::Label(rest.trim().to_string())]));
     }
+    // `call`: a direct symbol, or an indirect `*%reg` / `*(mem)` target.
+    if base == "call" {
+        let t = rest.trim();
+        let op = if let Some(r) = t.strip_prefix("*%").and_then(reg_number) {
+            TextOp::Reg(r)
+        } else if let Some(m) = t.strip_prefix('*').and_then(parse_mem) {
+            TextOp::Mem(m)
+        } else {
+            TextOp::Label(t.to_string())
+        };
+        return Ok(("call".to_string(), width, vec![op]));
+    }
     let mut ops = Vec::new();
     for tok in split_operands(rest) {
         ops.push(operand(tok)?);
@@ -99,8 +111,11 @@ fn parse_imm(tok: &str) -> Option<i64> {
 /// is a recognised instruction so `jle`→`jl` etc. are not mangled.
 fn strip_suffix(mnem: &str) -> (&str, u32) {
     let known_base = |m: &str| {
-        matches!(m, "mov" | "add" | "sub" | "and" | "or" | "xor" | "cmp" | "test" | "inc" | "dec" | "lea")
-            || m.starts_with("cmov")
+        matches!(
+            m,
+            "mov" | "add" | "sub" | "and" | "or" | "xor" | "cmp" | "test" | "inc" | "dec" | "lea"
+                | "push" | "pop" | "call"
+        ) || m.starts_with("cmov")
     };
     for (suf, w) in [('q', 64u32), ('l', 32), ('w', 16), ('b', 8)] {
         if let Some(stripped) = mnem.strip_suffix(suf) {

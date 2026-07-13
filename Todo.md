@@ -37,6 +37,15 @@
   extrahiert und trägt die `in_bounds`-Obligation (per CLI-Rauchtest verifiziert:
   OOB → FAIL). Arch+Syntax werden aus der Quelle auto-erkannt (`csolver_asm::detect`).
   Inline-Asm bleibt opak (per Contract abgedeckt, siehe [[contract-externalization]]).
+- [x] `push`/`pop`/`call` (x86) und `bl`/`blr` (ARM) lassen die Funktion **nicht
+  mehr droppen**: `call`/`bl` sind opake `Inst::Call` mit Fall-Through (Analyse
+  läuft weiter, havoct caller-saved + rax/x0); `push`/`pop` modellieren bewusst
+  keinen Speicherzugriff (der Callee-Save-Spill liegt immer auf gültigem Stack —
+  ihn nicht zu modellieren ist sound und vermeidet, dass eine winzige Push-Region
+  über `mov rbp,rsp` jeden `[rbp-k]`-Local fälschlich als OOB meldet). Ergebnis:
+  rsp-relative Frames (optimiert) verifizieren präzise (PASS/FAIL), rbp-relative
+  -O0-Frames sind ehrlich UNKNOWN statt falsch FAIL. Verbleibende Grenze: eine
+  präzise Frame-Pointer-Modellierung (rbp = frame_base + N) für -O0-PASS.
 
 ## Prozess / Infrastruktur
 

@@ -14,7 +14,7 @@
 
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use csolver_core::{Error, RegionKind, Result};
-use csolver_ir::{BinOp, CmpOp, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
+use csolver_ir::{BinOp, Callee, CmpOp, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
 
 /// The stack-pointer register number (also `sp`/register 31 in the memory and
 /// add/sub-immediate forms).
@@ -123,8 +123,11 @@ fn lower_insn(
     match mnem {
         "ret" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Ret }),
         "nop" => Ok(fall(vec![])),
-        // A call clobbers state we do not track — stop analysis here (sound).
-        "bl" | "blr" | "svc" | "brk" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Ret }),
+        // A call (`bl sym`/`blr Xn`) returns and falls through: model it as an
+        // opaque `Inst::Call` binding x0 (havocs caller-saved state), so analysis
+        // continues past it. `svc`/`brk` trap — stop analysis (sound).
+        "bl" | "blr" => Ok(fall(vec![lower_call(&ops)])),
+        "svc" | "brk" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Ret }),
         "b" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Jmp(label(&ops, 0, labels)?) }),
         // b.<cond> — the mnemonic carries the condition after the dot.
         _ if mnem.starts_with("b.") => {
@@ -352,6 +355,18 @@ fn parse_lsl_scale(t: &&str) -> Option<u32> {
     let s = t.trim().strip_prefix("lsl")?.trim().strip_prefix('#')?;
     let bits: u32 = s.trim().parse().ok()?;
     Some(1u32 << bits)
+}
+
+/// Lower a `bl sym` / `blr Xn` call to an opaque `Inst::Call` binding x0 (the
+/// PCS integer result register): a direct symbol, or an indirect register target.
+fn lower_call(ops: &[&str]) -> Inst {
+    let t = ops.first().map(|s| s.trim()).unwrap_or("");
+    let callee = match reg_number(t) {
+        Some(n) => Callee::Indirect(Operand::Reg(reg(n))),
+        None if !t.is_empty() => Callee::Symbol(t.to_string()),
+        None => Callee::Symbol("<indirect>".to_string()),
+    };
+    Inst::Call { dst: Some(reg(0)), callee, args: Vec::new(), ret_ty: Type::int(64), ret_ref: None }
 }
 
 fn branch(off: usize, next: usize, target: usize, cc: CmpOp, flags: Option<(Operand, Operand)>) -> Result<DecodedInsn> {

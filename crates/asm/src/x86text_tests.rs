@@ -1,6 +1,6 @@
 use super::*;
 use crate::{detect, Architecture, Syntax};
-use csolver_ir::Inst;
+use csolver_ir::{Callee, Inst};
 
 // ==========================================================================
 // AT&T syntax
@@ -65,9 +65,38 @@ f:
 
 #[test]
 fn att_unknown_mnemonic_drops_the_function() {
-    let m = decode_att("f:\n\tpushq\t%rbp\n\tretq\n");
+    let m = decode_att("f:\n\tvfmadd\t%xmm0, %xmm1\n\tretq\n");
     assert!(m.functions.is_empty());
     assert_eq!(m.unanalyzed.len(), 1);
+}
+
+#[test]
+fn att_prologue_push_pop_and_call() {
+    // The standard `push rbp; mov rbp,rsp; sub rsp; call helper; pop rbp; ret`
+    // frame decodes end-to-end (push/pop no longer drop the function). The `sub
+    // rsp` frame is still a precise stack region; `call` is an opaque Inst::Call.
+    let src = "\
+f:
+\tpushq\t%rbp
+\tmovq\t%rsp, %rbp
+\tsubq\t$16, %rsp
+\tcall\thelper
+\taddq\t$16, %rsp
+\tpopq\t%rbp
+\tretq
+";
+    let m = decode_att(src);
+    assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
+    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
+    assert!(insts.iter().any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. })), "sub rsp → stack frame");
+    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "helper")));
+}
+
+#[test]
+fn att_indirect_call() {
+    let m = decode_att("f:\n\tcall\t*%rax\n\tretq\n");
+    assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+    assert!(m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Call { callee: Callee::Indirect(_), .. })));
 }
 
 // ==========================================================================
@@ -158,6 +187,26 @@ fn intel_negative_displacement() {
     let m = decode_intel(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
     assert!(m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Store { .. })));
+}
+
+#[test]
+fn intel_prologue_push_call_pop() {
+    let src = "\
+.intel_syntax noprefix
+f:
+\tpush\trbp
+\tmov\trbp, rsp
+\tsub\trsp, 16
+\tcall\thelper
+\tadd\trsp, 16
+\tpop\trbp
+\tret
+";
+    let m = decode_intel(src);
+    assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
+    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
+    assert!(insts.iter().any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. })), "sub rsp → stack frame");
+    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "helper")));
 }
 
 // ==========================================================================
