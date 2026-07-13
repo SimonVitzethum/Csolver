@@ -24,6 +24,7 @@
 mod exec;
 mod lockclass;
 mod summary;
+pub mod sync;
 
 pub use exec::{
     discharge_full, discharge_function, discharge_with, discharge_with_fields,

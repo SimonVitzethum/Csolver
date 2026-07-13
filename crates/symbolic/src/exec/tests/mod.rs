@@ -15,5 +15,5 @@ mod part_e;
 mod part_f;
 mod part_g;
 
-pub(self) use part_a::*;
-pub(self) use part_d::*;
+use part_a::*;
+use part_d::*;

@@ -16,7 +16,7 @@ fn llvm_call_with_align_global_arg_parses() {
 /// it after loop rotation: a **pointer-walking** loop (`iter != end`, bottom-test
 /// — load before the exit check), guarded by an `is_empty` preheader test. This
 /// is the real compiled shape the equality-exit pointer-induction analysis is for.
-pub const PTR_WALK: &str = r#"
+pub(crate) const PTR_WALK: &str = r#"
 define void @walk(ptr noalias noundef nonnull readonly align 4 %s.0, i64 noundef %s.1) unnamed_addr #0 {
 start:
   %end = getelementptr inbounds i32, ptr %s.0, i64 %s.1
@@ -50,7 +50,7 @@ fn llvm_pointer_walk_loop_verifies_pass() {
 /// Soundness: the same pointer walk WITHOUT the `is_empty` preheader guard. On an
 /// empty slice the unconditional first load reads out of bounds, so it must not
 /// be proved PASS — the rotated-walk base case is unprovable without the guard.
-pub const PTR_WALK_NOGUARD: &str = r#"
+pub(crate) const PTR_WALK_NOGUARD: &str = r#"
 define void @walk_noguard(ptr noalias noundef nonnull readonly align 4 %s.0, i64 noundef %s.1) unnamed_addr #0 {
 start:
   %end = getelementptr inbounds i32, ptr %s.0, i64 %s.1
@@ -81,7 +81,7 @@ fn llvm_pointer_walk_without_guard_is_not_pass() {
 /// `memcpy`/`memset` safety: a copy/fill of `len` bytes is proved when both the
 /// destination (write) and source (read) are valid for `len` bytes. A copy of
 /// 16 bytes between `dereferenceable(16)` pointers verifies; copying 32 does not.
-pub const MEM_INTRINSICS: &str = r#"
+pub(crate) const MEM_INTRINSICS: &str = r#"
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 define void @copy16(ptr align 1 dereferenceable(16) %dst, ptr align 1 dereferenceable(16) %src) unnamed_addr #0 {

@@ -353,7 +353,7 @@ impl Explorer<'_> {
                 // Per-CPU accessor: tag the returned pointer's identity so accesses through it
                 // are excluded from the data-race pass (per-CPU data is thread-local).
                 if let (Some(d), Callee::Symbol(n)) = (dst, callee) {
-                    if PERCPU_ACCESSOR.contains(&n.as_str()) {
+                    if crate::sync::classes().percpu(n) {
                         if let Some(RefBase::Opaque(id)) =
                             state.env.get(d).and_then(Self::ptr_base_key)
                         {

@@ -297,6 +297,19 @@ pub(crate) fn emit_contract(
                     insts.push(Inst::Cas { val: ctx.operand(a, 64)? });
                 }
             }
+            // Synchronisation classification (locks, blocking, IRQ/RCU state, per-CPU,
+            // container lookups): consumed by the symbolic executor's pre-solve collector
+            // (`csolver_symbolic::sync`), which matches the surviving call by name — no
+            // instruction to emit, and the call must NOT be marked handled.
+            Effect::LockAcquire { .. }
+            | Effect::Blocking
+            | Effect::IrqDisable
+            | Effect::IrqEnable
+            | Effect::RcuReadLock
+            | Effect::RcuReadUnlock
+            | Effect::PercpuPtr
+            | Effect::ContainerLookup { .. }
+            | Effect::GlobalLookup { .. } => {}
         }
     }
     // A recognized non-allocating call still yields a result the caller may use

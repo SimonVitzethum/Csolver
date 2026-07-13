@@ -28,25 +28,33 @@ impl Explorer<'_> {
                 return;
             }
         };
+        // The synchronisation classification, collected from the contract files before
+        // solving (crates/contracts/data/kernel_sync.contract) — see `crate::sync`.
+        let sync = crate::sync::classes();
         // RCU read-side critical section: track nesting depth so a shared read inside it is
         // excluded from the data-race pass (race-free by the RCU contract).
-        if RCU_READ_LOCK.contains(&name) {
+        if sync.rcu_read_lock(name) {
             state.rcu_depth += 1;
-        } else if RCU_READ_UNLOCK.contains(&name) {
+        } else if sync.rcu_read_unlock(name) {
             state.rcu_depth = state.rcu_depth.saturating_sub(1);
         }
         // IRQ-disabled section (G9): an access here holds the synthetic `@irqoff` lock, so a
         // location protected against IRQs inconsistently (irqsave here, plain lock there) races.
-        if IRQ_DISABLE.contains(&name) {
+        if sync.irq_disable(name) {
             state.irq_off += 1;
-        } else if IRQ_ENABLE.contains(&name) {
+        } else if sync.irq_enable(name) {
             state.irq_off = state.irq_off.saturating_sub(1);
         }
-        let base = args.first().map(|a| self.eval_value(a, state)).and_then(|v| Self::ptr_base_key(&v));
+        let acquire = sync.lock_acquire(name);
+        // The lock argument: the contract's declared index for an acquire, arg0 otherwise
+        // (the release-drop below inspects every pointer argument anyway).
+        let lock_arg = acquire.map_or(0, |s| s.arg);
+        let base =
+            args.get(lock_arg).map(|a| self.eval_value(a, state)).and_then(|v| Self::ptr_base_key(&v));
         // Sleep-in-atomic: a blocking/sleeping call while a spinlock is *definitely* held is a
         // deadlock/scheduler-corruption bug — refuted with a reachability witness. Every other
         // call records the obligation proven, so it is never left Open.
-        if BLOCKING.contains(&name) && !state.spin_held.is_empty() {
+        if sync.blocking(name) && !state.spin_held.is_empty() {
             self.record_temporal(
                 (block, idx),
                 SafetyProperty::SleepInAtomic,
@@ -58,14 +66,14 @@ impl Explorer<'_> {
         } else {
             self.record(block, idx, SafetyProperty::SleepInAtomic, true, "no sleeping call while a spinlock is held", "");
         }
-        if LOCK_ACQUIRE.contains(&name) {
+        if let Some(spec) = acquire {
             // Lock-order edges (ABBA, G6): name the acquired lock's *class* from its
             // pointer argument, and for every distinct lock class already held on this
             // path emit an ordered edge (held → acquired). A B→A edge somewhere else in
             // the program then closes an ABBA cycle. The base's class is recorded below,
             // so a further nested acquire sees this lock as a predecessor.
             let newclass = args
-                .first()
+                .get(lock_arg)
                 .and_then(|a| crate::lockclass::lock_class_of_arg(&self.lock_classes, a));
             if let Some(nc) = &newclass {
                 for held in state.held_classes.values() {
@@ -109,7 +117,7 @@ impl Explorer<'_> {
             }
             // A **spinning** lock also enters atomic context — track it separately, so a
             // later blocking call is caught (a sleepable `mutex`/`down` is not tracked here).
-            if SPIN_ACQUIRE.contains(&name) {
+            if spec.spin {
                 if let Some(b) = base {
                     state.spin_held.insert(b);
                 }

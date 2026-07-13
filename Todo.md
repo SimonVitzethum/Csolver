@@ -20,12 +20,6 @@
 
 ## Technische Schuld
 
-- [ ] **Kernel-Wissen als hartkodierte Namenslisten** statt Contracts:
-  `LOCK_ACQUIRE`/`SPIN_ACQUIRE`/`BLOCKING`/`IRQ_DISABLE`/`IRQ_ENABLE`/`RCU_*`/
-  `PERCPU_ACCESSOR` in `exec.rs`, Container-/fd-Table-Lookups in `lockclass.rs`.
-  Migration ins `csolver-contracts`-System (wie bei den Allokator-Tabellen bereits
-  geschehen), damit neue Kernel-APIs per `.contract`-Datei statt Codeänderung
-  abgedeckt werden.
 - [ ] Korrumpierter Doc-Kommentar `crates/llvm/src/parser.rs:48`
   („…plain sum ofgrep FAIL ~/fullscan.log" — versehentlich eingefügter Shell-Befehl).
 - [ ] `FIXME` in `crates/asm/src/x86.rs` (~Z. 2959): MOVUPD-Variante fehlt.
@@ -56,3 +50,16 @@
 
 - [x] Datei-Refactor: alle Quelldateien möglichst < 500 Zeilen (siehe oben) —
   mechanische Aufteilung in Submodule, verhaltensneutral, Testsuite grün.
+  Ausnahmen (Einzelfunktionen, nicht mechanisch teilbar): `asm/x86/lower.rs`
+  (`decode_one`, ~890 Z.) und `asm/x86/opcode.rs` (`decode_typed_opcode`, ~615 Z.);
+  mögliche spätere Verbesserung: den in sich geschlossenen `0x0f`-Arm von
+  `decode_one` in eine `decode_two_byte`-Hilfsfunktion ausziehen.
+- [x] **Kernel-Wissen als hartkodierte Namenslisten** → Contracts migriert:
+  Die Lock-/Sleep-/IRQ-/RCU-/Percpu-/Lookup-Klassifikation lebt jetzt in
+  `crates/contracts/data/kernel_sync.contract` (neue Effekte `lock-acquire`,
+  `blocking`, `irq-disable`/`irq-enable`, `rcu-read-lock`/`-unlock`, `percpu-ptr`,
+  `container-lookup`, `global-lookup`). Ein Collector (`csolver_symbolic::sync`)
+  sammelt sie **vor dem Solving** in eine Namens-Tabelle, die der Executor pro Call
+  abfragt; `exec/kernel_names.rs` und die Match-Listen in `lockclass.rs` sind
+  gelöscht. Neue Kernel-APIs = eine Contract-Zeile statt Codeänderung
+  (`sync::install()` erlaubt später per `--contracts` überlagerte Nutzer-Dateien).

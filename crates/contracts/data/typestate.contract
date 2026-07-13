@@ -41,9 +41,9 @@ typestate-require arg0 perm checked
 typestate-set arg0 toctou checked
 
 # A yield (blocking call, reschedule, sleep) lets an adversary act: every `checked` path
-# becomes `stale`.
-[schedule msleep ssleep mutex_lock down cond_resched]
-typestate-yield toctou checked stale
+# becomes `stale`. The yield lives on the blocking primitives' blocks in
+# kernel_sync.contract (`schedule`/`msleep`/`ssleep`/`cond_resched`/`mutex_lock`/`down`),
+# since one name has exactly one contract block.
 
 # Using (open) a path whose check went stale across a yield is a TOCTOU race.
 [open openat fopen_path]

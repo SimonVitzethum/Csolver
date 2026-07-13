@@ -125,7 +125,7 @@ start:
 /// anywhere), but under `closed_world` the module's call sites are taken to be
 /// all of them — here the sole caller passes a live 16-byte alloca, so the two
 /// i64 loads become provable.
-pub const CLOSED_WORLD: &str = r#"
+pub(crate) const CLOSED_WORLD: &str = r#"
 define i64 @sum_pair(ptr %p) {
 entry:
   %a = load i64, ptr %p, align 8
@@ -167,7 +167,7 @@ fn closed_world_synthesizes_exported_contract() {
 /// Soundness control for closed-world: the synthesized contract is the *weakest*
 /// guarantee across call sites. With one caller passing 16 bytes and another only
 /// 8, the offset-8 load must stay unprovable — no false PASS.
-pub const CLOSED_WORLD_WEAKEST: &str = r#"
+pub(crate) const CLOSED_WORLD_WEAKEST: &str = r#"
 define i64 @sum_pair(ptr %p) {
 entry:
   %a = load i64, ptr %p, align 8
@@ -210,7 +210,7 @@ fn closed_world_takes_weakest_call_site_guarantee() {
 /// stores `&x` into that field (byte offset 8) before the call, so the callee's
 /// load of the field yields a valid pointer and the deref proves. `main` builds a
 /// `{ i64, ptr }` on the stack, writes `&x` into the pointer field, and calls.
-pub const MEMBER_PROV: &str = r#"
+pub(crate) const MEMBER_PROV: &str = r#"
 define i32 @read_member(ptr %w) {
 entry:
   %f = getelementptr inbounds i8, ptr %w, i64 8
@@ -254,7 +254,7 @@ fn closed_world_member_provenance_recovers_raw_pointer_member() {
 
 /// Soundness control: if a call site leaves the pointer field unwritten, the
 /// callee's deref must stay unprovable even under closed-world — no false PASS.
-pub const MEMBER_PROV_UNSET: &str = r#"
+pub(crate) const MEMBER_PROV_UNSET: &str = r#"
 define i32 @read_member(ptr %w) {
 entry:
   %f = getelementptr inbounds i8, ptr %w, i64 8
@@ -288,7 +288,7 @@ fn closed_world_member_provenance_declines_unwritten_field() {
 /// chain whose intermediate `local_defs` also treats as a region root; the field
 /// slot must still be attributed to the aggregate the caller passes, not to that
 /// intermediate. Here field 0 is the pointer, filled with `&x` before the call.
-pub const MEMBER_PROV_STRUCT_GEP: &str = r#"
+pub(crate) const MEMBER_PROV_STRUCT_GEP: &str = r#"
 %struct.P = type { ptr }
 define i64 @deref_field(ptr %s) {
 entry:
@@ -335,7 +335,7 @@ fn closed_world_member_provenance_through_struct_gep() {
 /// could rewrite the field, then calls the member reader with no re-store. The
 /// field guarantee must be dropped — a raw external call is never silently
 /// ignored (that would be a false PASS).
-pub const MEMBER_PROV_ESCAPE: &str = r#"
+pub(crate) const MEMBER_PROV_ESCAPE: &str = r#"
 declare void @clobber(ptr)
 define i32 @read_member(ptr %w) {
 entry:
@@ -375,7 +375,7 @@ fn closed_world_member_provenance_respects_escape_via_external_call() {
 /// closed-world the callee's parameter must still be contracted from that gep —
 /// here `reads` (two i64 loads) is called with `&a[0]` of a `[2 x i64]`, so it
 /// gets a 16-byte region and proves.
-pub const GEP_ARG: &str = r#"
+pub(crate) const GEP_ARG: &str = r#"
 define i64 @reads(ptr %p) {
 entry:
   %a = load i64, ptr %p, align 8
@@ -409,7 +409,7 @@ fn closed_world_synthesizes_through_constant_gep_arg() {
 /// Soundness control: a gep to `&a[1]` of a two-element array leaves only 8 bytes,
 /// so a callee reading `p[1]` (offset 8) is out of bounds — the reduced-size
 /// guarantee must keep it unprovable, never a false PASS.
-pub const GEP_ARG_OOB: &str = r#"
+pub(crate) const GEP_ARG_OOB: &str = r#"
 define i64 @reads(ptr %p) {
 entry:
   %a = load i64, ptr %p, align 8
@@ -444,7 +444,7 @@ fn closed_world_gep_arg_reduces_size_soundly() {
 /// counter both spilled to allocas and reloaded each iteration — becomes
 /// analyzable: the counter is an induction variable again, so `p[i]` (i in
 /// [0,4), region 4×i64) proves in bounds under closed-world.
-pub const SPILLED_LOOP: &str = r#"
+pub(crate) const SPILLED_LOOP: &str = r#"
 define i64 @sum4(ptr %p) {
 entry:
   %pa = alloca ptr, align 8

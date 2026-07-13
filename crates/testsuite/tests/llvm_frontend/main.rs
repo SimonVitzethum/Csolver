@@ -8,9 +8,6 @@ use csolver_ir::Frontend;
 use csolver_llvm::{LlvmFrontend, LlvmInput};
 use csolver_verifier::{verify_module, Config};
 
-/// `make_and_store(i)`: allocate `[8 x i32]`, then under `0 <= i && i < 8`
-/// store through `&buf[i]`. Every implied memory obligation is provable.
-
 mod part_a;
 mod part_b;
 mod part_c;

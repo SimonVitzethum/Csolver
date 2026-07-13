@@ -26,7 +26,13 @@ typestate-set arg0 reclaim deferred
 typestate-set arg0 reclaim deferred
 
 # --- Safe points (grace period / scan / epoch advance) make deferred objects reclaimable -----
-[synchronize_rcu synchronize_rcu_expedited synchronize_sched synchronize_srcu synchronize_srcu_expedited hazptr_scan hazard_pointer_scan ebr_advance epoch_advance rcu_barrier srcu_barrier]
+# `synchronize_rcu`/`synchronize_srcu` wait for a grace period and hence may sleep —
+# `blocking` makes them sleep-in-atomic sinks (kernel_sync.contract has the other sleepers).
+[synchronize_rcu synchronize_srcu]
+typestate-yield reclaim deferred safe
+blocking
+
+[synchronize_rcu_expedited synchronize_sched synchronize_srcu_expedited hazptr_scan hazard_pointer_scan ebr_advance epoch_advance rcu_barrier srcu_barrier]
 typestate-yield reclaim deferred safe
 
 # --- The deferred frees are the safe path — they clear the object's deferred state directly ---

@@ -3,7 +3,7 @@ use super::*;
 
 /// `fn get(s: &[i32; 8], i: usize) -> i32 { s[i] }` as rustc MIR: the
 /// bounds-check `assert(Lt(i, 8))` guards the indexed load, so it verifies PASS.
-pub const CHECKED: &str = r#"
+pub(crate) const CHECKED: &str = r#"
 fn get(_1: &[i32; 8], _2: usize) -> i32 {
     debug s => _1;
     debug i => _2;
@@ -34,7 +34,7 @@ fn mir_checked_index_verifies_pass() {
 /// The same indexed load WITHOUT the bounds-check assert (a hypothetical
 /// `get_unchecked`): nothing constrains `i < 8`, so the access must not be
 /// proved PASS. This is what makes the MIR assert meaningful.
-pub const UNCHECKED: &str = r#"
+pub(crate) const UNCHECKED: &str = r#"
 fn get_unchecked(_1: &[i32; 8], _2: usize) -> i32 {
     let mut _0: i32;
     bb0: {
@@ -59,7 +59,7 @@ fn mir_unchecked_index_is_not_pass() {
 /// length): the length comes from `Len((*_1))`, which the frontend resolves to a
 /// synthetic length parameter, and the `assert(Lt(i, len))` proves the access in
 /// bounds. Verifies PASS under the `slice-abi` assumption.
-pub const SLICE: &str = r#"
+pub(crate) const SLICE: &str = r#"
 fn get(_1: &[i32], _2: usize) -> i32 {
     debug s => _1;
     debug i => _2;
@@ -91,7 +91,7 @@ fn mir_checked_slice_index_verifies_pass() {
 /// invariant `i >= 0`, the guard `i < len` (from the `switchInt` edge), and the
 /// slice contract (region size `len * 4`) combine to prove every access. The
 /// length is read from `Len((*_1))` at the header.
-pub const SLICE_LOOP: &str = r#"
+pub(crate) const SLICE_LOOP: &str = r#"
 fn sum(_1: &[i32]) -> () {
     let mut _0: ();
     let mut _2: usize;
@@ -133,7 +133,7 @@ fn mir_slice_index_loop_verifies_pass() {
 /// the `assert(Lt(i, len))` bounds check, and a `debug`/`let` preamble. Verifies
 /// PASS — validating the frontend against genuine compiler output, not just
 /// hand-written fixtures.
-pub const REAL_GET: &str = r#"
+pub(crate) const REAL_GET: &str = r#"
 fn get(_1: &[i32], _2: usize) -> i32 {
     debug s => _1;
     debug i => _2;
@@ -170,7 +170,7 @@ fn mir_real_rustc_slice_get_verifies_pass() {
 /// (`(_11.1: bool)`), `switchInt`, and nested `scope`s. The indexed load is
 /// proved in bounds via the bounds-check `assert`; the overflow checks are
 /// modelled opaquely (arithmetic, not memory). Verifies PASS.
-pub const REAL_SUM_LOOP: &str = r#"
+pub(crate) const REAL_SUM_LOOP: &str = r#"
 fn sum(_1: &[i32]) -> i32 {
     debug s => _1;
     let mut _0: i32;
@@ -249,7 +249,7 @@ fn mir_real_rustc_debug_loop_verifies_pass() {
 /// (`_4 = &raw const (fake) (*_1); _5 = PtrMetadata(move _4)`), so the synthetic
 /// length must flow through the pointer copy. The bounds-checked store verifies
 /// PASS.
-pub const REAL_WRITE_SLICE: &str = r#"
+pub(crate) const REAL_WRITE_SLICE: &str = r#"
 fn write_slice(_1: &mut [i32], _2: usize, _3: i32) -> () {
     debug s => _1;
     debug i => _2;
@@ -286,7 +286,7 @@ fn mir_real_slice_write_verifies_pass() {
 /// over a **unit-stride** `&[u8]` — the access offset is the bare index, whose
 /// bit-precise refinement of `i + 1 ≤ len` once made it slow; with the tight
 /// refine budget it stays on the fast linear path and verifies PASS quickly.
-pub const REAL_FILL: &str = r#"
+pub(crate) const REAL_FILL: &str = r#"
 fn fill(_1: &mut [u8], _2: u8) -> () {
     debug s => _1;
     debug v => _2;
@@ -356,7 +356,7 @@ fn mir_real_mut_slice_fill_loop_verifies_pass() {
 /// deref goes through the (opaque) result of a `get_unchecked` call. It must NOT
 /// be proved PASS: dropping the unmodelled deref would be an unsound vacuous
 /// PASS, so the access is emitted through the opaque pointer and stays UNKNOWN.
-pub const REAL_UNCHECKED: &str = r#"
+pub(crate) const REAL_UNCHECKED: &str = r#"
 fn unchecked(_1: &[i32], _2: usize) -> i32 {
     debug s => _1;
     debug i => _2;
@@ -393,7 +393,7 @@ fn mir_real_unchecked_deref_is_not_pass() {
 /// disequality the linear fragment cannot read. It verifies PASS only because the
 /// prover **skips** the unusable `≠` assumption and proves the access from its
 /// own `n-1 <u len` bounds guard.
-pub const REAL_LAST: &str = r#"
+pub(crate) const REAL_LAST: &str = r#"
 fn last(_1: &[i32]) -> i32 {
     debug s => _1;
     let mut _0: i32;

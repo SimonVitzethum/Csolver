@@ -3,7 +3,7 @@ use super::*;
 /// A function using a construct outside the modelled subset (a `drop`
 /// terminator) is recorded as unanalyzed rather than mis-lowered — and a sound
 /// function in the same dump still verifies.
-pub const MIXED: &str = r#"
+pub(crate) const MIXED: &str = r#"
 fn good(_1: &[i32; 8], _2: usize) -> i32 {
     let mut _0: i32;
     let mut _3: bool;
@@ -45,7 +45,7 @@ fn mir_per_function_recovery() {
 /// as a freeing call, so a guarded access *before* the drop still verifies PASS.
 /// (The free's soundness — a use of a *dropped* owned region is not a PASS — is
 /// covered by the differential corpus's `cond_use_after_free`.)
-pub const DROP_OK: &str = r#"
+pub(crate) const DROP_OK: &str = r#"
 fn drop_then_get(_1: &[i32; 8], _2: usize) -> i32 {
     let mut _0: i32;
     let mut _3: bool;
@@ -76,7 +76,7 @@ fn mir_drop_terminator_is_modelled_and_analyses() {
 /// array index). The call's assignment-form terminator lowers to an MSIR `Call`
 /// resolved to the in-module `helper` (`Callee::Direct`), and the whole module
 /// verifies via the helper's summary.
-pub const INTERPROC: &str = r#"
+pub(crate) const INTERPROC: &str = r#"
 fn helper(_1: &[i32; 8], _2: usize) -> i32 {
     let mut _0: i32;
     let mut _3: bool;
@@ -125,7 +125,7 @@ fn mir_interprocedural_call_lowers_and_verifies() {
 /// Soundness: a call to an *external* function (an unresolved symbol) lowers but
 /// its result is an unknown — so dereferencing the returned pointer is not
 /// proved safe. The function still lowers (it is not dropped).
-pub const EXTERN_CALL: &str = r#"
+pub(crate) const EXTERN_CALL: &str = r#"
 fn uses_extern(_1: usize) -> i32 {
     let mut _0: i32;
     let mut _2: *mut i32;
@@ -162,7 +162,7 @@ fn mir_external_call_result_is_unknown() {
 /// two asserts give `i < len` and `j < 4`, which together prove
 /// `i*16 + j*4 + 4 <= len*16`. Array strides are unambiguous, so no struct
 /// layout is needed. Frozen text, captured from rustc.
-pub const REAL_NESTED: &str = r#"
+pub(crate) const REAL_NESTED: &str = r#"
 fn nested(_1: &[[i32; 4]], _2: usize, _3: usize) -> i32 {
     debug m => _1;
     debug i => _2;
@@ -226,7 +226,7 @@ fn mir_real_nested_index_verifies_pass() {
 /// `i*16 + j*4` can exceed `len*16` for a large `j`, so the access must not be
 /// proved in bounds — which it can only be if the inner index is actually
 /// modelled (dropping it would fabricate a false PASS).
-pub const NESTED_INNER_UNCHECKED: &str = r#"
+pub(crate) const NESTED_INNER_UNCHECKED: &str = r#"
 fn nested_inner(_1: &[[i32; 4]], _2: usize, _3: usize) -> i32 {
     let mut _0: i32;
     let mut _7: usize;
@@ -262,7 +262,7 @@ fn mir_nested_index_inner_unchecked_is_not_pass() {
 /// placed at a byte offset; instead the `&Point` parameter is an opaque-size
 /// region and the field access is proved in bounds and aligned by construction
 /// (a typed field of a valid reference lies within it), under `struct-abi`.
-pub const REAL_STRUCT_FIELDS: &str = r#"
+pub(crate) const REAL_STRUCT_FIELDS: &str = r#"
 fn get_x(_1: &Point) -> i32 {
     debug p => _1;
     let mut _0: i32;
@@ -296,7 +296,7 @@ fn mir_real_struct_field_access_verifies_pass() {
 /// `&Point` (not `&mut`) must not prove `valid_write` — a readonly reference may
 /// be read but not written. (rustc would never emit this, but the verifier's
 /// permission gate must hold regardless.)
-pub const FIELD_WRITE_READONLY: &str = r#"
+pub(crate) const FIELD_WRITE_READONLY: &str = r#"
 fn ro_write(_1: &Point, _2: i32) -> () {
     let mut _0: ();
     bb0: {
@@ -324,7 +324,7 @@ fn mir_readonly_field_write_is_not_pass() {
 /// both arms), `&(((*_1) as Some).0: i32)` (a *variant field* address — the same
 /// field-sensitive model as a struct field, since the payload lies within the
 /// enum), and the generic type `Option<i32>` in the signature. Verifies PASS.
-pub const REAL_ENUM_MATCH: &str = r#"
+pub(crate) const REAL_ENUM_MATCH: &str = r#"
 fn opt_or(_1: &Option<i32>) -> i32 {
     debug o => _1;
     let mut _0: i32;
@@ -369,7 +369,7 @@ fn mir_real_enum_match_verifies_pass() {
 /// proved in bounds of `[i32; 8]`. Without the store→load round-trip the loaded
 /// value would be unknown and the index unprovable. (This only propagates a value
 /// the program actually stored, so it can never turn a real bug into a PASS.)
-pub const FIELD_ROUNDTRIP: &str = r#"
+pub(crate) const FIELD_ROUNDTRIP: &str = r#"
 fn roundtrip(_1: &mut Pair, _2: &[i32; 8]) -> i32 {
     let mut _0: i32;
     let mut _3: i32;
@@ -396,7 +396,7 @@ fn mir_field_store_load_roundtrips() {
 /// field **1** must *not* recover the stored value (distinct fields do not alias),
 /// so the index built from field 1 stays unknown — the store to field 0 may never
 /// pollute a different field, which would be a false PASS.
-pub const FIELD_CROSS: &str = r#"
+pub(crate) const FIELD_CROSS: &str = r#"
 fn cross_field(_1: &mut Pair, _2: &[i32; 8]) -> i32 {
     let mut _0: i32;
     let mut _3: i32;
@@ -426,7 +426,7 @@ fn mir_field_distinct_fields_do_not_alias() {
 /// (bb4). The frontend captures each statement's `// … at FILE:L:C` span and
 /// threads it onto the lowered instructions, so each obligation points back at the
 /// access that produced it.
-pub const PICK_SPANS: &str = r#"
+pub(crate) const PICK_SPANS: &str = r#"
 fn pick(_1: &[i32; 4], _2: bool) -> i32 {
     debug a => _1;                       // in scope 0 at src/lib.rs:1:13: 1:14
     let _3: usize;                       // in scope 0 at src/lib.rs:3:11: 3:12

@@ -201,3 +201,65 @@ fn comments_and_blank_lines_are_ignored() {
         .unwrap();
     assert_eq!(c.lookup("m").and_then(|c| c.alloc()), Some((&SizeExpr::Arg(0), 16)));
 }
+
+#[test]
+fn sync_effects_parse() {
+    let mut c = Contracts::default();
+    c.parse_str(
+        "[spin_lock]\nlock-acquire arg0 spin\n[mutex_lock]\nlock-acquire arg0\nblocking\n\
+         [local_irq_save]\nirq-disable\n[local_irq_restore]\nirq-enable\n\
+         [rcu_read_lock]\nrcu-read-lock\n[rcu_read_unlock]\nrcu-read-unlock\n\
+         [this_cpu_ptr]\npercpu-ptr\n[idr_find]\ncontainer-lookup arg0\n\
+         [fget]\nglobal-lookup @files\n",
+        "t",
+    )
+    .unwrap();
+    assert_eq!(
+        c.lookup("spin_lock").unwrap().effects,
+        vec![Effect::LockAcquire { arg: 0, spin: true }]
+    );
+    assert_eq!(
+        c.lookup("mutex_lock").unwrap().effects,
+        vec![Effect::LockAcquire { arg: 0, spin: false }, Effect::Blocking]
+    );
+    assert_eq!(c.lookup("local_irq_save").unwrap().effects, vec![Effect::IrqDisable]);
+    assert_eq!(c.lookup("local_irq_restore").unwrap().effects, vec![Effect::IrqEnable]);
+    assert_eq!(c.lookup("rcu_read_lock").unwrap().effects, vec![Effect::RcuReadLock]);
+    assert_eq!(c.lookup("rcu_read_unlock").unwrap().effects, vec![Effect::RcuReadUnlock]);
+    assert_eq!(c.lookup("this_cpu_ptr").unwrap().effects, vec![Effect::PercpuPtr]);
+    assert_eq!(c.lookup("idr_find").unwrap().effects, vec![Effect::ContainerLookup { arg: 0 }]);
+    assert_eq!(
+        c.lookup("fget").unwrap().effects,
+        vec![Effect::GlobalLookup { root: "@files".into() }]
+    );
+    // An unknown lock-acquire flag is an error.
+    assert!(Contracts::default().parse_str("[x]\nlock-acquire arg0 fast\n", "t").is_err());
+}
+
+#[test]
+fn default_kernel_sync_contract_loads() {
+    // The built-in kernel_sync.contract must classify the migrated primitives.
+    let c = Contracts::defaults();
+    assert_eq!(
+        c.lookup("spin_lock").unwrap().effects,
+        vec![Effect::LockAcquire { arg: 0, spin: true }]
+    );
+    assert!(c
+        .lookup("spin_lock_irqsave")
+        .unwrap()
+        .effects
+        .contains(&Effect::IrqDisable));
+    assert!(c.lookup("schedule").unwrap().effects.contains(&Effect::Blocking));
+    // `mutex_lock` keeps its TOCTOU yield alongside the sync classification.
+    assert!(c.lookup("mutex_lock").unwrap().effects.iter().any(|e| matches!(
+        e,
+        Effect::TypestateYield { protocol, .. } if protocol == "toctou"
+    )));
+    // `synchronize_rcu` keeps the reclaim safe-point yield and gains `blocking`.
+    let sr = &c.lookup("synchronize_rcu").unwrap().effects;
+    assert!(sr.contains(&Effect::Blocking));
+    assert!(sr.iter().any(|e| matches!(
+        e,
+        Effect::TypestateYield { protocol, .. } if protocol == "reclaim"
+    )));
+}

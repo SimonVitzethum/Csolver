@@ -10,13 +10,13 @@ use csolver_ir::Frontend;
 use csolver_mir::{MirFrontend, MirInput};
 use csolver_verifier::{verify_module, Config};
 
-#[allow(clippy::expect_used)]
-
 mod part_a;
 mod part_b;
 mod part_c;
 
-pub fn lower(src: &str, name: &str) -> csolver_ir::Module {
+/// Lower MIR text through the frontend (the shared helper for every part).
+#[allow(clippy::expect_used)]
+pub(crate) fn lower(src: &str, name: &str) -> csolver_ir::Module {
     MirFrontend
         .lower(MirInput { source: src.into(), name: name.into() })
         .expect("the MIR frontend lowers the body")

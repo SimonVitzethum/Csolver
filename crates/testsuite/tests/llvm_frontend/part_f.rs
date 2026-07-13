@@ -16,7 +16,7 @@ fn mem2reg_promotes_spilled_loop_to_provable() {
 /// Soundness control for mem2reg: promoting the counter must not mask a genuine
 /// out-of-bounds access. `sum` reads `p[0..8)` but the caller supplies only 4
 /// elements — the bounds obligation must remain unproven (no false PASS).
-pub const SPILLED_LOOP_OOB: &str = r#"
+pub(crate) const SPILLED_LOOP_OOB: &str = r#"
 define i64 @sum8(ptr %p) {
 entry:
   %sa = alloca i64, align 8
@@ -69,7 +69,7 @@ fn mem2reg_preserves_out_of_bounds_obligation() {
 /// and the region is 4 elements. The interval domain derives `n<=4` from the
 /// `else` edge of the clamp; the symbolic loop imports that bound, so `i<n<=4`
 /// proves `p[i]` in bounds under closed-world.
-pub const CLAMPED_LOOP: &str = r#"
+pub(crate) const CLAMPED_LOOP: &str = r#"
 define i64 @clamped(ptr %p, i64 %n) {
 entry:
   %c = icmp sgt i64 %n, 4
@@ -133,7 +133,7 @@ fn guard_refinement_over_clamp_is_not_pass() {
 /// where the caller stores `&v` into `vp` and passes `&vp`. A local buffer
 /// initializer (`memset buf`) between the store and the call must not wipe the
 /// field guarantee — it writes `buf`, not `vp` — so `*pp` stays a valid pointer.
-pub const DOUBLE_PTR_MEMSET: &str = r#"
+pub(crate) const DOUBLE_PTR_MEMSET: &str = r#"
 declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 define i64 @f_pp(ptr %pp) {
 entry:
@@ -191,7 +191,7 @@ fn member_provenance_dropped_by_memset_of_the_field() {
 /// uncontracted (UNKNOWN in isolation) verifies once the caller-declared
 /// precondition "`p` is valid for `n` 8-byte elements" is applied — the `i < n`
 /// loop then proves `p[i]` in bounds, resting on the `precondition` assumption.
-pub const BUFFER_API: &str = r#"
+pub(crate) const BUFFER_API: &str = r#"
 define i64 @sum(ptr %p, i64 %n) {
 entry:
   br label %head
@@ -234,7 +234,7 @@ fn precondition_sidecar_verifies_annotated_buffer_api() {
 /// a region declared null-terminated (`cstring`) verifies — the scan cannot pass
 /// the terminator, which lies before the end. Language-agnostic: any "scan until a
 /// zero element" loop.
-pub const SENTINEL_SCAN: &str = r#"
+pub(crate) const SENTINEL_SCAN: &str = r#"
 define i64 @scan(ptr %s) {
 entry:
   br label %head
@@ -358,7 +358,7 @@ exit:
 /// pointer stored into a (non-promotable, aggregate) slot before an `if` is loaded
 /// and dereferenced after it; the deref proves only because the store's provenance
 /// is kept across the merge.
-pub const MERGE_MEMORY: &str = r#"
+pub(crate) const MERGE_MEMORY: &str = r#"
 define i64 @merged(ptr %p, i1 %c) {
 entry:
   %slot = alloca [1 x ptr], align 8
@@ -438,7 +438,7 @@ entry:
 /// slot, so the later deref proves in bounds for both — a real UNKNOWN→PASS flip
 /// that heap *intersection* (drop-on-disagree) could not make. Cross-language: any
 /// `slot = c ? p : p+k; *slot` with both offsets in bounds.
-pub const MERGE_JOIN: &str = r#"
+pub(crate) const MERGE_JOIN: &str = r#"
 define i64 @joined(ptr %p, i1 %c) {
 entry:
   %slot = alloca [1 x ptr], align 8

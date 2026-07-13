@@ -16,7 +16,7 @@ fn heap_merge_joins_differing_but_valid_pointer_stores() {
 /// A pointer that is a `select`/PHI of two *different* valid regions (`c ? &a : &b`)
 /// is no longer opaque: an access through it is proved in bounds for each
 /// alternative under its guard. Language-agnostic (any `cond ? p : q`).
-pub const SELECT_PTR: &str = r#"
+pub(crate) const SELECT_PTR: &str = r#"
 define i64 @sel(ptr %a, ptr %b, i1 %c) {
 entry:
   br i1 %c, label %ta, label %tb

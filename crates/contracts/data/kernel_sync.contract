@@ -1,0 +1,90 @@
+# Kernel/POSIX synchronisation classification — locks, atomic context, IRQ state, RCU
+# read sections, per-CPU accessors and cross-syscall container lookups.
+#
+# These blocks replace the executor's former hardcoded name tables: before solving, a
+# collector (csolver_symbolic::sync) gathers every name's classification from the loaded
+# contracts, and the executor consults that table at each call. Covering a new lock/sleep
+# primitive is therefore one contract line, not a code change.
+#
+# Membership rules (soundness):
+# * `lock-acquire` only for primitives that ALWAYS take the lock — `*_trylock` may fail
+#   and is deliberately excluded (it would false-flag a trylock-then-lock retry).
+#   Releases need no effect: the executor drops any held lock's base handed to a call,
+#   which covers matched unlocks (incl. `spin_unlock_irqrestore`) and unlock wrappers.
+# * `spin` marks acquisitions that enter atomic context (preemption off) — spinlocks,
+#   rwlocks, seqlock write side. A `mutex`/`down` (semaphore) may itself sleep and is a
+#   `blocking` acquire instead.
+# * `blocking` only for the unambiguous always-may-sleep primitives (GFP-flag-conditional
+#   allocators like `kmalloc(GFP_KERNEL)` need flag analysis and are not here).
+
+# --- spinning locks (atomic context), no IRQ effect -------------------------------------
+# Seqlock write side (`write_seqlock`) excludes other writers exactly like a spinlock (the
+# read side is lock-free and retried). A userspace `pthread_spin_lock` busy-waits exactly
+# like a kernel spinlock; `pthread_mutex`/`rwlock` block and are listed further down.
+[spin_lock _raw_spin_lock raw_spin_lock read_lock write_lock read_lock_bh write_lock_bh _raw_read_lock _raw_write_lock write_seqlock write_seqlock_bh raw_write_seqlock __write_seqlock pthread_spin_lock]
+lock-acquire arg0 spin
+
+# --- spinning locks that also disable IRQs / soft-IRQs (G9 `@irqoff` protection) --------
+[spin_lock_irq spin_lock_bh spin_lock_irqsave _raw_spin_lock_irq _raw_spin_lock_bh _raw_spin_lock_irqsave raw_spin_lock_irq raw_spin_lock_irqsave raw_spin_lock_bh read_lock_irq write_lock_irq read_lock_irqsave write_lock_irqsave write_seqlock_irq write_seqlock_irqsave]
+lock-acquire arg0 spin
+irq-disable
+
+# --- sleeping lock acquisitions (blocking, NOT atomic context) --------------------------
+# `mutex_lock` and `down` are also TOCTOU yields (a sleep lets an adversary act on a
+# checked path — see typestate.contract for the `toctou` protocol).
+[mutex_lock down]
+lock-acquire arg0
+blocking
+typestate-yield toctou checked stale
+
+[mutex_lock_nested mutex_lock_interruptible mutex_lock_killable down_write down_read down_interruptible down_killable down_write_killable]
+lock-acquire arg0
+blocking
+
+# --- userspace POSIX sleeping locks (arg0 = the lock, exactly as in the kernel model) ----
+[pthread_mutex_lock pthread_mutex_timedlock pthread_rwlock_rdlock pthread_rwlock_wrlock pthread_rwlock_timedrdlock pthread_rwlock_timedwrlock]
+lock-acquire arg0
+
+# --- explicit yields/sleeps: blocking AND a TOCTOU yield ---------------------------------
+[schedule msleep ssleep cond_resched]
+blocking
+typestate-yield toctou checked stale
+
+# --- other always-may-sleep primitives ---------------------------------------------------
+[down_timeout schedule_timeout schedule_timeout_interruptible schedule_timeout_uninterruptible io_schedule msleep_interruptible usleep_range might_sleep ___might_sleep __might_sleep wait_for_completion wait_for_completion_interruptible wait_for_completion_killable wait_for_completion_timeout synchronize_net synchronize_irq flush_work flush_workqueue]
+blocking
+
+# --- bare IRQ / soft-IRQ disable and enable (no lock involved) ---------------------------
+[local_irq_save local_irq_disable local_bh_disable]
+irq-disable
+
+[spin_unlock_irqrestore spin_unlock_irq _raw_spin_unlock_irqrestore _raw_spin_unlock_irq raw_spin_unlock_irqrestore raw_spin_unlock_irq read_unlock_irqrestore write_unlock_irqrestore read_unlock_irq write_unlock_irq local_irq_restore local_irq_enable local_bh_enable spin_unlock_bh _raw_spin_unlock_bh raw_spin_unlock_bh write_sequnlock_irqrestore write_sequnlock_irq]
+irq-enable
+
+# --- RCU read-side critical sections ------------------------------------------------------
+# A shared read inside one is race-free by the RCU contract (the updater publishes
+# atomically and defers reclamation) — a major false-positive reducer for RCU-heavy code.
+[rcu_read_lock rcu_read_lock_bh rcu_read_lock_sched srcu_read_lock rcu_read_lock_trace rcu_read_lock_any_held]
+rcu-read-lock
+
+[rcu_read_unlock rcu_read_unlock_bh rcu_read_unlock_sched srcu_read_unlock rcu_read_unlock_trace]
+rcu-read-unlock
+
+# --- per-CPU data accessors ---------------------------------------------------------------
+# The result is thread-local by construction (each CPU has its own instance, accessed with
+# preemption disabled) — accesses through it are excluded from the data-race pass.
+[this_cpu_ptr per_cpu_ptr raw_cpu_ptr get_cpu_ptr get_cpu_var __this_cpu_ptr this_cpu_read alloc_percpu __alloc_percpu]
+percpu-ptr
+
+# --- cross-syscall container lookups (object identity across independent syscall entries) -
+# The result is named as loaded from the container (arg0), so a free/use in two independent
+# syscall entries composes on the same root. Sound gate: the root is global-rooted (and thus
+# visible to the cross-syscall detectors) only when the container itself is a global.
+[idr_find idr_get_next idr_get_next_ul xa_load xa_find xa_find_after radix_tree_lookup radix_tree_lookup_slot mtree_load mt_find rhashtable_lookup rhashtable_lookup_fast rhltable_lookup assoc_array_find]
+container-lookup arg0
+
+# --- file-table lookups: no container argument (the table is `current->files`) ------------
+# The result is rooted at the synthetic global `@files` — the process file table, a
+# persistent shared root across syscalls.
+[fget fget_raw fget_task fget_pos __fget __fget_files fdget fdget_raw fdget_pos lookup_fd_rcu files_lookup_fd_rcu close_fd_get_file fcheck_files lookup_fdget_rcu]
+global-lookup @files

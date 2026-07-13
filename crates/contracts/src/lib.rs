@@ -306,6 +306,49 @@ pub enum Effect {
         /// The state that, if still held at return, is a leak.
         state: String,
     },
+    /// **Unconditional lock acquisition** on the lock at argument `arg`. Drives the AA
+    /// self-deadlock check, the lockset race pass and the ABBA lock-order edges. Only for
+    /// primitives that *always* take the lock — a `*_trylock` may fail and must not carry
+    /// this effect. Releases need no effect: the executor drops any held lock's base handed
+    /// to a subsequent call (which soundly covers matched unlocks and unlock wrappers).
+    /// `spin=true` marks a **spinning** acquire that enters atomic context (preemption off),
+    /// so a later [`Effect::Blocking`] call while it is held is a sleep-in-atomic deadlock;
+    /// a `mutex`/semaphore acquire sleeps itself and is *not* spin.
+    LockAcquire {
+        /// The 0-based argument index of the lock pointer.
+        arg: usize,
+        /// Whether the acquire spins (enters atomic / preemption-off context).
+        spin: bool,
+    },
+    /// The call **may sleep** (block): illegal in atomic context (a held spinning lock).
+    Blocking,
+    /// **Disables IRQs** (or soft-IRQs) — code after it runs protected against an interrupt
+    /// handler on the same CPU, modelled as holding a synthetic `@irqoff` lock.
+    IrqDisable,
+    /// **Re-enables IRQs** — leaves the `@irqoff` protection of [`Effect::IrqDisable`].
+    IrqEnable,
+    /// Enters an **RCU read-side critical section**: shared reads inside it are race-free by
+    /// the RCU contract, so the data-race pass excludes them.
+    RcuReadLock,
+    /// Leaves an RCU read-side critical section.
+    RcuReadUnlock,
+    /// The call returns a pointer to **per-CPU** data — thread-local by construction, so
+    /// accesses through the result are excluded from the data-race pass.
+    PercpuPtr,
+    /// A **cross-syscall container lookup**: the result is an object fetched from the
+    /// persistent container at argument `arg` (idr/xarray/radix-tree), so a free/use of it
+    /// in two independent syscall entries composes on the same root.
+    ContainerLookup {
+        /// The 0-based argument index of the container.
+        arg: usize,
+    },
+    /// A lookup rooted at a **synthetic global** (`fget`'s `current->files` file table):
+    /// the call has no container argument, so its result is named after `root` — a
+    /// persistent shared root across syscalls.
+    GlobalLookup {
+        /// The synthetic global root name (e.g. `@files`).
+        root: String,
+    },
 }
 
 /// A contract for one API family: the set of names it applies to, and its effects.
@@ -489,6 +532,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("thread.contract", include_str!("../data/thread.contract")),
     ("lifetime.contract", include_str!("../data/lifetime.contract")),
     ("rcu.contract", include_str!("../data/rcu.contract")),
+    ("kernel_sync.contract", include_str!("../data/kernel_sync.contract")),
 ];
 
 #[cfg(test)]

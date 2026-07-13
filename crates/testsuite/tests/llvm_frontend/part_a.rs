@@ -1,6 +1,6 @@
 use super::*;
 
-pub const GUARDED_STORE: &str = r#"
+pub(crate) const GUARDED_STORE: &str = r#"
 define void @make_and_store(i64 %i) {
 entry:
   %buf = alloca [8 x i32], align 4
@@ -38,7 +38,7 @@ fn llvm_guarded_store_verifies_pass() {
 /// An out-of-bounds constant store must NOT verify as PASS — the guard allows
 /// `i < 16` but the buffer only holds 8 `i32`s, so `buf[i]` can be out of
 /// bounds. The store stays UNKNOWN (no false PASS).
-pub const OOB_STORE: &str = r#"
+pub(crate) const OOB_STORE: &str = r#"
 define void @maybe_oob(i64 %i) {
 entry:
   %buf = alloca [8 x i32], align 4
@@ -59,7 +59,7 @@ done:
 /// A real `phi`-based loop `for i in 0..16 { buf[i] = 0 }` over `[16 x i32]`.
 /// Exercises the frontend's PHI→block-argument lowering together with the
 /// loop-invariant handling in the analysis core.
-pub const PHI_LOOP: &str = r#"
+pub(crate) const PHI_LOOP: &str = r#"
 define void @loop_store() {
 entry:
   %buf = alloca [16 x i32], align 4
@@ -98,7 +98,7 @@ fn llvm_phi_loop_verifies_pass() {
 /// per-instruction `!dbg` metadata, an `attributes #0 = { … }` block, and a
 /// trailing metadata section. All of it must be tolerated and the function
 /// verified PASS.
-pub const RUSTC_STYLE: &str = r##"
+pub(crate) const RUSTC_STYLE: &str = r##"
 ; ModuleID = 'example.cgu.0'
 source_filename = "example.cgu.0"
 target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
@@ -149,7 +149,7 @@ fn llvm_rustc_style_module_verifies_pass() {
 /// A pointer parameter with a `dereferenceable(32)` contract (as `rustc` emits
 /// for `&mut [i32; 8]`): the guarded store through it verifies PASS, with the
 /// `param-contracts` assumption recorded.
-pub const DEREF_PARAM: &str = r#"
+pub(crate) const DEREF_PARAM: &str = r#"
 define void @store_through(i64 noundef %i, ptr noalias noundef align 4 dereferenceable(32) %buf) unnamed_addr #0 {
 start:
   %c = icmp ult i64 %i, 8
@@ -178,7 +178,7 @@ fn llvm_dereferenceable_param_verifies_pass() {
 
 /// Soundness: a `readonly` pointer parameter must NOT let a *write* through it
 /// be proved — the contract grants read access only.
-pub const READONLY_PARAM: &str = r#"
+pub(crate) const READONLY_PARAM: &str = r#"
 define void @write_readonly(ptr readonly align 4 dereferenceable(32) %buf) unnamed_addr #0 {
 start:
   %p = getelementptr inbounds i32, ptr %buf, i64 0
@@ -208,7 +208,7 @@ fn llvm_write_to_readonly_param_is_not_pass() {
 /// (`<4 x i32>`), bracketed by `llvm.lifetime` intrinsics, then a guarded
 /// `buf[i]` load. Vectors are modelled by their byte size and the lifetime
 /// intrinsics are no-ops, so the whole function verifies PASS.
-pub const VECTORIZED: &str = r#"
+pub(crate) const VECTORIZED: &str = r#"
 define noundef i32 @pick(i64 noundef %i) unnamed_addr #0 {
 start:
   %buf = alloca [32 x i8], align 16
@@ -244,7 +244,7 @@ fn llvm_vectorized_function_verifies_pass() {
 /// A module with a verifiable function plus one using an unsupported construct
 /// (`select`). The good one is still verified PASS; the unsupported one is
 /// reported UNKNOWN (not silently dropped), so the module is UNKNOWN.
-pub const MIXED: &str = r#"
+pub(crate) const MIXED: &str = r#"
 define void @good(i64 %i) {
 entry:
   %buf = alloca [8 x i32], align 4
@@ -297,7 +297,7 @@ fn llvm_per_function_recovery() {
 /// `[4 x i32]`: each arm does an in-bounds store, and the three edges merge at
 /// the return block. Exercises the frontend's `switch` lowering end-to-end
 /// through the unchanged analysis core. Every access is in bounds → PASS.
-pub const SWITCH_DISPATCH: &str = r#"
+pub(crate) const SWITCH_DISPATCH: &str = r#"
 define void @classify(i64 %x) {
 entry:
   %buf = alloca [4 x i32], align 4
@@ -334,7 +334,7 @@ fn llvm_switch_dispatch_verifies_pass() {
 /// Soundness: an out-of-bounds store inside a `switch` arm must not be proved
 /// PASS — `switch` lowering must not weaken the bounds check. The arm writes
 /// `buf[7]` into a `[4 x i32]`.
-pub const SWITCH_OOB: &str = r#"
+pub(crate) const SWITCH_OOB: &str = r#"
 define void @bad_arm(i64 %x) {
 entry:
   %buf = alloca [4 x i32], align 4
@@ -363,7 +363,7 @@ fn llvm_switch_arm_out_of_bounds_is_not_pass() {
 /// Real `rustc -O` shape of `get(s: &[i32], i) -> if i < s.len() { s[i] } else
 /// { -1 }`: the slice `(ptr %s.0, i64 %s.1)` is recognized, the access is proved
 /// in bounds from `i < len`, and the `slice-abi` assumption is recorded.
-pub const SLICE_GET: &str = r#"
+pub(crate) const SLICE_GET: &str = r#"
 define noundef i32 @get(ptr noalias noundef nonnull readonly align 4 %s.0, i64 noundef %s.1, i64 noundef %i) unnamed_addr #0 {
 start:
   %_3 = icmp ult i64 %i, %s.1
@@ -393,7 +393,7 @@ fn llvm_slice_indexed_access_verifies_pass() {
 
 /// Soundness: a slice access WITHOUT a bounds guard must not be proved in
 /// bounds (the index is unconstrained against the length).
-pub const SLICE_UNCHECKED: &str = r#"
+pub(crate) const SLICE_UNCHECKED: &str = r#"
 define i32 @get_unchecked(ptr align 4 %s.0, i64 %s.1, i64 %i) unnamed_addr #0 {
 start:
   %p = getelementptr inbounds i32, ptr %s.0, i64 %i
@@ -421,7 +421,7 @@ fn llvm_unguarded_slice_access_is_not_pass() {
 /// An index-based loop over a slice (`for i in 0..s.len() { ... s[i] ... }`):
 /// the loop invariant `i >= 0`, the guard `i < len`, and the slice contract
 /// (region size `len * 4`) combine to prove every iteration's access in bounds.
-pub const SLICE_INDEX_LOOP: &str = r#"
+pub(crate) const SLICE_INDEX_LOOP: &str = r#"
 define i32 @sum(ptr noundef nonnull readonly align 4 %s.0, i64 noundef %s.1) unnamed_addr #0 {
 start:
   br label %head
@@ -456,7 +456,7 @@ fn llvm_index_loop_over_slice_verifies_pass() {
 /// Regression: a call argument with `align N @global` must not mistake the
 /// alignment value for the operand (this broke `rustc`'s `panic_bounds_check`
 /// calls, which pass `ptr align 8 @alloc…`).
-pub const CALL_ALIGN_GLOBAL: &str = r#"
+pub(crate) const CALL_ALIGN_GLOBAL: &str = r#"
 define void @caller() unnamed_addr #0 {
 start:
   call void @sink(i64 1, i64 7, ptr align 8 @glob)

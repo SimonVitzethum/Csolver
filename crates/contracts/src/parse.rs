@@ -140,6 +140,32 @@ pub(crate) fn parse_effect(line: &str) -> Result<Effect, String> {
             };
             Ok(Effect::Barrier { kind })
         }
+        // `lock-acquire arg<k> [spin]` — an unconditional lock acquire; `spin` marks
+        // atomic (preemption-off) context. `blocking`, `irq-disable`/`irq-enable`,
+        // `rcu-read-lock`/`rcu-read-unlock` and `percpu-ptr` take no arguments.
+        "lock-acquire" => {
+            let arg = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let spin = match rest.get(1).copied() {
+                None => false,
+                Some("spin") => true,
+                Some(other) => return Err(format!("unknown lock-acquire flag `{other}`")),
+            };
+            Ok(Effect::LockAcquire { arg, spin })
+        }
+        "blocking" => Ok(Effect::Blocking),
+        "irq-disable" => Ok(Effect::IrqDisable),
+        "irq-enable" => Ok(Effect::IrqEnable),
+        "rcu-read-lock" => Ok(Effect::RcuReadLock),
+        "rcu-read-unlock" => Ok(Effect::RcuReadUnlock),
+        "percpu-ptr" => Ok(Effect::PercpuPtr),
+        // `container-lookup arg<k>` and `global-lookup <root>` — cross-syscall lookup naming.
+        "container-lookup" => {
+            Ok(Effect::ContainerLookup { arg: parse_arg(rest.first().copied().unwrap_or(""))? })
+        }
+        "global-lookup" => {
+            let root = rest.first().copied().ok_or("`global-lookup` needs a root name")?.to_string();
+            Ok(Effect::GlobalLookup { root })
+        }
         // `typestate-leak <protocol> <state>` (registers a leak state; checked at returns).
         "typestate-leak" => {
             let protocol = rest.first().copied().ok_or("`typestate-leak` needs a protocol")?.to_string();

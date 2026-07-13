@@ -57,7 +57,6 @@ const STRUCT_ABI: &str = "struct-abi";
 
 
 // --- module split (mechanical refactor; one `impl Explorer` part per file) ---
-mod kernel_names;
 mod driver;
 mod value;
 mod classify;
@@ -80,7 +79,6 @@ mod tests;
 
 use classify::*;
 use driver::*;
-use kernel_names::*;
 use state::*;
 use value::*;
 
