@@ -654,6 +654,11 @@ impl Inst {
             // A freeing-wrapper call must not re-free a pointer an earlier freeing call
             // already freed (`NoDoubleFree`); a lock-acquiring call must not re-acquire a
             // held lock (`DataRace`, bug-finding only).
+            // An indirect call also carries the valid-target obligation (the function
+            // pointer must not be null/invalid); a direct/symbol call cannot be.
+            Inst::Call { callee: Callee::Indirect(_), .. } => {
+                &[NoDoubleFree, DataRace, SleepInAtomic, TypestateViolation, ValidIndirectTarget]
+            }
             Inst::Call { .. } => &[NoDoubleFree, DataRace, SleepInAtomic, TypestateViolation],
             // A division or modulo carries the divisor-non-zero obligation (bug-finding only).
             Inst::Assign {

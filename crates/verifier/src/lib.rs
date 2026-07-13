@@ -691,6 +691,7 @@ fn verify_function_with(
                         | SafetyProperty::NoDivByZero
                         | SafetyProperty::NoShiftOverflow
                         | SafetyProperty::NoArithOverflow
+                        | SafetyProperty::ValidIndirectTarget
                 ) && !config.bug_finding
                 {
                     continue;

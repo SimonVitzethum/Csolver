@@ -4398,6 +4398,24 @@ impl Explorer<'_> {
             }
             _ => None,
         };
+        // Valid indirect target (a CFI slice): an indirect call through a function
+        // pointer that is provably null is a definite control-flow-integrity bug
+        // (calling through a null/uninit callback). A devirtualised or non-null
+        // pointer is fine; an opaque (unknown-but-assumed-valid) pointer is not
+        // flagged. Bug-finding-only, refuted with a witness on a feasible path.
+        if let Callee::Indirect(op) = callee {
+            let null_target = resolved_fid.is_none()
+                && matches!(self.eval_value(op, state), SymValue::Ptr(p) if matches!(p.prov, Prov::Null));
+            self.record_temporal(
+                (block, idx),
+                SafetyProperty::ValidIndirectTarget,
+                null_target,
+                state,
+                "indirect call target is a valid function pointer",
+                "indirect call through a null/uninitialised function pointer",
+            );
+        }
+
         let summary = resolved_fid
             .and_then(|fid| self.summaries.get(&fid).cloned())
             // Whole-program: a cross-file `Symbol(name)` call resolves to the remote
@@ -8119,6 +8137,40 @@ mod tests {
         );
         let uaf2 = r2.mem_decision(BlockId(0), 6, SafetyProperty::NoUseAfterFree).expect("uaf2");
         assert!(!uaf2.proven, "an opaque indirect call must havoc, leaving the write unproven");
+    }
+
+    /// A CFI slice: an indirect call through a **null** function pointer is a
+    /// definite control-flow-integrity violation (`ValidIndirectTarget` refuted),
+    /// while a devirtualised (known-target) call is proven valid.
+    #[test]
+    fn indirect_call_through_null_fn_ptr_is_refuted() {
+        use std::collections::HashMap;
+        let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb0.insts.push(Inst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Indirect(Operand::Const(Const::Null)),
+            args: vec![],
+            ret_ty: Type::Unit,
+            ret_ref: None,
+        });
+        let f = Function {
+            id: FuncId(0),
+            name: "callnull".into(),
+            params: vec![],
+            ret_ty: Type::Unit,
+            blocks: vec![bb0],
+            entry: BlockId(0),
+        };
+        let empty_grants = HashMap::new();
+        let r = discharge_inner(
+            &f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[],
+            &HashMap::new(), &empty_grants, &HashMap::new(), None,
+        );
+        let d = r
+            .mem_decision(BlockId(0), 0, SafetyProperty::ValidIndirectTarget)
+            .expect("valid-target obligation recorded");
+        assert!(!d.proven, "a null function-pointer call must not be proven valid");
+        assert!(d.refutation.is_some(), "the null call is refuted with a witness");
     }
 
     /// A1 (IR-intrinsic read-only): a store into a `constant` global — a `.rodata`
