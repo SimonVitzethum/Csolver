@@ -428,6 +428,10 @@ struct FileScan {
     /// Ordered per-function interleaving traces `(function, trace)` — aggregated program-wide
     /// for the two-thread atomicity-violation check (subsystem 4).
     race_traces: Vec<(String, Vec<(u8, String)>)>,
+    /// Per-function **direct-call edges** `(caller, callees)` — aggregated program-wide into a
+    /// whole-program call graph so the concurrency oracle can compute which functions are reachable
+    /// from a concurrent context (an entry or a spawned thread) in `--whole-program`/scan_dir mode.
+    call_edges: Vec<(String, Vec<String>)>,
     /// Symbolic exploration hit its budget on ≥1 function: the unit is a
     /// candidate for a full-effort *deferred* re-run rather than accepting Unknown.
     truncated: bool,
@@ -942,6 +946,24 @@ fn scan_one_unit(
     // the group holds ALL callers (closed-world) would be unsound on a partial merge (a
     // caller in another subsystem could violate a synthesized contract → false PASS).
     fs.dropped = module.unanalyzed.len() as u64;
+    // Collect this unit's direct-call edges for the whole-program concurrency oracle (scan_dir).
+    {
+        use csolver_ir::{Callee, Inst};
+        for f in &module.functions {
+            let callees: Vec<String> = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| match i {
+                    Inst::Call { callee: Callee::Symbol(name), .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !callees.is_empty() {
+                fs.call_edges.push((f.name.clone(), callees));
+            }
+        }
+    }
     // Whole-program (2b): a cross-file `Callee::Symbol(name)` with no in-unit definition
     // resolves to the program-wide callee summary instead of an opaque havoc, and an
     // external callee's whole-program preconditions overlay its per-file ones — cross-file
@@ -1285,6 +1307,7 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
     let mut lock_edges: Vec<(String, String, String)> = Vec::new();
     let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
     let mut race_traces: Vec<(String, Vec<(u8, String)>)> = Vec::new();
+    let mut call_edges: Vec<(String, Vec<String>)> = Vec::new();
     for (_, fs) in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -1295,16 +1318,72 @@ fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) 
         lock_edges.extend(fs.lock_edges);
         race_accesses.extend(fs.race_accesses);
         race_traces.extend(fs.race_traces);
+        call_edges.extend(fs.call_edges);
     }
     // De-duplicate the inventory: the same bug in many files (a duplicated / static-inline
     // function) is one finding, not N. Keeps the first (unit-ordered) occurrence.
     let mut seen: std::collections::HashSet<FindingKey> = std::collections::HashSet::new();
     findings.retain(|f| seen.insert(finding_key(f)));
 
+    let entry_patterns = config.entry_patterns.as_deref().unwrap_or(&[]);
+    // Concurrency oracle for the whole-program scan: over the aggregated call graph, the set of
+    // functions reachable from a concurrent seed — an attacker entry (`--entries`) or a spawned
+    // thread / registered IRQ-work-timer handler (a `spawn` trace event). A function outside it is
+    // single-threaded-reachable and cannot race, so the concurrent-* detectors skip it. Empty seed
+    // (no entries, no spawn evidence) ⇒ `None` ⇒ pair-all, never dropping a real race.
+    let concurrent = whole_program_concurrent(&call_edges, &race_traces, entry_patterns);
+
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses);
-    report_atomicity(&race_traces, config.entry_patterns.as_deref().unwrap_or(&[]), None);
+    report_atomicity(&race_traces, entry_patterns, concurrent.as_ref());
     report_scan(&findings, pass, fail, unknown, dropped, errored)
+}
+
+/// The set of functions that can run concurrently (for the whole-program concurrency oracle): the
+/// direct-call-graph closure from a concurrent seed — functions matching an entry pattern, and the
+/// targets of `spawn` events (kthread/pthread/work/irq/timer handlers). `None` when the seed is
+/// empty (no entries and no spawn evidence): then the oracle does not fire and all threads are
+/// paired, so a real race is never dropped. Direct calls only — a function reachable *solely* via an
+/// indirect call from a concurrent context may be missed (a recall trade-off), which the spawn/irq/
+/// work/timer handler seeds (themselves the indirect-call targets) largely cover.
+fn whole_program_concurrent(
+    call_edges: &[(String, Vec<String>)],
+    race_traces: &[(String, Vec<(u8, String)>)],
+    entry_patterns: &[String],
+) -> Option<std::collections::HashSet<String>> {
+    use std::collections::{HashMap, HashSet};
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (caller, callees) in call_edges {
+        edges.entry(caller).or_default().extend(callees.iter().map(String::as_str));
+    }
+    // Seed: entries + spawn targets (trace event kind 7).
+    let mut reach: HashSet<String> = HashSet::new();
+    for (name, _) in call_edges {
+        if csolver_verifier::matches_entry(name, entry_patterns) {
+            reach.insert(name.clone());
+        }
+    }
+    for (_, tr) in race_traces {
+        for (k, child) in tr {
+            if *k == 7 {
+                reach.insert(child.clone());
+            }
+        }
+    }
+    if reach.is_empty() {
+        return None; // no concurrency evidence — do not restrict (pair-all)
+    }
+    let mut work: Vec<String> = reach.iter().cloned().collect();
+    while let Some(f) = work.pop() {
+        if let Some(callees) = edges.get(f.as_str()) {
+            for &c in callees {
+                if reach.insert(c.to_string()) {
+                    work.push(c.to_string());
+                }
+            }
+        }
+    }
+    Some(reach)
 }
 
 /// A finding's identity for de-duplication: the same `(function, property, witness)`
@@ -1745,6 +1824,37 @@ fn verdict_code(verdict: Verdict) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole-program concurrency oracle: from a concurrent seed (an entry, or a spawned handler
+    /// — `spawn` trace event kind 7) it returns the direct-call-graph closure; a function reachable
+    /// only from single-threaded code is excluded, and an empty seed yields `None` (pair-all).
+    #[test]
+    fn whole_program_concurrency_closure() {
+        // sys_read (entry) → helper_a → helper_b ;  init_only → cold  (single-threaded).
+        let edges = vec![
+            ("sys_read".to_string(), vec!["helper_a".to_string()]),
+            ("helper_a".to_string(), vec!["helper_b".to_string()]),
+            ("init_only".to_string(), vec!["cold".to_string()]),
+        ];
+        let no_traces: Vec<(String, Vec<(u8, String)>)> = vec![];
+        let entries = vec!["sys_*".to_string()];
+        let set = whole_program_concurrent(&edges, &no_traces, &entries).expect("seed non-empty");
+        assert!(set.contains("sys_read") && set.contains("helper_a") && set.contains("helper_b"),
+            "the entry and its transitive callees are concurrent: {set:?}");
+        assert!(!set.contains("init_only") && !set.contains("cold"),
+            "single-threaded-only functions are excluded: {set:?}");
+        // A spawned handler (trace kind 7) seeds concurrency without any entry pattern.
+        let traces = vec![("mod_init".to_string(), vec![(7u8, "worker".to_string())])];
+        let via_spawn = whole_program_concurrent(
+            &[("worker".to_string(), vec!["helper_b".to_string()])],
+            &traces,
+            &[],
+        )
+        .expect("spawn seed");
+        assert!(via_spawn.contains("worker") && via_spawn.contains("helper_b"));
+        // No entries and no spawn evidence ⇒ None (the oracle does not restrict).
+        assert!(whole_program_concurrent(&edges, &no_traces, &[]).is_none());
+    }
 
     /// The coverage report must *name* functions that were not analyzed rather than
     /// fold them into a flattering count — the crate-level never-silently-skip

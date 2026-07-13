@@ -10,6 +10,19 @@ spawn arg2
 [kthread_run kthread_create kthread_create_on_node kthread_run_on_cpu]
 spawn arg0
 
+# Asynchronous callback registration: the registered handler runs later, concurrently with the
+# rest of the code — a spawn for happens-before and for the concurrency oracle's seed (a handler is
+# an attacker-independent concurrent entry, like a kthread). The handler function is the argument.
+# request_irq(irq, handler, flags, name, dev) / request_threaded_irq(irq, handler, thread_fn, …).
+[request_irq request_threaded_irq devm_request_irq devm_request_threaded_irq]
+spawn arg1
+# INIT_WORK(work, func) / INIT_DELAYED_WORK / INIT_WORK_ONSTACK — the work function is arg1.
+[INIT_WORK INIT_DELAYED_WORK INIT_WORK_ONSTACK __INIT_WORK]
+spawn arg1
+# timer_setup(timer, callback, flags) / tasklet_setup(t, callback) / tasklet_init(t, func, data).
+[timer_setup setup_timer tasklet_setup tasklet_init]
+spawn arg1
+
 # Joins wait for the spawned children.
 [pthread_join kthread_stop]
 join
