@@ -121,12 +121,26 @@ pub struct Function {
 
 impl Function {
     /// Look up a block by id.
+    ///
+    /// Fast path: every frontend materialises blocks in id order, so position
+    /// `id` almost always *is* the block — checked in O(1) before falling back
+    /// to the linear scan the (public) `blocks` field's freedom requires. This
+    /// keeps the hot per-lookup cost constant without a cache field that every
+    /// struct-literal construction site would have to initialise.
     pub fn block(&self, id: BlockId) -> Option<&BasicBlock> {
-        self.blocks.iter().find(|b| b.id == id)
+        match self.blocks.get(id.index()) {
+            Some(b) if b.id == id => Some(b),
+            _ => self.blocks.iter().find(|b| b.id == id),
+        }
     }
 
     /// Mutable access to the block with the given id (for MSIR→MSIR passes).
     pub fn block_mut(&mut self, id: BlockId) -> Option<&mut BasicBlock> {
+        // Mirrors `block`'s positional fast path. (The borrow is re-taken for
+        // the fallback — NLL rejects holding the probe across it.)
+        if matches!(self.blocks.get(id.index()), Some(b) if b.id == id) {
+            return self.blocks.get_mut(id.index());
+        }
         self.blocks.iter_mut().find(|b| b.id == id)
     }
 

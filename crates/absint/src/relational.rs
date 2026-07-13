@@ -71,7 +71,7 @@ pub fn analyze_zones(f: &Function) -> ZoneAnalysis {
     let dominators = Dominators::new(&cfg);
     let loops = Loops::detect(&cfg, &dominators);
 
-    let ctx = Ctx { f: f.clone(), cfg: cfg.clone(), index: index.clone(), cmp_map };
+    let ctx = Ctx { f, cfg: &cfg, index: &index, cmp_map };
     let solution = solve(
         &cfg,
         &loops,
@@ -82,15 +82,17 @@ pub fn analyze_zones(f: &Function) -> ZoneAnalysis {
     ZoneAnalysis { solution: Some(solution), cfg, index }
 }
 
-/// Analysis context shared by the transfer closures.
-struct Ctx {
-    f: Function,
-    cfg: Cfg,
-    index: HashMap<RegId, usize>,
+/// Analysis context shared by the transfer closures — borrows the function,
+/// CFG and index from the caller (cloning the whole `Function` per analysis
+/// was a measurable waste on large functions).
+struct Ctx<'a> {
+    f: &'a Function,
+    cfg: &'a Cfg,
+    index: &'a HashMap<RegId, usize>,
     cmp_map: HashMap<RegId, (CmpOp, Operand, Operand)>,
 }
 
-impl Ctx {
+impl Ctx<'_> {
     fn idx(&self, r: RegId) -> Option<usize> {
         self.index.get(&r).copied()
     }

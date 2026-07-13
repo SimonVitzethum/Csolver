@@ -20,14 +20,7 @@
 
 ## Technische Schuld
 
-- [ ] Korrumpierter Doc-Kommentar `crates/llvm/src/parser.rs:48`
-  („…plain sum ofgrep FAIL ~/fullscan.log" — versehentlich eingefügter Shell-Befehl).
-- [ ] `FIXME` in `crates/asm/src/x86.rs` (~Z. 2959): MOVUPD-Variante fehlt.
-- [ ] `Function::block()` / `block_mut()` sind lineare Suchen (`ir/func.rs`) und
-  laufen in heißen Pfaden (Transferfunktionen) pro Aufruf → O(n²) bei großen
-  Funktionen. Index-Tabelle (BlockId → Position) wäre billig.
-- [ ] `Ctx` in `absint/relational.rs` klont die ganze `Function` (+ `Cfg`) —
-  Borrow statt Clone.
+*(alle Punkte erledigt — siehe „Erledigt“)*
 
 ## Bekannte Stubs / Präzisionsgrenzen (sound, aber offen)
 
@@ -63,3 +56,10 @@
   abfragt; `exec/kernel_names.rs` und die Match-Listen in `lockclass.rs` sind
   gelöscht. Neue Kernel-APIs = eine Contract-Zeile statt Codeänderung
   (`sync::install()` erlaubt später per `--contracts` überlagerte Nutzer-Dateien).
+- [x] Korrumpierter Doc-Kommentar (`llvm/parser/ast.rs`) repariert.
+- [x] MOVUPD: eigene `Instruction::Movupd`-Variante statt des Movsd-Fehlmappings
+  (8-Byte-Move stand für einen 16-Byte-Move); Store-Form `66 0F 11` ergänzt.
+- [x] `Function::block()`/`block_mut()`: O(1)-Positions-Fastpath (Blöcke liegen
+  bei allen Frontends an Position == id), linearer Scan nur noch als Fallback.
+- [x] `Ctx` in `absint/relational.rs` borrowt `Function`/`Cfg`/Index statt zu
+  klonen.
