@@ -134,6 +134,16 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
     if symbols.iter().all(|s| !s.is_function) {
         symbols.extend(parse_exports(bytes, &sections, export_rva, export_size));
     }
+    // A linked `.exe` with neither a COFF symbol table nor exports (a stripped image)
+    // still has an entry point: synthesize a function there so at least the entry is
+    // analysable. `entry` is an RVA into an executable section.
+    if symbols.iter().all(|s| !s.is_function) {
+        if let Some(e) = entry_rva.map(u64::from) {
+            if let Some(si) = sections.iter().position(|s| s.executable && s.size > 0 && e >= s.address && e < s.address + s.size) {
+                symbols.push(Symbol { name: "entry".into(), address: e, size: 0, is_function: true, section_index: si as u16 });
+            }
+        }
+    }
     estimate_sizes(&mut symbols, &sections);
 
     Ok(Image {

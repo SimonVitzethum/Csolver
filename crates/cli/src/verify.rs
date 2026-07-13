@@ -117,6 +117,25 @@ pub(crate) fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module
     };
     // Global regions the RIP-relative accesses resolve to (name → size/writability).
     let mut globals: HashMap<String, csolver_ir::GlobalDef> = HashMap::new();
+    // A PE (Windows) / Mach-O (macOS) linked image carries no per-instruction
+    // relocations: a `[rip + disp32]` is *self*-relative, so a global access is resolved
+    // from the section table (target VA = function VA + disp position + 4 + disp32) to the
+    // CONTAINING SECTION — register every section as a global region up front so the
+    // executor can seed it. Section-wide bounds are looser than a per-symbol size (a recall
+    // loss), but always contain the target — sound (never a false PASS). ELF keeps its
+    // precise per-symbol relocation resolution below.
+    let self_relative = image.relocations.is_empty();
+    if self_relative {
+        for s in &image.sections {
+            if !s.name.is_empty() && s.size > 0 && !s.executable {
+                globals.entry(s.name.clone()).or_insert(csolver_ir::GlobalDef {
+                    size: s.size,
+                    align: 1,
+                    writable: s.writable,
+                });
+            }
+        }
+    }
     let mut modules: Vec<csolver_ir::Module> = Vec::new();
     for sym in image.functions() {
         let Some(code) = image.function_code(sym, bytes) else { continue };
@@ -147,11 +166,25 @@ pub(crate) fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module
         }
         // Map a function-relative disp32 position to (target global, offset-within-it).
         let resolve = |disp_pos: usize| -> Option<(String, i64)> {
-            let at = func_off + disp_pos as u64;
-            let r = relocs.iter().find(|r| r.offset == at)?;
-            let off = pcrel_off(r)?;
-            let t = image.symbols.get(r.symbol as usize)?;
-            (t.size > 0 && !t.name.is_empty()).then(|| (t.name.clone(), off))
+            // ELF: a per-symbol relocation gives the exact target and addend.
+            if !self_relative {
+                let at = func_off + disp_pos as u64;
+                let r = relocs.iter().find(|r| r.offset == at)?;
+                let off = pcrel_off(r)?;
+                let t = image.symbols.get(r.symbol as usize)?;
+                return (t.size > 0 && !t.name.is_empty()).then(|| (t.name.clone(), off));
+            }
+            // PE/Mach-O linked image: the disp32 is self-relative. target VA = function VA
+            // + (disp position + 4) + disp32. The `+4` is exact for `lea`/loads/reg-stores
+            // (no trailing immediate — the size-critical, pointer-forming cases); a direct
+            // store with an immediate undershoots but stays in the same section. Resolve to
+            // the containing section (registered above).
+            let disp = i32::from_le_bytes(code.get(disp_pos..disp_pos + 4)?.try_into().ok()?) as i64;
+            let target = (sym.address as i64).checked_add(disp_pos as i64 + 4 + disp)?;
+            let target = u64::try_from(target).ok()?;
+            let sec = image.section_at(target)?;
+            (!sec.name.is_empty() && !sec.executable)
+                .then(|| (sec.name.clone(), (target - sec.address) as i64))
         };
         let m = match image.machine {
             csolver_elf::EM_X86_64 => csolver_asm::x86::decode_function_reloc(&sym.name, code, &resolve),
