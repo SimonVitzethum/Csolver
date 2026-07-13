@@ -101,6 +101,15 @@ impl Explorer<'_> {
                 // off `facts` (it would slow every proof) and used only to make a
                 // memory-OOB counterexample faithful.
                 let nowrap = self.size_no_wrap_fact(count_e, stride);
+                // A stack allocation whose byte count is **not a compile-time constant**
+                // is a *guessed*-size region: a machine-code frame model (`rsp`/`rbp` with
+                // an open-above size) or a variable-length array. Mark it `assumed` so a
+                // constant in-bounds obligation past the guessed size is left UNKNOWN rather
+                // than refuted (no false FAIL on a stack-passed argument at `[rbp + 16]`, or
+                // a fixed index into a VLA); a genuinely adversarial (input-driven) offset is
+                // still refuted (see `check_access`). A constant-count `alloca`/`sub rsp, N`
+                // stays precise (refutable) as before.
+                let assumed = *region == RegionKind::Stack && !matches!(count, Operand::Const(_));
                 let rid = state.regions.len();
                 state.regions.push(SymRegion {
                     kind: *region,
@@ -112,7 +121,7 @@ impl Explorer<'_> {
                     size_nowrap: Some(nowrap),
                     sentinel: None,
                     user_controlled: false,
-                    assumed: false,
+                    assumed,
                     prov_labels: HashSet::new(),
                 });
                 // Bug-finding: an attacker-controlled `count * sizeof(T)` size that can

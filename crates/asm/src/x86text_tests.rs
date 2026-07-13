@@ -1,6 +1,6 @@
 use super::*;
 use crate::{detect, Architecture, Syntax};
-use csolver_ir::{Callee, Inst};
+use csolver_ir::{Callee, Inst, RegId};
 
 // ==========================================================================
 // AT&T syntax
@@ -90,6 +90,34 @@ f:
     let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
     assert!(insts.iter().any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. })), "sub rsp → stack frame");
     assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "helper")));
+}
+
+#[test]
+fn frame_pointer_idiom_builds_one_open_frame() {
+    // `push rbp; mov rbp, rsp; sub rsp, 16` → a single frame region with a
+    // symbolic (open-above) size bound into rsp (reg 4), and rbp (reg 5) bound to
+    // rsp + 16 (the top of the local area).
+    let src = "f:\n\tpushq\t%rbp\n\tmovq\t%rsp, %rbp\n\tsubq\t$16, %rsp\n\tretq\n";
+    let m = decode_att(src);
+    assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
+    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
+    // The frame Alloc's count is a register (symbolic), not a constant — this is
+    // what marks the region `assumed` (open above) in the executor.
+    assert!(
+        insts.iter().any(|i| matches!(
+            i,
+            Inst::Alloc { dst, region: RegionKind::Stack, count: Operand::Reg(_), .. } if *dst == RegId(4)
+        )),
+        "frame region: symbolic-size stack Alloc into rsp"
+    );
+    // rbp (reg 5) = rsp + 16 (a PtrOffset placing rbp at the top of the locals).
+    assert!(
+        insts.iter().any(|i| matches!(
+            i,
+            Inst::PtrOffset { dst, base: Operand::Reg(b), .. } if *dst == RegId(5) && *b == RegId(4)
+        )),
+        "rbp bound to rsp + N"
+    );
 }
 
 #[test]

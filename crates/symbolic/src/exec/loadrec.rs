@@ -85,7 +85,13 @@ impl Explorer<'_> {
     /// contract)? Such a region's bytes are *uninitialized* until written.
     pub(crate) fn is_fresh_alloc(&self, p: &SymPointer, state: &PathState) -> bool {
         match &p.prov {
-            Prov::Region(rid) => state.regions.get(*rid).is_some_and(|r| r.contract.is_none()),
+            // An `assumed`-size region (a machine-code stack frame or a VLA) may hold
+            // data initialized *outside* the tracked extent — a caller-passed stack
+            // argument above `rbp`, say — so a read of a byte we did not see written is
+            // not a definite uninitialized-read bug: leave it UNKNOWN, never refute.
+            Prov::Region(rid) => {
+                state.regions.get(*rid).is_some_and(|r| r.contract.is_none() && !r.assumed)
+            }
             _ => false,
         }
     }

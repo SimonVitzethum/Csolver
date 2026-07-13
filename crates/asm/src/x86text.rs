@@ -117,11 +117,14 @@ fn decode_function_lines(lines: &[String], intel: bool) -> Result<Function> {
             insns.push(line);
         }
     }
-    // Pass 2: lower each instruction. `flags` carries the last cmp/test operands.
+    // Pass 2: lower each instruction. `flags` carries the last cmp/test operands;
+    // `fp` records that the frame-pointer idiom (`mov rbp, rsp`) is pending, so the
+    // following `sub rsp, N` builds a precise frame (see `lower_alu_or_frame`).
     let mut decoded: Vec<DecodedInsn> = Vec::new();
     let mut flags: Option<(Operand, Operand)> = None;
+    let mut fp = false;
     for (i, ins) in insns.iter().enumerate() {
-        decoded.push(lower_insn(ins, i, &labels, &mut flags, intel)?);
+        decoded.push(lower_insn(ins, i, &labels, &mut flags, &mut fp, intel)?);
     }
     let (blocks, entry) = build_blocks(decoded)?;
     Ok(Function {
@@ -136,11 +139,13 @@ fn decode_function_lines(lines: &[String], intel: bool) -> Result<Function> {
 
 /// Lower one instruction at sequential offset `off`. Dispatches the operand
 /// grammar on `intel`, then runs the shared instruction semantics.
+#[allow(clippy::too_many_arguments)]
 fn lower_insn(
     ins: &str,
     off: usize,
     labels: &std::collections::HashMap<String, usize>,
     flags: &mut Option<(Operand, Operand)>,
+    fp: &mut bool,
     intel: bool,
 ) -> Result<DecodedInsn> {
     let next = off + 1;
@@ -185,12 +190,20 @@ fn lower_insn(
             insts.extend(b.pre);
             Ok(fall(insts))
         }
-        "mov" | "movabs" => lower_mov(&ops, off, width).map(&fall),
+        "mov" | "movabs" => {
+            // Frame-pointer establishment `mov rbp, rsp` (AT&T-internal order
+            // src=rsp(4), dst=rbp(5)): mark the frame pending so the next
+            // `sub rsp, N` builds the precise frame region binding both rsp and rbp.
+            if matches!((op_at(&ops, 0), op_at(&ops, 1)), (Ok(TextOp::Reg(4)), Ok(TextOp::Reg(5)))) {
+                *fp = true;
+            }
+            lower_mov(&ops, off, width).map(&fall)
+        }
         // Sign/zero-extending moves — the value flows through (model as a move).
         "movslq" | "movsbl" | "movzbl" | "movzwl" | "movswl" | "movsbq" | "movzbq" | "movsxd"
         | "movsx" | "movzx" => lower_mov(&ops, off, width).map(&fall),
         "lea" => lower_lea(&ops, off).map(&fall),
-        "add" | "sub" | "and" | "or" | "xor" => lower_alu_or_frame(&base, &ops, off, width).map(&fall),
+        "add" | "sub" | "and" | "or" | "xor" => lower_alu_or_frame(&base, &ops, off, width, fp).map(&fall),
         "inc" | "dec" => {
             let d = reg_of(op_at(&ops, 0)?)?;
             let bin = if base == "inc" { BinOp::Add } else { BinOp::Sub };
@@ -306,14 +319,18 @@ fn lower_lea(ops: &[TextOp], off: usize) -> Result<Vec<Inst>> {
 /// `add/sub/and/or/xor`, with the stack-frame prologue special case: `sub $N,
 /// %rsp` (rsp = register 4) allocates the frame region so `[rsp+disp]` is
 /// checked against it; `add $N, %rsp` tears it down (a no-op).
-fn lower_alu_or_frame(base: &str, ops: &[TextOp], off: usize, width: u32) -> Result<Vec<Inst>> {
+fn lower_alu_or_frame(base: &str, ops: &[TextOp], off: usize, width: u32, fp: &mut bool) -> Result<Vec<Inst>> {
     if matches!(base, "add" | "sub") {
         if let (TextOp::Imm(n), TextOp::Reg(4)) = (op_at(ops, 0)?, op_at(ops, 1)?) {
-            return Ok(if base == "sub" {
-                vec![Inst::Alloc { dst: reg(4), region: RegionKind::Stack, elem: Type::int(8), count: Operand::int(64, *n as u128), align: 16 }]
-            } else {
-                vec![]
-            });
+            if base == "sub" {
+                // A frame with an established frame pointer (`mov rbp, rsp` seen):
+                // build one frame region for both rsp and rbp (see `frame_insts`).
+                if std::mem::take(fp) {
+                    return Ok(frame_insts(*n as u128, off));
+                }
+                return Ok(vec![Inst::Alloc { dst: reg(4), region: RegionKind::Stack, elem: Type::int(8), count: Operand::int(64, *n as u128), align: 16 }]);
+            }
+            return Ok(vec![]); // `add $N, %rsp` — frame teardown, a no-op.
         }
     }
     let bin = match base {
@@ -338,6 +355,51 @@ fn lower_alu_or_frame(base: &str, ops: &[TextOp], off: usize, width: u32) -> Res
     let mut insts = src.pre;
     insts.push(Inst::Assign { dst: d, ty, value: RValue::Bin { op: bin, lhs: Operand::Reg(d), rhs: src.value, flags: Default::default() } });
     Ok(insts)
+}
+
+/// The precise frame model for the `push rbp; mov rbp, rsp; sub rsp, N` idiom.
+///
+/// Allocates **one** stack region for the whole frame whose size is *bounded
+/// below* by `N + 16` (the callee-owned locals + saved-rbp + return-address
+/// slots, always present) but *open above* (the caller's frame extent is
+/// unknown), then binds `rsp` to the region base and `rbp` to `base + N`:
+///
+/// * a local `[rbp - k]` (`k ≤ N`) or `[rsp + j]` (`j < N`) is provably in
+///   bounds → **PASS**;
+/// * the saved-rbp / return-address slots `[rbp + 0..16)` are in bounds → PASS;
+/// * a stack-passed argument `[rbp + 16 + …]` lands in the caller's frame, whose
+///   size is unknown, so it is neither provably in nor out of bounds → **UNKNOWN**
+///   (honest — not a false bug);
+/// * an access below `rsp` (`[rsp - x]` / `[rbp - (N + x)]`) has a negative
+///   offset → provably out of bounds → **FAIL** (a real stack underflow).
+///
+/// The open-above bound is `size = (N + 16) + (fresh & 0xFFFF_FFFF)`: masking a
+/// never-written (unconstrained) register to 32 bits makes the addend lie in
+/// `[0, 2^32)` — a non-negative, non-wrapping symbolic size of at least `N + 16`
+/// and at most `~4 GiB`, so no real access is ever wrongly refuted.
+fn frame_insts(n: u128, off: usize) -> Vec<Inst> {
+    // A never-assigned register reads as a fresh, unconstrained symbol.
+    let fresh = RegId(3600 + off as u32);
+    let headroom = RegId(3601 + off as u32);
+    let size = RegId(3602 + off as u32);
+    vec![
+        // headroom = fresh & 0xFFFF_FFFF   ∈ [0, 2^32)
+        Inst::Assign {
+            dst: headroom,
+            ty: Type::int(64),
+            value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(fresh), rhs: Operand::int(64, 0xFFFF_FFFF), flags: Default::default() },
+        },
+        // size = (N + 16) + headroom   ∈ [N+16, N+16+2^32)
+        Inst::Assign {
+            dst: size,
+            ty: Type::int(64),
+            value: RValue::Bin { op: BinOp::Add, lhs: Operand::int(64, n + 16), rhs: Operand::Reg(headroom), flags: Default::default() },
+        },
+        // rsp = base of the frame region (offset 0).
+        Inst::Alloc { dst: reg(4), region: RegionKind::Stack, elem: Type::int(8), count: Operand::Reg(size), align: 16 },
+        // rbp = base + N (the top of the local area; locals are at negative offsets).
+        Inst::PtrOffset { dst: reg(5), base: Operand::Reg(reg(4)), index: Operand::int(64, n), elem: Type::int(8) },
+    ]
 }
 
 fn label(ops: &[TextOp], i: usize, labels: &std::collections::HashMap<String, usize>) -> Result<usize> {

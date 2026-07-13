@@ -44,8 +44,17 @@
   ihn nicht zu modellieren ist sound und vermeidet, dass eine winzige Push-Region
   über `mov rbp,rsp` jeden `[rbp-k]`-Local fälschlich als OOB meldet). Ergebnis:
   rsp-relative Frames (optimiert) verifizieren präzise (PASS/FAIL), rbp-relative
-  -O0-Frames sind ehrlich UNKNOWN statt falsch FAIL. Verbleibende Grenze: eine
-  präzise Frame-Pointer-Modellierung (rbp = frame_base + N) für -O0-PASS.
+  -O0-Frames sind ehrlich UNKNOWN statt falsch FAIL.
+- [x] **Präzise Frame-Pointer-Modellierung**: Das Idiom `push rbp; mov rbp,rsp;
+  sub rsp,N` baut jetzt **eine** Frame-Region mit unten beschränkter, oben offener
+  Größe (`≥ N+16` via Maskierung eines freien Registers), rsp am Boden (Offset 0),
+  rbp an der Oberkante (Offset N). Locals (`[rbp-k]`, `[rsp+j]`) → **PASS**;
+  Caller-Args (`[rbp+16+]`) → UNKNOWN; echte Unterläufe → sound. Dazu im Executor:
+  eine Stack-Region mit **symbolischer** (geratener) Größe ist eine `assumed`-Region
+  (gilt auch für VLAs) — die vorhandene „kein falscher FAIL bei konstantem Offset"-
+  Logik greift, und `is_fresh_alloc` refutiert Uninit-Reads solcher Regionen nicht
+  (Caller-Args sind extern initialisiert). CLI-verifiziert: -O0-rbp-Frame → PASS,
+  Stack-Args → UNKNOWN (kein falscher FAIL), adversariale OOB weiterhin FAIL.
 
 ## Prozess / Infrastruktur
 

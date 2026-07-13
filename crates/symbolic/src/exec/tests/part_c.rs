@@ -275,3 +275,37 @@ fn time_budget_bail_reports_no_memory_decision() {
         );
     }
 }
+
+/// A **stack** allocation of `count` bytes, then a read of the never-written
+/// first word. `count` symbolic (a frame model / VLA) vs. a constant.
+fn stack_uninit_read(count: Operand) -> Function {
+    let p = RegId(1);
+    let v = RegId(2);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc { dst: p, region: RegionKind::Stack, elem: Type::int(8), count, align: 16 });
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(p), align: 1, volatile: false });
+    Function {
+        id: FuncId(0),
+        name: "frame".into(),
+        params: vec![(RegId(0), Type::int(64))],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
+#[test]
+fn symbolic_size_stack_uninit_read_is_not_refuted() {
+    // A symbolic-size stack region is `assumed` (an open-above machine frame or a
+    // VLA): a read of an untracked byte may be caller-initialized, so it is left
+    // UNKNOWN, never a false uninitialized-read FAIL.
+    let sym = discharge_function(&stack_uninit_read(Operand::Reg(RegId(0))));
+    let d = sym.mem_decision(BlockId(0), 1, SafetyProperty::ValidRead).expect("ValidRead obligation");
+    assert!(d.refutation.is_none(), "symbolic-size (assumed) stack read is not refuted: {d:?}");
+
+    // A *constant*-size stack region stays precise: the same unwritten read IS a
+    // definite uninitialized-read refutation (the gating is exactly the symbolic size).
+    let fixed = discharge_function(&stack_uninit_read(Operand::int(64, 16)));
+    let d = fixed.mem_decision(BlockId(0), 1, SafetyProperty::ValidRead).expect("ValidRead obligation");
+    assert!(d.refutation.is_some(), "constant-size stack unwritten read is refuted: {d:?}");
+}
