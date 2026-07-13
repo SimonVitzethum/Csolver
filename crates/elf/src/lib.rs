@@ -33,6 +33,9 @@ mod tests;
 #[cfg(test)]
 #[path = "elf_tests2.rs"]
 mod tests2;
+#[cfg(test)]
+#[path = "elf_tests3.rs"]
+mod tests3;
 pub use aux::gnu_hash;
 pub use consts::{r_aarch64, r_x86_64};
 pub use load::{load, EM_AARCH64, EM_X86_64};

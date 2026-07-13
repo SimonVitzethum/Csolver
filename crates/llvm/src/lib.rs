@@ -61,3 +61,6 @@ impl Frontend for LlvmFrontend {
 #[cfg(test)]
 #[path = "llvm_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "llvm_tests2.rs"]
+mod tests2;

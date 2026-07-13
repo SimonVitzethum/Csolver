@@ -7,3 +7,5 @@ mod part_a;
 mod part_b;
 mod part_c;
 mod part_d;
+mod part_e;
+mod part_f;

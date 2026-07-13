@@ -96,6 +96,9 @@ mod tests;
 #[cfg(test)]
 #[path = "contracts/tests2.rs"]
 mod tests2;
+#[cfg(test)]
+#[path = "contracts/tests3.rs"]
+mod tests3;
 pub(crate) use facts::*;
 pub(crate) use fields::*;
 pub(crate) use fieldsyn::*;

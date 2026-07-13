@@ -1,5 +1,5 @@
 use super::*;
-use super::part_b::TRUNCATED_OPS;
+use super::part_f::TRUNCATED_OPS;
 
 #[test]
 fn every_decode_point_rejects_truncated_input() {
