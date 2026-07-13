@@ -329,27 +329,66 @@ pub struct FreeUseWitness {
     pub double_free: bool,
 }
 
-/// A `(class, lockset)` list — an event's location class and the lock classes held at it.
-type ClassLocksets = Vec<(String, std::collections::BTreeSet<String>)>;
+/// A collected shared event: its location `class`, the `lockset` (lock classes held at it), and
+/// `joined` — the set of peer thread **function names** this thread has already `Join`ed at this
+/// point. An event whose `joined` contains a peer's name happens-*after* every event of that peer
+/// (the child finished before this event ran), so the two are **not concurrent** and a pairing
+/// between them is dropped — the thread-lifetime happens-before that the lockset check alone misses
+/// (e.g. a parent that frees an object only *after* `kthread_stop`-ing the worker that used it).
+type ClassLocksets = Vec<(String, std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)>;
 
-/// Per-thread, the `(class, lockset)` of every free and every access (read/write) — the lockset
-/// being the lock classes held at that event (Acquire/Release tracked along the trace).
+/// Track, along a thread's trace, the lockset held and the set of peer names already joined (a
+/// `Join` joins every child spawned so far, per [`Event::Join`]). Call `record(class)` at each
+/// event of interest to snapshot `(class, lockset, joined)`.
+struct LifetimeTracker {
+    held: std::collections::BTreeSet<String>,
+    spawned: std::collections::BTreeSet<String>,
+    joined: std::collections::BTreeSet<String>,
+}
+impl LifetimeTracker {
+    fn new() -> Self {
+        Self { held: Default::default(), spawned: Default::default(), joined: Default::default() }
+    }
+    /// Advance over a control/sync event; returns `true` if `e` was consumed here.
+    fn step(&mut self, e: &Event) -> bool {
+        match e {
+            Event::Acquire(l) => { self.held.insert(l.clone()); true }
+            Event::Release(l) => { self.held.remove(l); true }
+            Event::Spawn(n) => { self.spawned.insert(n.clone()); true }
+            // A join waits for every child spawned so far: they are all now happens-before.
+            Event::Join => { self.joined.extend(std::mem::take(&mut self.spawned)); true }
+            _ => false,
+        }
+    }
+    fn snap(&self, class: &str) -> (String, std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) {
+        (class.to_string(), self.held.clone(), self.joined.clone())
+    }
+}
+
+/// Two collected events are **lifetime-ordered** (one happens-before the other via a thread
+/// join, so they are not concurrent) when either event happened after its thread joined the
+/// other's thread. `a`/`b` are the collected records, `an`/`bn` their thread names.
+fn lifetime_ordered(
+    a: &(String, std::collections::BTreeSet<String>, std::collections::BTreeSet<String>),
+    an: &str,
+    b: &(String, std::collections::BTreeSet<String>, std::collections::BTreeSet<String>),
+    bn: &str,
+) -> bool {
+    a.2.contains(bn) || b.2.contains(an)
+}
+
+/// Per-thread, the `(class, lockset, joined)` of every free and every access (read/write).
 fn free_and_access_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
-    let mut held: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut lt = LifetimeTracker::new();
     let mut frees = Vec::new();
     let mut accesses = Vec::new();
     for e in &t.events {
+        if lt.step(e) {
+            continue;
+        }
         match e {
-            Event::Acquire(l) => {
-                held.insert(l.clone());
-            }
-            Event::Release(l) => {
-                held.remove(l);
-            }
-            Event::Free(x) => frees.push((x.clone(), held.clone())),
-            Event::Read(x) | Event::DepRead(x) | Event::Write(x) => {
-                accesses.push((x.clone(), held.clone()))
-            }
+            Event::Free(x) => frees.push(lt.snap(x)),
+            Event::Read(x) | Event::DepRead(x) | Event::Write(x) => accesses.push(lt.snap(x)),
             _ => {}
         }
     }
@@ -369,12 +408,17 @@ pub fn find_cross_thread_uaf(threads: &[Thread]) -> Vec<FreeUseWitness> {
             if i == j {
                 continue;
             }
-            // A free in `i` vs an access in `j`, disjoint locksets → use-after-free.
-            for (fx, fl) in &per[i].0 {
-                for (ax, al) in &per[j].1 {
-                    if fx == ax && fl.is_disjoint(al) && seen.insert((fx.clone(), false)) {
+            let (ni, nj) = (threads[i].name.as_str(), threads[j].name.as_str());
+            // A free in `i` vs an access in `j`, disjoint locksets and not lifetime-ordered → UAF.
+            for f in &per[i].0 {
+                for a in &per[j].1 {
+                    if f.0 == a.0
+                        && f.1.is_disjoint(&a.1)
+                        && !lifetime_ordered(f, ni, a, nj)
+                        && seen.insert((f.0.clone(), false))
+                    {
                         out.push(FreeUseWitness {
-                            location: fx.clone(),
+                            location: f.0.clone(),
                             threads: (threads[i].name.clone(), threads[j].name.clone()),
                             double_free: false,
                         });
@@ -382,10 +426,14 @@ pub fn find_cross_thread_uaf(threads: &[Thread]) -> Vec<FreeUseWitness> {
                 }
                 // A free in `i` vs a free in `j` (i<j to avoid the mirror), disjoint → double-free.
                 if i < j {
-                    for (gx, gl) in &per[j].0 {
-                        if fx == gx && fl.is_disjoint(gl) && seen.insert((fx.clone(), true)) {
+                    for g in &per[j].0 {
+                        if f.0 == g.0
+                            && f.1.is_disjoint(&g.1)
+                            && !lifetime_ordered(f, ni, g, nj)
+                            && seen.insert((f.0.clone(), true))
+                        {
                             out.push(FreeUseWitness {
-                                location: fx.clone(),
+                                location: f.0.clone(),
                                 threads: (threads[i].name.clone(), threads[j].name.clone()),
                                 double_free: true,
                             });
@@ -607,19 +655,16 @@ pub struct AbaWitness {
 /// Per-thread, the `(class, lockset)` of every compare-and-swap and every modification (a write
 /// or free) — used to match a CAS against a concurrent A→B→A modification.
 fn cas_and_mod_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
-    let mut held: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut lt = LifetimeTracker::new();
     let mut cas = Vec::new();
     let mut modif = Vec::new();
     for e in &t.events {
+        if lt.step(e) {
+            continue;
+        }
         match e {
-            Event::Acquire(l) => {
-                held.insert(l.clone());
-            }
-            Event::Release(l) => {
-                held.remove(l);
-            }
-            Event::Cas(x) => cas.push((x.clone(), held.clone())),
-            Event::Write(x) | Event::Free(x) => modif.push((x.clone(), held.clone())),
+            Event::Cas(x) => cas.push(lt.snap(x)),
+            Event::Write(x) | Event::Free(x) => modif.push(lt.snap(x)),
             _ => {}
         }
     }
@@ -639,11 +684,16 @@ pub fn find_aba(threads: &[Thread]) -> Vec<AbaWitness> {
             if i == j {
                 continue;
             }
-            for (cx, cl) in &per[i].0 {
-                for (mx, ml) in &per[j].1 {
-                    if cx == mx && cl.is_disjoint(ml) && seen.insert(cx.clone()) {
+            let (ni, nj) = (threads[i].name.as_str(), threads[j].name.as_str());
+            for c in &per[i].0 {
+                for m in &per[j].1 {
+                    if c.0 == m.0
+                        && c.1.is_disjoint(&m.1)
+                        && !lifetime_ordered(c, ni, m, nj)
+                        && seen.insert(c.0.clone())
+                    {
                         out.push(AbaWitness {
-                            location: cx.clone(),
+                            location: c.0.clone(),
                             threads: (threads[i].name.clone(), threads[j].name.clone()),
                         });
                     }
@@ -670,19 +720,16 @@ pub struct RefcountRaceWitness {
 
 /// Per-thread, the `(class, lockset)` of every unchecked get and every put.
 fn get_and_put_locksets(t: &Thread) -> (ClassLocksets, ClassLocksets) {
-    let mut held: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut lt = LifetimeTracker::new();
     let mut gets = Vec::new();
     let mut puts = Vec::new();
     for e in &t.events {
+        if lt.step(e) {
+            continue;
+        }
         match e {
-            Event::Acquire(l) => {
-                held.insert(l.clone());
-            }
-            Event::Release(l) => {
-                held.remove(l);
-            }
-            Event::RefGet(x) => gets.push((x.clone(), held.clone())),
-            Event::RefPut(x) => puts.push((x.clone(), held.clone())),
+            Event::RefGet(x) => gets.push(lt.snap(x)),
+            Event::RefPut(x) => puts.push(lt.snap(x)),
             _ => {}
         }
     }
@@ -702,11 +749,16 @@ pub fn find_refcount_races(threads: &[Thread]) -> Vec<RefcountRaceWitness> {
             if i == j {
                 continue;
             }
-            for (gx, gl) in &per[i].0 {
-                for (px, pl) in &per[j].1 {
-                    if gx == px && gl.is_disjoint(pl) && seen.insert(gx.clone()) {
+            let (ni, nj) = (threads[i].name.as_str(), threads[j].name.as_str());
+            for g in &per[i].0 {
+                for p in &per[j].1 {
+                    if g.0 == p.0
+                        && g.1.is_disjoint(&p.1)
+                        && !lifetime_ordered(g, ni, p, nj)
+                        && seen.insert(g.0.clone())
+                    {
                         out.push(RefcountRaceWitness {
-                            location: gx.clone(),
+                            location: g.0.clone(),
                             threads: (threads[i].name.clone(), threads[j].name.clone()),
                         });
                     }
@@ -1501,6 +1553,44 @@ mod tests {
         let v = find_cross_thread_uaf(&[a, b]);
         assert_eq!(v.len(), 1);
         assert!(v[0].double_free, "two concurrent frees are a double-free");
+    }
+
+    // Thread-lifetime happens-before: a parent that frees an object only AFTER `Join`-ing the
+    // worker that used it is not racing — the worker finished first. The lockset check alone
+    // (disjoint locks) would flag it; the join ordering must suppress the false positive.
+    #[test]
+    fn free_after_join_is_not_a_uaf() {
+        let worker = thread("worker", vec![Read("obj".into())]);
+        let parent = thread("parent", vec![Spawn("worker".into()), Join, Free("obj".into())]);
+        assert!(
+            find_cross_thread_uaf(&[parent, worker]).is_empty(),
+            "the worker is joined before the free — they are ordered, not concurrent"
+        );
+    }
+
+    // But a free BEFORE the join (still inside the worker's lifetime) IS a race: the parent frees
+    // while the worker may still be reading.
+    #[test]
+    fn free_before_join_is_a_uaf() {
+        let worker = thread("worker", vec![Read("obj".into())]);
+        let parent = thread("parent", vec![Spawn("worker".into()), Free("obj".into()), Join]);
+        assert_eq!(
+            find_cross_thread_uaf(&[parent, worker]).len(),
+            1,
+            "the free happens inside the worker's lifetime (before the join) — a real UAF"
+        );
+    }
+
+    // The lifetime ordering also suppresses a refcount-race false positive: an unchecked get in a
+    // worker that the parent joins before its put cannot race that put.
+    #[test]
+    fn refcount_get_before_parent_joins_then_puts_is_ordered() {
+        let worker = thread("worker", vec![RefGet("sk".into())]);
+        let parent = thread("parent", vec![Spawn("worker".into()), Join, RefPut("sk".into())]);
+        assert!(
+            find_refcount_races(&[parent, worker]).is_empty(),
+            "the worker (and its get) is joined before the put — ordered, not a race"
+        );
     }
 
     // A lock release/acquire is also a full barrier → no store-buffer reordering.
