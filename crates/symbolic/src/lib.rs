@@ -74,6 +74,11 @@ pub struct ExecLimits {
     /// Honour `RefWitness { assumed: true }` — a raw pointer field recovered from
     /// debug info, valid only under the `assume_valid_params` opt-in.
     pub assume_valid_params: bool,
+    /// **Rust aliasing (borrow-stack) model.** When on, track each pointer's originating
+    /// borrow (from `RefWitness`) and flag a `NoAliasingViolation` — currently a write
+    /// through a shared `&T` reference. Off by default (the reference model is only
+    /// partially reconstructed from the frontends; opt-in until complete).
+    pub aliasing_model: bool,
 }
 
 impl Default for ExecLimits {
@@ -84,6 +89,7 @@ impl Default for ExecLimits {
             bug_finding: false,
             exported: true,
             assume_valid_params: false,
+            aliasing_model: false,
         }
     }
 }

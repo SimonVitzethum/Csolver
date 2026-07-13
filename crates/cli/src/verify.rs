@@ -8,6 +8,7 @@ pub(crate) fn verify_path(
     closed_world: bool,
     bug_finding: bool,
     assume_valid_params: bool,
+    aliasing_model: bool,
     pre_file: Option<&Path>,
     entry_patterns: Option<Vec<String>>,
 ) -> Result<ExitCode, String> {
@@ -83,6 +84,7 @@ pub(crate) fn verify_path(
                 closed_world,
                 bug_finding,
                 assume_valid_params,
+                aliasing_model,
                 entry_patterns,
                 ..Config::default()
             };

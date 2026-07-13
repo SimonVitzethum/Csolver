@@ -195,6 +195,8 @@ pub(crate) fn discharge_inner(
         race_accesses: HashSet::new(),
         load_derived: load_derived_regs(f),
         race_trace: Vec::new(),
+        // Opt-in Rust aliasing model: the shared-borrow register set (empty otherwise).
+        shared_borrow_regs: if limits.aliasing_model { shared_borrow_regs(f) } else { HashSet::new() },
         f,
     };
 

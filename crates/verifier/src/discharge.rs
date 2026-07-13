@@ -33,7 +33,7 @@ pub(crate) fn verify_function_with(
         Some(s) => discharge_with_scalars(
             f, s, name_summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
             global_fn_ptrs, analysis.as_ref(), config.time_budget, config.bug_finding, exported,
-            config.assume_valid_params,
+            config.assume_valid_params, config.aliasing_model,
         ),
         None => discharge_function(f),
     });

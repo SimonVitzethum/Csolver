@@ -93,6 +93,11 @@ pub struct Config {
     /// analysis whose dominant `UNKNOWN` cause is an uncontracted pointer parameter
     /// (per-TU kernel/driver code).
     pub assume_valid_params: bool,
+    /// **Rust aliasing (borrow-stack) model.** Opt-in Stacked/Tree-Borrows checking: flag a
+    /// `NoAliasingViolation` (currently a write through a shared `&T` reference). Off by
+    /// default — the reference model is only partially reconstructed from the frontends, so
+    /// this is opt-in (`--aliasing-model`) until the full borrow-stack lands.
+    pub aliasing_model: bool,
     /// Optional **entry-point name patterns** (exact, or a trailing-`*` prefix). When
     /// present, ONLY a function whose name matches is treated as an attacker-reachable
     /// entry — its `arg…` parameters are genuine adversarial inputs in bug-finding mode;
@@ -141,6 +146,7 @@ impl Default for Config {
             closed_world: false,
             bug_finding: false,
             assume_valid_params: false,
+            aliasing_model: false,
             entry_patterns: None,
             time_budget: Some(std::time::Duration::from_secs(30)),
         }

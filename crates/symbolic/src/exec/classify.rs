@@ -166,6 +166,54 @@ pub(crate) fn load_derived_regs(f: &Function) -> HashSet<RegId> {
     derived
 }
 
+/// The pointer registers derived from a genuine **shared borrow** (`&T`) — a
+/// `RefWitness { writable: false, assumed: false }` and anything computed from it by a copy,
+/// a pointer cast, a `PtrOffset`, or a `FieldPtr`. A `Store` through such a register is a
+/// write through a shared reference, an unambiguous Rust aliasing violation. A fixpoint over
+/// the function (defs dominate uses, but a fixpoint is robust to block order). Only shared
+/// borrows are seeded — a `&mut` (`writable`) or an opaque/raw pointer never enters the set,
+/// so a legitimate write is never flagged. Interior mutability (`&Cell<T>`) writes go through
+/// a raw pointer from `UnsafeCell::get` (an opaque call result), which carries no shared tag,
+/// so those are not flagged either. Computed only when the aliasing model is enabled.
+pub(crate) fn shared_borrow_regs(f: &Function) -> HashSet<RegId> {
+    let mut shared: HashSet<RegId> = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let (dst, is_shared) = match inst {
+                    Inst::RefWitness { dst, writable, assumed, .. } => {
+                        (Some(*dst), !*writable && !*assumed)
+                    }
+                    Inst::Assign { dst, value, .. } => {
+                        let dep = match value {
+                            RValue::Use(o) | RValue::Cast { operand: o, .. } => {
+                                o.as_reg().is_some_and(|r| shared.contains(&r))
+                            }
+                            _ => false,
+                        };
+                        (Some(*dst), dep)
+                    }
+                    Inst::PtrOffset { dst, base, .. } => {
+                        (Some(*dst), base.as_reg().is_some_and(|r| shared.contains(&r)))
+                    }
+                    Inst::FieldPtr { dst, base, .. } => {
+                        (Some(*dst), base.as_reg().is_some_and(|r| shared.contains(&r)))
+                    }
+                    _ => (None, false),
+                };
+                if let Some(d) = dst {
+                    if is_shared && shared.insert(d) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    shared
+}
+
 /// The register operands of an r-value.
 /// Whether two **sorted, deduplicated** `ExprId` slices share at least one element — a linear
 /// merge walk (used by the `branch_infeasible` relevance pre-filter to test variable overlap).

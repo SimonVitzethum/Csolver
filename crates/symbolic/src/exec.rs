@@ -201,7 +201,7 @@ pub fn discharge_with_fields(
     discharge_with_scalars(
         f, summaries, &HashMap::new(), contracts, field_contracts, &[], globals, prov_grants,
         &HashMap::new(), None, ExecLimits::default().time_budget, bug_finding, exported,
-        assume_valid_params,
+        assume_valid_params, false,
     )
 }
 
@@ -226,9 +226,10 @@ pub fn discharge_with_scalars(
     bug_finding: bool,
     exported: bool,
     assume_valid_params: bool,
+    aliasing_model: bool,
 ) -> SymbolicReport {
     let limits =
-        ExecLimits { bug_finding, exported, assume_valid_params, time_budget, ..ExecLimits::default() };
+        ExecLimits { bug_finding, exported, assume_valid_params, aliasing_model, time_budget, ..ExecLimits::default() };
     discharge_inner(
         f, limits, summaries, name_summaries, contracts, field_contracts, scalar_pre, globals,
         prov_grants, global_fn_ptrs, analysis_in,

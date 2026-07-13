@@ -296,5 +296,11 @@ pub(crate) struct Explorer<'f> {
     /// `csolver_verifier::interleave` to find atomicity violations (a split-critical-section
     /// read-modify-write a foreign write can interrupt) with an interleaving witness.
     pub(crate) race_trace: Vec<(u8, String)>,
+    /// **Shared-borrow registers** (opt-in `--aliasing-model`): pointer registers derived —
+    /// through casts / field / index projections / copies — from a genuine shared `&T` borrow
+    /// (a `RefWitness { writable: false, assumed: false }`). A `Store` through one is a write
+    /// through a shared reference, an unambiguous Rust aliasing (borrow-stack) violation. Empty
+    /// unless the aliasing model is on (see [`shared_borrow_regs`]).
+    pub(crate) shared_borrow_regs: HashSet<RegId>,
     pub(crate) f: &'f Function,
 }

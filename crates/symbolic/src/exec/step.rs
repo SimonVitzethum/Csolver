@@ -314,6 +314,21 @@ impl Explorer<'_> {
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidWrite, state);
+                // Rust aliasing model (opt-in): a write through a pointer derived from a shared
+                // `&T` borrow is an unambiguous borrow-stack violation. Refuted only on a
+                // feasible path (record_temporal gates on a feasibility witness) — no false FAIL.
+                if self.limits.aliasing_model
+                    && ptr.as_reg().is_some_and(|r| self.shared_borrow_regs.contains(&r))
+                {
+                    self.record_temporal(
+                        (block, idx),
+                        SafetyProperty::NoAliasingViolation,
+                        true,
+                        state,
+                        "no write through a shared (&T) reference",
+                        "write through a shared reference (Rust aliasing violation)",
+                    );
+                }
                 // An atomic/volatile write (`WRITE_ONCE`/`atomic_set`) is race-free by
                 // construction — excluded from the data-race pass.
                 if !*volatile {

@@ -115,6 +115,17 @@ pub enum SafetyProperty {
     /// bug-finding-only obligation. Refuted only when a spinlock is *definitely* held on
     /// every path reaching the sleeping call (no false FAIL under a partial hold).
     SleepInAtomic,
+    /// No **Rust aliasing (borrow-stack) violation**: the Stacked/Tree-Borrows discipline
+    /// the Rust reference model requires. Currently the soundly-decidable, unambiguous
+    /// subclass — a **write through a shared reference** (`&T`): a store whose pointer is
+    /// derived (through casts / field / index projections) from a genuine `&T` borrow, which
+    /// is always undefined behaviour (a `&T` grants read-only access; interior mutability
+    /// writes go through a raw pointer from `UnsafeCell::get`, so they carry no shared tag).
+    /// Opt-in behind `--aliasing-model` (the reference model is only partially reconstructed
+    /// from the current frontends). Refuted only on a feasible path (no false FAIL). The full
+    /// borrow-stack — use-after-invalidation of `&mut`, two-live-`&mut` siblings, protectors —
+    /// needs frontend retag events and derivation-tree tracking; recorded as future work.
+    NoAliasingViolation,
 }
 
 impl SafetyProperty {
@@ -147,6 +158,7 @@ impl SafetyProperty {
             SafetyProperty::NoDivByZero => "no_div_by_zero",
             SafetyProperty::NoShiftOverflow => "no_shift_overflow",
             SafetyProperty::NoArithOverflow => "no_arith_overflow",
+            SafetyProperty::NoAliasingViolation => "no_aliasing_violation",
         }
     }
 
@@ -179,6 +191,7 @@ impl SafetyProperty {
             SafetyProperty::NoDivByZero => "divisor of a division/modulo is non-zero",
             SafetyProperty::NoShiftOverflow => "shift amount is less than the bit width",
             SafetyProperty::NoArithOverflow => "nsw/nuw arithmetic does not overflow",
+            SafetyProperty::NoAliasingViolation => "no write through a shared (&T) reference",
         }
     }
 
@@ -212,6 +225,7 @@ impl SafetyProperty {
             NoDivByZero,
             NoShiftOverflow,
             NoArithOverflow,
+            NoAliasingViolation,
         ]
     }
 }

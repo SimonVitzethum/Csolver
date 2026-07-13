@@ -37,6 +37,9 @@ USAGE:
                                     --assume-valid-params: assume a raw pointer parameter
                                     of known pointee size is valid (framework/kernel entry
                                     ABI — opt-in, unsound in general, surfaced as an assumption);
+                                    --aliasing-model: opt-in Rust borrow-stack checking —
+                                    flag a write through a shared &T reference
+                                    (no_aliasing_violation);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
     solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>] [--cross-file] [--whole-program] [--reachable]
@@ -119,6 +122,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let closed_world = args.iter().any(|a| a == "--closed-world");
     let bug_finding = args.iter().any(|a| a == "--bugs");
     let assume_valid_params = args.iter().any(|a| a == "--assume-valid-params");
+    let aliasing_model = args.iter().any(|a| a == "--aliasing-model");
     let cross_file = args.iter().any(|a| a == "--cross-file");
     let whole_program = args.iter().any(|a| a == "--whole-program");
     let reachable = args.iter().any(|a| a == "--reachable");
@@ -169,7 +173,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--") && !flag_values.contains(&a.as_str()))
                 .ok_or("`verify` needs a path argument")?;
-            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, pre_file.as_deref(), entry_patterns)
+            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, aliasing_model, pre_file.as_deref(), entry_patterns)
         }
         "scan" => {
             let dir = args
@@ -194,10 +198,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     eprintln!("--reachable: no --entries given — deriving the attacker surface automatically");
                     derive_auto_entries(Path::new(dir), None)
                 });
-                let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns: Some(pats.clone()), ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, aliasing_model, entry_patterns: Some(pats.clone()), ..Config::default() };
                 scan_reachable(Path::new(dir), &config, &pats)
             } else {
-                let config = Config { closed_world, bug_finding, assume_valid_params, entry_patterns, ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, aliasing_model, entry_patterns, ..Config::default() };
                 scan_dir(Path::new(dir), &config, cross_file, whole_program)
             }
         }

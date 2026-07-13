@@ -1,5 +1,26 @@
 # Todo — Schwächen & Risiken aus dem Code-Review (2026-07-13)
 
+## Rust-Aliasing-Modell (Borrow-Stack, `--aliasing-model`) — Restarbeit
+
+Der Opt-in-Detektor deckt aktuell nur die **eindeutige** Klasse ab: ein Schreibzugriff
+durch eine geteilte `&T`-Referenz (`SafetyProperty::NoAliasingViolation`, sound, kein
+False-FAIL, nur auf feasibler Pfad refutiert). Für ein vollständiges Stacked/Tree-Borrows
+fehlt (jeweils Frontend- **und** Executor-Arbeit, nicht ohne Design entscheidbar):
+
+- [ ] **Retag-Events im Frontend.** Der MIR-Frontend senkt `Rvalue::Ref` zu einer reinen
+  Registerkopie und verwirft die Mutabilität; nur `RefWitness` trägt `writable`. Für das
+  volle Modell muss der Frontend `-Zmir-emit-retag`-`Retag(...)`-Statements als explizite
+  Borrow-Events (mit `&`/`&mut`/Two-Phase/Raw) emittieren.
+- [ ] **Use-after-invalidation von `&mut`.** Zwei gleichzeitig lebende `&mut` auf dieselbe
+  Stelle bzw. Nutzung eines `&mut`, das durch einen aliasenden Zugriff invalidiert wurde —
+  braucht einen **Ableitungsbaum** (Reborrow-Kette), sonst False-FAILs auf legitimen
+  Reborrows (`&mut *a`). Pro Region ein Borrow-Stack aus getaggten Einträgen.
+- [ ] **Protectors** für Funktionsargumente (ein an eine Funktion übergebenes `&mut` bleibt
+  für deren Dauer eindeutig) und **Interior Mutability** (`UnsafeCell`) exakt statt über die
+  aktuelle „Raw-Pointer-aus-Call trägt kein Tag“-Heuristik.
+- [ ] Der Tag müsste am `SymPointer` hängen (fließt durch `gep`/Kopie), aus `PartialEq`
+  ausgeschlossen wie `POrigin` — 31 Konstruktionsstellen, daher als eigener Schritt.
+
 ## Struktur / Wartbarkeit
 
 - [ ] **`crates/symbolic/src/exec.rs` (8314 Zeilen) aufteilen.** Monolith trägt

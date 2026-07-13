@@ -251,6 +251,76 @@ fn wide_cfg_is_processed_once_per_block_not_per_path() {
     assert_eq!(r.outcome(BlockId(32), 0), Some(SymOutcome::Proven), "final check verified");
 }
 
+/// A write through a shared `&T` borrow: materialise a shared reference, then (via a copy)
+/// store through it. This is the unambiguous Rust aliasing (borrow-stack) violation.
+fn write_through_shared_ref(writable: bool) -> Function {
+    let r0 = RegId(0);
+    let r1 = RegId(1);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::RefWitness {
+        dst: r0,
+        size: Some(8),
+        align: 8,
+        writable,
+        assumed: false,
+        src: None,
+    });
+    // A pointer copy (models `&T as *const T as *mut T`): the shared tag flows through.
+    bb0.insts.push(Inst::Assign {
+        dst: r1,
+        ty: Type::ptr(Type::int(64)),
+        value: RValue::Use(Operand::Reg(r0)),
+    });
+    bb0.insts.push(Inst::Store {
+        ty: Type::int(64),
+        ptr: Operand::Reg(r1),
+        value: Operand::int(64, 5),
+        align: 8,
+        volatile: false,
+    });
+    Function {
+        id: FuncId(0),
+        name: "write_through_shared".into(),
+        params: vec![],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
+#[test]
+fn write_through_shared_ref_is_flagged_only_with_the_aliasing_model() {
+    let f = write_through_shared_ref(false);
+    // The store is at index 2 (RefWitness, Assign, Store).
+    let store = (BlockId(0), 2usize);
+
+    // With the aliasing model ON: a definite borrow-stack violation, refuted with a witness.
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    let d = on
+        .mem_decision(store.0, store.1, SafetyProperty::NoAliasingViolation)
+        .expect("aliasing obligation recorded");
+    assert!(!d.proven, "write through &T is a violation");
+    assert!(d.refutation.is_some(), "refuted with a feasibility witness");
+
+    // With the aliasing model OFF (the default): no such obligation exists at all.
+    let off = discharge_with(&f, crate::ExecLimits::default());
+    assert!(
+        off.mem_decision(store.0, store.1, SafetyProperty::NoAliasingViolation).is_none(),
+        "the aliasing model is opt-in — nothing is checked by default"
+    );
+}
+
+#[test]
+fn write_through_mut_ref_is_not_an_aliasing_violation() {
+    // A `&mut T` write is legitimate — never flagged, even with the model on.
+    let f = write_through_shared_ref(true);
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    assert!(
+        on.mem_decision(BlockId(0), 2, SafetyProperty::NoAliasingViolation).is_none(),
+        "a write through &mut is allowed"
+    );
+}
+
 #[test]
 fn double_free_is_refuted() {
     let r = discharge_function(&double_free());
