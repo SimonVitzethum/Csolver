@@ -224,6 +224,7 @@ impl fmt::Display for Instruction {
             Instruction::Movaps(d, s) => fmt_binary(f, "movaps", d, s),
             Instruction::Movapd(d, s) => fmt_binary(f, "movapd", d, s),
             Instruction::Movups(d, s) => fmt_binary(f, "movups", d, s),
+            Instruction::Movupd(d, s) => fmt_binary(f, "movupd", d, s),
             Instruction::Movdqa(d, s) => fmt_binary(f, "movdqa", d, s),
             Instruction::Movdqu(d, s) => fmt_binary(f, "movdqu", d, s),
             Instruction::Movss(d, s) => fmt_binary(f, "movss", d, s),

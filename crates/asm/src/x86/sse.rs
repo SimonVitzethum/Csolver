@@ -103,9 +103,7 @@ pub(crate) fn decode_sse_0f_op(
                 .ok_or_else(|| CoreError::parse("x86: invalid dst XMM register in MOV*"))?;
             let inst = match pp {
                 0 => Instruction::Movups(xmm_op(dst, Width::DQ), src),
-                1 => Instruction::Movsd(xmm_op(dst, Width::DQ), src), // MOVUPD → not directly in enum; use Movsd
-                // Actually MOVUPD is distinct. For simplicity, map to Movsd.
-                // FIXME: add proper MOVUPD variant if needed.
+                1 => Instruction::Movupd(xmm_op(dst, Width::DQ), src),
                 2 => Instruction::Movss(xmm_op(dst, Width::DQ), src),
                 3 => Instruction::Movsd(xmm_op(dst, Width::DQ), src),
                 _ => return Err(CoreError::unsupported("x86: unsupported VEX.pp for 0F 10")),
@@ -119,6 +117,7 @@ pub(crate) fn decode_sse_0f_op(
                 .ok_or_else(|| CoreError::parse("x86: invalid src XMM register in MOV*"))?;
             let inst = match pp {
                 0 => Instruction::Movups(dst, xmm_op(src, Width::DQ)),
+                1 => Instruction::Movupd(dst, xmm_op(src, Width::DQ)),
                 2 => Instruction::Movss(dst, xmm_op(src, Width::DQ)),
                 3 => Instruction::Movsd(dst, xmm_op(src, Width::DQ)),
                 _ => return Err(CoreError::unsupported("x86: unsupported VEX.pp for 0F 11")),

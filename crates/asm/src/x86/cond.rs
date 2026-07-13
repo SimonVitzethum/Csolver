@@ -154,6 +154,8 @@ pub enum Instruction {
     Movapd(X86Operand, X86Operand),
     /// `movups dst, src` — move unaligned packed singles (0F 10 /r).
     Movups(X86Operand, X86Operand),
+    /// `movupd dst, src` — move unaligned packed doubles (66 0F 10 /r).
+    Movupd(X86Operand, X86Operand),
     /// `movdqa dst, src` — move aligned packed integers (66 0F 6F /r).
     Movdqa(X86Operand, X86Operand),
     /// `movdqu dst, src` — move unaligned packed integers (F3 0F 6F /r).

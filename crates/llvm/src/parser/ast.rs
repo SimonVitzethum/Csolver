@@ -31,7 +31,7 @@ pub struct LGlobal {
     pub writable: bool,
     /// Declared `align` (1 if unspecified).
     pub align: u32,
-    /// The type was a *packed* struct `<{ … }>`: its size is the plain sum ofgrep FAIL ~/fullscan.log
+    /// The type was a *packed* struct `<{ … }>`: its size is the plain sum of
     /// the field sizes (no padding). Packed types stay rejected in instruction
     /// contexts (a padded stand-in could oversize them); here the exact packed
     /// size is computable, so global definitions can be recorded.

@@ -147,6 +147,27 @@ fn typed_sse_movups_reg_reg() {
 }
 
 #[test]
+fn typed_sse_movupd_reg_reg() {
+    // movupd xmm0, xmm1  = 66 0f 10 c1 — a distinct 16-byte unaligned move,
+    // NOT the 8-byte movsd it used to be mis-decoded as.
+    let d = decode_instruction(&[0x66, 0x0f, 0x10, 0xc1], 0).unwrap();
+    assert_eq!(
+        d.instruction,
+        Instruction::Movupd(
+            xmm_op(XmmReg::XMM0, Width::DQ),
+            xmm_op(XmmReg::XMM1, Width::DQ),
+        )
+    );
+}
+
+#[test]
+fn typed_sse_movupd_store() {
+    // movupd [rdi], xmm2  = 66 0f 11 17
+    let d = decode_instruction(&[0x66, 0x0f, 0x11, 0x17], 0).unwrap();
+    assert!(matches!(d.instruction, Instruction::Movupd(X86Operand::Mem(..), _)));
+}
+
+#[test]
 fn typed_sse_movss_reg_reg() {
     // movss xmm0, xmm1  = f3 0f 10 c1
     let d = decode_instruction(&[0xf3, 0x0f, 0x10, 0xc1], 0).unwrap();
