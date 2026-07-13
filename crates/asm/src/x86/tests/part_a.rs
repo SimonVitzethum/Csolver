@@ -528,3 +528,13 @@ fn unmodeled_control_flow_still_drops() {
     });
     assert!(!bridged, "control-flow must not be bridged as a data havoc");
 }
+
+#[test]
+fn recursive_descent_skips_unreachable_trailing_bytes() {
+    // `xor eax,eax; ret;` followed by unreachable garbage (0xff 0xff 0xff). A linear
+    // sweep would decode the garbage after the ret and drop the whole function; the
+    // recursive-descent decode stops at the ret and never touches it — so it decodes.
+    let m = decode_function("f", &[0x31, 0xc0, 0xc3, 0xff, 0xff, 0xff]);
+    assert!(m.unanalyzed.is_empty(), "unreachable trailing bytes must not drop the function: {:?}", m.unanalyzed);
+    assert_eq!(m.functions.len(), 1);
+}

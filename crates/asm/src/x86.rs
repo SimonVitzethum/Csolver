@@ -64,19 +64,42 @@ struct Decoded {
     ctrl: Ctrl,
 }
 
-/// Linearly decode every instruction of the function body, threading the
-/// `flags` state (the last `cmp`/`test` operands) so a following `jcc` knows its
-/// condition.
+/// **Recursive-descent** decode: decode only the bytes REACHABLE from the entry by
+/// following control flow (fall-through + branch targets), not a blind linear sweep.
+/// So trailing padding (`int3`/`nop`) after a function's `ret`, and other unreachable
+/// bytes, are never decoded — they cannot drop the whole function on a bad opcode (the
+/// bane of stripped images whose function sizes overshoot into padding).
+///
+/// `flags` (the last `cmp`/`test` operands) is threaded within each straight-line run
+/// and reset at each run's start: a `cmp; jcc` pair is always in one run (adjacent), so
+/// the condition stays exact; a block entered via a jump conservatively starts with no
+/// flags (its `jcc`, if any, uses the unconstrained fallback — sound).
 fn decode_cfg(code: &[u8], resolve: RelocResolver) -> csolver_core::Result<Vec<DecodedInsn>> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    let mut flags: Option<(Operand, Operand)> = None;
-    while pos < code.len() {
-        let d = decode_one(code, pos, &mut flags, resolve)?;
-        out.push(DecodedInsn { offset: pos, next: d.next, insts: d.insts, ctrl: d.ctrl });
-        pos = d.next;
+    use std::collections::BTreeMap;
+    let mut decoded: BTreeMap<usize, DecodedInsn> = BTreeMap::new();
+    let mut work: Vec<usize> = vec![0];
+    while let Some(start) = work.pop() {
+        let mut pos = start;
+        let mut flags: Option<(Operand, Operand)> = None;
+        while pos < code.len() && !decoded.contains_key(&pos) {
+            let d = decode_one(code, pos, &mut flags, resolve)?;
+            let (next, ctrl) = (d.next, d.ctrl);
+            decoded.insert(pos, DecodedInsn { offset: pos, next, insts: d.insts, ctrl });
+            match ctrl {
+                Ctrl::Ret => break,
+                Ctrl::Jmp(t) => {
+                    work.push(t);
+                    break;
+                }
+                Ctrl::Jcc(t, _) => {
+                    work.push(t);
+                    pos = next;
+                }
+                Ctrl::Fall => pos = next,
+            }
+        }
     }
-    Ok(out)
+    Ok(decoded.into_values().collect())
 }
 
 pub(crate) fn reg(num: u8) -> RegId {
