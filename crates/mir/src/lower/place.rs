@@ -363,7 +363,7 @@ impl Ctx {
     }
 
     /// The local id an operand copies/moves from (`None` for a constant).
-    fn operand_local(op: &Operand) -> Option<u32> {
+    pub(crate) fn operand_local(op: &Operand) -> Option<u32> {
         match op {
             Operand::Copy(Place::Local(n)) | Operand::Move(Place::Local(n)) => Some(*n),
             _ => None,

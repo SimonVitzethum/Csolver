@@ -23,7 +23,8 @@ pub(crate) fn bin_kind(w: &str) -> Option<BinKind> {
         "BitOr" => BinKind::BitOr,
         "BitXor" => BinKind::BitXor,
         // A modelled-as-opaque arithmetic op (Div/Rem/Shl/Shr/Offset/checked …).
-        "Div" | "Rem" | "Shl" | "Shr" | "Offset" => BinKind::Other,
+        "Offset" => BinKind::Offset,
+        "Div" | "Rem" | "Shl" | "Shr" => BinKind::Other,
         _ => return None,
     })
 }

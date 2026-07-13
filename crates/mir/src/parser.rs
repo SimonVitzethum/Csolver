@@ -81,6 +81,8 @@ pub(crate) enum BinKind {
     BitAnd,
     BitOr,
     BitXor,
+    /// Pointer arithmetic `ptr.offset(count)` — `base + count * size_of::<pointee>()`.
+    Offset,
     Other,
 }
 

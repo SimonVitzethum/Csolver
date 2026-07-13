@@ -474,3 +474,31 @@ fn copy_nonoverlapping_lowers_to_a_checked_memcpy() {
         "the copy carries a no-overlap obligation"
     );
 }
+
+/// `Offset` (pointer arithmetic `ptr.offset(n)`) must lower to a `PtrOffset` that keeps
+/// the base pointer's provenance (stride = the pointee type), not an opaque `Undef` —
+/// so a store through the offset pointer is bounds-checked against the same region.
+const PTR_OFFSET: &str = r#"
+fn f(_1: *mut i32, _2: usize) -> () {
+    let mut _0: ();
+    let mut _3: *mut i32;
+    bb0: {
+        _3 = Offset(copy _1, copy _2);
+        (*_3) = const 0_i32;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn ptr_offset_lowers_to_ptroffset_not_opaque() {
+    use csolver_ir::Inst;
+    let module = lower(PTR_OFFSET, "f");
+    assert!(module.unanalyzed.is_empty(), "lowers: {:?}", module.unanalyzed);
+    let insts: Vec<&Inst> = module.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| &b.insts).collect();
+    let po = insts.iter().find(|i| matches!(i, Inst::PtrOffset { .. })).expect("Offset → PtrOffset");
+    // The stride is the pointee type (i32), so the byte offset is count * 4 — a store
+    // through it is then checked against the base region (not a lost, opaque pointer).
+    assert!(matches!(po, Inst::PtrOffset { elem, .. } if elem.size_bytes(&csolver_ir::DataLayout::LP64) == Some(4)));
+    assert!(insts.iter().any(|i| matches!(i, Inst::Store { .. })), "the store through it is modelled");
+}

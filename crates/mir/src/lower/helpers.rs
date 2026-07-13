@@ -23,7 +23,9 @@ pub(crate) fn bin_rvalue(kind: BinKind, lhs: IrOp, rhs: IrOp) -> Option<RValue> 
         BinKind::BitAnd => bin(BinOp::And),
         BinKind::BitOr => bin(BinOp::Or),
         BinKind::BitXor => bin(BinOp::Xor),
-        BinKind::Other => None,
+        // `Offset` is pointer arithmetic (a `PtrOffset` inst, handled in `stmt.rs`), not
+        // a value `RValue`; a `CheckedBin`/other context has no pointee type so it stays opaque.
+        BinKind::Offset | BinKind::Other => None,
     }
 }
 

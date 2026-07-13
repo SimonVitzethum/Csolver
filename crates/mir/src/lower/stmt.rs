@@ -106,6 +106,21 @@ impl Ctx {
                 out.push(assign(dst, RValue::Use(v)));
                 Ok(())
             }
+            // `ptr.offset(count)` / `ptr.add(count)` (MIR `Offset`): the result is
+            // `base + count * size_of::<T>()`, keeping the base pointer's provenance.
+            // Lower to a `PtrOffset` (stride = the pointee type) when the pointee is
+            // known, so a later access through the result is bounds-checked against the
+            // same region — instead of the opaque `Undef` a generic `Bin` would give.
+            // Unknown pointee → fall back to opaque (sound: no wrong stride).
+            Rvalue::Bin(BinKind::Offset, a, b) => {
+                let base = self.operand_value(a, out);
+                let index = self.operand_value(b, out);
+                match Self::operand_local(a).and_then(|l| self.deref_elem(l)) {
+                    Some(elem) => out.push(Inst::PtrOffset { dst, base, index, elem }),
+                    None => out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef)))),
+                }
+                Ok(())
+            }
             Rvalue::Bin(kind, a, b) => {
                 let av = self.operand_value(a, out);
                 let bv = self.operand_value(b, out);
