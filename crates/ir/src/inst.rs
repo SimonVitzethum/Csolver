@@ -1,8 +1,8 @@
 //! MSIR operands, r-values, conditions and instructions.
 
-use crate::id::{FuncId, RegId};
+use crate::id::RegId;
 use crate::ty::Type;
-use csolver_core::{BitVector, RegionKind, SafetyProperty};
+use csolver_core::{RegionKind, SafetyProperty};
 
 /// A compile-time-constant operand.
 pub use crate::ops::*;
