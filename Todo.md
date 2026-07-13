@@ -33,8 +33,8 @@
 
 ## Prozess / Infrastruktur
 
-- [ ] **Kein CI-Setup** (kein `.github/`): `cargo test --workspace` +
-  `cargo clippy` als CI wäre ein 10-Minuten-Gewinn bei dieser Testdisziplin.
+- [x] ~~Kein CI-Setup~~ → `.github/workflows/ci.yml`: `cargo test --workspace`
+  + `cargo clippy --all-targets -- -D warnings` auf Push/PR.
 - [ ] Bus-Faktor 1: Soundness-Argumente leben in Kommentaren/`docs/`, nicht
   maschinengeprüft. Diskrepanz „formal verifier" vs. „informell argumentierte
   Soundness + Test-Orakel" dokumentiert halten.

@@ -1,0 +1,26 @@
+# CI: the same bar every local commit is held to — full test suite, zero
+# clippy warnings (including test targets), and a formatting check.
+# No external dependencies, so plain `cargo` on stable is the whole matrix.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (workspace)
+        run: cargo test --workspace
+      - name: Clippy (all targets, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
