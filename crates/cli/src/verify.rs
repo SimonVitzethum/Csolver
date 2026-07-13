@@ -16,6 +16,13 @@ pub(crate) fn verify_path(
     if path.extension().and_then(|e| e.to_str()) == Some("rs") {
         return verify_rust_source(path, json);
     }
+    // An ISO 9660 image (`.iso` or the `CD001` magic): a *container* — enumerate the
+    // object files inside (UEFI `.efi`/PE, loose `.exe`/`.dll`, ELF) and verify each.
+    if path.extension().and_then(|e| e.to_str()) == Some("iso")
+        || read_head(path, 0x8006).is_ok_and(|h| csolver_elf::iso::is_iso(&h))
+    {
+        return verify_iso(path, json, bug_finding, assume_valid_params);
+    }
     let level = detect_level(path)?;
     // LLVM/MIR are mature; an ELF object is decoded via `csolver-asm` (x86-64 /
     // AArch64) and verified; the textual `.s` frontend is still a stub (reports its
@@ -85,6 +92,74 @@ pub(crate) fn verify_path(
             ))
         }
     }
+}
+
+/// Read the first `n` bytes of `path` (for a magic sniff that needs more than the
+/// 4-byte header — e.g. ISO 9660's `CD001` at offset 0x8001).
+fn read_head(path: &Path, n: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; n];
+    let read = f.read(&mut buf).map_err(|e| e.to_string())?;
+    buf.truncate(read);
+    Ok(buf)
+}
+
+/// Verify every **object file inside an ISO 9660 image** — a container the pipeline
+/// unpacks: enumerate its files, and for each whose bytes carry an ELF / PE / Mach-O
+/// magic, decode and verify it (UEFI `.efi` boot apps are PE, so a boot/install image's
+/// binaries are analysed this way). Prints a per-file verdict; the exit code is the
+/// worst verdict over all analysed files.
+fn verify_iso(path: &Path, json: bool, bug_finding: bool, assume_valid_params: bool) -> Result<ExitCode, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let files = csolver_elf::iso::list_files(&bytes).map_err(|e| e.to_string())?;
+    let (mut any_fail, mut any_unknown, mut analyzed) = (false, false, 0usize);
+    let mut lines: Vec<String> = Vec::new();
+    for f in &files {
+        let end = f.offset.saturating_add(f.size).min(bytes.len());
+        let Some(slice) = bytes.get(f.offset..end) else { continue };
+        if csolver_elf::detect_format(slice).is_none() {
+            continue; // not an object file — skip (data/resource/boot-catalog)
+        }
+        analyzed += 1;
+        match lower_elf(slice) {
+            Ok(module) => {
+                let config = Config {
+                    level: SourceLevel::Elf,
+                    bug_finding,
+                    assume_valid_params,
+                    ..Config::default()
+                };
+                let report = verify_module(&module, &config);
+                match report.verdict {
+                    Verdict::Fail => any_fail = true,
+                    Verdict::Unknown => any_unknown = true,
+                    Verdict::Pass => {}
+                }
+                lines.push(format!("  {:<44} {:?}  ({} fn)", f.path, report.verdict, module.functions.len()));
+            }
+            Err(e) => lines.push(format!("  {:<44} not analyzed: {e}", f.path)),
+        }
+    }
+    if !json {
+        eprintln!(
+            "ISO {}: {} file(s), {} object file(s) analysed",
+            path.display(),
+            files.len(),
+            analyzed
+        );
+        for l in &lines {
+            eprintln!("{l}");
+        }
+    }
+    let worst = if any_fail {
+        Verdict::Fail
+    } else if any_unknown {
+        Verdict::Unknown
+    } else {
+        Verdict::Pass
+    };
+    Ok(verdict_code(worst))
 }
 
 /// Lower an ELF object/binary to MSIR: parse it (`csolver-elf`), then decode each

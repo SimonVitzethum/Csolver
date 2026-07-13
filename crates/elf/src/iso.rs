@@ -1,0 +1,153 @@
+//! A focused ISO 9660 (CD/DVD image) directory reader → the files it contains.
+//!
+//! An `.iso` is a *container*, not an object file: it holds a filesystem. This walks the
+//! ISO 9660 volume — the Primary (or Joliet Supplementary) Volume Descriptor and the
+//! directory tree — and returns each regular file as `(path, byte offset, size)` so the
+//! pipeline can slice it out and hand any object file inside (a UEFI `.efi`/PE, a loose
+//! `.exe`/`.dll`, a Linux ELF) to [`crate::load_object`]. UEFI boot applications are PE,
+//! so this is the route to "check the binaries on a boot/install image".
+//!
+//! Joliet (UTF-16BE long names) is preferred when present; otherwise the plain ISO 9660
+//! names are used. Bounds-checked throughout — a malformed image yields [`Error`], never
+//! a panic (an ISO is untrusted input). Rock Ridge, El Torito boot catalogs, and nested
+//! archives (`install.wim`) are out of scope.
+
+use super::*;
+use crate::reloc::read_u32;
+
+const SECTOR: usize = 2048;
+const DIR_FLAG: u8 = 0x02;
+const MAX_FILES: usize = 100_000;
+const MAX_DEPTH: usize = 32;
+
+/// One regular file found in an ISO: its path, byte offset in the image, and size.
+#[derive(Debug, Clone)]
+pub struct IsoFile {
+    /// Slash-separated path within the image (e.g. `EFI/BOOT/BOOTX64.EFI`).
+    pub path: String,
+    /// Byte offset of the file's first extent within the image.
+    pub offset: usize,
+    /// File size in bytes.
+    pub size: usize,
+}
+
+/// Whether `bytes` looks like an ISO 9660 image (the `CD001` identifier of the first
+/// volume descriptor at sector 16).
+pub fn is_iso(bytes: &[u8]) -> bool {
+    bytes.get(0x8001..0x8006) == Some(b"CD001")
+}
+
+/// Enumerate the regular files in an ISO 9660 image.
+pub fn list_files(bytes: &[u8]) -> Result<Vec<IsoFile>> {
+    if !is_iso(bytes) {
+        return Err(Error::parse("ISO: missing 'CD001' volume-descriptor identifier"));
+    }
+    // Scan the volume-descriptor set (sector 16 onward): prefer a Joliet supplementary
+    // descriptor (type 2, UTF-16BE names) over the primary (type 1).
+    let mut primary_root: Option<[u8; 34]> = None;
+    let mut joliet_root: Option<[u8; 34]> = None;
+    let mut vd = 16 * SECTOR;
+    for _ in 0..64 {
+        let ty = *bytes.get(vd).ok_or_else(|| Error::parse("ISO: truncated volume descriptor"))?;
+        if bytes.get(vd + 1..vd + 6) != Some(b"CD001") {
+            break;
+        }
+        match ty {
+            1 => primary_root = root_record(bytes, vd),
+            2 if is_joliet(bytes, vd) => joliet_root = root_record(bytes, vd),
+            255 => break, // volume-descriptor set terminator
+            _ => {}
+        }
+        vd += SECTOR;
+    }
+    let (root, joliet) = match (joliet_root, primary_root) {
+        (Some(r), _) => (r, true),
+        (None, Some(r)) => (r, false),
+        (None, None) => return Err(Error::parse("ISO: no primary volume descriptor")),
+    };
+    let mut out = Vec::new();
+    walk_dir(bytes, &root, "", joliet, 0, &mut out)?;
+    Ok(out)
+}
+
+/// The 34-byte root directory record embedded at offset 156 of a volume descriptor.
+fn root_record(bytes: &[u8], vd: usize) -> Option<[u8; 34]> {
+    bytes.get(vd + 156..vd + 190)?.try_into().ok()
+}
+
+/// Whether a supplementary volume descriptor selects Joliet (a UCS-2 escape sequence
+/// `%/@`, `%/C`, or `%/E` in the escape-sequences field at offset 88).
+fn is_joliet(bytes: &[u8], vd: usize) -> bool {
+    let esc = bytes.get(vd + 88..vd + 120).unwrap_or(&[]);
+    esc.windows(3).any(|w| w == b"%/@" || w == b"%/C" || w == b"%/E")
+}
+
+/// Recursively walk a directory record's extent, collecting regular files.
+fn walk_dir(
+    bytes: &[u8],
+    record: &[u8],
+    prefix: &str,
+    joliet: bool,
+    depth: usize,
+    out: &mut Vec<IsoFile>,
+) -> Result<()> {
+    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        return Ok(());
+    }
+    let lba = read_u32(record, 2)? as usize; // extent location (LE half of the both-endian field)
+    let len = read_u32(record, 10)? as usize; // data length
+    let start = lba.checked_mul(SECTOR).ok_or_else(|| Error::parse("ISO: extent offset overflow"))?;
+    let data = bytes.get(start..start + len).ok_or_else(|| Error::parse("ISO: directory extent out of range"))?;
+
+    let mut p = 0usize;
+    while p < data.len() {
+        let rec_len = data[p] as usize;
+        if rec_len == 0 {
+            // No more records in this sector — advance to the next sector boundary.
+            p = (p / SECTOR + 1) * SECTOR;
+            continue;
+        }
+        if p + rec_len > data.len() || rec_len < 34 {
+            break;
+        }
+        let rec = &data[p..p + rec_len];
+        let flags = rec[25];
+        let name_len = rec[32] as usize;
+        let name_bytes = rec.get(33..33 + name_len).unwrap_or(&[]);
+        // Skip the `.` (self, name 0x00) and `..` (parent, 0x01) entries.
+        let is_special = name_len == 1 && matches!(name_bytes.first(), Some(0) | Some(1));
+        if !is_special {
+            let name = decode_name(name_bytes, joliet);
+            let child_prefix = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            if flags & DIR_FLAG != 0 {
+                walk_dir(bytes, rec, &child_prefix, joliet, depth + 1, out)?;
+            } else if out.len() < MAX_FILES {
+                let f_lba = read_u32(rec, 2)? as usize;
+                let f_len = read_u32(rec, 10)? as usize;
+                out.push(IsoFile {
+                    path: child_prefix,
+                    offset: f_lba.saturating_mul(SECTOR),
+                    size: f_len,
+                });
+            }
+        }
+        p += rec_len;
+    }
+    Ok(())
+}
+
+/// Decode a file-identifier: UTF-16BE for Joliet, ASCII otherwise; strip the `;1`
+/// version suffix ISO 9660 appends.
+fn decode_name(raw: &[u8], joliet: bool) -> String {
+    let s = if joliet {
+        let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(raw).into_owned()
+    };
+    s.rsplit_once(';').map(|(n, _)| n).unwrap_or(&s).to_string()
+}
+
+#[cfg(test)]
+#[path = "iso_tests.rs"]
+mod tests;

@@ -36,6 +36,7 @@ use std::convert::TryFrom;
 // --- module split (mechanical refactor) ---
 mod aux;
 mod consts;
+pub mod iso;
 mod load;
 pub mod macho;
 pub mod pe;
