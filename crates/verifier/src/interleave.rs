@@ -508,81 +508,132 @@ fn root_slot(class: &str) -> &str {
     class.strip_prefix("deref:").unwrap_or(class)
 }
 
-/// Whole-program **cross-entry use-after-free / double-free** search: a free of a global-rooted
-/// object in one entry (that does not clear the global root) and a later dereference (UAF) or free
-/// (double-free) of the same object in a *different* entry. `entries` should be the attacker-
-/// reachable entry functions' traces; the global-root restriction means only *persistent* shared
-/// state is considered, so a param-passed object (which cannot survive to an unrelated entry) never
-/// fires. A bug-finding heuristic — it does not model an intervening
-/// re-validation the two syscalls might both perform, so it reports candidates.
+/// The abstract lifetime of a global-rooted object in the cross-entry **sequence-closure** model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootLife {
+    /// Allocated / valid (the initial state, and after a reassign/re-open).
+    Live,
+    /// Freed but the global slot still points at it — a dangling handle carried between syscalls.
+    Dangling,
+}
+
+/// The effect of one event on a given `root` object: **free** (→Dangling), **clear** (a reassign of
+/// the root slot → Live, the intervening re-open/re-check), or **use** (a deref — an error while
+/// Dangling). `None` = the event does not touch this root. A refcount put is a free (a release may
+/// drop the last reference); a write *through* the object is a use, a write *to the slot* is a clear.
+fn root_effect(e: &Event, root: &str) -> Option<RootEff> {
+    let slot = root_slot(root);
+    match e {
+        Event::Free(x) | Event::RefPut(x) if x == root => Some(RootEff::Free),
+        // A write to the root SLOT (checked first) reassigns the global → clears the dangling.
+        Event::Write(x) | Event::Rmw(x) if x == slot => Some(RootEff::Clear),
+        // A write THROUGH the object (its own deref class) is a use.
+        Event::Write(x) | Event::Rmw(x) if x == root => Some(RootEff::Use),
+        Event::Read(x) | Event::DepRead(x) | Event::RefGet(x) if x == root => Some(RootEff::Use),
+        _ => None,
+    }
+}
+
+enum RootEff {
+    Free,
+    Clear,
+    Use,
+}
+
+/// Simulate one entry's ordered effect on `root` from `start`, returning the output state and
+/// whether — **in program order** — a use-after-free (use while Dangling) or a double-free (free
+/// while Dangling) occurs. Order-sensitivity is what lets an entry that re-checks/re-opens *before*
+/// using (`if (!x) x = open(); use(x)`) not be flagged, unlike the old order-insensitive fold.
+fn simulate_root(events: &[Event], root: &str, start: RootLife) -> (RootLife, bool, bool) {
+    let mut st = start;
+    let (mut uaf, mut double_free) = (false, false);
+    for e in events {
+        match root_effect(e, root) {
+            Some(RootEff::Free) => {
+                if st == RootLife::Dangling {
+                    double_free = true;
+                }
+                st = RootLife::Dangling;
+            }
+            Some(RootEff::Clear) => st = RootLife::Live,
+            Some(RootEff::Use) => {
+                if st == RootLife::Dangling {
+                    uaf = true;
+                }
+            }
+            None => {}
+        }
+    }
+    (st, uaf, double_free)
+}
+
+/// Whole-program **cross-entry use-after-free / double-free** search — a **sequence-closure** over
+/// entry compositions (not just pairs). Each global-rooted object is an abstract state machine
+/// (`Live`/`Dangling`); an entry's ordered effect frees (→Dangling), reassigns (→Live), or uses it.
+/// A fixpoint computes every state the object can be in when a syscall STARTS (over all attacker
+/// sequences); an entry that then uses (UAF) or re-frees (double-free) it while Dangling is a bug.
+/// This (a) catches multi-syscall chains where the dangling state is only reachable after several
+/// entries and the double-free-by-calling-the-same-syscall-twice case, and (b) removes the false
+/// positive where the using entry re-validates the handle before use (an intervening re-open). The
+/// global-root restriction keeps only persistent shared state (a param object cannot survive to an
+/// unrelated entry). Still a bug-finding candidate (no data-flow guard modelling).
 pub fn find_cross_entry_uaf(entries: &[Thread]) -> Vec<CrossEntryWitness> {
     use std::collections::BTreeSet;
-    struct EntryEff {
-        /// Global-rooted classes this entry frees.
-        frees: Vec<String>,
-        /// Global slots this entry writes (a reassign/clear of the root — removes the dangling).
-        writes_slot: BTreeSet<String>,
-        /// Global-rooted classes this entry dereferences (read/write through the root).
-        uses: BTreeSet<String>,
-    }
-    let eff: Vec<EntryEff> = entries
-        .iter()
-        .map(|t| {
-            let mut frees = Vec::new();
-            let mut writes_slot = BTreeSet::new();
-            let mut uses = BTreeSet::new();
-            for e in &t.events {
-                match e {
-                    Event::Free(x) if is_global_rooted(x) => frees.push(x.clone()),
-                    Event::Write(x) | Event::Rmw(x) if is_global_rooted(x) => {
-                        writes_slot.insert(x.clone());
-                        uses.insert(x.clone());
-                    }
-                    Event::Read(x) | Event::DepRead(x) if is_global_rooted(x) => {
-                        uses.insert(x.clone());
-                    }
-                    // A refcount put on a global object is a *release* — it may drop the last
-                    // reference and free it — so it composes across entries exactly like a free
-                    // (a later use or a second put in another entry is a UAF / double-put). An
-                    // unchecked get is a use of the object.
-                    Event::RefPut(x) if is_global_rooted(x) => frees.push(x.clone()),
-                    Event::RefGet(x) if is_global_rooted(x) => {
-                        uses.insert(x.clone());
-                    }
-                    _ => {}
+    // Every global-rooted object class freed/used anywhere is a candidate root.
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for t in entries {
+        for e in &t.events {
+            let cls = match e {
+                Event::Free(x) | Event::RefPut(x) | Event::Read(x) | Event::DepRead(x)
+                | Event::RefGet(x) | Event::Write(x) | Event::Rmw(x) => Some(x),
+                _ => None,
+            };
+            if let Some(c) = cls {
+                if is_global_rooted(c) {
+                    roots.insert(c.clone());
                 }
             }
-            EntryEff { frees, writes_slot, uses }
-        })
-        .collect();
+        }
+    }
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
-    for i in 0..entries.len() {
-        for j in 0..entries.len() {
-            if i == j {
+    for root in &roots {
+        // The entries that leave the object Dangling (free it without reassigning the slot). If none,
+        // the object is never freed → no cross-entry UAF/double-free.
+        let freers: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| simulate_root(&t.events, root, RootLife::Live).0 == RootLife::Dangling)
+            .map(|(i, _)| i)
+            .collect();
+        if freers.is_empty() {
+            continue;
+        }
+        for (j, t) in entries.iter().enumerate() {
+            // A cross-entry bug needs a *different* entry to have left the object dangling before
+            // `j` runs (the attacker invokes that syscall, then `j`). The same syscall twice is
+            // excluded — a re-invocation on the same freed handle is normally rejected by the fd/
+            // handle layer (`EBADF`), so it is not treated as a cross-entry double-free here.
+            let Some(&i) = freers.iter().find(|&&f| f != j) else {
                 continue;
+            };
+            // Simulate `j` starting Dangling: a use before it re-validates is a UAF; a second free
+            // is a double-free. The order-sensitivity means a `j` that re-opens the handle first
+            // (Clear → Live) is NOT flagged — the precision the pairwise fold lacked.
+            let (_, uaf, double_free) = simulate_root(&t.events, root, RootLife::Dangling);
+            if uaf && seen.insert((root.clone(), false)) {
+                out.push(CrossEntryWitness {
+                    location: root.clone(),
+                    entries: (entries[i].name.clone(), t.name.clone()),
+                    double_free: false,
+                });
             }
-            for fx in &eff[i].frees {
-                // The freeing entry reassigned/cleared the global root → not left dangling, skip.
-                if eff[i].writes_slot.contains(root_slot(fx)) {
-                    continue;
-                }
-                // A later dereference of the same object in a different entry → cross-entry UAF.
-                if eff[j].uses.contains(fx) && seen.insert((fx.clone(), false)) {
-                    out.push(CrossEntryWitness {
-                        location: fx.clone(),
-                        entries: (entries[i].name.clone(), entries[j].name.clone()),
-                        double_free: false,
-                    });
-                }
-                // A second free of the same object in a different entry → cross-entry double-free.
-                if i < j && eff[j].frees.contains(fx) && seen.insert((fx.clone(), true)) {
-                    out.push(CrossEntryWitness {
-                        location: fx.clone(),
-                        entries: (entries[i].name.clone(), entries[j].name.clone()),
-                        double_free: true,
-                    });
-                }
+            if double_free && seen.insert((root.clone(), true)) {
+                out.push(CrossEntryWitness {
+                    location: root.clone(),
+                    entries: (entries[i].name.clone(), t.name.clone()),
+                    double_free: true,
+                });
             }
         }
     }
@@ -1870,5 +1921,62 @@ mod tests {
         // The same worker, never spawned, is not self-checked (no evidence of concurrency).
         let lone = thread("worker", vec![Read("counter".into()), Rmw("counter".into())]);
         assert!(find_atomicity_violations(&[lone]).is_empty(), "an un-spawned function is not self-raced");
+    }
+
+    // Cross-entry sequence closure — the basic two-syscall chain: `close` frees a global-rooted
+    // object, a later `use` derefs it. Attacker calls close then use → cross-syscall UAF.
+    #[test]
+    fn cross_entry_sequence_free_then_use_is_a_uaf() {
+        let close = thread("sys_close", vec![Free("deref:g:obj@0".into())]);
+        let uses = thread("sys_read", vec![Read("deref:g:obj@0".into())]);
+        let v = find_cross_entry_uaf(&[close, uses]);
+        assert_eq!(v.len(), 1, "close-then-read is a cross-entry UAF: {v:?}");
+        assert!(!v[0].double_free && v[0].location == "deref:g:obj@0");
+    }
+
+    // PRECISION gain: the using entry RE-VALIDATES the handle before using it (`if (!x) x = open();
+    // use(x)` — modelled as a Clear/reassign of the slot then a Use). Even though another entry can
+    // leave the object Dangling, this entry is never dangerous → no false positive (the old
+    // order-insensitive pairwise fold reported it).
+    #[test]
+    fn cross_entry_reopen_before_use_is_not_a_uaf() {
+        let close = thread("sys_close", vec![Free("deref:g:obj@0".into())]);
+        // Re-open (write the slot `g:obj@0`) THEN use the object → safe.
+        let reopen_use = thread(
+            "sys_read",
+            vec![Write("g:obj@0".into()), Read("deref:g:obj@0".into())],
+        );
+        assert!(
+            find_cross_entry_uaf(&[close, reopen_use]).is_empty(),
+            "an entry that re-opens the handle before using it is not a UAF"
+        );
+    }
+
+    // Two DISTINCT entries both freeing the same global handle → cross-entry double-free. (The
+    // same syscall twice is NOT flagged — the handle layer rejects the re-invocation with EBADF.)
+    #[test]
+    fn cross_entry_two_entries_double_free() {
+        let close = thread("sys_close", vec![Free("deref:g:obj@0".into())]);
+        let ioctl_free = thread("sys_ioctl", vec![Free("deref:g:obj@0".into())]);
+        let v = find_cross_entry_uaf(&[close, ioctl_free]);
+        assert!(
+            v.iter().any(|w| w.double_free && w.location == "deref:g:obj@0"),
+            "two distinct entries freeing the same global handle is a double-free: {v:?}"
+        );
+        // A single freeing entry (only re-invocable as itself) is NOT a cross-entry double-free.
+        assert!(
+            find_cross_entry_uaf(&[thread("sys_close", vec![Free("deref:g:obj@0".into())])])
+                .iter()
+                .all(|w| !w.double_free),
+            "the same syscall twice is not treated as a cross-entry double-free (EBADF-guarded)"
+        );
+    }
+
+    // A parameter-local (non-global) object never fires — it cannot survive to another syscall.
+    #[test]
+    fn cross_entry_param_local_object_is_not_flagged() {
+        let close = thread("a", vec![Free("{sock}@0".into())]);
+        let uses = thread("b", vec![Read("{sock}@0".into())]);
+        assert!(find_cross_entry_uaf(&[close, uses]).is_empty(), "a param-local object is not persistent");
     }
 }
