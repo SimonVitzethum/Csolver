@@ -28,8 +28,15 @@
   zurück (bewusste pure-Rust-Entscheidung; externes Backend = Opt-in-Frage).
 - [ ] Bit-Blaster: `udiv`/`sdiv`/`urem`/`srem` und symbolische Shift-Amounts
   werden nicht gebitblastet (Fallback auf linear/UNKNOWN).
-- [ ] Textueller Intel-Syntax-x86- und AArch64-Assembler fehlen (nur AT&T bzw.
-  ELF-Objekt); Inline-Asm nur opak.
+- [x] ~~Textueller Intel-Syntax-x86- und AArch64-Assembler fehlen~~ → beide
+  ergänzt: `x86text` deckt jetzt **AT&T und Intel** x86-64 über ein uniformes
+  Operand-Modell (`TextOp`, AT&T-interne Reihenfolge) ab, `arm64_text` das
+  **textuelle AArch64** (mov/add/sub/and/orr/eor/shifts, ldr/str/ldp/stp,
+  cmp/b/b.cond/cbz/cbnz, adrp+`:lo12:`). Jeder Speicheroperand (inkl.
+  RIP-relativ / adrp-Symbol / skaliertem Index) wird zu `PtrOffset`+Load/Store
+  extrahiert und trägt die `in_bounds`-Obligation (per CLI-Rauchtest verifiziert:
+  OOB → FAIL). Arch+Syntax werden aus der Quelle auto-erkannt (`csolver_asm::detect`).
+  Inline-Asm bleibt opak (per Contract abgedeckt, siehe [[contract-externalization]]).
 
 ## Prozess / Infrastruktur
 

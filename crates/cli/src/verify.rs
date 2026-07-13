@@ -35,12 +35,9 @@ pub(crate) fn verify_path(
         SourceLevel::Asm => {
             use csolver_ir::Frontend;
             let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            csolver_asm::AsmFrontend.lower(csolver_asm::AsmInput {
-                source,
-                arch: csolver_asm::Architecture::X86_64,
-                // clang/gcc `-S` emit AT&T syntax by default on Linux.
-                syntax: csolver_asm::Syntax::Att,
-            })
+            // Auto-detect x86 (AT&T/Intel) vs. AArch64 and the syntax from the source.
+            let (arch, syntax) = csolver_asm::detect(&source);
+            csolver_asm::AsmFrontend.lower(csolver_asm::AsmInput { source, arch, syntax })
         }
         SourceLevel::Elf => {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
