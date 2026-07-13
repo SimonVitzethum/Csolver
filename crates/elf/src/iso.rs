@@ -8,9 +8,11 @@
 //! so this is the route to "check the binaries on a boot/install image".
 //!
 //! Joliet (UTF-16BE long names) is preferred when present; otherwise the plain ISO 9660
-//! names are used. Bounds-checked throughout — a malformed image yields [`Error`], never
-//! a panic (an ISO is untrusted input). Rock Ridge and El Torito boot catalogs are out of
-//! scope here; a nested `install.wim` is handled by [`crate::wim`].
+//! names are used, upgraded to the Rock Ridge (SUSP `NM`) POSIX long name when the record
+//! carries one. El Torito boot images (the BIOS/UEFI boot loader referenced by the boot-
+//! record volume descriptor) are enumerated too, so a boot image's PE is analysed. Bounds-
+//! checked throughout — a malformed image yields [`Error`], never a panic (an ISO is
+//! untrusted input). A nested `install.wim` is handled by [`crate::wim`].
 
 use super::*;
 use crate::reloc::read_u32;
@@ -67,7 +69,50 @@ pub fn list_files(bytes: &[u8]) -> Result<Vec<IsoFile>> {
     };
     let mut out = Vec::new();
     walk_dir(bytes, &root, "", joliet, 0, &mut out)?;
+    // El Torito boot images (a UEFI/BIOS boot image referenced by the boot-record volume
+    // descriptor, not the directory tree) — often a PE bootloader worth analysing.
+    out.extend(el_torito_boot_images(bytes));
     Ok(out)
+}
+
+/// The boot image(s) an El Torito boot-record volume descriptor points at. The BRVD sits
+/// at sector 17 with the `EL TORITO SPECIFICATION` identifier; its pointer (offset 71) is
+/// the boot catalog LBA. The catalog's initial/default entry (offset 32) gives the boot
+/// image's LBA (offset 8) and its declared sector count (offset 6). Returns an empty vec
+/// when absent or malformed (bounds-checked — an ISO is untrusted input).
+fn el_torito_boot_images(bytes: &[u8]) -> Vec<IsoFile> {
+    let mut out = Vec::new();
+    let brvd = 17 * SECTOR;
+    // type 0 + "CD001" + "EL TORITO SPECIFICATION" boot-system identifier.
+    if bytes.get(brvd) != Some(&0)
+        || bytes.get(brvd + 1..brvd + 6) != Some(b"CD001")
+        || bytes.get(brvd + 7..brvd + 30) != Some(b"EL TORITO SPECIFICATION")
+    {
+        return out;
+    }
+    let Ok(cat_lba) = read_u32(bytes, brvd + 71) else { return out };
+    let cat = (cat_lba as usize).saturating_mul(SECTOR);
+    // Validation entry (32 bytes) then the initial/default entry at +32.
+    let entry = cat + 32;
+    // Byte 0 == 0x88 marks a bootable entry.
+    if bytes.get(entry) != Some(&0x88) {
+        return out;
+    }
+    let Ok(sectors) = read_u16_le(bytes, entry + 6) else { return out };
+    let Ok(img_lba) = read_u32(bytes, entry + 8) else { return out };
+    let offset = (img_lba as usize).saturating_mul(SECTOR);
+    // The count is in 512-byte virtual sectors (the declared initial load size).
+    let size = (sectors as usize).saturating_mul(512);
+    if offset < bytes.len() && size > 0 {
+        out.push(IsoFile { path: "[EL TORITO] boot image".to_string(), offset, size });
+    }
+    out
+}
+
+/// Read a little-endian u16 at `off` (bounds-checked).
+fn read_u16_le(bytes: &[u8], off: usize) -> Result<u16> {
+    let b = bytes.get(off..off + 2).ok_or_else(|| Error::parse("ISO: truncated u16"))?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
 /// The 34-byte root directory record embedded at offset 156 of a volume descriptor.
@@ -117,7 +162,16 @@ fn walk_dir(
         // Skip the `.` (self, name 0x00) and `..` (parent, 0x01) entries.
         let is_special = name_len == 1 && matches!(name_bytes.first(), Some(0) | Some(1));
         if !is_special {
-            let name = decode_name(name_bytes, joliet);
+            // Rock Ridge (SUSP "NM" entries in the System Use area) carries the real POSIX
+            // long name on Linux ISOs — prefer it over the truncated ISO 9660 name. Not
+            // used for Joliet (which already has the full Unicode name).
+            let name = if joliet {
+                decode_name(name_bytes, joliet)
+            } else {
+                let sys_use_start = 33 + name_len + (1 - (name_len & 1));
+                let sys_use = rec.get(sys_use_start..).unwrap_or(&[]);
+                rock_ridge_name(sys_use).unwrap_or_else(|| decode_name(name_bytes, joliet))
+            };
             let child_prefix = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
             if flags & DIR_FLAG != 0 {
                 walk_dir(bytes, rec, &child_prefix, joliet, depth + 1, out)?;
@@ -134,6 +188,35 @@ fn walk_dir(
         p += rec_len;
     }
     Ok(())
+}
+
+/// Recover the Rock Ridge alternate name from a directory record's System Use area: the
+/// concatenation of the `NM` (SUSP) entries' bodies. Each SUSP entry is
+/// `[sig(2)][len(1)][ver(1)][data…]`; an `NM` body is `[flags(1)][chars…]`. The CONTINUE
+/// flag (bit 0) chains parts; the CURRENT (`.`) / PARENT (`..`) flags mark self/parent and
+/// yield no name. Returns `None` when no `NM` entry is present. Bounds-checked.
+fn rock_ridge_name(sys_use: &[u8]) -> Option<String> {
+    let mut name = String::new();
+    let mut found = false;
+    let mut p = 0usize;
+    while p + 4 <= sys_use.len() {
+        let len = sys_use[p + 2] as usize;
+        if len < 4 || p + len > sys_use.len() {
+            break;
+        }
+        if &sys_use[p..p + 2] == b"NM" && len >= 5 {
+            let flags = sys_use[p + 3];
+            if flags & 0b110 != 0 {
+                return None; // CURRENT (.) or PARENT (..) — not a real file name
+            }
+            if let Ok(s) = std::str::from_utf8(&sys_use[p + 5..p + len]) {
+                name.push_str(s);
+                found = true;
+            }
+        }
+        p += len;
+    }
+    (found && !name.is_empty()).then_some(name)
 }
 
 /// Decode a file-identifier: UTF-16BE for Joliet, ASCII otherwise; strip the `;1`

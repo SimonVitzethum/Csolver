@@ -91,3 +91,47 @@ fn rejects_non_iso() {
     assert!(iso::list_files(b"not an iso").is_err());
     assert!(iso::list_files(&[0u8; 100]).is_err());
 }
+
+#[test]
+fn rock_ridge_nm_name_overrides_the_short_name() {
+    // A System Use area with one NM entry carrying "linux-kernel.efi".
+    let long = b"linux-kernel.efi";
+    let mut su = vec![b'N', b'M', (5 + long.len()) as u8, 1, 0];
+    su.extend_from_slice(long);
+    assert_eq!(rock_ridge_name(&su).as_deref(), Some("linux-kernel.efi"));
+    // The CURRENT (.) flag (bit 1) yields no name.
+    let dot = vec![b'N', b'M', 5u8, 1, 0b010];
+    assert_eq!(rock_ridge_name(&dot), None);
+    // No NM entry at all → None.
+    assert_eq!(rock_ridge_name(&[b'P', b'X', 4, 1]), None);
+}
+
+#[test]
+fn el_torito_boot_image_is_enumerated() {
+    const SECTOR: usize = 2048;
+    let mut img = vec![0u8; 22 * SECTOR];
+    // Boot-record volume descriptor at sector 17.
+    let brvd = 17 * SECTOR;
+    img[brvd] = 0;
+    img[brvd + 1..brvd + 6].copy_from_slice(b"CD001");
+    img[brvd + 6] = 1;
+    img[brvd + 7..brvd + 30].copy_from_slice(b"EL TORITO SPECIFICATION");
+    img[brvd + 71..brvd + 75].copy_from_slice(&19u32.to_le_bytes()); // boot catalog @ sector 19
+    // Boot catalog at sector 19: validation entry then initial/default entry at +32.
+    let cat = 19 * SECTOR;
+    img[cat] = 0x01; // validation header
+    img[cat + 30] = 0x55;
+    img[cat + 31] = 0xaa;
+    let entry = cat + 32;
+    img[entry] = 0x88; // bootable
+    img[entry + 6..entry + 8].copy_from_slice(&4u16.to_le_bytes()); // 4 virtual sectors
+    img[entry + 8..entry + 12].copy_from_slice(&20u32.to_le_bytes()); // image @ sector 20
+    // Put a PE magic at the boot image so it would be recognised.
+    let bootimg = 20 * SECTOR;
+    img[bootimg..bootimg + 4].copy_from_slice(&[0x4d, 0x5a, 0x90, 0x00]);
+
+    let boots = el_torito_boot_images(&img);
+    assert_eq!(boots.len(), 1);
+    assert_eq!(boots[0].offset, 20 * SECTOR);
+    assert_eq!(boots[0].size, 4 * 512);
+}

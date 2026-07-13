@@ -24,10 +24,11 @@
 //! * **Mach-O** ([`mod@macho`]): the 64-bit header (or the x86-64/arm64 slice of a fat
 //!   binary), `LC_SEGMENT_64` sections and the `LC_SYMTAB` symbol table.
 //!
-//! Not covered (lower value for the kernel/systems focus): 32-bit / big-endian variants,
-//! PE base-relocation and Mach-O relocation application (so RIP-relative globals resolve
-//! only for ELF's per-symbol relocations), PDB / `.debug_line` / CFI, and compressed
-//! debug sections.
+//! ELF32 and big-endian ELF are parsed by a class/endian-generic reader (core fields only;
+//! DWARF/hash/version auxiliaries stay on the ELF64-LE fast path). Not covered (lower value
+//! for the kernel/systems focus): PE base-relocation and Mach-O relocation application (so
+//! RIP-relative globals resolve only for ELF's per-symbol relocations), PDB / CFI, and
+//! compressed debug sections. A `.debug_line` reader is in [`mod@dwarf_line`].
 
 use csolver_core::{Error, RegionKind, Result};
 use std::convert::TryFrom;
@@ -38,6 +39,7 @@ mod aux;
 mod consts;
 pub mod iso;
 mod load;
+mod load_generic;
 pub mod wim;
 pub mod macho;
 pub mod pe;

@@ -249,9 +249,6 @@ fn parses_sections_symbols_and_code() {
 fn rejects_non_elf_and_truncation() {
     assert!(load(b"not an elf at all").is_err());
     assert!(load(b"\x7fELF").is_err()); // magic only, truncated
-    let mut bad = sample_elf();
-    bad[4] = 1; // ELF32
-    assert!(load(&bad).is_err());
 }
 
 #[test]
@@ -273,17 +270,17 @@ fn rejects_header_shorter_than_64() {
 }
 
 #[test]
-fn rejects_big_endian() {
-    let mut elf = sample_elf();
-    elf[5] = 2; // big-endian
-    assert!(load(&elf).is_err());
-}
-
-#[test]
-fn rejects_elf32() {
-    let mut elf = sample_elf();
-    elf[4] = 1; // ELF32
-    assert!(load(&elf).is_err());
+fn elf32_and_big_endian_are_routed_to_the_generic_reader_without_panic() {
+    // ELF32 / big-endian are no longer rejected — they dispatch to the class/endian-generic
+    // reader (positively tested in load_generic_tests). Flipping only the class/data byte of
+    // an ELF64-LE image yields a malformed image; the contract here is merely that parsing is
+    // bounds-safe (returns a value, never panics) on such adversarial input.
+    let mut e32 = sample_elf();
+    e32[4] = 1; // ELFCLASS32
+    let _ = load(&e32);
+    let mut ebe = sample_elf();
+    ebe[5] = 2; // big-endian
+    let _ = load(&ebe);
 }
 
 #[test]

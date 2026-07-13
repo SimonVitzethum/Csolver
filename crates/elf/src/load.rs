@@ -13,11 +13,11 @@ pub fn load(bytes: &[u8]) -> Result<Image> {
     if &bytes[0..4] != b"\x7fELF" {
         return Err(Error::parse("ELF: bad magic"));
     }
-    if bytes[4] != 2 {
-        return Err(Error::unsupported("ELF: only ELF64 is supported"));
-    }
-    if bytes[5] != 1 {
-        return Err(Error::unsupported("ELF: only little-endian is supported"));
+    // ELF32 (ei_class = 1) and big-endian (ei_data = 2) images are parsed by the
+    // class/endian-generic reader; this fast path handles the mainstream ELF64-LE case
+    // (and also parses the DWARF / hash / version auxiliaries).
+    if bytes[4] != 2 || bytes[5] != 1 {
+        return crate::load_generic::load_generic(bytes);
     }
 
     let machine = read_u16(bytes, 18)?;
