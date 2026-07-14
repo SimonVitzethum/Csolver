@@ -173,7 +173,24 @@ fn read_head(path: &Path, n: usize) -> Result<Vec<u8>, String> {
 /// worst verdict over all analysed files.
 fn verify_iso(path: &Path, json: bool, bug_finding: bool, assume_valid_params: bool) -> Result<ExitCode, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let files = csolver_elf::iso::list_files(&bytes).map_err(|e| e.to_string())?;
+    // An ISO may be a plain ISO 9660, a UDF volume, or a **hybrid** (every Windows install ISO:
+    // the ISO 9660 side is a stub, the real files live in UDF). Gather from both readers and
+    // deduplicate by byte offset, so a boot `.efi`/`.exe` is found wherever it is stored.
+    let mut files = csolver_elf::iso::list_files(&bytes).unwrap_or_default();
+    if csolver_elf::udf::is_udf(&bytes) {
+        if let Ok(udf_files) = csolver_elf::udf::list_files(&bytes) {
+            files.extend(udf_files.into_iter().map(|u| csolver_elf::iso::IsoFile {
+                path: u.path,
+                offset: u.offset,
+                size: u.size,
+            }));
+        }
+    }
+    files.sort_by_key(|f| f.offset);
+    files.dedup_by_key(|f| f.offset);
+    if files.is_empty() {
+        return Err("no ISO 9660 or UDF files found in the image".to_string());
+    }
     let (mut any_fail, mut any_unknown, mut analyzed) = (false, false, 0usize);
     let mut lines: Vec<String> = Vec::new();
     for f in &files {

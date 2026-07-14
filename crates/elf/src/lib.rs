@@ -40,6 +40,7 @@ mod consts;
 pub mod iso;
 mod load;
 mod load_generic;
+pub mod udf;
 pub mod wim;
 pub mod macho;
 pub mod pe;
