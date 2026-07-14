@@ -260,6 +260,55 @@ fn retag(dst_borrow: RegId, parent: RegId) -> Inst {
     }
 }
 
+/// A shared retag marker: `dst_borrow = &(*parent)` (a `&T` reborrow).
+fn retag_shared(dst_borrow: RegId, parent: RegId) -> Inst {
+    Inst::Intrinsic {
+        dst: None,
+        name: "csolver.retag.shared".into(),
+        args: vec![Operand::Reg(dst_borrow), Operand::Reg(parent)],
+    }
+}
+
+#[test]
+fn read_through_shared_ref_after_mut_write_invalidated_it_is_flagged() {
+    // r1 = &mut *r0; s = &*r1; *r1 = 6; read *s  — the write through r1 invalidates the
+    // shared borrow s (Stacked Borrows); reading s afterwards is UB.
+    let (r0, r1, s, v) = (RegId(0), RegId(1), RegId(2), RegId(3));
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc { dst: r0, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 8 });
+    bb0.insts.push(Inst::Assign { dst: r1, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb0.insts.push(retag(r1, r0));
+    bb0.insts.push(Inst::Assign { dst: s, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r1)) });
+    bb0.insts.push(retag_shared(s, r1));
+    bb0.insts.push(Inst::Store { ty: Type::int(64), ptr: Operand::Reg(r1), value: Operand::int(64, 6), align: 8, volatile: false });
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(64), ptr: Operand::Reg(s), align: 8, volatile: false });
+    let f = Function { id: FuncId(0), name: "shared_uaf".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) };
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    let load = (BlockId(0), 6usize);
+    let d = on.mem_decision(load.0, load.1, SafetyProperty::NoAliasingViolation).expect("aliasing obligation");
+    assert!(!d.proven && d.refutation.is_some(), "reading a shared borrow after a &mut write invalidated it is UB");
+}
+
+#[test]
+fn multiple_shared_borrows_are_not_flagged() {
+    // s1 = &*r0; s2 = &*r0; read s1; read s2  — many shared borrows coexist (no violation).
+    let (r0, s1, s2, v1, v2) = (RegId(0), RegId(1), RegId(2), RegId(3), RegId(4));
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc { dst: r0, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 8 });
+    bb0.insts.push(Inst::Assign { dst: s1, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb0.insts.push(retag_shared(s1, r0));
+    bb0.insts.push(Inst::Assign { dst: s2, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb0.insts.push(retag_shared(s2, r0));
+    bb0.insts.push(Inst::Load { dst: v1, ty: Type::int(64), ptr: Operand::Reg(s1), align: 8, volatile: false });
+    bb0.insts.push(Inst::Load { dst: v2, ty: Type::int(64), ptr: Operand::Reg(s2), align: 8, volatile: false });
+    let f = Function { id: FuncId(0), name: "multi_shared".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) };
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    for idx in [5usize, 6] {
+        let d = on.mem_decision(BlockId(0), idx, SafetyProperty::NoAliasingViolation);
+        assert!(d.is_none() || d.is_some_and(|d| d.proven), "coexisting shared borrows must not be flagged (idx {idx})");
+    }
+}
+
 /// Build: `r0 = alloc`; two independent `&mut` reborrows of it (`r1`, `r2`); then a store
 /// through the chosen one. If `use_first` the store is through `r1` — which the creation of
 /// `r2` invalidated (two live `&mut` to the same place) → a use-after-invalidation. If not,

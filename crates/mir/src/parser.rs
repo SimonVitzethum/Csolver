@@ -95,8 +95,8 @@ pub(crate) enum Rvalue {
     /// Field `.0` is the arithmetic result, `.1` the overflow flag.
     CheckedBin(BinKind, Operand, Operand),
     Len(Place),
-    /// `&PLACE` / `&mut PLACE`; the bool is `true` for `&mut` (a mutable borrow).
-    Ref(Place, bool),
+    /// `&PLACE` / `&mut PLACE` / `&raw …` — with the borrow kind (for the aliasing model).
+    Ref(Place, RefKind),
     Cast(Operand),
     /// `discriminant(PLACE)` — reads an enum's tag. The value is opaque (so a
     /// `switchInt` on it soundly explores every arm); lowering still checks the
@@ -104,6 +104,18 @@ pub(crate) enum Rvalue {
     Discriminant(Place),
     /// An rvalue outside the modelled subset.
     Other,
+}
+
+/// The kind of a `&`-borrow, for the opt-in aliasing (borrow-stack) model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefKind {
+    /// A mutable borrow (`&mut PLACE` / `&raw mut PLACE`) — a unique reborrow.
+    Mut,
+    /// A shared borrow (`&PLACE` / `&raw const PLACE`).
+    Shared,
+    /// A borrow that is NOT a plain unique/shared reborrow (`fake`/`shallow`/`two_phase`),
+    /// so it emits no retag marker (the aliasing model would otherwise risk a false FAIL).
+    Opaque,
 }
 
 /// Who an assignment-form call invokes.

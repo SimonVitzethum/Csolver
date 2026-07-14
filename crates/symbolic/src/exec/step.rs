@@ -407,12 +407,14 @@ impl Explorer<'_> {
                     }
                 }
             }
-            // A `&mut` reborrow marker (opt-in aliasing model). `args = [new-borrow reg, parent
-            // pointer]`. Push the new borrow tag onto the parent pointer's region borrow stack,
-            // popping the parent's other descendants (which the reborrow invalidates). A no-op
-            // unless the model is on. See `step_retag`.
+            // A reborrow marker (opt-in aliasing model): `csolver.retag.mut` (a `&mut`) or
+            // `csolver.retag.shared` (a `&T`). `args = [new-borrow reg, parent pointer]`. Push
+            // the new borrow tag onto the parent pointer's region borrow stack — a `&mut` pops
+            // the parent's other descendants (which the reborrow invalidates); a `&T` coexists.
+            // A no-op unless the model is on. See `step_retag`.
             Inst::Intrinsic { name, args, .. }
-                if self.limits.aliasing_model && name == "csolver.retag.mut" =>
+                if self.limits.aliasing_model
+                    && (name == "csolver.retag.mut" || name == "csolver.retag.shared") =>
             {
                 self.step_retag(args, state);
             }

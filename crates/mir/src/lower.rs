@@ -8,7 +8,7 @@
 //! Anything outside the modelled subset (a `call`, an unmodelled rvalue/place)
 //! is surfaced — the function is recorded unanalyzed rather than mis-lowered.
 
-use crate::parser::{BinKind, MBlock, MConst, MStmt, MTerm, MType, MirBody, Operand, Place, Rvalue};
+use crate::parser::{BinKind, MBlock, MConst, MStmt, MTerm, MType, MirBody, Operand, Place, RefKind, Rvalue};
 use csolver_core::{Error, Result};
 use crate::parser::CalleeSpec;
 use csolver_ir::{

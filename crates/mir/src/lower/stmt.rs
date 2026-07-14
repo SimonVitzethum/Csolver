@@ -160,7 +160,7 @@ impl Ctx {
                 out.push(assign(dst, RValue::Use(value)));
                 Ok(())
             }
-            Rvalue::Ref(place, mutable) => {
+            Rvalue::Ref(place, kind) => {
                 // `&(*_p)[i]` is the element address; `&(*_p)` is the pointer
                 // itself; other refs (a stack local's address) are opaque.
                 match place {
@@ -190,16 +190,22 @@ impl Ctx {
                     }
                     _ => out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef)))),
                 }
-                // A `&mut *_p` reborrow through a pointer local emits a **retag** marker
-                // AFTER the value is set: `dst` is a new mutable borrow derived from `_p`, so
-                // the opt-in borrow-stack can invalidate a sibling `&mut` of the same location.
-                // A no-op unless `--aliasing-model` is on (the executor ignores it otherwise).
-                if *mutable {
+                // A `&mut *_p` / `&(*_p)` reborrow through a pointer local emits a **retag**
+                // marker AFTER the value is set: `dst` is a new borrow derived from `_p`, so the
+                // opt-in borrow-stack can invalidate a sibling `&mut` (a mutable reborrow) or
+                // detect a read through a shared borrow a later `&mut` write invalidated. A no-op
+                // unless `--aliasing-model` is on (the executor ignores the marker otherwise).
+                let retag_name = match kind {
+                    RefKind::Mut => Some("csolver.retag.mut"),
+                    RefKind::Shared => Some("csolver.retag.shared"),
+                    RefKind::Opaque => None,
+                };
+                if let Some(name) = retag_name {
                     if let Place::Deref(inner) = place {
                         if let Place::Local(p) = inner.as_ref() {
                             out.push(Inst::Intrinsic {
                                 dst: None,
-                                name: "csolver.retag.mut".into(),
+                                name: name.into(),
                                 args: vec![IrOp::Reg(dst), IrOp::Reg(RegId(*p))],
                             });
                         }

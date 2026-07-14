@@ -528,14 +528,29 @@ fn g(_1: *const i32) -> i32 {
 }
 "#;
 
+/// `&raw mut (*_p)` is a unique reborrow — emits a `csolver.retag.mut` marker like `&mut`.
+pub(crate) const REBORROW_RAW_MUT: &str = r#"
+fn h(_1: *mut i32) -> () {
+    let mut _2: *mut i32;
+    bb0: {
+        _2 = &raw mut (*_1);
+        (*_2) = const 7_i32;
+        return;
+    }
+}
+"#;
+
 #[test]
-fn mut_reborrow_emits_a_retag_marker_shared_does_not() {
+fn reborrows_emit_the_right_retag_marker() {
     use csolver_ir::Inst;
-    let has_retag = |src, name| {
+    let retag_name = |src, name| -> Option<String> {
         let m = lower(src, name);
-        m.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| &b.insts)
-            .any(|i| matches!(i, Inst::Intrinsic { name, .. } if name == "csolver.retag.mut"))
+        m.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| &b.insts).find_map(|i| match i {
+            Inst::Intrinsic { name, .. } if name.starts_with("csolver.retag.") => Some(name.clone()),
+            _ => None,
+        })
     };
-    assert!(has_retag(REBORROW_MUT, "f"), "&mut *_p emits a retag marker");
-    assert!(!has_retag(REBORROW_SHARED, "g"), "shared &(*_p) emits no retag marker");
+    assert_eq!(retag_name(REBORROW_MUT, "f").as_deref(), Some("csolver.retag.mut"), "&mut *_p → retag.mut");
+    assert_eq!(retag_name(REBORROW_SHARED, "g").as_deref(), Some("csolver.retag.shared"), "&(*_p) → retag.shared");
+    assert_eq!(retag_name(REBORROW_RAW_MUT, "h").as_deref(), Some("csolver.retag.mut"), "&raw mut *_p → retag.mut");
 }

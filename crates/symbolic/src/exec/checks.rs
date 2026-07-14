@@ -355,17 +355,29 @@ impl Explorer<'_> {
             return; // already poisoned
         }
         let parent_tag = self.borrow_info.parent.get(&new_tag).copied().flatten();
+        let unique = self.borrow_info.unique.get(&new_tag).copied().unwrap_or(true);
         let mut stack = state.region_borrows.get(&rid).cloned().flatten().unwrap_or_default();
-        let new_val = match parent_tag {
-            None => Some(vec![new_tag]), // root reborrow — invalidates all prior borrows
-            Some(pt) => match stack.iter().position(|&t| t == pt) {
-                Some(pos) => {
-                    stack.truncate(pos + 1);
-                    stack.push(new_tag);
-                    Some(stack)
-                }
-                None => None, // parent no longer live → poison (sound)
-            },
+        let new_val = if !unique {
+            // A **shared** (`&T`) reborrow: add the tag without popping siblings — shared borrows
+            // coexist (an under-approximation of Stacked Borrows' read effect: only ever *adds* a
+            // live tag, so it can never turn a valid access into a false FAIL). A later `&mut`
+            // write through a lower tag still pops it (see the write case in `check_borrow_access`).
+            if !stack.contains(&new_tag) {
+                stack.push(new_tag);
+            }
+            Some(stack)
+        } else {
+            match parent_tag {
+                None => Some(vec![new_tag]), // root **mutable** reborrow — invalidates all prior borrows
+                Some(pt) => match stack.iter().position(|&t| t == pt) {
+                    Some(pos) => {
+                        stack.truncate(pos + 1);
+                        stack.push(new_tag);
+                        Some(stack)
+                    }
+                    None => None, // parent no longer live → poison (sound)
+                },
+            }
         };
         state.region_borrows.insert(rid, new_val);
     }

@@ -179,21 +179,29 @@ pub(crate) struct BorrowInfo {
     pub(crate) of: HashMap<RegId, RegId>,
     /// Borrow tag → its parent borrow (`None` = a root reborrow of an untracked pointer).
     pub(crate) parent: HashMap<RegId, Option<RegId>>,
+    /// Borrow tag → whether it is a **unique** (`&mut`) borrow (`false` = a shared `&T`).
+    pub(crate) unique: HashMap<RegId, bool>,
 }
 
-/// Compute [`BorrowInfo`] for `f`: seed each `csolver.retag.mut` dst as a sealed borrow tag,
-/// propagate the borrow through copies/casts/`PtrOffset`/`FieldPtr` to a fixpoint, then resolve
-/// each retag's parent to the parent pointer's borrow tag.
+/// Compute [`BorrowInfo`] for `f`: seed each `csolver.retag.{mut,shared}` dst as a sealed
+/// borrow tag, propagate the borrow through copies/casts/`PtrOffset`/`FieldPtr` to a fixpoint,
+/// then resolve each retag's parent to the parent pointer's borrow tag.
 pub(crate) fn borrow_info(f: &Function) -> BorrowInfo {
-    // Sealed borrow tags (a retag dst never inherits another borrow) + each retag's parent reg.
+    // Sealed borrow tags (a retag dst never inherits another borrow) + each retag's parent reg
+    // and uniqueness.
     let mut retag_parent_reg: HashMap<RegId, RegId> = HashMap::new();
+    let mut unique: HashMap<RegId, bool> = HashMap::new();
     for b in &f.blocks {
         for inst in &b.insts {
             if let Inst::Intrinsic { name, args, .. } = inst {
-                if name == "csolver.retag.mut" {
-                    if let (Some(d), Some(p)) = (args.first().and_then(|o| o.as_reg()), args.get(1).and_then(|o| o.as_reg())) {
-                        retag_parent_reg.insert(d, p);
-                    }
+                let is_unique = match name.as_str() {
+                    "csolver.retag.mut" => true,
+                    "csolver.retag.shared" => false,
+                    _ => continue,
+                };
+                if let (Some(d), Some(p)) = (args.first().and_then(|o| o.as_reg()), args.get(1).and_then(|o| o.as_reg())) {
+                    retag_parent_reg.insert(d, p);
+                    unique.insert(d, is_unique);
                 }
             }
         }
@@ -229,7 +237,7 @@ pub(crate) fn borrow_info(f: &Function) -> BorrowInfo {
     for (&d, &p) in &retag_parent_reg {
         parent.insert(d, of.get(&p).copied());
     }
-    BorrowInfo { of, parent }
+    BorrowInfo { of, parent, unique }
 }
 
 /// The pointer registers derived from a genuine **shared borrow** (`&T`) — a

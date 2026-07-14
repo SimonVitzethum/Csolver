@@ -115,24 +115,29 @@ impl Parser {
     pub(crate) fn rvalue(&mut self) -> Result<Rvalue> {
         // `&PLACE` / `&mut PLACE` / `&raw const PLACE` / `&raw const (fake) PLACE`.
         if self.eat_punct('&') {
-            let mut mutable = self.eat_word("mut"); // `&mut PLACE`
+            let mut kind = if self.eat_word("mut") { RefKind::Mut } else { RefKind::Shared };
             if self.eat_word("raw") {
-                // `&raw mut PLACE` is mutable; `&raw const PLACE` is not.
-                if self.eat_word("mut") {
-                    mutable = true;
+                // `&raw mut PLACE` is a unique borrow; `&raw const PLACE` a shared one.
+                kind = if self.eat_word("mut") {
+                    RefKind::Mut
                 } else {
                     let _ = self.eat_word("const");
-                }
+                    RefKind::Shared
+                };
             }
-            // Skip a parenthesised borrow-kind annotation `(fake)` / `(shallow)`
-            // — distinguished from the place `(*_p)` by its leading keyword.
+            // A parenthesised borrow-kind annotation `(fake)` / `(shallow)` / `(two_phase)`:
+            // a `fake`/`shallow` borrow is not a real reborrow, and a `two_phase` borrow's
+            // reservation phase legitimately coexists with the parent, so none is treated as a
+            // plain retag (the aliasing model would otherwise risk a false FAIL) — `Opaque`, no
+            // marker emitted. Distinguished from the place `(*_p)` by its leading keyword.
             if self.peek() == &Tok::Punct('(')
                 && matches!(self.peek2(), Tok::Word(w) if matches!(w.as_str(), "fake" | "shallow" | "shared" | "two_phase"))
             {
+                kind = RefKind::Opaque;
                 self.pos += 1;
                 self.skip_balanced_paren();
             }
-            return Ok(Rvalue::Ref(self.place()?, mutable));
+            return Ok(Rvalue::Ref(self.place()?, kind));
         }
         if let Tok::Word(w) = self.peek().clone() {
             // `Len(PLACE)`.
