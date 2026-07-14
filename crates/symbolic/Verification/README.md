@@ -151,15 +151,19 @@ both refuted only on a feasible path (no false FAIL), off by default:
 (1) **write through a shared `&T`** — a static pre-pass (`shared_borrow_regs`) marks every
 pointer register derived (copy/cast/`PtrOffset`/`FieldPtr`) from a `RefWitness{writable:false}`;
 a `Store` through one is flagged.
-(2) **use-after-invalidation of a `&mut`** — the MIR frontend emits a `csolver.retag.mut` marker
-for a `&mut *_p` reborrow; a static `borrow_info` pre-pass assigns each reborrow a **tag**
-(register-as-tag) with a **derivation tree** (`parent`), and the dynamic `PathState.region_borrows`
-holds each region's live borrow-tag stack. A reborrow pushes its tag, popping the parent's other
-descendants (siblings are invalidated); a root reborrow invalidates all prior borrows; a write pops
-the tags above it; an access through a tag no longer on the stack is the violation. A merge keeps a
-region's stack only if all incoming paths agree, else poisons it (checks skipped — sound).
-The remaining borrow-stack (two-phase/`&raw` retags, protectors, shared-read tags, `SymPointer`-carried
-tags) is future work — see `Todo.md`.
+(2) **use-after-invalidation of a `&mut`** (and read through an invalidated `&T`) — the MIR
+frontend emits a `csolver.retag.{mut,shared}` marker for a `&mut *_p` / `&(*_p)` reborrow, and
+prepends a protector marker for each `&mut` reference **parameter**. Each borrow carries a **tag**
+on its pointer value (`SymPointer::borrow`, excluded from `PartialEq` so no verdict changes), which
+flows through copies, `gep`, **memory** (store→load) and **phi** (merge keeps it iff both sides agree).
+`PathState.region_borrows` holds each region's live borrow-tag stack: a `&mut` reborrow pushes its
+tag popping the parent's other descendants (siblings invalidated), a root reborrow invalidates all
+prior borrows, a shared reborrow coexists (added without popping), a write pops the tags above it;
+an access through a tag no longer on the stack is the violation. A merge keeps a region's stack only
+if all incoming paths agree, else poisons it (checks skipped — sound). Both classes are **record-only**:
+`discharge` queries the decision per Load/Store under the flag and raises a FAIL only on a found
+violation. Remaining (precision, not soundness): exact two-phase/`UnsafeCell`, interprocedural
+protectors — see `Todo.md`.
 
 ## Interprocedural summaries (increment 5)
 Each function gets a [`Summary`] (`summary.rs`): its **effects** (`writes` /

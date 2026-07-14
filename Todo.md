@@ -21,16 +21,26 @@ Weitere abgeschlossene Teile (1fb77cf):
   seinen Tag hinzu ohne Geschwister zu poppen (Under-Approx der SB-Lese-Effekte → nie False-FAIL);
   ein `&mut`-Write darunter poppt ihn → Read durch invalidierten Shared-Borrow = Verletzung.
 
-Für ein **vollständiges** Stacked/Tree-Borrows fehlt noch (beides **KEIN** Soundness-Loch —
-das Modell ist ohne sie sound, sie fügen nur Detection/Präzision hinzu):
-- [ ] **Protectors** für Funktionsargumente (ein übergebenes `&mut` bleibt für die Call-Dauer
-  eindeutig, Aliasing während des Calls ist UB). Genuin **interprozedural**: wir analysieren
-  Funktionen einzeln, ein Call ist opak; `region_borrows` bleibt über Calls stale, aber sound
-  (SSA-Tags bleiben gültig, eine ungesehene fremde Invalidierung = verpasster Bug, kein False-FAIL).
-- [ ] **Tag am `SymPointer`** für Borrows, die der Register-Tag-Vorabpass nicht sieht (durch
-  Speicher gespeichert+geladen, oder durch Phi/Block-Parameter geführt — Letztere werden aktuell
-  beim Merge konservativ *poisont*). Rein Präzision; invasiv (31 Konstruktionsstellen, aus
-  `PartialEq` auszuschließen wie `POrigin`), daher als eigener großer Schritt.
+Weitere abgeschlossene Teile (9231b06):
+- [x] **Tag am `SymPointer`** (dynamisch): `SymPointer.borrow: Option<RegId>`, aus `PartialEq`
+  ausgeschlossen wie `POrigin` (kein Verdikt/Merge gestört). Fließt mit dem Zeigerwert — durch
+  Kopien, `gep`, **Speicher (store→load trägt den `SymValue`)** und **Phi** (Block-Param-Eval +
+  Merge, Tag bleibt wenn beide Seiten gleich). Ersetzt den statischen Register-Vorabpass. Getestet:
+  Borrow überlebt store→load-Round-Trip.
+- [x] **Protectors**: ein `&mut`-**Referenz**-Parameter (nicht raw `*mut`) ist ein geschützter
+  Root-Borrow — der MIR-Frontend prependet ein `csolver.retag.mut(param,param)` ans Entry;
+  der Param nimmt am Borrow-Stack teil. End-to-end via Frontend getestet.
+- [x] **Surfacing-Lücke gefixt**: `NoAliasingViolation` ist record-only (nur bei Verletzung),
+  wurde nie aus `implied_checks` enumeriert → erreichte nie ein `verify_module`/CLI-Verdikt.
+  discharge.rs fragt es jetzt pro Load/Store unter `--aliasing-model` explizit ab. **Das macht
+  das gesamte Aliasing-Modell end-to-end über die CLI wirksam.**
+
+Restliche Präzision (KEIN Soundness-Loch, rein Detection):
+- [ ] **Two-Phase-Borrows exakt** (aktuell konservativ unterdrückt) + `UnsafeCell`/Interior
+  Mutability exakt statt heuristisch.
+- [ ] **Interprozedurale Protektoren** (ein an einen opaken Call übergebenes `&mut`): wir
+  analysieren Funktionen einzeln; `region_borrows` bleibt über Calls stale, aber sound (eine
+  ungesehene fremde Invalidierung = verpasster Bug, kein False-FAIL).
 
 ## Sound-Coverage-Lücken — Status & warum offen (2026-07-14 geprüft)
 
