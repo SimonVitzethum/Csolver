@@ -21,6 +21,39 @@ fehlt (jeweils Frontend- **und** Executor-Arbeit, nicht ohne Design entscheidbar
 - [ ] Der Tag müsste am `SymPointer` hängen (fließt durch `gep`/Kopie), aus `PartialEq`
   ausgeschlossen wie `POrigin` — 31 Konstruktionsstellen, daher als eigener Schritt.
 
+## Sound-Coverage-Lücken — Status & warum offen (2026-07-14 geprüft)
+
+- [x] **Signed-mul-Overflow** — bereits abgedeckt (`arith_no_overflow` baut das
+  nsw-Ziel via `ctx.sext` als Doppelbreiten-Produkt; getestet `mul nsw`→FAIL in
+  `llvm_frontend/part_g.rs`). Audit/Kommentar waren veraltet, korrigiert.
+- [ ] **Use-after-scope innerhalb einer Funktion.** Blockiert: MIR modelliert
+  `&_local` gar nicht als Region (fällt auf `Const::Undef`, opak = sound). Es gibt
+  **keine Stack-Region**, die ein `StorageDead(_n)` als tot markieren könnte
+  (aktuell als Nop übersprungen). Voraussetzung = Stack-Locals als Regionen
+  modellieren (Kern-Modelländerung, FP-Risiko: bisher opake `&local` würden neue
+  Obligations tragen). Der LLVM-Pfad (`llvm.lifetime.end`) **ist** erledigt
+  (eef91eb); der dangling-**return** von `&local` ebenfalls (ec8914a).
+- [ ] **StackIntegrity / ValidStackFrame** — außerhalb des MSIR-Modells: gerettete
+  Register / Rücksprungadresse / Canaries existieren im IR nicht (Prologe werden
+  bei ELF-Dekodierung als Frame-Setup abstrahiert). Brauchte ein Byte-genaues
+  Stack-Frame-Modell im Binär-Pfad. Kein kleiner sound Slice.
+- [ ] **Type-Confusion / Strict-Aliasing / Union-Punning** — partiell abgedeckt
+  (Provenance-Labels + objtype-Contracts, 3a992a1). Volles TBAA/Strict-Aliasing ist
+  FP-anfällig (legitime `repr`-Reinterpretation vs. UB nur mit Typ-Lattice sound
+  trennbar); bewusst nicht halb gebaut (soundness-first).
+
+## WIM: LZX/LZMS-Dekompression (`crates/elf/src/wim.rs`)
+
+- [ ] **LZX** (Default-Kompression realer `install.wim`). Aktuell sauberer
+  `Error::unsupported` (sound). NICHT blind implementieren: ein inhaltlich falsch
+  dekomprimierter Chunk **gleicher Länge** überlebt den Size-Guard → analysierte
+  Garbage-Bytes könnten einen **False-PASS** eines nicht existierenden Binaries
+  erzeugen (Kardinalsünde). Voraussetzung = ein **verifiziertes Testkorpus**
+  (wimlib-/DISM-erzeugte LZX-WIM-Fixture) für Round-Trip-Tests. Format: LZX =
+  LZ77 + Huffman (Main-/Length-/Aligned-Tree, 20-Elem-Pretrees, Delta-kodierte
+  Baumlängen über Blockgrenzen, R0/R1/R2-Repeat-Offsets, E8-Call-Translation,
+  Block-Typen verbatim/aligned/uncompressed), 16-bit-LE-Bitstrom. LZMS analog.
+
 ## Struktur / Wartbarkeit
 
 - [ ] **`crates/symbolic/src/exec.rs` (8314 Zeilen) aufteilen.** Monolith trägt
