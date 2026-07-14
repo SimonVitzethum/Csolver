@@ -125,17 +125,26 @@ impl Parser {
                     RefKind::Shared
                 };
             }
-            // A parenthesised borrow-kind annotation `(fake)` / `(shallow)` / `(two_phase)`:
-            // a `fake`/`shallow` borrow is not a real reborrow, and a `two_phase` borrow's
-            // reservation phase legitimately coexists with the parent, so none is treated as a
-            // plain retag (the aliasing model would otherwise risk a false FAIL) — `Opaque`, no
-            // marker emitted. Distinguished from the place `(*_p)` by its leading keyword.
-            if self.peek() == &Tok::Punct('(')
-                && matches!(self.peek2(), Tok::Word(w) if matches!(w.as_str(), "fake" | "shallow" | "shared" | "two_phase"))
-            {
-                kind = RefKind::Opaque;
-                self.pos += 1;
-                self.skip_balanced_paren();
+            // A parenthesised borrow-kind annotation, distinguished from the place `(*_p)` by
+            // its leading keyword. A `two_phase` `&mut` is modelled as a **shared** reborrow: its
+            // reservation phase legitimately coexists with the parent (a shared tag never pops a
+            // sibling — sound, no false FAIL — while a real aliasing `&mut` write through a lower
+            // tag still invalidates it, so it is not merely dropped). A `fake`/`shallow` borrow is
+            // not a real reborrow at all → `Opaque` (no marker).
+            if self.peek() == &Tok::Punct('(') {
+                match self.peek2() {
+                    Tok::Word(w) if w == "two_phase" => {
+                        kind = RefKind::Shared;
+                        self.pos += 1;
+                        self.skip_balanced_paren();
+                    }
+                    Tok::Word(w) if matches!(w.as_str(), "fake" | "shallow" | "shared") => {
+                        kind = RefKind::Opaque;
+                        self.pos += 1;
+                        self.skip_balanced_paren();
+                    }
+                    _ => {}
+                }
             }
             return Ok(Rvalue::Ref(self.place()?, kind));
         }

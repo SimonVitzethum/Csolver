@@ -131,7 +131,9 @@ pub(crate) fn verify_function_with(
             // reborrow invalidated it). So query it explicitly and add a FAIL obligation only
             // when a violation was found; a safe access records nothing (no obligation), so this
             // never turns a safe access UNKNOWN. Off unless the aliasing model is enabled.
-            if config.aliasing_model && matches!(inst, Inst::Load { .. } | Inst::Store { .. }) {
+            if config.aliasing_model
+                && matches!(inst, Inst::Load { .. } | Inst::Store { .. } | Inst::Call { .. })
+            {
                 let property = SafetyProperty::NoAliasingViolation;
                 if let Some(d) = symbolic.as_ref().and_then(|r| r.mem_decision(block.id, index, property)) {
                     if !d.proven {

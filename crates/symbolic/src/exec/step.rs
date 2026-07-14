@@ -379,6 +379,18 @@ impl Explorer<'_> {
             }
             Inst::Call { dst, callee, args, ret_ty, ret_ref } => {
                 self.check_lock_call((block, idx), callee, args, state);
+                // Interprocedural protector (opt-in aliasing model): passing a borrow to a call
+                // reborrows it (a protected use), so an argument whose `&mut` tag was already
+                // invalidated by an aliasing reborrow is a use-after-invalidation. Checked as a
+                // read (a valid tag is never popped by a read, so no false FAIL).
+                if self.limits.aliasing_model {
+                    for arg in args {
+                        let p = self.eval_pointer(arg, state);
+                        if p.borrow.is_some() {
+                            self.check_borrow_access((block, idx), false, &p, state);
+                        }
+                    }
+                }
                 self.step_call((block, idx), dst.as_ref(), callee, args, ret_ty, *ret_ref, state);
                 // Per-CPU accessor: tag the returned pointer's identity so accesses through it
                 // are excluded from the data-race pass (per-CPU data is thread-local).

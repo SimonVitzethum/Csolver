@@ -581,3 +581,26 @@ fn mut_param_protector_flags_use_after_reborrow_invalidation() {
     let off = Config { level: csolver_core::SourceLevel::Mir, ..Config::default() };
     assert_ne!(verify_module(&module, &off).verdict, Verdict::Fail, "off by default → not flagged");
 }
+
+/// A `two_phase` `&mut` reborrow is modelled as a **shared** reborrow (`csolver.retag.shared`):
+/// its reservation phase coexists with the parent, so it must not be a plain unique retag.
+#[test]
+fn two_phase_borrow_emits_a_shared_retag() {
+    use csolver_ir::Inst;
+    let src = r#"
+fn f(_1: *mut i32) -> () {
+    let mut _2: &mut i32;
+    bb0: {
+        _2 = &mut (two_phase) (*_1);
+        (*_2) = const 5_i32;
+        return;
+    }
+}
+"#;
+    let m = lower(src, "f");
+    let name = m.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts).find_map(|i| match i {
+        Inst::Intrinsic { name, .. } if name.starts_with("csolver.retag.") => Some(name.clone()),
+        _ => None,
+    });
+    assert_eq!(name.as_deref(), Some("csolver.retag.shared"), "two_phase &mut → shared retag");
+}

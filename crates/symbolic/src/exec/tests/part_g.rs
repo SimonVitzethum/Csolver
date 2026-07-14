@@ -490,3 +490,20 @@ fn borrow_tag_flows_through_memory_store_load() {
     let d = on.mem_decision(BlockId(0), 8, SafetyProperty::NoAliasingViolation).expect("aliasing obligation at the final store");
     assert!(!d.proven && d.refutation.is_some(), "the borrow tag must survive store→load, so using r2 after r1 was invalidated is UB");
 }
+
+#[test]
+fn passing_an_invalidated_mut_borrow_to_a_call_is_flagged() {
+    // r1 = &mut *r0; r2 = &mut *r0 (invalidates r1); foo(r1)  — passing the dead r1 is UB.
+    let (r0, r1, r2) = (RegId(0), RegId(1), RegId(2));
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb.insts.push(Inst::Alloc { dst: r0, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 8 });
+    bb.insts.push(Inst::Assign { dst: r1, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb.insts.push(retag(r1, r0));
+    bb.insts.push(Inst::Assign { dst: r2, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb.insts.push(retag(r2, r0));
+    bb.insts.push(Inst::Call { dst: None, callee: csolver_ir::Callee::Symbol("foo".into()), args: vec![Operand::Reg(r1)], ret_ty: Type::Unit, ret_ref: None });
+    let f = Function { id: FuncId(0), name: "callarg".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb], entry: BlockId(0) };
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    let d = on.mem_decision(BlockId(0), 5, SafetyProperty::NoAliasingViolation).expect("aliasing obligation at the call");
+    assert!(!d.proven && d.refutation.is_some(), "passing an invalidated &mut as a call argument is a use-after-invalidation");
+}
