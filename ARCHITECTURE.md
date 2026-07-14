@@ -1,8 +1,10 @@
 # CSolver — Architecture
 
 > A formal memory-safety verifier for Rust (including `unsafe`), C, and C++ at the
-> MIR, LLVM-IR, x86-64/AArch64 assembly, and ELF levels — with an opt-in
-> **bug-finding mode** for kernel-style C.
+> MIR, LLVM-IR, x86-64/AArch64 assembly, and compiled-binary levels (ELF / PE-COFF /
+> Mach-O objects, and ISO 9660 / WIM container images unpacked to the objects inside)
+> — with an opt-in **bug-finding mode** for kernel-style C and an opt-in Rust
+> **aliasing model** (`--aliasing-model`).
 
 This document is the **authoritative architecture**. It is read *before*
 implementing a component and kept current. Each component points at the

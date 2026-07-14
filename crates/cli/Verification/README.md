@@ -5,9 +5,13 @@ The `solver` binary: input detection, frontend dispatch, verification, and
 text/JSON reporting. Exit codes encode the verdict (0/1/2) or tool error (3).
 
 ## Specification
-- `verify <path>` selects the frontend by extension/ELF magic; a frontend that
-  cannot lower is a **tool error** (exit 3), not a verdict. Flags: `--closed-world`,
-  `--bugs`, `--assume-valid-params`, `--pre <file>`, `--json`.
+- `verify <path>` selects the frontend by extension/magic: `.rs` (turnkey rustc→MIR),
+  `.mir`, `.ll`, `.s`, an **object file** (ELF / PE-COFF / Mach-O, via `load_object`),
+  or a **container** (`.iso` ISO 9660, `.wim` WIM) which is unpacked and each object file
+  inside verified (worst-verdict aggregated). A frontend that cannot lower is a **tool
+  error** (exit 3), not a verdict. Flags: `--closed-world`, `--bugs`,
+  `--assume-valid-params`, `--aliasing-model` (opt-in Rust borrow-stack), `--pre <file>`,
+  `--json`.
 - `scan <dir>` verifies **every** `.ll` under a tree without stopping at any
   UNKNOWN/FAIL, then prints every memory-safety violation (file::function,
   property, genuine-input witness) and a **coverage** breakdown (PASS/FAIL/UNKNOWN
@@ -28,8 +32,8 @@ text/JSON reporting. Exit codes encode the verdict (0/1/2) or tool error (3).
 - The caller treats exit codes as authoritative for CI gating.
 
 ## Limits
-- M0: `verify` reaches only stub frontends; `report` (re-render saved JSON) is
-  not implemented. `demo` is the working end-to-end path.
+- The `.s` textual-assembly frontend is AT&T-x86-64 only; other syntaxes/arches
+  degrade to `Unsupported`. WIM LZX/LZMS resources are skipped (reported), not decoded.
 
 ## Proofs (arguments)
 - The CLI performs no analysis itself; it cannot affect soundness, only routing

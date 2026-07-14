@@ -70,15 +70,18 @@ over-approximation of the real `rsp` arithmetic for frame-local accesses (under
 `alloc-succeeds`, i.e. no stack overflow).
 
 ## Soundness by graceful degradation
-The decoded subset is intentionally tiny and **grows monotonically**: an
-unrecognized opcode or addressing mode makes the *whole function* `unanalyzed`
-(reported `UNKNOWN`), never a guessed or skipped instruction. A decoder that
-silently mis-modelled or dropped an instruction could fabricate a false `PASS` —
-the one outcome a verifier must never produce — so this layer can only be
-incomplete, never unsound. End-to-end: a real ELF `xor eax,eax; ret` verifies
-`PASS`; a raw-pointer store (`mov [rdi], rsi`) is `UNKNOWN` (no provenance for
-`rdi`); a `syscall` is `UNKNOWN` (undecoded). See
-`csolver-testsuite/tests/binary.rs`.
+Decoding is **recursive descent**: only bytes reachable from the entry are decoded
+(a worklist over `jmp`/`jcc` targets and fall-through), so trailing padding or data
+between functions is never mis-decoded. An unrecognized **non-control-flow** opcode is
+no longer fatal to the function — it is **bridged** to an opaque call + a general-purpose
+register/flags havoc (`bridge_unmodeled`), a sound over-approximation, so a stripped or
+padded binary is still analysed instead of dropped wholesale. A `call` is modelled as an
+opaque call with fall-through. Only a genuinely undecodable control-flow shape leaves the
+function `unanalyzed` (`UNKNOWN`). A decoder that silently *mis-modelled* an instruction
+could fabricate a false `PASS` — the one outcome a verifier must never produce — so a
+handled opcode is modelled exactly or bridged, never guessed. End-to-end: a real ELF `xor
+eax,eax; ret` verifies `PASS`; a raw-pointer store (`mov [rdi], rsi`) is `UNKNOWN` (no
+provenance for `rdi`). See `csolver-testsuite/tests/binary.rs`.
 
 ### The residual risk graceful degradation does *not* cover
 Degradation protects against a *missing* instruction, not a *mis-modelled* one.

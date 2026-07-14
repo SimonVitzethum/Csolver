@@ -5,6 +5,17 @@
 > Grounded in the current code, not aspiration. Effort and line counts are honest
 > estimates with their assumptions stated.
 
+> **STATUS (2026-07): largely BUILT — this plan is now mostly historical.** The
+> binary path is wired end-to-end (`solver verify <binary>` → `lower_elf`): the
+> loader reads **ELF (incl. ELF32/BE) + PE/COFF + Mach-O** via `load_object`, with
+> relocations, DWARF `.debug_info`/`.debug_line`, and container unpacking (ISO 9660
+> incl. Rock Ridge/El Torito, WIM with XPRESS). The x86-64 decoder is far past the
+> teaching subset (SSE/VEX, `call`/`push`/`pop`, RIP-relative, sub-registers, recursive
+> descent, and an **unmodeled-instruction bridge** so unknown opcodes havoc opaquely
+> instead of dropping the function). The **hand-written decoder semantics remain the
+> top residual false-PASS risk** (see the scope banner in §2 / ROADMAP) — that caveat
+> stands. The tables below reflect the *original* starting point, not today's code.
+
 ## 1. Current state (measured)
 
 | Piece | State | Wired to CLI? |

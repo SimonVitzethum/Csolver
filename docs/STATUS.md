@@ -85,6 +85,29 @@ Highlights beyond the historical log below:
   resolved a symbol's section by *address*, which is ambiguous in a relocatable `.o` (all
   sections at address 0) — now by `section_index`.
 
+- **Binary/container + coverage batch (2026-07).** The ELF loader became a
+  **multi-format object loader** — `load_object` dispatches ELF / PE-COFF (Windows) /
+  Mach-O (macOS) into one `Image`, plus **ELF32 + big-endian**; DWARF gained a
+  `.debug_line` (address→source-line) reader beside `.debug_info`. The x86-64 decoder
+  now uses **recursive descent** (decodes only reachable bytes) and **bridges any
+  unmodeled instruction** to an opaque call + register havoc, so stripped/padded
+  binaries (incl. discovered function starts) are analysed rather than dropped; direct
+  `call`/`call reg` are opaque-with-fall-through. Container images are unpacked:
+  **ISO 9660** (Joliet, **Rock Ridge** POSIX names, **El Torito** boot images) and
+  **WIM** (`install.wim`/`boot.wim`: header/lookup table, **XPRESS-Huffman**
+  decompression; LZX/LZMS reported as not-decoded, never fabricated bytes). New
+  obligations: integer UB (`NoDivByZero`, `NoShiftOverflow`, `NoArithOverflow` incl.
+  signed mul via `sext`), `NoDanglingDeref` (dangling-stack return + `llvm.lifetime`
+  use-after-scope), `ValidIndirectTarget` (null indirect-call target), type-confusion
+  via objtype contracts. **Opt-in `--aliasing-model`** adds the Rust borrow-stack class
+  (`NoAliasingViolation`, currently write-through-`&T`, refuted only on a feasible path).
+- **Cross-language pointer recovery via LLVM attributes (2026-07).** Beside the DWARF
+  reference recovery, the language-independent `dereferenceable(N)` and **`nonnull`**
+  parameter attributes are imported: a `nonnull`-without-size pointer (`SizeSpec::NonNull`)
+  is a non-null opaque pointer that proves `NoNullDeref` only (bounds/liveness stay
+  UNKNOWN — it may dangle). Verified against real **Zig** 0.16 and **Julia** 1.12 output;
+  the same path covers **Swift**'s ABI. CI pinned to Rust 1.96.
+
 Known open frontend gap on real kernel IR: complex `getelementptr` shapes
 (multi-index / vector) still drop the enclosing function to `unanalyzed`.
 

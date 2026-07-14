@@ -78,8 +78,14 @@ To consume real Rust/asm/binaries, the stub front-ends must lower to MSIR:
    a *loop* in a binary verify end-to-end via the state-merging engine. A second
    decoder handles **AArch64** (fixed 32-bit instructions: `ret`, `add`/`sub`
    immediate incl. the stack frame, `ldr`/`str`), so the same stack-safety proofs
-   hold on ARM binaries. Remaining: the broad ISA (and ARM control flow), DWARF
-   types, relocations/PLT, and PE/Mach-O.
+   hold on ARM binaries. **Since done:** `load_object` now reads **PE/COFF** and
+   **Mach-O** (and **ELF32 + big-endian**) into the common `Image`; ELF relocations
+   drive RIP-relative global resolution; DWARF `.debug_info` (pointee sizes) **and**
+   `.debug_line` (source lines) are parsed; the x86-64 decoder uses **recursive descent**
+   with an **unmodeled-instruction bridge** (opaque havoc) so stripped/padded binaries are
+   analysed; container images (**ISO 9660** incl. Rock Ridge/El Torito, **WIM** with
+   XPRESS) are unpacked to their object files. Remaining: the broad ISA (and ARM control
+   flow); DWARF variable types / CFI; PDB; WIM LZX/LZMS (needs a verified corpus).
 
 > **Scope decision — the binary/ASM track is FROZEN as a research demonstrator.**
 > The x86-64 and AArch64 decoders carry **hand-written, unvalidated instruction

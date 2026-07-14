@@ -1,7 +1,9 @@
 # CSolver
 
 A **formal memory-safety verifier** for Rust (including `unsafe`), C, and C++,
-operating on Rust MIR, LLVM-IR, x86-64 / AArch64 assembly, and ELF binaries.
+operating on Rust MIR, LLVM-IR, x86-64 / AArch64 assembly, and compiled binaries
+(ELF, PE/COFF, Mach-O — plus ISO 9660 and WIM images, unpacked to the object files
+inside).
 
 CSolver has two modes:
 
@@ -63,23 +65,40 @@ false-FAILs).
 Every verdict is checked against a **dynamic oracle**: Rust against **Miri**, C
 against **AddressSanitizer + UBSan** (see [differential/](differential/)). The
 `--bugs` mode finds all 8 memory-bug classes in the C differential corpus with
-**zero false positives**. The **asm** and **ELF** frontends are the next major
-work — see [docs/STATUS.md](docs/STATUS.md), [docs/ROADMAP.md](docs/ROADMAP.md),
-and [ARCHITECTURE.md](ARCHITECTURE.md).
+**zero false positives**.
+
+**Binary & container frontends.** `csolver-elf` is a pure-Rust, zero-dependency
+loader for **ELF** (incl. ELF32 / big-endian), **PE/COFF** (Windows), and **Mach-O**
+(macOS) behind one `load_object`, plus DWARF `.debug_info`/`.debug_line`; the x86-64
+decoder uses **recursive descent** (only reachable bytes) and bridges any unmodeled
+instruction to an opaque havoc, so a stripped or padded binary is analysed rather than
+dropped. Container images are unpacked to the object files inside them: **ISO 9660**
+(Joliet + Rock Ridge names + El Torito boot images) and **WIM** (`install.wim`;
+XPRESS-Huffman decompression, LZX/LZMS reported as not-decoded). See
+[docs/STATUS.md](docs/STATUS.md), [docs/ROADMAP.md](docs/ROADMAP.md), and
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Properties targeted
 
 No out-of-bounds access · no use-after-free · no double-free · no dangling
-deref · no null deref · stack integrity · valid pointer arithmetic · valid
-references · valid reads/writes · no forbidden region overlap · alignment ·
-valid stack frames · valid indirect branch targets · write-capability
-(provenance: no write through a pointer to a read-only/foreign region) ·
-no info-leak (no `copy_to_user` of uninitialized memory).
+deref (incl. dangling-stack return & `llvm.lifetime` use-after-scope) · no null
+deref · valid pointer arithmetic · valid references · valid reads/writes · no
+forbidden region overlap · alignment · valid indirect branch targets ·
+write-capability (provenance: no write through a pointer to a read-only/foreign
+region) · no info-leak (no `copy_to_user` of uninitialized memory) · integer UB:
+no division/modulo by zero, no shift past the bit width, no `nsw`/`nuw`
+add/sub/mul overflow (signed mul included).
 
-Bug-finding mode adds two further classes as obligations: **no allocation-size
-overflow** (`n * sizeof(T)` wrap) and **no data race** (currently the
-soundly single-function-decidable AA self-deadlock). These are enumerated only
-under `--bugs`, so sound `verify` verdicts are unchanged.
+Opt-in behind `--aliasing-model`: **no Rust aliasing (borrow-stack) violation** —
+currently the unambiguous *write through a shared `&T`* class.
+
+Bug-finding mode (`--bugs`) adds recall-oriented obligations: **no allocation-size
+overflow** (`n * sizeof(T)` wrap), **no data race** (AA self-deadlock, Eraser
+lockset, ABBA lock-order, atomicity/weak-memory), **no double-fetch** of user
+memory, **no tainted value into an unsafe sink**, **no typestate/protocol
+violation**, **no secret-dependent branch/index**, and **no sleep in atomic
+context**. These are enumerated only under `--bugs`, so sound `verify` verdicts are
+unchanged.
 
 ## Soundness contract
 
@@ -103,9 +122,12 @@ cargo run -p csolver-cli -- --help
 ## CLI
 
 ```sh
-solver verify <path>              # a .rs (turnkey), .mir, .ll, .s, or ELF
+solver verify <path>              # .rs (turnkey), .mir, .ll, .s, or a binary/container:
+                                  #   ELF/PE/Mach-O object, .iso (ISO 9660), .wim (WIM)
 solver verify <module.ll> --closed-world   # whole-program: synthesize contracts
 solver verify <module.ll> --bugs           # bug-finding mode (find, don't prove)
+solver verify <module.ll> --aliasing-model # opt-in Rust borrow-stack (write-through-&T)
+solver verify <module.ll> --assume-valid-params  # trust raw-pointer params of known size
 solver verify <module.ll> --pre <file>     # caller preconditions (bytes/elements/cstring)
 solver verify <path> --json                # machine-readable report
 solver scan <dir> [--bugs] [--assume-valid-params]   # sweep EVERY .ll under a tree:

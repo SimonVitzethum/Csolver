@@ -64,6 +64,19 @@ assumption). A real `rustc -O` function taking `&mut [i32; 8]`
 verifies fully **PASS**; writing through a `readonly` parameter is correctly
 *not* proved.
 
+**`nonnull` (non-null-only) and cross-language coverage.** A `nonnull` pointer
+parameter *without* a `dereferenceable` size (Zig `*T`, and any frontend that
+asserts non-null but not a size) becomes a `SizeSpec::NonNull` contract — a
+non-null **opaque** pointer, not a region: only `NoNullDeref` is discharged through
+it (and gep/copy-derived pointers), while bounds/liveness stay `UNKNOWN` (a
+`nonnull` pointer may still dangle). The `dereferenceable`/`nonnull` attribute paths
+are **language-independent** and LLVM-semantics-sound, so they cover any LLVM
+frontend: verified against real **Zig** 0.16 (`*T` ⇒ `ptr nonnull`, `?*T` ⇒ not) and
+**Julia** 1.12 (`swiftcc` + `nonnull dereferenceable(N)` GC arrays); the same path
+covers **Swift**'s ABI. The DWARF path (`crates/elf` / `debuginfo.rs`) recovers
+per-language *reference* pointees (`&T` for Rust, `T&` for C++/D) as a secondary
+source; see `tests/dwarf-corpus`.
+
 **Slices.** An aligned pointer parameter immediately followed by an integer is
 recognized as the Rust slice ABI `&[T]` `(ptr, usize len)`; its region size is
 the symbolic `len * size_of::<T>()` (element size taken from a `getelementptr`

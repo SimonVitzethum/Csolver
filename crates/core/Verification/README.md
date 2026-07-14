@@ -11,9 +11,16 @@ catalogue includes `WriteCapability` — a write/access must target a region who
 by external contract labels; see `csolver-contracts`) — plus `NoInfoLeak`
 (no `copy_to_user` of uninitialized memory), `NoSizeOverflow` (an `n*sizeof(C)`
 allocation size must not wrap), and `DataRace` (currently the AA self-deadlock
-subclass). `NoSizeOverflow` and `DataRace` are **bug-finding-only** obligations
-(the verifier does not enumerate them in sound `verify` mode). The enum is
-`#[non_exhaustive]`, so external matches must carry a wildcard arm.
+subclass). Integer-UB obligations: `NoDivByZero`, `NoShiftOverflow`, and
+`NoArithOverflow` (`nsw`/`nuw` add/sub/mul — signed mul via a `sext` double-width
+product). Temporal/CFI: `NoDanglingDeref` (a dangling-stack return, an
+`llvm.lifetime.end` use-after-scope) and `ValidIndirectTarget` (a null indirect-call
+target). `NoAliasingViolation` — the Rust borrow-stack class, currently a **write
+through a shared `&T`** — is opt-in behind `--aliasing-model`. `NoSizeOverflow`,
+`DataRace`, `DoubleFetch`, `TaintedSink`, `TypestateViolation`, `SecretDependent`,
+and `SleepInAtomic` are **bug-finding-only** obligations (the verifier does not
+enumerate them in sound `verify` mode). The enum is `#[non_exhaustive]`, so external
+matches must carry a wildcard arm.
 
 ## Specification
 - `Verdict::combine` is a commutative, associative monoid with identity `Pass`;
