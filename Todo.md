@@ -58,33 +58,31 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
 - [x] **Signed-mul-Overflow** — bereits abgedeckt (`arith_no_overflow` baut das
   nsw-Ziel via `ctx.sext` als Doppelbreiten-Produkt; getestet `mul nsw`→FAIL in
   `llvm_frontend/part_g.rs`). Audit/Kommentar waren veraltet, korrigiert.
-- [ ] **Use-after-scope innerhalb einer Funktion.** Blockiert: MIR modelliert
-  `&_local` gar nicht als Region (fällt auf `Const::Undef`, opak = sound). Es gibt
-  **keine Stack-Region**, die ein `StorageDead(_n)` als tot markieren könnte
-  (aktuell als Nop übersprungen). Voraussetzung = Stack-Locals als Regionen
-  modellieren (Kern-Modelländerung, FP-Risiko: bisher opake `&local` würden neue
-  Obligations tragen). Der LLVM-Pfad (`llvm.lifetime.end`) **ist** erledigt
-  (eef91eb); der dangling-**return** von `&local` ebenfalls (ec8914a).
-- [ ] **StackIntegrity / ValidStackFrame** — außerhalb des MSIR-Modells: gerettete
-  Register / Rücksprungadresse / Canaries existieren im IR nicht (Prologe werden
-  bei ELF-Dekodierung als Frame-Setup abstrahiert). Brauchte ein Byte-genaues
-  Stack-Frame-Modell im Binär-Pfad. Kein kleiner sound Slice.
+- [x] **Use-after-scope innerhalb einer Funktion** (aef8779): ein address-taken Stack-Local
+  bekannter Größe wird als **Stack-Region** modelliert (MIR-Parser erfasst `StorageLive/Dead`),
+  `StorageDead(_x)` beendet die Lifetime → Deref danach = dangling. Region exakt dimensioniert
+  (keine Bounds-FP) + initialisiert geseedet (keine Uninit-FP); Unbekannt-Größe bleibt opak
+  (keine Perturbation). Der LLVM-`llvm.lifetime.end`-Pfad (eef91eb) und dangling-return (ec8914a)
+  waren bereits da.
+- [ ] **StackIntegrity / ValidStackFrame (ROP)** — im Binär-Pfad ist ein Store über das
+  Frame-Ende (Rücksprungadresse) bereits als InBounds-OOB gefangen; eine **dedizierte** Property
+  bräuchte ein Rücksprungadress-/Canary-Modell im Binär-Pfad. Kein kleiner sound Slice, gering
+  im Wert (schon durch InBounds subsumiert).
 - [ ] **Type-Confusion / Strict-Aliasing / Union-Punning** — partiell abgedeckt
   (Provenance-Labels + objtype-Contracts, 3a992a1). Volles TBAA/Strict-Aliasing ist
   FP-anfällig (legitime `repr`-Reinterpretation vs. UB nur mit Typ-Lattice sound
   trennbar); bewusst nicht halb gebaut (soundness-first).
 
-## WIM: LZX/LZMS-Dekompression (`crates/elf/src/wim.rs`)
+## Windows-ISO-Pipeline (UDF + WIM LZX) — ERLEDIGT
 
-- [ ] **LZX** (Default-Kompression realer `install.wim`). Aktuell sauberer
-  `Error::unsupported` (sound). NICHT blind implementieren: ein inhaltlich falsch
-  dekomprimierter Chunk **gleicher Länge** überlebt den Size-Guard → analysierte
-  Garbage-Bytes könnten einen **False-PASS** eines nicht existierenden Binaries
-  erzeugen (Kardinalsünde). Voraussetzung = ein **verifiziertes Testkorpus**
-  (wimlib-/DISM-erzeugte LZX-WIM-Fixture) für Round-Trip-Tests. Format: LZX =
-  LZ77 + Huffman (Main-/Length-/Aligned-Tree, 20-Elem-Pretrees, Delta-kodierte
-  Baumlängen über Blockgrenzen, R0/R1/R2-Repeat-Offsets, E8-Call-Translation,
-  Block-Typen verbatim/aligned/uncompressed), 16-bit-LE-Bitstrom. LZMS analog.
+- [x] **UDF-Filesystem-Reader** (b34d6f6, `crates/elf/src/udf.rs`): jedes Windows-Installations-ISO
+  ist ein UDF-Hybrid (ISO-9660-Zweig = Stub). AVDP→VDS→FSD→Verzeichnisbaum. An echter Win11-25H2-ISO
+  verifiziert (1064 Dateien, hunderte PE-Objekte + `install.wim`). CLI kombiniert ISO 9660 + UDF.
+- [x] **WIM LZX** (4dfd91d, `crates/elf/src/lzx.rs`): **byte-exakt** — gegen 1475 echte `boot.wim`-
+  Resourcen per gespeicherter SHA-1 verifiziert (0 Mismatches). Blocker (Testkorpus) gelöst: das
+  Korpus sind die WIMs der ISO selbst, erreicht via den UDF-Reader.
+- [ ] **LZMS** (selten, `/compress:recovery`) und **PDB** (separate `.pdb`-Datei, per GUID von der
+  PE referenziert — nicht im Installations-ISO; braucht Windows-Buildumgebung + MSF/Stream-Parser).
 
 ## Struktur / Wartbarkeit
 

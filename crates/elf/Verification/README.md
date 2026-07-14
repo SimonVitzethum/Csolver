@@ -31,11 +31,17 @@ run the SAME decode + verify pipeline; only the front matter differs per OS.
   - **ISO 9660** (`iso`): the volume descriptors and directory tree → each regular file
     as `(path, offset, size)`; Joliet (UTF-16BE) preferred, **Rock Ridge** (SUSP `NM`)
     POSIX long names recovered, **El Torito** boot images enumerated (a boot loader's PE).
+  - **UDF** (`udf`, ISO 13346 / ECMA-167): the filesystem every Windows install ISO and modern
+    large hybrid uses (the ISO 9660 side is a compatibility stub). Anchor VD Pointer → Volume
+    Descriptor Sequence (partition + logical volume) → File Set Descriptor → root File Entry →
+    directory walk (File Identifier Descriptors). Verified on a real Win11 25H2 ISO: 1064 files,
+    hundreds of PE objects found (`bootx64.efi`, `setup.exe`, `sources/*.dll`) plus `install.wim`.
   - **WIM** (`wim`, `install.wim`/`boot.wim`): header, RESHDR resource headers, the lookup
     table; `data_resources()`+`extract()` decompress each file resource. **XPRESS-Huffman**
-    (MS-XCA §2.1) is implemented; a raw chunk is copied. **LZX/LZMS** return a clean
-    `Unsupported` (a content-wrong decode of the right length could yield a false PASS, so it
-    must not be implemented without a verified test corpus).
+    (MS-XCA §2.1) **and LZX** ([`crate::lzx`], the `install.wim` default) are implemented — the
+    LZX decoder is **byte-exact**, cross-checked against 1475 real `boot.wim` resources by their
+    stored SHA-1. A raw chunk is copied. **LZMS** returns a clean `Unsupported`. Decompression is
+    size-checked, so a decoder mistake is a clean failure, never garbage.
 - **Stripped binaries:** with no symbol table, x86-64 function starts are discovered
   heuristically (`endbr64`, `push rbp; mov rbp,rsp`); a spurious start only yields an
   UNKNOWN function, never a false PASS of another.
@@ -50,10 +56,10 @@ run the SAME decode + verify pipeline; only the front matter differs per OS.
   is an error, so a decoder mistake is a clean failure, never garbage bytes.
 
 ## Limits
-- LZX/LZMS WIM resources are not decoded (a default `install.wim` is often LZX) — recorded
-  in `Todo.md` with the format notes; needs a wimlib/DISM-generated fixture to verify soundly.
-- PE base-relocation and Mach-O relocation application are not performed (so RIP-relative
-  globals resolve only for ELF's per-symbol relocations); PDB / CFI are future.
+- WIM LZMS is not decoded (rare; used for `/compress:recovery` solid resources). PE
+  base-relocation and Mach-O relocation application are not performed (so RIP-relative globals
+  resolve only for ELF's per-symbol relocations); PDB (a separate `.pdb` file, referenced by GUID
+  from the PE) and CFI are future.
 
 ## Test strategy
 Hand-built minimal images (ELF64/ELF32 LE+BE, ISO with a file, El Torito catalog, an NM
