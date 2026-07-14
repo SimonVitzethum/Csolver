@@ -276,7 +276,12 @@ impl Explorer<'_> {
         // A call is an over-approximation point (havoc'd heap/return unless a
         // precise summary applies); conservatively mark the path inexact so we
         // never refute through a call. Proofs are unaffected (this only gates
-        // refutation, not PASS).
+        // refutation, not PASS). This clearing — together with the loop-header and
+        // path-merge clearing — is the **load-bearing soundness gate**: refuting on an
+        // inexact path (where the symbolic state is an over-approximation) would fabricate
+        // false counterexamples, so strict `verify` deliberately trades recall for it and
+        // `--bugs` re-widens refutation only to genuine-input goals. It cannot be relaxed
+        // in general without breaking soundness (see docs/soundness-invariants.md).
         state.exact = false;
 
         // Effects: a writing or freeing callee invalidates the symbolic heap;

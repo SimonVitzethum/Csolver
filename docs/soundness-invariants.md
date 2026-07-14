@@ -15,7 +15,10 @@ Each entry: **invariant — the check — where.**
   `URem`/`SRem`, bitwise, constant *and* symbolic shifts, all comparisons) is checked against an
   independent `oracle_bin`/`oracle_cmp`: the correct result must be *provable* and a wrong result
   *not* provable. — `bitblast_tests.rs::bitblast_matches_oracle_4bit` (always on), `_6bit`
-  (on-demand), `symbolic_shift_at_width_64_boundaries`, `division_by_zero_is_smtlib_total`.
+  (on-demand), `symbolic_shift_at_width_64_boundaries`, `wide_ops_at_width_128_are_bit_precise`
+  (the full 128-bit domain), `division_by_zero_is_smtlib_total`. The whole engine is in-house
+  (no external SMT backend); `MAX_WIDTH = 128`, and a 128-bit `udiv`/`sdiv`/`urem`/`srem` that
+  exceeds the CNF cap falls back soundly to the linear procedure.
 - **The CDCL SAT core only ever trusts `Unsat`.** Randomised brute-force oracle over thousands of
   instances, including ones that force restarts + clause deletion on hard 3-SAT. —
   `sat_tests.rs`.
@@ -56,7 +59,11 @@ Each entry: **invariant — the check — where.**
 - **Loop zone difference-bound facts** use wrapping add; sound only under `linear-no-overflow`, an
   assumption not re-recorded when a bit-precise proof consumes the fact. Pre-existing; differentials
   don't flag it; would need a zone-abstract-domain audit. (`AUDIT.md`.)
-- **External SMT encoding** (`solver::encode`) is intentionally unwired — the in-house engine
-  decides everything; see the function doc.
+- **The exact-path refutation gate** (`state.exact`, cleared at calls/loops/merges) is *load-
+  bearing*: refuting on an inexact path would fabricate false counterexamples, so strict `verify`
+  trades recall for it and `--bugs` re-widens only to genuine-input goals. It cannot be relaxed in
+  general without breaking soundness — this is the deliberate precision/recall boundary, not a bug.
+- **StackIntegrity / ValidStackFrame** carry no dedicated emission by design: their concrete paths
+  are subsumed by `InBounds` (overflow to a saved RA) and `ValidIndirectTarget` (call into data).
 
 When you add a soundness-relevant feature, add its guard here.

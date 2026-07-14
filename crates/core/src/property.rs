@@ -21,6 +21,15 @@ pub enum SafetyProperty {
     /// No dereference of the null pointer.
     NoNullDeref,
     /// The stack is not corrupted (saved registers, return address, canaries).
+    ///
+    /// **Subsumed — no dedicated emission by design.** The concrete corruption paths are
+    /// already covered elsewhere: a buffer overflow that reaches a saved register / return
+    /// address is an out-of-bounds store ([`SafetyProperty::InBounds`]), and calling into
+    /// overwritten data is [`SafetyProperty::ValidIndirectTarget`] (an indirect call into a
+    /// stack/heap region). A *dedicated* refutation would need an explicit return-address /
+    /// canary model in the binary frame (the prologue is modelled as one frame region with no
+    /// distinguished RA slot), which is deep and adds nothing over the InBounds coverage — so
+    /// this variant is deliberately never recorded, retained only as a taxonomy label.
     StackIntegrity,
     /// Pointer arithmetic stays within (or one-past-end of) the same object.
     ValidPointerArith,
@@ -35,6 +44,11 @@ pub enum SafetyProperty {
     /// An access satisfies its type's alignment requirement.
     Alignment,
     /// A function's stack frame is set up and torn down correctly.
+    ///
+    /// **Subsumed — no dedicated emission by design** (see [`SafetyProperty::StackIntegrity`]).
+    /// A malformed frame manifests as an out-of-bounds stack access ([`SafetyProperty::InBounds`])
+    /// or a dangling stack pointer ([`SafetyProperty::NoDanglingDeref`]); a separate well-formedness
+    /// property would duplicate those without a return-address model. Retained as a taxonomy label.
     ValidStackFrame,
     /// An indirect branch/call target is within the analyzable set.
     ValidIndirectTarget,

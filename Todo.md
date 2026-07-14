@@ -1,5 +1,28 @@
 # Todo — Schwächen & Risiken aus dem Code-Review (2026-07-13)
 
+## Coverage-Schließung (Code-Audit) 2026-07-14 — Batch
+
+Aus dem code-basierten „was deckt der Solver nicht ab"-Audit; alle sound geschlossen oder als
+bewusste Grenze dokumentiert:
+
+- [x] **SMT-Backend entfernt** (dcd3abf): `crates/smt` gelöscht; der hauseigene CDCL/Bit-Precise-
+  + Linear-Solver entscheidet alles. `Justification::SmtUnsat`→`Unsat` umbenannt.
+- [x] **Bit-Blaster volle 128-Bit-Domäne** (96b2a27): `MAX_WIDTH` 64→128, `MAX_CLAUSES` 60k→300k.
+  i128 add/sub/mul/shift/bitwise/compare jetzt bit-präzise; i128 **div/rem** (>300k Klauseln)
+  fällt sound auf linear zurück. Einzige nicht-blastbare Konstruktion: Breite > 128.
+- [x] **x86 ALU-Read-Modify-Write auf Speicher + LOCK-Prefix** (7315d70): `add/or/and/sub/xor
+  [mem], r` → load-modify-store (Speicherzugriff jetzt geprüft); LOCK → Full-Barrier + atomare
+  RMW. (Der *typed* Decoder lehnt ALU-mem weiter ab — separate Tabelle, nur Länge/Differential.)
+- [x] **StackIntegrity/ValidStackFrame** — am Enum als **subsumiert-by-design** dokumentiert:
+  Overflow→RA = InBounds, Call-in-Daten = ValidIndirectTarget; dedizierte RA/Canary-Property
+  bräuchte ein Rücksprungadress-Modell (tief, kein Mehrwert über InBounds).
+- [x] **Exact-Path-Gate (Recall-Rand)** — als **load-bearing Soundness-Grenze** dokumentiert
+  (calls.rs, docs/soundness-invariants.md): auf inexakten Pfaden zu refutieren erzeugt false
+  FAILs; kann nicht generell aufgehoben werden. Bewusster Precision/Recall-Tradeoff, kein Bug.
+- Bewusst **nicht** geschlossen (korrekt so): Float/Vektor bleiben opak (Werte treiben keine
+  Memory-Safety); volle x86-SSE/AVX- + AArch64-Decoder-Vollständigkeit ist unbeschränkt und
+  großteils irrelevant; die „E"-Klassen (TBAA, ABA-value, LZMS/PDB) unverändert zurückgestellt.
+
 ## Rust-Aliasing-Modell (Borrow-Stack, `--aliasing-model`) — Restarbeit
 
 Der Opt-in-Detektor (`SafetyProperty::NoAliasingViolation`, sound, kein False-FAIL, nur auf
