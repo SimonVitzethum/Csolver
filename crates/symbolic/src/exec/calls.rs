@@ -363,6 +363,29 @@ impl Explorer<'_> {
             self.apply_prov_transfer(&prov, &argvals, state);
         }
 
+        // Out-parameter stack escape: the callee unconditionally stored the address of one of
+        // its own (now-popped) stack locals through parameter K (`*out = &x`). Model that by
+        // storing a dangling pointer (into a fresh already-freed region) at the argument's
+        // location, so the caller reading it back and dereferencing is a definite use-after-free.
+        if let Some(escapes) = summary.as_ref().map(|s| s.escapes_stack.clone()) {
+            for k in escapes {
+                if let Some(SymValue::Ptr(target)) = argvals.get(k) {
+                    let rid = self.materialize_freed_region(state);
+                    let dangling = SymValue::Ptr(SymPointer {
+                        prov: Prov::Region(rid),
+                        offset: self.ctx.int(PTR_WIDTH, 0),
+                        align: 1,
+                        borrow: None,
+                    });
+                    state.heap.push(StoreRecord {
+                        target: target.clone(),
+                        value: dangling,
+                        size: (PTR_WIDTH / 8) as u64,
+                    });
+                }
+            }
+        }
+
         if let Some(d) = dst {
             let value = match summary.as_ref().map(|s| &s.ret) {
                 Some(RetSummary::PtrFromArg { arg, offset }) => {

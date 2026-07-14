@@ -150,6 +150,14 @@ pub struct Summary {
     /// UAF) is caught cross-function. A straight-line sum (path-approximate — a `get`/`put`
     /// wrapper is unconditional), so it only ever *adds* a bug-finding check.
     pub refcount_effect: Vec<(usize, u32, i64)>,
+    /// **Out-parameter stack escape**: pointer-parameter indices through which the function
+    /// *unconditionally* stores the address of one of its own stack locals (`*out = &x`). The
+    /// frame is popped at return, so the pointer the caller reads back from that location is
+    /// dangling — a use-after-scope one call away. Only escapes in the **entry block** (which
+    /// always executes) are recorded, so the store is unconditional and marking the caller's
+    /// location dangling can never be a false FAIL. Applied at the call site as a dangling
+    /// store into the argument's location.
+    pub escapes_stack: Vec<usize>,
 }
 
 impl Summary {

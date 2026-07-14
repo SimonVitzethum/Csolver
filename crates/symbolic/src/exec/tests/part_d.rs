@@ -402,6 +402,7 @@ fn use_after_freeing_call_is_not_proven() {
             frees_arg: None,
             prov: crate::summary::ProvTransfer::default(),
             refcount_effect: vec![],
+            escapes_stack: vec![],
         },
     );
     let r = discharge_with_summaries(&f, &summaries);
@@ -444,7 +445,7 @@ fn double_free_through_a_freeing_wrapper_is_flagged() {
     let mut summaries = HashMap::new();
     summaries.insert(
         FuncId(9),
-        Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default(), refcount_effect: vec![] },
+        Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default(), refcount_effect: vec![], escapes_stack: vec![] },
     );
     let r = discharge_with_fields(
         &f, &summaries, &[], &[], &HashMap::new(), &HashMap::new(), true, true, false,

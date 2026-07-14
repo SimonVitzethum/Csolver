@@ -33,7 +33,67 @@ pub(crate) fn summarize_fn(f: &Function) -> Summary {
         frees_arg: derive_frees_arg(f),
         prov: prov_transfer_of_fn(f),
         refcount_effect: refcount_effect_of_fn(f),
+        escapes_stack: escapes_stack_through(f),
     }
+}
+
+/// Pointer-parameter indices through which the function **unconditionally** stores the address
+/// of one of its own stack locals (`*out = &x`). Only the **entry block** is scanned — it always
+/// executes, so a store found there is unconditional and the caller-side dangling mark can never
+/// be a false FAIL (a conditional escape in a later block is soundly missed, not mis-flagged).
+pub(crate) fn escapes_stack_through(f: &Function) -> Vec<usize> {
+    let Some(entry) = f.blocks.iter().find(|b| b.id == f.entry) else { return Vec::new() };
+    let mut env: HashMap<RegId, AbsVal> = HashMap::new();
+    for (k, (reg, ty)) in f.params.iter().enumerate() {
+        let v = if ty.is_ptr() {
+            AbsVal::PtrArg { arg: k, off: Affine::constant(0) }
+        } else {
+            AbsVal::Scalar(Affine::param(k))
+        };
+        env.insert(*reg, v);
+    }
+    let mut escapes = Vec::new();
+    for inst in &entry.insts {
+        // A store of a local stack address through a parameter pointer is an out-param escape.
+        if let Inst::Store { ptr, value, .. } = inst {
+            if let (AbsVal::PtrArg { arg, .. }, AbsVal::LocalStack) =
+                (eval_operand(ptr, &env), eval_operand(value, &env))
+            {
+                if !escapes.contains(&arg) {
+                    escapes.push(arg);
+                }
+            }
+        }
+        match inst {
+            Inst::Alloc { dst, .. } => {
+                env.insert(*dst, AbsVal::LocalStack);
+            }
+            Inst::Assign { dst, value, .. } => {
+                let v = eval_rvalue(value, &env);
+                env.insert(*dst, v);
+            }
+            Inst::PtrOffset { dst, base, index, elem } => {
+                let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1) as i128;
+                let v = match (eval_operand(base, &env), eval_operand(index, &env)) {
+                    (AbsVal::PtrArg { arg, off }, AbsVal::Scalar(ix)) => {
+                        match ix.scale(stride).and_then(|t| off.add(&t)) {
+                            Some(o) => AbsVal::PtrArg { arg, off: o },
+                            None => AbsVal::Opaque,
+                        }
+                    }
+                    (AbsVal::LocalStack, _) => AbsVal::LocalStack,
+                    _ => AbsVal::Opaque,
+                };
+                env.insert(*dst, v);
+            }
+            other => {
+                if let Some(d) = other.defined_reg() {
+                    env.insert(d, AbsVal::Opaque);
+                }
+            }
+        }
+    }
+    escapes
 }
 
 /// The net reference-count change this function makes to each pointer parameter's object, per

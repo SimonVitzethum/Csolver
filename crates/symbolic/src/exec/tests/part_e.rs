@@ -73,7 +73,7 @@ fn indirect_call_devirtualised_to_a_pure_summary_preserves_state() {
     // A pure callee: no writes, no frees.
     summaries.insert(
         FuncId(1),
-        Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default(), refcount_effect: vec![] },
+        Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default(), refcount_effect: vec![], escapes_stack: vec![] },
     );
     let mut globals = HashMap::new();
     globals.insert("G".to_string(), csolver_ir::GlobalDef { size: 8, align: 8, writable: false });
@@ -302,7 +302,7 @@ fn cross_file_symbol_call_resolves_via_name_summaries() {
     let mut pure = HashMap::new();
     pure.insert(
         "remote".to_string(),
-        Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default(), refcount_effect: vec![] },
+        Summary { ret: RetSummary::Unknown, writes: false, frees: false, frees_arg: None, prov: ProvTransfer::default(), refcount_effect: vec![], escapes_stack: vec![] },
     );
     let r_pure = discharge_inner(
         &f, ExecLimits::default(), &HashMap::new(), &pure, &[], &[], &[], &HashMap::new(),
@@ -316,7 +316,7 @@ fn cross_file_symbol_call_resolves_via_name_summaries() {
     let mut frees = HashMap::new();
     frees.insert(
         "remote".to_string(),
-        Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default(), refcount_effect: vec![] },
+        Summary { ret: RetSummary::Unknown, writes: false, frees: true, frees_arg: Some(0), prov: ProvTransfer::default(), refcount_effect: vec![], escapes_stack: vec![] },
     );
     let r_free = discharge_inner(
         &f, ExecLimits::default(), &HashMap::new(), &frees, &[], &[], &[], &HashMap::new(),

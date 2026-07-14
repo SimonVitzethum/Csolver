@@ -114,6 +114,63 @@ fn summarize_program_equals_summarize_of_the_linked_module() {
     assert!(want[&FuncId(3)].writes, "b_wrapper inherits via Direct");
 }
 
+/// The out-parameter stack-escape detector records a parameter through which the entry block
+/// **unconditionally** stores the address of a local (`*out = &x`), but NOT a store of a
+/// parameter pointer (the caller owns it), so the caller-side dangling mark is never a false FAIL.
+#[test]
+fn out_param_stack_escape_detection() {
+    let out = RegId(0);
+    let x = RegId(1);
+    // fn bad(out) { let x; *out = &x }
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb.insts.push(Inst::Alloc {
+        dst: x,
+        region: csolver_core::RegionKind::Stack,
+        elem: Type::int(32),
+        count: Operand::int(64, 1),
+        align: 4,
+    });
+    bb.insts.push(Inst::Store {
+        ty: Type::ptr(Type::int(32)),
+        ptr: Operand::Reg(out),
+        value: Operand::Reg(x),
+        align: 8,
+        volatile: false,
+    });
+    let bad = Function {
+        id: FuncId(0),
+        name: "bad".into(),
+        params: vec![(out, Type::ptr(Type::ptr(Type::int(32))))],
+        ret_ty: Type::Unit,
+        blocks: vec![bb],
+        entry: BlockId(0),
+    };
+    assert_eq!(summarize_fn(&bad).escapes_stack, vec![0]);
+
+    // fn passthrough(out, p) { *out = p } — stores a *parameter* pointer, not a local → no escape.
+    let p = RegId(2);
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb.insts.push(Inst::Store {
+        ty: Type::ptr(Type::int(32)),
+        ptr: Operand::Reg(out),
+        value: Operand::Reg(p),
+        align: 8,
+        volatile: false,
+    });
+    let passthrough = Function {
+        id: FuncId(0),
+        name: "passthrough".into(),
+        params: vec![
+            (out, Type::ptr(Type::ptr(Type::int(32)))),
+            (p, Type::ptr(Type::int(32))),
+        ],
+        ret_ty: Type::Unit,
+        blocks: vec![bb],
+        entry: BlockId(0),
+    };
+    assert!(summarize_fn(&passthrough).escapes_stack.is_empty(), "a parameter pointer does not escape");
+}
+
 /// A wrapper that returns a callee's dangling-stack result inherits `DanglingStack`
 /// through the cross-function fixpoint, so the wrapper's callers are caught too — for
 /// both an in-module `Direct` and a cross-module `Symbol` edge. A wrapper around a

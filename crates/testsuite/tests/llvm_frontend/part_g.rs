@@ -293,6 +293,37 @@ fn caller_side_deref_of_returned_local_is_flagged() {
     assert_eq!(verdict_of(&wrapped, "caller3"), Verdict::Fail, "a dangling return forwarded through a wrapper is still a use-after-free at the caller");
 }
 
+/// Interprocedural **out-parameter** stack escape: a callee stores the address of its own local
+/// through a pointer parameter (`*out = &x`); the caller reads it back and dereferences it — a
+/// use-after-scope one call away. The callee's summary records the escaping parameter, and the
+/// call site stores a dangling pointer at the argument's location, so the caller's load+deref is
+/// a use-after-free. The negative control (the callee stores a *heap* pointer through the
+/// out-param) must leave the caller safe.
+#[test]
+fn out_parameter_stack_escape_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |src: &str| LlvmFrontend.lower(LlvmInput { source: src.into(), name: "r".into() }).expect("lower");
+    let verdict_of = |m: &_, f: &str| {
+        verify_module(m, &cfg).functions.into_iter().find(|r| r.function == f).expect("fn report").verdict
+    };
+    // @bad stores &local through *out; @caller reads it back and writes through it → UAF.
+    let bad = lower(concat!(
+        "define void @bad(ptr %out) {\nb:\n  %x = alloca i32, align 4\n  store ptr %x, ptr %out, align 8\n  ret void\n}\n",
+        "define void @caller() {\nb:\n  %slot = alloca ptr, align 8\n  call void @bad(ptr %slot)\n  \
+           %p = load ptr, ptr %slot, align 8\n  store i32 7, ptr %p, align 4\n  ret void\n}\n",
+    ));
+    assert_eq!(verdict_of(&bad, "caller"), Verdict::Fail, "dereferencing an escaped out-parameter local is a use-after-free");
+    // Negative control: @okfn stores a heap pointer (from @alloc) through *out — the caller owns
+    // that object, so reading it back and dereferencing is fine.
+    let ok = lower(concat!(
+        "declare ptr @alloc()\n",
+        "define void @okfn(ptr %out) {\nb:\n  %h = call ptr @alloc()\n  store ptr %h, ptr %out, align 8\n  ret void\n}\n",
+        "define void @caller2() {\nb:\n  %slot = alloca ptr, align 8\n  call void @okfn(ptr %slot)\n  \
+           %p = load ptr, ptr %slot, align 8\n  store i32 7, ptr %p, align 4\n  ret void\n}\n",
+    ));
+    assert_ne!(verdict_of(&ok, "caller2"), Verdict::Fail, "an out-param holding a heap pointer is not dangling");
+}
+
 /// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the
 /// request's destination to grant `write` — which `foreign` does not → FAIL. This exercises
 /// `label`/`propagate`/`require` (data/provenance.contract) end to end through real API names.
