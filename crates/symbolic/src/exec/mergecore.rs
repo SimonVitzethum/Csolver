@@ -274,6 +274,8 @@ impl Explorer<'_> {
         match (a, b) {
             (SymValue::Scalar(ea), SymValue::Scalar(eb)) => SymValue::Scalar(self.ctx.ite(d, ea, eb)),
             (SymValue::Ptr(pa), SymValue::Ptr(pb)) if pa.prov == pb.prov => SymValue::Ptr(SymPointer {
+                // The borrow tag survives a select only if both sides agree (else ambiguous → None).
+                borrow: if pa.borrow == pb.borrow { pa.borrow } else { None },
                 prov: pa.prov,
                 offset: self.ctx.ite(d, pa.offset, pb.offset),
                 align: gcd(pa.align, pb.align),
@@ -288,9 +290,11 @@ impl Explorer<'_> {
                         prov: Prov::Unknown(POrigin::SelectJoin, None),
                         offset: self.ctx.int(PTR_WIDTH, 0),
                         align: 1,
+                        borrow: None,
                     })
                 } else {
                     SymValue::Ptr(SymPointer {
+                        borrow: if pa.borrow == pb.borrow { pa.borrow } else { None },
                         prov: Prov::Select {
                             cond: d,
                             then_ptr: Box::new(pa.clone()),

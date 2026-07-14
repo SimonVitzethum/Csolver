@@ -131,7 +131,7 @@ impl Explorer<'_> {
         for k in 0..scanned {
             let delta = self.ctx.int(PTR_WIDTH, (k * word) as u128);
             let off = self.ctx.bin(BvOp::Add, base.offset, delta);
-            let p = SymPointer { prov: base.prov.clone(), offset: off, align: 1 };
+            let p = SymPointer { prov: base.prov.clone(), offset: off, align: 1, borrow: None };
             let (_, origin) = self.load_value(&p, word, &Type::int(64), state);
             if matches!(origin, LoadOrigin::Unwritten) {
                 return true;
@@ -141,7 +141,7 @@ impl Explorer<'_> {
         if tail > 0 && full <= MAX_CHUNKS {
             let delta = self.ctx.int(PTR_WIDTH, (full * word) as u128);
             let off = self.ctx.bin(BvOp::Add, base.offset, delta);
-            let p = SymPointer { prov: base.prov.clone(), offset: off, align: 1 };
+            let p = SymPointer { prov: base.prov.clone(), offset: off, align: 1, borrow: None };
             let ty = Type::int((tail * 8) as u32);
             let (_, origin) = self.load_value(&p, tail, &ty, state);
             if matches!(origin, LoadOrigin::Unwritten) {

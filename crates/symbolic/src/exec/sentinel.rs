@@ -218,6 +218,7 @@ impl Explorer<'_> {
                 prov: Prov::Region(cap.region),
                 offset: o,
                 align: gcd(cap.align, stride),
+                borrow: None,
             }),
         );
         let o_upper = plus_d(self, o);

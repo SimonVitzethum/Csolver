@@ -175,21 +175,17 @@ pub(crate) fn load_derived_regs(f: &Function) -> HashSet<RegId> {
 /// are *live* per region (see `PathState.region_borrows`).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BorrowInfo {
-    /// Pointer register → the borrow tag (retag-dst register) it belongs to.
-    pub(crate) of: HashMap<RegId, RegId>,
-    /// Borrow tag → its parent borrow (`None` = a root reborrow of an untracked pointer).
-    pub(crate) parent: HashMap<RegId, Option<RegId>>,
-    /// Borrow tag → whether it is a **unique** (`&mut`) borrow (`false` = a shared `&T`).
+    /// Borrow tag (a `csolver.retag.*` dst register, or a `&mut`-parameter register) → whether
+    /// it is a **unique** (`&mut`) borrow. A tag absent here defaults to unique (parameters and
+    /// mutable reborrows), so only `csolver.retag.shared` dsts record `false`. The tag itself
+    /// flows dynamically on the pointer value ([`SymPointer::borrow`]), so no static
+    /// register→tag map is needed — this only records per-tag uniqueness (a static property).
     pub(crate) unique: HashMap<RegId, bool>,
 }
 
-/// Compute [`BorrowInfo`] for `f`: seed each `csolver.retag.{mut,shared}` dst as a sealed
-/// borrow tag, propagate the borrow through copies/casts/`PtrOffset`/`FieldPtr` to a fixpoint,
-/// then resolve each retag's parent to the parent pointer's borrow tag.
+/// Compute [`BorrowInfo`] for `f`: record each `csolver.retag.{mut,shared}` dst's uniqueness.
+/// The tag→pointer association is dynamic (`SymPointer::borrow`), so nothing else is precomputed.
 pub(crate) fn borrow_info(f: &Function) -> BorrowInfo {
-    // Sealed borrow tags (a retag dst never inherits another borrow) + each retag's parent reg
-    // and uniqueness.
-    let mut retag_parent_reg: HashMap<RegId, RegId> = HashMap::new();
     let mut unique: HashMap<RegId, bool> = HashMap::new();
     for b in &f.blocks {
         for inst in &b.insts {
@@ -199,45 +195,13 @@ pub(crate) fn borrow_info(f: &Function) -> BorrowInfo {
                     "csolver.retag.shared" => false,
                     _ => continue,
                 };
-                if let (Some(d), Some(p)) = (args.first().and_then(|o| o.as_reg()), args.get(1).and_then(|o| o.as_reg())) {
-                    retag_parent_reg.insert(d, p);
+                if let Some(d) = args.first().and_then(|o| o.as_reg()) {
                     unique.insert(d, is_unique);
                 }
             }
         }
     }
-    let mut of: HashMap<RegId, RegId> = HashMap::new();
-    for &d in retag_parent_reg.keys() {
-        of.insert(d, d); // a retag dst is its own borrow (sealed — never overwritten below)
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in &f.blocks {
-            for inst in &b.insts {
-                let (dst, src) = match inst {
-                    Inst::Assign { dst, value: RValue::Use(o) | RValue::Cast { operand: o, .. }, .. } => (*dst, o.as_reg()),
-                    Inst::PtrOffset { dst, base, .. } => (*dst, base.as_reg()),
-                    Inst::FieldPtr { dst, base, .. } => (*dst, base.as_reg()),
-                    _ => continue,
-                };
-                if retag_parent_reg.contains_key(&dst) {
-                    continue; // sealed
-                }
-                if let Some(tag) = src.and_then(|r| of.get(&r).copied()) {
-                    if of.insert(dst, tag) != Some(tag) {
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-    // Resolve each retag's parent borrow: the parent pointer's borrow tag, or None (root).
-    let mut parent: HashMap<RegId, Option<RegId>> = HashMap::new();
-    for (&d, &p) in &retag_parent_reg {
-        parent.insert(d, of.get(&p).copied());
-    }
-    BorrowInfo { of, parent, unique }
+    BorrowInfo { unique }
 }
 
 /// The pointer registers derived from a genuine **shared borrow** (`&T`) — a

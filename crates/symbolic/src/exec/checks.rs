@@ -24,6 +24,7 @@ impl Explorer<'_> {
                 prov: sub.prov.clone(),
                 offset: ex.ctx.bin(BvOp::Add, sub.offset, outer),
                 align: sub.align,
+                borrow: sub.borrow,
             };
             let pa = branch(self, &then_ptr);
             let pb = branch(self, &else_ptr);
@@ -157,6 +158,7 @@ impl Explorer<'_> {
                 prov: sub.prov.clone(),
                 offset: ex.ctx.bin(BvOp::Add, sub.offset, outer),
                 align: sub.align,
+                borrow: sub.borrow,
             };
             let pa = branch(self, &then_ptr);
             let pb = branch(self, &else_ptr);
@@ -336,10 +338,12 @@ impl Explorer<'_> {
         [lower, upper]
     }
 
-    /// A `&mut` reborrow (`csolver.retag.mut`), for the opt-in aliasing model. `args[0]` is the
-    /// new borrow tag (register), `args[1]` the parent pointer. Push the tag onto the parent
-    /// pointer's region borrow stack, popping the parent's other descendants — a reborrow
-    /// invalidates its siblings (Stacked/Tree-Borrows). A root reborrow (parent has no tag —
+    /// A reborrow marker (`csolver.retag.mut`/`.shared`), for the opt-in aliasing model.
+    /// `args[0]` is the new borrow tag (register), `args[1]` the parent pointer. The parent's
+    /// tag is read **dynamically** from the parent pointer's [`SymPointer::borrow`] (so it flows
+    /// through memory/phi), and the new tag is stamped onto the reborrow's pointer value. A
+    /// **unique** (`&mut`) reborrow pushes its tag, popping the parent's other descendants — a
+    /// reborrow invalidates its siblings (Stacked/Tree-Borrows). A root reborrow (parent has no tag —
     /// e.g. a `&mut` parameter) invalidates every prior borrow of the region. If the parent is
     /// no longer live, the region is *poisoned* (checks skipped — sound, never a false FAIL).
     pub(crate) fn step_retag(&mut self, args: &[Operand], state: &mut PathState) {
@@ -348,14 +352,21 @@ impl Explorer<'_> {
         else {
             return;
         };
-        let Prov::Region(rid) = self.eval_pointer(&parent_op, state).prov else {
+        let parent_ptr = self.eval_pointer(&parent_op, state);
+        let Prov::Region(rid) = parent_ptr.prov else {
             return;
         };
         if matches!(state.region_borrows.get(&rid), Some(None)) {
             return; // already poisoned
         }
-        let parent_tag = self.borrow_info.parent.get(&new_tag).copied().flatten();
+        // The parent's borrow tag flows on the pointer value (through memory/phi too); `None`
+        // is a root reborrow of an untracked pointer (e.g. a `&mut` parameter's owner).
+        let parent_tag = parent_ptr.borrow;
         let unique = self.borrow_info.unique.get(&new_tag).copied().unwrap_or(true);
+        // Stamp the new borrow tag onto the reborrow's pointer value so it flows onward.
+        if let Some(SymValue::Ptr(p)) = state.env.get_mut(&new_tag) {
+            p.borrow = Some(new_tag);
+        }
         let mut stack = state.region_borrows.get(&rid).cloned().flatten().unwrap_or_default();
         let new_val = if !unique {
             // A **shared** (`&T`) reborrow: add the tag without popping siblings — shared borrows
@@ -390,16 +401,12 @@ impl Explorer<'_> {
     pub(crate) fn check_borrow_access(
         &mut self,
         at: (BlockId, usize),
-        ptr: &Operand,
         is_write: bool,
         p: &SymPointer,
         state: &mut PathState,
     ) {
-        let (Some(reg), Prov::Region(rid)) = (ptr.as_reg(), &p.prov) else {
-            return;
-        };
-        let Some(&tag) = self.borrow_info.of.get(&reg) else {
-            return; // pointer is not a tracked borrow
+        let (Some(tag), Prov::Region(rid)) = (p.borrow, &p.prov) else {
+            return; // pointer carries no borrow tag, or has no tracked region
         };
         let rid = *rid;
         let Some(Some(stack)) = state.region_borrows.get(&rid) else {

@@ -33,6 +33,7 @@ impl Explorer<'_> {
                 prov: Prov::Unknown(origin, Some(id)),
                 offset: self.ctx.int(PTR_WIDTH, 0),
                 align: 1,
+                borrow: None,
             })
         } else {
             SymValue::Scalar(self.fresh_scalar(type_width(ty)))

@@ -64,6 +64,7 @@ impl Explorer<'_> {
                         prov: base.prov.clone(),
                         offset: ex.ctx.bin(BvOp::Add, base.offset, off_e),
                         align: 1,
+                        borrow: None,
                     };
                     ex.load_value(&field_ptr, PTR_WIDTH as u64 / 8, &Type::ptr(Type::int(8)), st).0
                 };

@@ -126,6 +126,7 @@ impl Explorer<'_> {
                             prov: Prov::Unknown(POrigin::Loop, Some(id)),
                             offset,
                             align: 1,
+                            borrow: None,
                         }),
                     );
                 }

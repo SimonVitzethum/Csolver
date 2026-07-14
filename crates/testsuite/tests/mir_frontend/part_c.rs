@@ -554,3 +554,30 @@ fn reborrows_emit_the_right_retag_marker() {
     assert_eq!(retag_name(REBORROW_SHARED, "g").as_deref(), Some("csolver.retag.shared"), "&(*_p) → retag.shared");
     assert_eq!(retag_name(REBORROW_RAW_MUT, "h").as_deref(), Some("csolver.retag.mut"), "&raw mut *_p → retag.mut");
 }
+
+/// **Protector**: a `&mut` reference parameter is a protected root borrow for the whole
+/// function. Reborrowing it (`_2`), then writing through the PARAMETER (which pops the
+/// reborrow), then using the reborrow is a use-after-invalidation — flagged only with the
+/// aliasing model on. Exercises the entry protector marker end-to-end through the frontend.
+pub(crate) const PROTECTOR_UAF: &str = r#"
+fn f(_1: &mut i32) -> () {
+    let mut _2: &mut i32;
+    bb0: {
+        _2 = &mut (*_1);
+        (*_1) = const 5_i32;
+        (*_2) = const 6_i32;
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mut_param_protector_flags_use_after_reborrow_invalidation() {
+    let module = lower(PROTECTOR_UAF, "f");
+    // With the aliasing model ON: `(*_2)=6` after `(*_1)=5` invalidated _2 is a violation.
+    let on = Config { level: csolver_core::SourceLevel::Mir, aliasing_model: true, ..Config::default() };
+    assert_eq!(verify_module(&module, &on).verdict, Verdict::Fail, "param protector catches the reborrow-then-param-write-then-use");
+    // OFF (default): the borrow stack is inert, so no such violation.
+    let off = Config { level: csolver_core::SourceLevel::Mir, ..Config::default() };
+    assert_ne!(verify_module(&module, &off).verdict, Verdict::Fail, "off by default → not flagged");
+}

@@ -135,12 +135,29 @@ impl PartialEq for Prov {
 }
 impl Eq for Prov {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct SymPointer {
     pub(crate) prov: Prov,
     pub(crate) offset: ExprId,
     pub(crate) align: u64,
+    /// **Borrow tag** for the opt-in aliasing model (`--aliasing-model`): the retag-dst (or
+    /// `&mut`-parameter) register this pointer's borrow belongs to. It flows with the pointer
+    /// *value* — through copies, `gep`, and crucially **through memory (store→load) and
+    /// block-parameter merges** that the static register pre-pass cannot follow. Purely
+    /// diagnostic metadata: **deliberately excluded from `PartialEq`/`Eq`** (see below), so
+    /// aliasing, merging and every existing verdict stay byte-identical to before it existed.
+    /// `None` for a pointer with no tracked borrow. Set only when the model is on.
+    pub(crate) borrow: Option<RegId>,
 }
+
+// Pointer equality is over `(prov, offset, align)` only: the borrow tag is metadata that must
+// not affect aliasing/merge/any verdict (the same discipline as `Prov`'s excluded `POrigin`).
+impl PartialEq for SymPointer {
+    fn eq(&self, other: &Self) -> bool {
+        self.prov == other.prov && self.offset == other.offset && self.align == other.align
+    }
+}
+impl Eq for SymPointer {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SymRegion {

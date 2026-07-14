@@ -367,6 +367,7 @@ impl Explorer<'_> {
                         prov: Prov::Region(rid),
                         offset: self.ctx.int(PTR_WIDTH, 0),
                         align: 1,
+                        borrow: None,
                     })
                 }
                 _ => self.fresh_value(ret_ty, POrigin::Call),
@@ -430,6 +431,7 @@ impl Explorer<'_> {
                     prov: base.prov.clone(),
                     offset: new_off,
                     align: base.align,
+                    borrow: base.borrow, // a summarized offset stays within the same borrow
                 })
             }
             _ => self.fresh_value(ret_ty, POrigin::Call),

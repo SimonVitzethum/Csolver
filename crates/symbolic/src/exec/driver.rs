@@ -321,6 +321,7 @@ pub(crate) fn discharge_inner(
                 prov: Prov::Region(rid),
                 offset: zero,
                 align: c.align.max(1) as u64,
+                borrow: None,
             }),
         );
         // Member-provenance: seed every field this parameter's call sites all fill
@@ -353,11 +354,12 @@ pub(crate) fn discharge_inner(
             let palign = fc.pointee.align.max(1) as u64;
             let off_e = ex.ctx.int(PTR_WIDTH, fc.offset as u128);
             initial_heap.push(StoreRecord {
-                target: SymPointer { prov: Prov::Region(rid), offset: off_e, align: palign },
+                target: SymPointer { prov: Prov::Region(rid), offset: off_e, align: palign, borrow: None },
                 value: SymValue::Ptr(SymPointer {
                     prov: Prov::Region(prid),
                     offset: zero,
                     align: palign,
+                    borrow: None,
                 }),
                 size: PTR_WIDTH as u64 / 8,
             });

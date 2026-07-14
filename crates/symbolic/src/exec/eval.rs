@@ -19,6 +19,7 @@ impl Explorer<'_> {
                         prov: Prov::Unknown(POrigin::RegionDrop, None),
                         offset: p.offset,
                         align: p.align,
+                        borrow: p.borrow,
                     })
                 }
                 Some(v) => v.clone(),
@@ -29,6 +30,7 @@ impl Explorer<'_> {
                 prov: Prov::Null,
                 offset: self.ctx.int(PTR_WIDTH, 0),
                 align: 1,
+                borrow: None,
             }),
             Operand::Const(Const::Undef) => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
             Operand::Const(Const::Symbol(name)) => match self.global_rids.get(name) {
@@ -36,6 +38,7 @@ impl Explorer<'_> {
                     prov: Prov::Region(rid),
                     offset: self.ctx.int(PTR_WIDTH, 0),
                     align,
+                    borrow: None,
                 }),
                 // Not a known global (e.g. a function address): an opaque scalar.
                 None => SymValue::Scalar(self.ctx.symbol(format!("@{name}"), PTR_WIDTH)),
@@ -57,7 +60,7 @@ impl Explorer<'_> {
                         } else {
                             1
                         };
-                        SymValue::Ptr(SymPointer { prov: Prov::Region(rid), offset, align: a })
+                        SymValue::Ptr(SymPointer { prov: Prov::Region(rid), offset, align: a, borrow: None })
                     }
                     None => SymValue::Scalar(self.fresh_scalar(PTR_WIDTH)),
                 }
@@ -122,6 +125,7 @@ impl Explorer<'_> {
                     prov: Prov::Unknown(POrigin::ScalarAsPtr(cause), None),
                     offset: self.ctx.int(PTR_WIDTH, 0),
                     align: 1,
+                    borrow: None,
                 }
             }
         }
@@ -229,6 +233,7 @@ impl Explorer<'_> {
                     prov: Prov::Unknown(POrigin::IntToPtr, None),
                     offset: self.ctx.int(PTR_WIDTH, 0),
                     align: 1,
+                    borrow: None,
                 }),
                 CastOp::ZExt | CastOp::SExt => match self.eval_value(operand, state) {
                     SymValue::Scalar(e) => SymValue::Scalar(e),

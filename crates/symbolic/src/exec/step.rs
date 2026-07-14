@@ -152,6 +152,7 @@ impl Explorer<'_> {
                         prov: Prov::Region(rid),
                         offset: zero,
                         align: *align as u64,
+                        borrow: None,
                     }),
                 );
             }
@@ -180,6 +181,7 @@ impl Explorer<'_> {
                     prov: base_ptr.prov.clone(),
                     offset: new_off,
                     align: new_align,
+                    borrow: base_ptr.borrow, // a gep stays within the same borrow
                 };
                 self.check_ptr_arith(block, idx, &result, state);
                 state.env.insert(*dst, SymValue::Ptr(result));
@@ -204,7 +206,7 @@ impl Explorer<'_> {
                         let end = self.ctx.int(PTR_WIDTH, (off + *size) as u128);
                         let hi = self.ctx.cmp(SCmp::Sle, end, region_size);
                         state.facts.push(hi);
-                        SymPointer { prov: Prov::Region(rid), offset: off_e, align: (*align).max(1) }
+                        SymPointer { prov: Prov::Region(rid), offset: off_e, align: (*align).max(1), borrow: base_ptr.borrow }
                     }
                     // Not a known region (null/unknown provenance): the field
                     // pointer inherits it, so a later access is soundly unproven.
@@ -212,6 +214,7 @@ impl Explorer<'_> {
                         prov: base_ptr.prov.clone(),
                         offset: base_ptr.offset,
                         align: (*align).max(1),
+                        borrow: base_ptr.borrow,
                     },
                 };
                 state.env.insert(*dst, SymValue::Ptr(result));
@@ -221,7 +224,7 @@ impl Explorer<'_> {
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidRead, state);
                 if self.limits.aliasing_model {
-                    self.check_borrow_access((block, idx), ptr, false, &p, state);
+                    self.check_borrow_access((block, idx), false, &p, state);
                 }
                 // An atomic/volatile read (`READ_ONCE`/`atomic_read`) is race-free by
                 // construction — excluded from the data-race pass.
@@ -330,7 +333,7 @@ impl Explorer<'_> {
                             "write through a shared reference (Rust aliasing violation)",
                         );
                     }
-                    self.check_borrow_access((block, idx), ptr, true, &p, state);
+                    self.check_borrow_access((block, idx), true, &p, state);
                 }
                 // An atomic/volatile write (`WRITE_ONCE`/`atomic_set`) is race-free by
                 // construction — excluded from the data-race pass.

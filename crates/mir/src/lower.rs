@@ -124,7 +124,16 @@ fn lower_function(
     let mut params = Vec::new();
     let mut contracts = Vec::new();
     let mut pending_slices: Vec<(u32, u32, u64, bool)> = Vec::new();
+    // Locals of `&mut T` *reference* parameters (NOT raw `*mut T`, which may legitimately
+    // alias) — each gets an entry retag marker so it is a **protected root borrow** for the
+    // whole function (opt-in aliasing model): the parameter borrow participates in the
+    // borrow-stack, so a reborrow that invalidates it followed by a use through the parameter
+    // is caught. A no-op unless `--aliasing-model` is on.
+    let mut mut_ref_locals: Vec<u32> = Vec::new();
     for (idx, (local, mty)) in body.params.iter().enumerate() {
+        if matches!(mty, MType::Ref(_, true)) {
+            mut_ref_locals.push(*local);
+        }
         match mty {
             MType::Ref(inner, mutable) | MType::Ptr(inner, mutable) => {
                 params.push((RegId(*local), Type::ptr(mtype_to_ir(inner))));
@@ -187,6 +196,20 @@ fn lower_function(
     let mut blocks = Vec::new();
     for b in &body.blocks {
         blocks.push(ctx.lower_block(b)?);
+    }
+    // Prepend a protector retag for each `&mut` reference parameter to the entry block: the
+    // parameter is its own root borrow (parent = itself → a root reborrow of the untracked owner).
+    if let Some(entry) = blocks.first_mut() {
+        for &local in mut_ref_locals.iter().rev() {
+            entry.insts.insert(
+                0,
+                Inst::Intrinsic {
+                    dst: None,
+                    name: "csolver.retag.mut".into(),
+                    args: vec![IrOp::Reg(RegId(local)), IrOp::Reg(RegId(local))],
+                },
+            );
+        }
     }
     if ctx.lowering_failed {
         return Err(Error::unsupported("a memory access could not be lowered to a known pointer"));

@@ -54,6 +54,7 @@ impl Explorer<'_> {
                         prov: Prov::Region(rid),
                         offset: zero,
                         align: (*align).max(1) as u64,
+                        borrow: None,
                     }),
                 );
             }

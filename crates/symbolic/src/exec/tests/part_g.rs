@@ -464,3 +464,29 @@ fn double_free_is_refuted() {
     assert!(!second.proven);
     assert!(second.refutation.is_some(), "double free is refuted with a witness");
 }
+
+
+#[test]
+fn borrow_tag_flows_through_memory_store_load() {
+    // r1 = &mut *r0; store r1 into slot; r2 = load slot; r3 = &mut *r0 (invalidates r1);
+    // *r2 = 5  — r2 (loaded from memory) still carries r1's tag, which r3 invalidated → UB.
+    let (r0, slot, r1, r2, r3) = (RegId(0), RegId(1), RegId(2), RegId(3), RegId(4));
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb.insts.push(Inst::Alloc { dst: r0, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 8 });
+    bb.insts.push(Inst::Alloc { dst: slot, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 8 });
+    bb.insts.push(Inst::Assign { dst: r1, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb.insts.push(retag(r1, r0));
+    // store the borrow pointer r1 into the slot
+    bb.insts.push(Inst::Store { ty: Type::ptr(Type::int(64)), ptr: Operand::Reg(slot), value: Operand::Reg(r1), align: 8, volatile: false });
+    // load it back into r2 (the tag must survive the round-trip through memory)
+    bb.insts.push(Inst::Load { dst: r2, ty: Type::ptr(Type::int(64)), ptr: Operand::Reg(slot), align: 8, volatile: false });
+    // a sibling reborrow r3 invalidates r1
+    bb.insts.push(Inst::Assign { dst: r3, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb.insts.push(retag(r3, r0));
+    // use r2 (which carries r1's tag) → r1 was invalidated → UB
+    bb.insts.push(Inst::Store { ty: Type::int(64), ptr: Operand::Reg(r2), value: Operand::int(64, 5), align: 8, volatile: false });
+    let f = Function { id: FuncId(0), name: "mem".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb], entry: BlockId(0) };
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    let d = on.mem_decision(BlockId(0), 8, SafetyProperty::NoAliasingViolation).expect("aliasing obligation at the final store");
+    assert!(!d.proven && d.refutation.is_some(), "the borrow tag must survive store→load, so using r2 after r1 was invalidated is UB");
+}

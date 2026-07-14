@@ -124,6 +124,32 @@ pub(crate) fn verify_function_with(
                 };
                 outcomes.push(ObligationOutcome { obligation, result });
             }
+
+            // Rust aliasing (borrow-stack) violation (`--aliasing-model`): a **record-only**
+            // obligation — the executor records a decision at a Load/Store ONLY when it finds a
+            // violation (a write through a shared `&T`, or a use of a `&mut` after an aliasing
+            // reborrow invalidated it). So query it explicitly and add a FAIL obligation only
+            // when a violation was found; a safe access records nothing (no obligation), so this
+            // never turns a safe access UNKNOWN. Off unless the aliasing model is enabled.
+            if config.aliasing_model && matches!(inst, Inst::Load { .. } | Inst::Store { .. }) {
+                let property = SafetyProperty::NoAliasingViolation;
+                if let Some(d) = symbolic.as_ref().and_then(|r| r.mem_decision(block.id, index, property)) {
+                    if !d.proven {
+                        let id = ObligationId(*next_id);
+                        *next_id += 1;
+                        let location = Location::level_only(config.level)
+                            .in_function(f.name.as_str())
+                            .at_instruction(index as u32)
+                            .with_raw(block.inst_spans.get(index).cloned().flatten());
+                        let obligation = ProofObligation::new(id, property, location, d.predicate.clone());
+                        let result = match &d.refutation {
+                            Some(model) => refuted_by_symbolic(property, &d.predicate, model.clone()),
+                            None => open_memory(property, &d.predicate, &d.residual),
+                        };
+                        outcomes.push(ObligationOutcome { obligation, result });
+                    }
+                }
+            }
         }
         // Terminator-level obligation: a `return` of a pointer into this frame's
         // own stack is a dangling return (use-after-return in the making). The
