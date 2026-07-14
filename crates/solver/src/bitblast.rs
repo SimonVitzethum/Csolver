@@ -12,11 +12,12 @@
 //!
 //! ## What is and isn't blasted
 //!
-//! Supported: constants, symbols, `Add`/`Sub`/`Mul`, bitwise `And`/`Or`/`Xor`,
+//! Supported: constants, symbols, `Add`/`Sub`/`Mul`, `UDiv`/`SDiv`/`URem`/`SRem`
+//! (restoring long division, SMT-LIB-total on a zero divisor), bitwise `And`/`Or`/`Xor`,
 //! constant-amount `Shl`/`LShr`/`AShr`, all comparisons, `Not`/`And`/`Or`/`Ite`.
-//! Anything else — division/remainder, a *symbolic* shift amount, or a width
-//! above [`MAX_WIDTH`] — makes [`Blaster::encode_bool`] return `None`, so the
-//! caller soundly falls back (it never mis-encodes into a wrong answer).
+//! Anything else — a *symbolic* shift amount, or a width above [`MAX_WIDTH`] — makes
+//! [`Blaster::encode_bool`] return `None`, so the caller soundly falls back (it never
+//! mis-encodes into a wrong answer).
 
 use crate::expr::{BvOp, CmpOp, ExprCtx, ExprId, Node};
 use crate::sat::Lit;
@@ -247,6 +248,70 @@ impl Cnf {
             acc = self.add(&acc, &pp);
         }
         acc
+    }
+
+    /// Two's-complement negation `-a` = `¬a + 1`.
+    fn negate(&mut self, a: &[Lit]) -> Vec<Lit> {
+        let na: Vec<Lit> = a.iter().map(|l| l.negated()).collect();
+        let zeros = vec![self.lit_false(); a.len()];
+        let cin = self.lit_true();
+        self.adder(&na, &zeros, cin).0
+    }
+
+    /// The magnitude `|a|` and sign bit of a two's-complement value: `(sign ? -a : a, sign)`.
+    /// Note `|INT_MIN|` is `INT_MIN` as an unsigned pattern (`2^(w-1)`) — the same wraparound
+    /// SMT-LIB `bvsdiv`/`bvsrem` use, so the `INT_MIN / -1` edge case comes out consistently.
+    fn abs_sign(&mut self, a: &[Lit]) -> (Vec<Lit>, Lit) {
+        let w = a.len();
+        let sign = a[w - 1];
+        let nega = self.negate(a);
+        let mag = (0..w).map(|i| self.mux(sign, nega[i], a[i])).collect();
+        (mag, sign)
+    }
+
+    /// **Unsigned** division, restoring long division: returns `(quotient, remainder)`, both
+    /// width `w` (LSB-first). The partial remainder is kept in `w+1` bits (headroom for the
+    /// shift-in before the trial subtraction); its top bit is provably 0 after each step (the
+    /// reduced remainder is `< divisor ≤ 2^w-1`), so the low `w` bits carry it forward. The
+    /// **divide-by-zero** valuation is SMT-LIB-total: `bvudiv a 0 = ~0` (every trial subtracts
+    /// 0 → all quotient bits set) and `bvurem a 0 = a` (nothing is ever reduced → the shifted-in
+    /// dividend remains) — so no term is left under-constrained even without a guard, and the
+    /// IR's `NoDivByZero` obligation independently flags the UB.
+    fn udivrem(&mut self, a: &[Lit], b: &[Lit]) -> (Vec<Lit>, Vec<Lit>) {
+        let w = a.len();
+        let zero = self.lit_false();
+        let mut rem = vec![zero; w]; // partial remainder, always < b (fits w bits)
+        let mut quot = vec![zero; w];
+        let mut bext = b.to_vec(); // divisor zero-extended to w+1 bits
+        bext.push(zero);
+        for i in (0..w).rev() {
+            // shifted = (rem << 1) | a[i]  — w+1 bits, LSB = the next dividend bit.
+            let mut shifted = Vec::with_capacity(w + 1);
+            shifted.push(a[i]);
+            shifted.extend_from_slice(&rem);
+            // carry == 1  ⇔  shifted ≥u bext  ⇔  subtract and set this quotient bit.
+            let (diff, carry) = self.sub_with_borrow(&shifted, &bext);
+            quot[i] = carry;
+            let newrem: Vec<Lit> = (0..=w).map(|k| self.mux(carry, diff[k], shifted[k])).collect();
+            rem = newrem[..w].to_vec(); // newrem[w] is provably 0
+        }
+        (quot, rem)
+    }
+
+    /// **Signed** division/remainder (LLVM/SMT rounding toward zero): divide the magnitudes,
+    /// then fix signs — quotient sign is `sign_a ⊕ sign_b`, remainder sign follows the
+    /// **dividend** (`a = (a/b)*b + (a%b)`).
+    fn sdivrem(&mut self, a: &[Lit], b: &[Lit]) -> (Vec<Lit>, Vec<Lit>) {
+        let w = a.len();
+        let (ma, sa) = self.abs_sign(a);
+        let (mb, sb) = self.abs_sign(b);
+        let (uq, ur) = self.udivrem(&ma, &mb);
+        let qsign = self.xor2(sa, sb);
+        let neg_uq = self.negate(&uq);
+        let quot = (0..w).map(|i| self.mux(qsign, neg_uq[i], uq[i])).collect();
+        let neg_ur = self.negate(&ur);
+        let rem = (0..w).map(|i| self.mux(sa, neg_ur[i], ur[i])).collect();
+        (quot, rem)
     }
 
     /// `a & b`, `a | b`, `a ^ b` bitwise.

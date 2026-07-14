@@ -173,8 +173,10 @@ impl<'c> Blaster<'c> {
                 let k = self.ctx.as_const(b_id)?.unsigned();
                 self.shift_const(op, a, k, w)
             }
-            // Division/remainder are not blasted (sound fallback to linear).
-            BvOp::UDiv | BvOp::SDiv | BvOp::URem | BvOp::SRem => return None,
+            BvOp::UDiv => self.cnf.udivrem(a, b).0,
+            BvOp::URem => self.cnf.udivrem(a, b).1,
+            BvOp::SDiv => self.cnf.sdivrem(a, b).0,
+            BvOp::SRem => self.cnf.sdivrem(a, b).1,
         };
         Some(bits)
     }

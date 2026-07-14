@@ -41,7 +41,14 @@ fn oracle_bin(op: BvOp, a: u128, b: u128, w: u32) -> u128 {
             let k = if b >= w as u128 { w - 1 } else { b as u32 };
             mask((s >> k) as u128, w)
         }
-        _ => unreachable!("oracle_bin called with non-blastable op"),
+        // Division/remainder — the caller guarantees `b != 0` (the 0-divisor totality
+        // contract is checked separately). Signed ops round toward zero (Rust `/`, `%`
+        // on `i128`), matching LLVM/SMT; `INT_MIN / -1` masks back to `INT_MIN` with no
+        // `i128` overflow since `w < 128`.
+        BvOp::UDiv => mask(a / b, w),
+        BvOp::URem => mask(a % b, w),
+        BvOp::SDiv => mask((as_signed(a, w) / as_signed(b, w)) as u128, w),
+        BvOp::SRem => mask((as_signed(a, w) % as_signed(b, w)) as u128, w),
     }
 }
 
@@ -124,6 +131,31 @@ fn check_exhaustive(w: u32) {
                 );
             }
 
+            // Division/remainder (two symbolic operands), skipping the 0-divisor case
+            // (its SMT-LIB-total valuation is asserted separately below).
+            if vb != 0 {
+                for op in [BvOp::UDiv, BvOp::SDiv, BvOp::URem, BvOp::SRem] {
+                    let expr = c.bin(op, a, b);
+                    let want = oracle_bin(op, va, vb, w);
+                    let goal = {
+                        let k = c.int(w, want);
+                        c.cmp(CmpOp::Eq, expr, k)
+                    };
+                    assert!(
+                        prove_implies(&c, &assume_ab, goal),
+                        "{op:?} a={va} b={vb} (w{w}): correct result {want} not provable",
+                    );
+                    let bad = {
+                        let wrong = c.int(w, mask(want.wrapping_add(1), w));
+                        c.cmp(CmpOp::Eq, expr, wrong)
+                    };
+                    assert!(
+                        !prove_implies(&c, &assume_ab, bad),
+                        "{op:?} a={va} b={vb} (w{w}): a wrong result was provable",
+                    );
+                }
+            }
+
             // Constant-amount shifts (the right operand is the constant cb).
             for op in shift_ops {
                 let expr = c.bin(op, a, cb);
@@ -170,6 +202,34 @@ fn bitblast_matches_oracle_4bit() {
 #[ignore = "slow exhaustive sweep; run on demand"]
 fn bitblast_matches_oracle_6bit() {
     check_exhaustive(6);
+}
+
+/// The division circuits must be **total** on a zero divisor, matching SMT-LIB:
+/// `bvudiv a 0 = ~0` (all ones) and `bvurem a 0 = a`. This pins the corner the
+/// exhaustive sweep skips, so a term is never left under-constrained even absent
+/// a `NoDivByZero` guard (the guard independently flags the UB, but the solver
+/// must still be sound if it ever encodes the raw term).
+#[test]
+fn division_by_zero_is_smtlib_total() {
+    let w = 4;
+    let ones = mask(u128::MAX, w);
+    for va in 0..(1u128 << w) {
+        let mut c = ExprCtx::new();
+        let a = c.symbol("a", w);
+        let ca = c.int(w, va);
+        let z = c.int(w, 0);
+        let assume = [c.cmp(CmpOp::Eq, a, ca)];
+
+        let udiv = c.bin(BvOp::UDiv, a, z);
+        let want_q = c.int(w, ones);
+        let q_ok = c.cmp(CmpOp::Eq, udiv, want_q);
+        assert!(prove_implies(&c, &assume, q_ok), "udiv a 0 must be all-ones (a={va})");
+
+        let urem = c.bin(BvOp::URem, a, z);
+        let want_r = c.int(w, va);
+        let r_ok = c.cmp(CmpOp::Eq, urem, want_r);
+        assert!(prove_implies(&c, &assume, r_ok), "urem a 0 must be a (a={va})");
+    }
 }
 
 /// Regression for the `shift_const` overflow: at width 64 a constant shift
