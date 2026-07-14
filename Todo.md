@@ -1,5 +1,44 @@
 # Todo — Schwächen & Risiken aus dem Code-Review (2026-07-13)
 
+## → WAS IST JETZT NOCH ZU TUN (Stand 2026-07-14, priorisiert)
+
+Nach den Batches (SMT entfernt, 128-Bit, x86-ALU-mem+LOCK, interproc-Escape, CFI-Slice,
+acquire/release, div/rem+Shifts). Alles Übrige ist **sound** (degradiert zu UNKNOWN, nie
+false PASS). Geordnet nach *sound machbar × Wert*.
+
+**Tier 1 — sound & begrenzt (echter Wert, umsetzbar):**
+- [ ] **x86 MSIR: restliche Speicheroperand-Formen** (`decode_one`) — noch abgelehnt:
+  `cmp/test [mem]` (read-only, einfach), `inc/dec [mem]` und `<op> [mem], imm` (Group-1) und
+  `xchg [mem]` (RMW, wie ALU-mem lösbar), `cmovcc [mem]` (bedingter Load). Jede fügt echte
+  Binär-Coverage hinzu (Zugriff wird geprüft statt verworfen).
+- [ ] **Typed-Decoder ALU-mem** — der *typed* Decoder (`decode.rs`, Länge/Differential) lehnt
+  `<alu> [mem], r` weiter ab; nachziehen, damit der Längenpfad die Form auch kennt.
+- [ ] **Interproc-Escape: Out-Parameter-Store** (`void bad(int** out){int x; *out=&x;}`) — der
+  Return-basierte + Wrapper-Fall sind erledigt; der Escape via Store in ein Caller-Out-Param
+  fehlt (braucht Escape-durch-Store im Summary).
+
+**Tier 2 — braucht ein anderes Modell (Klasse „E", bewusst zurückgestellt):**
+- [ ] **TBAA / Strict-Aliasing / Union-Punning** — kein sound Refutations-Slice ohne Typ-Lattice
+  (legitime `repr`-Reinterpretation = identische Form). Details unten.
+- [ ] **ABA value-aware & Refcount „last reference"** — Lockset-Trace trägt keine Werte/Tags.
+
+**Tier 3 — extern blockiert:**
+- [ ] **LZMS** (kein Testkorpus — ISO ist all-LZX) und **PDB** (keine Windows-Buildumgebung).
+
+**Tier 4 — inhärente Grenzen (nicht sound schließbar / bewusst):**
+- Exact-Path-Recall-Gate (Bugs hinter Schleifen/Merges/opaken Calls nur in `--bugs` + genuine
+  Inputs) — *load-bearing Soundness-Grenze*, siehe `docs/soundness-invariants.md`.
+- Float/Vektor bleiben opak (Werte treiben keine Memory-Safety — flaggen wäre falsch).
+- Volle x86-SSE/AVX- + AArch64-Decoder-Vollständigkeit (unbeschränkt, großteils irrelevant).
+- Bit-Blaster: Breite > 128 und i128-`div/rem` (>300k Klauseln) → sound Linear-Fallback.
+
+**Tier 5 — Infra/Hygiene:**
+- [ ] Bus-Faktor 1 — teilweise gemildert (`docs/soundness-invariants.md`); Soundness-Argumente
+  weiter nicht maschinengeprüft.
+- [ ] MIR-Coroutine-`yield` — niche; aktuell sound abgelehnt (Funktion nicht analysiert).
+
+---
+
 ## Coverage-Schließung (Code-Audit) 2026-07-14 — Batch
 
 Aus dem code-basierten „was deckt der Solver nicht ab"-Audit; alle sound geschlossen oder als
@@ -160,8 +199,8 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
 
 ## Bekannte Stubs / Präzisionsgrenzen (sound, aber offen)
 
-- [ ] `csolver-smt` ist ein `NullSolver`; `solver::encode` gibt `Unsupported`
-  zurück (bewusste pure-Rust-Entscheidung; externes Backend = Opt-in-Frage).
+- [x] ~~`csolver-smt` NullSolver~~ → **Backend ganz entfernt** (dcd3abf): der hauseigene
+  CDCL/Bit-Precise-+Linear-Solver entscheidet alles; kein externes SMT mehr.
 - [x] Bit-Blaster: `udiv`/`sdiv`/`urem`/`srem` (107748c) + **symbolische Shift-Amounts**
   (ac41781, log₂(w)-Stufen-Barrel-Shifter) gebitblastet — beide gegen unabhängiges Orakel
   exhaustiv verifiziert. **Einzige nicht geblastete Konstruktion jetzt: Breite > `MAX_WIDTH`
