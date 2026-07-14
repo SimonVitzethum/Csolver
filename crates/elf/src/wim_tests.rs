@@ -148,6 +148,6 @@ fn xpress_decodes_a_back_reference() {
 fn chunked_uncompressed_chunk_passes_through() {
     // A single 5-byte chunk stored raw (compressed size == uncompressed size) round-trips
     // through the chunk pipeline without invoking the XPRESS decoder.
-    let out = decompress_chunked(b"hello", 5).unwrap();
+    let out = decompress_chunked(b"hello", 5, Compression::Xpress).unwrap();
     assert_eq!(&out, b"hello");
 }
