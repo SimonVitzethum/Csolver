@@ -3,10 +3,29 @@ use super::*;
 impl Parser {
     pub(crate) fn statement(&mut self) -> Result<MStmt> {
         // No-effect statements: skip to `;`.
-        if let Tok::Word(w) = self.peek() {
+        if let Tok::Word(w) = self.peek().clone() {
+            // `StorageLive(_N)` / `StorageDead(_N)` carry the local whose stack storage begins/ends
+            // — captured (not skipped) so an address-taken local's scope can be modelled for
+            // use-after-scope.
+            if w == "StorageLive" || w == "StorageDead" {
+                self.pos += 1;
+                let local = if self.eat_punct('(') {
+                    let l = self.local().ok();
+                    let _ = self.eat_punct(')');
+                    l
+                } else {
+                    None
+                };
+                self.skip_statement();
+                return Ok(match (w.as_str(), local) {
+                    ("StorageLive", Some(l)) => MStmt::StorageLive(l),
+                    ("StorageDead", Some(l)) => MStmt::StorageDead(l),
+                    _ => MStmt::Nop,
+                });
+            }
             if matches!(
                 w.as_str(),
-                "StorageLive" | "StorageDead" | "nop" | "FakeRead" | "AscribeUserType" | "Retag"
+                "nop" | "FakeRead" | "AscribeUserType" | "Retag"
                     | "PlaceMention" | "Coverage" | "ConstEvalCounter" | "Deinit" | "assume"
                     | "BackwardIncompatibleDropHint"
             ) {

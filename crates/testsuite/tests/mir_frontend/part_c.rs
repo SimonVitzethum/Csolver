@@ -636,3 +636,47 @@ fn g(_1: &mut i32) -> () {
     assert!(!has_retag(cell, "f"), "a &UnsafeCell reborrow must not emit a retag");
     assert!(has_retag(plain, "g"), "a plain &mut reborrow still emits a retag");
 }
+
+/// Use-after-scope: take `&_1`, end `_1`'s storage (`StorageDead`), then dereference the pointer.
+/// The stack local's region is freed at `StorageDead`, so the later load is a dangling deref
+/// (use-after-free of the scope). A read BEFORE the StorageDead is fine.
+#[test]
+fn use_of_stack_local_after_storage_dead_is_flagged() {
+    let uaf = r#"
+fn f() -> i32 {
+    let mut _1: i32;
+    let mut _2: *const i32;
+    let mut _0: i32;
+    bb0: {
+        StorageLive(_1);
+        StorageLive(_2);
+        _1 = const 7_i32;
+        _2 = &_1;
+        StorageDead(_1);
+        _0 = (*_2);
+        return;
+    }
+}
+"#;
+    let report = verify_module(&lower(uaf, "f"), &Config { level: csolver_core::SourceLevel::Mir, ..Config::default() });
+    assert_eq!(report.functions[0].verdict, Verdict::Fail, "reading a stack local after its StorageDead is use-after-scope");
+
+    // Control: the SAME read BEFORE StorageDead is safe (no violation).
+    let ok = r#"
+fn g() -> i32 {
+    let mut _1: i32;
+    let mut _2: *const i32;
+    let mut _0: i32;
+    bb0: {
+        StorageLive(_1);
+        StorageLive(_2);
+        _1 = const 7_i32;
+        _2 = &_1;
+        _0 = (*_2);
+        StorageDead(_1);
+        return;
+    }
+}
+"#;
+    assert_ne!(verify_module(&lower(ok, "g"), &Config { level: csolver_core::SourceLevel::Mir, ..Config::default() }).functions[0].verdict, Verdict::Fail, "reading before StorageDead is fine");
+}

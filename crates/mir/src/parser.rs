@@ -145,7 +145,12 @@ pub(crate) enum CalleeSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MStmt {
     Assign(Place, Rvalue),
-    /// `StorageLive`/`StorageDead`/`nop`/`FakeRead`/… — no effect on the model.
+    /// `StorageLive(_N)` — the local's stack storage becomes live (its scope begins).
+    StorageLive(Local),
+    /// `StorageDead(_N)` — the local's stack storage ends; a pointer into it is now dangling
+    /// (use-after-scope). Only meaningful for an address-taken local (see the lowering).
+    StorageDead(Local),
+    /// `nop`/`FakeRead`/`AscribeUserType`/… — no effect on the model.
     Nop,
 }
 

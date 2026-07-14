@@ -13,8 +13,10 @@ use csolver_core::{Error, Result};
 use crate::parser::CalleeSpec;
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CmpOp, Const, DataLayout, FuncId, Function, Inst, MemKind,
-    Module, Operand as IrOp, PtrContract, RValue, RefResult, RegId, SizeSpec, Terminator, Type,
+    Module, Operand as IrOp, PtrContract, RValue, RefResult, RegId, SizeSpec, Terminator,
+    Type,
 };
+use csolver_core::RegionKind;
 use std::collections::HashMap;
 
 const LAYOUT: DataLayout = DataLayout::LP64;
@@ -72,6 +74,11 @@ pub(crate) struct Ctx {
     /// a nested field gets its own FieldPtr `field` key (and thus its own disjoint
     /// synthetic offset) that never collides with a sibling or a top-level field.
     pub(crate) field_path_ids: HashMap<Vec<u32>, u32>,
+    /// For an **address-taken stack local** (`_2 = &_x`) of statically-known size, the register
+    /// holding its stack-region pointer — allocated once and reused, so every `&_x` yields the
+    /// same region and `StorageDead(_x)` can end its lifetime (use-after-scope). Absent for a
+    /// local of unknown size (kept opaque, as before — no perturbation).
+    pub(crate) local_regions: HashMap<u32, RegId>,
 }
 
 /// FieldPtr `field` ids at or above this are *nested* field paths; below are plain
@@ -113,6 +120,7 @@ fn lower_function(
         lowering_failed: false,
         checked_arith: HashMap::new(),
         field_path_ids: HashMap::new(),
+        local_regions: HashMap::new(),
     };
 
     // Parameters and their contracts (by position). A reference parameter

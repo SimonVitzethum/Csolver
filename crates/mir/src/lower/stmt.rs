@@ -7,6 +7,41 @@ impl Ctx {
         r
     }
 
+    /// The stack-region pointer for an **address-taken** local `_n` of statically-known size:
+    /// allocated once (an `Alloc` of `sizeof(type)` bytes) and cached, so every `&_n` yields the
+    /// same region and `StorageDead(_n)` can end its lifetime. `None` for a local of unknown size,
+    /// which stays opaque (as before) — no change to existing verdicts there.
+    pub(crate) fn local_region(&mut self, n: u32, out: &mut Vec<Inst>) -> Option<RegId> {
+        if let Some(&reg) = self.local_regions.get(&n) {
+            return Some(reg);
+        }
+        let ir = mtype_to_ir(self.local_types.get(&n)?);
+        let size = ir.size_bytes(&LAYOUT).filter(|&s| s > 0)?;
+        let align = ir.align_bytes(&LAYOUT).unwrap_or(1).max(1) as u32;
+        let reg = self.fresh();
+        out.push(Inst::Alloc {
+            dst: reg,
+            region: RegionKind::Stack,
+            elem: Type::int(8),
+            count: IrOp::int(64, size as u128),
+            align,
+        });
+        // We do not route the local's *value* through this region (its scalar value stays in the
+        // SSA register), so seed the region as **initialised** with a symbolic value — otherwise a
+        // read through `&_x` would be a false uninitialised-read. This is a sound over-approximation
+        // (the pointee value is unknown), and it keeps the region's purpose: bounds + lifetime
+        // (use-after-scope), not value tracking. A whole-object initialiser store covers any size.
+        out.push(Inst::Store {
+            ty: ir.clone(),
+            ptr: IrOp::Reg(reg),
+            value: IrOp::Const(Const::Undef),
+            align,
+            volatile: false,
+        });
+        self.local_regions.insert(n, reg);
+        Some(reg)
+    }
+
     /// A stable FieldPtr `field` id for a field path. A single-level path keeps its
     /// plain field index (so top-level field handling and round-trips are
     /// unchanged); a nested path gets a fresh id in the reserved high namespace, so
@@ -42,8 +77,28 @@ impl Ctx {
     }
 
     pub(crate) fn lower_stmt(&mut self, s: &MStmt, out: &mut Vec<Inst>) -> Result<()> {
+        // A local's stack storage ending/beginning (use-after-scope). Only address-taken locals
+        // have a modelled stack region (see `local_region`); for those, mark it freed on
+        // `StorageDead` and re-live on `StorageLive` — a pointer dereferenced after the scope ends
+        // is then a dangling deref (`NoUseAfterFree`), while a re-entered loop scope re-lives the
+        // region (no false FAIL). A local with no region is a plain no-op.
+        match s {
+            MStmt::StorageDead(n) | MStmt::StorageLive(n) => {
+                if let Some(&reg) = self.local_regions.get(n) {
+                    let name = if matches!(s, MStmt::StorageDead(_)) {
+                        "llvm.lifetime.end"
+                    } else {
+                        "llvm.lifetime.start"
+                    };
+                    out.push(Inst::Intrinsic { dst: None, name: name.into(), args: vec![IrOp::Reg(reg)] });
+                }
+                return Ok(());
+            }
+            MStmt::Nop => return Ok(()),
+            MStmt::Assign(..) => {}
+        }
         let MStmt::Assign(place, rv) = s else {
-            return Ok(()); // Nop
+            return Ok(()); // unreachable (handled above)
         };
         match place {
             // Register destination: `_d = rvalue`.
@@ -188,6 +243,14 @@ impl Ctx {
                             out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
                         }
                     }
+                    // `&_x` / `&mut _x` — the address of a stack local. For a local of
+                    // statically-known size, model it as a stack region (so accesses through it
+                    // are bounds-checked, and `StorageDead(_x)` ends its scope — use-after-scope);
+                    // an unknown-size local stays opaque, as before.
+                    Place::Local(n) => match self.local_region(*n, out) {
+                        Some(reg) => out.push(assign(dst, RValue::Use(IrOp::Reg(reg)))),
+                        None => out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef)))),
+                    },
                     _ => out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef)))),
                 }
                 // A `&mut *_p` / `&(*_p)` reborrow through a pointer local emits a **retag**
