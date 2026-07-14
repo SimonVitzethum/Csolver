@@ -178,7 +178,10 @@ pub(crate) fn parse_prefixes(
                 *p += 1;
             }
             Some(0xF0) => {
-                return Err(CoreError::unsupported("x86: LOCK prefix"));
+                // LOCK: a 1-byte prefix making the following read-modify-write atomic. It does
+                // not change the instruction's length or operands, so consume it and decode the
+                // rest normally (the MSIR path additionally emits a full barrier — see decode_one).
+                *p += 1;
             }
             Some(0xF2) => {
                 sse_pp = 3; // REPNE → SSE prefix F2

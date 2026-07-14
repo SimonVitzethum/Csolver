@@ -20,10 +20,16 @@ fn every_decode_point_rejects_truncated_input() {
 }
 
 #[test]
-fn rejects_lock_prefix() {
-    let r = decode_instruction(&[0xf0, 0x90], 0);
-    assert!(r.is_err());
-    assert!(matches!(r.unwrap_err(), CoreError::Unsupported { .. }));
+fn lock_prefix_decodes_the_atomic_rmw() {
+    // f0 01 18  lock add [rax], ebx  ; c3 ret — the MSIR path models the atomic RMW as a
+    // full barrier followed by the read-modify-write (load + combine + store), so the memory
+    // access carries its obligations instead of the whole instruction being declined.
+    let m = decode_function("f", &[0xf0, 0x01, 0x18, 0xc3]);
+    assert!(m.unanalyzed.is_empty(), "fully decoded: {:?}", m.unanalyzed);
+    let insts = &m.functions[0].blocks[0].insts;
+    assert!(matches!(insts[0], Inst::Barrier { kind: 0, .. }), "LOCK is a full barrier");
+    assert!(insts.iter().any(|i| matches!(i, Inst::Load { .. })), "the RMW reads");
+    assert!(insts.iter().any(|i| matches!(i, Inst::Store { .. })), "and writes back");
 }
 
 #[test]

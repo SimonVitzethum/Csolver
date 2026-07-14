@@ -232,10 +232,12 @@ fn typed_error_unsupported_two_byte() {
 }
 
 #[test]
-fn typed_error_lock_prefix() {
-    let r = decode_instruction(&[0xf0, 0x90], 0);
-    assert!(r.is_err());
-    assert!(r.unwrap_err().to_string().contains("LOCK"));
+fn typed_lock_prefix_is_consumed() {
+    // LOCK is a 1-byte prefix; the typed decoder now consumes it and decodes the rest,
+    // rather than declining the instruction. (`f0 90` — the prefix then a NOP.)
+    let d = decode_instruction(&[0xf0, 0x90], 0).expect("lock prefix is consumed");
+    assert_eq!(d.instruction, Instruction::Nop);
+    assert_eq!(d.length, 2, "prefix + opcode");
 }
 
 #[test]

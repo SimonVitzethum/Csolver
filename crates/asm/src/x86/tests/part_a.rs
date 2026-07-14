@@ -100,6 +100,20 @@ fn decodes_a_store_through_a_register() {
 }
 
 #[test]
+fn decodes_alu_read_modify_write_on_memory() {
+    // 01 07  add [rdi], eax  ; c3 ret   (ModRM 0x07 = mod 00 reg eax rm rdi)
+    // Previously declined ("ALU with a memory operand"); now a load-modify-store so the
+    // memory access carries its in-bounds/permission obligations.
+    let m = decode_function("f", &[0x01, 0x07, 0xc3]);
+    assert!(m.unanalyzed.is_empty(), "fully decoded: {:?}", m.unanalyzed);
+    let insts = &m.functions[0].blocks[0].insts;
+    assert!(matches!(insts[0], Inst::PtrOffset { .. }), "address of [rdi]");
+    assert!(matches!(insts[1], Inst::Load { .. }), "read-modify-write reads first");
+    assert!(matches!(insts[2], Inst::Assign { .. }), "combine with the register");
+    assert!(matches!(insts[3], Inst::Store { .. }), "and writes the result back");
+}
+
+#[test]
 fn decodes_a_stack_frame_and_its_access() {
     // 48 83 ec 10        sub rsp, 16        (allocate a 16-byte frame)
     // 89 44 24 08        mov [rsp+8], eax   (store within the frame)

@@ -9,6 +9,16 @@ pub(crate) fn decode_one(
     resolve: RelocResolver,
 ) -> csolver_core::Result<Decoded> {
     let mut p = pos;
+    // LOCK prefix (`f0`): the following instruction is an atomic read-modify-write. Its memory
+    // access — and the in-bounds / permission obligations on it — are exactly those of the
+    // un-prefixed form, so decode the rest normally and prepend a **full barrier** (LOCK is a
+    // full memory fence). This models `lock add [mem], r` / `lock xchg` / `lock cmpxchg` as the
+    // RMW they are instead of declining the whole instruction.
+    if code.get(p) == Some(&0xf0) {
+        let mut inner = decode_one(code, p + 1, flags, resolve)?;
+        inner.insts.insert(0, Inst::Barrier { kind: 0, access: None });
+        return Ok(inner);
+    }
     // CET / alignment **no-ops**, special-cased before any prefix handling so no
     // general legacy prefix is ever *guessed* at (that would risk mis-decoding).
     // `endbr64`/`endbr32` (`f3 0f 1e fa|fb`) open almost every function in a
@@ -67,9 +77,6 @@ pub(crate) fn decode_one(
         0x31 | 0x01 | 0x29 | 0x21 | 0x09 => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: ALU with a memory operand"));
-            }
             let bin = match op {
                 0x31 => BinOp::Xor,
                 0x01 => BinOp::Add,
@@ -78,15 +85,33 @@ pub(crate) fn decode_one(
                 0x09 => BinOp::Or,
                 _ => unreachable!(),
             };
-            let dst = reg(m.rm);
             let src = reg(m.reg);
-            // `xor r, r` is the idiom for zeroing — model it as `r = 0`.
-            let value = if op == 0x31 && m.rm == m.reg {
-                RValue::Use(Operand::int(width, 0))
+            if m.mode == 0b11 {
+                let dst = reg(m.rm);
+                // `xor r, r` is the idiom for zeroing — model it as `r = 0`.
+                let value = if op == 0x31 && m.rm == m.reg {
+                    RValue::Use(Operand::int(width, 0))
+                } else {
+                    RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(src), flags: Default::default() }
+                };
+                done(vec![Inst::Assign { dst, ty, value }], p)
             } else {
-                RValue::Bin { op: bin, lhs: Operand::Reg(dst), rhs: Operand::Reg(src) , flags: Default::default() }
-            };
-            done(vec![Inst::Assign { dst, ty, value }], p)
+                // `<alu> [mem], r` — a read-modify-write on memory: load, combine with the
+                // register, store back. The load and store carry the ordinary in-bounds /
+                // permission obligations, so an OOB through the memory operand is now checked
+                // (previously this form was declined and the access went unmodelled).
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Assign {
+                    dst: loaded,
+                    ty: ty.clone(),
+                    value: RValue::Bin { op: bin, lhs: Operand::Reg(loaded), rhs: Operand::Reg(src), flags: Default::default() },
+                });
+                insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::Reg(loaded), align: 1, volatile: false });
+                done(insts, mem.next)
+            }
         }
         // <alu> r, r/m — reg destination, r/m source (reg or memory): add/or/and/sub/xor.
         0x03 | 0x0b | 0x23 | 0x2b | 0x33 => {
