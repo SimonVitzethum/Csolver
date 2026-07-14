@@ -170,6 +170,29 @@ fn check_exhaustive(w: u32) {
                 );
             }
 
+            // Symbolic-amount shifts (both operands symbolic → the barrel shifter). The oracle
+            // covers `amount >= w` (all-zero for Shl/LShr, all-sign for AShr).
+            for op in shift_ops {
+                let expr = c.bin(op, a, b);
+                let want = oracle_bin(op, va, vb, w);
+                let goal = {
+                    let k = c.int(w, want);
+                    c.cmp(CmpOp::Eq, expr, k)
+                };
+                assert!(
+                    prove_implies(&c, &assume_ab, goal),
+                    "{op:?} a={va} by symbolic {vb} (w{w}): correct result {want} not provable",
+                );
+                let bad = {
+                    let wrong = c.int(w, mask(want.wrapping_add(1), w));
+                    c.cmp(CmpOp::Eq, expr, wrong)
+                };
+                assert!(
+                    !prove_implies(&c, &assume_ab, bad),
+                    "{op:?} a={va} by symbolic {vb} (w{w}): a wrong result was provable",
+                );
+            }
+
             // Comparisons: the truth value must be provable, its negation not.
             for op in cmp_ops {
                 let res = c.cmp(op, a, b);
@@ -202,6 +225,38 @@ fn bitblast_matches_oracle_4bit() {
 #[ignore = "slow exhaustive sweep; run on demand"]
 fn bitblast_matches_oracle_6bit() {
     check_exhaustive(6);
+}
+
+/// The **symbolic** barrel shifter at the full 64-bit width — the stage count (6) and the
+/// out-of-range guard (`amount >= 64`) are exercised only here, not by the small sweeps. For a
+/// fixed `a` and each of a few boundary amounts (0, 1, 63, 64, u64::MAX) pinned on the symbolic
+/// operand, the correct result must be provable and a wrong one not.
+#[test]
+fn symbolic_shift_at_width_64_boundaries() {
+    let w = 64;
+    let a_val = 0xF0F0_F0F0_0F0F_0F0Fu128;
+    for op in [BvOp::Shl, BvOp::LShr, BvOp::AShr] {
+        for amt in [0u128, 1, 63, 64, u64::MAX as u128] {
+            let mut c = ExprCtx::new();
+            let a = c.symbol("a", w);
+            let b = c.symbol("b", w);
+            let ca = c.int(w, a_val);
+            let cb = c.int(w, amt);
+            let assume = [c.cmp(CmpOp::Eq, a, ca), c.cmp(CmpOp::Eq, b, cb)];
+            let expr = c.bin(op, a, b);
+            let want = oracle_bin(op, a_val, amt, w);
+            let goal = {
+                let k = c.int(w, want);
+                c.cmp(CmpOp::Eq, expr, k)
+            };
+            assert!(prove_implies(&c, &assume, goal), "{op:?} by {amt} (w64): {want:#x} not provable");
+            let bad = {
+                let wrong = c.int(w, mask(want.wrapping_add(1), w));
+                c.cmp(CmpOp::Eq, expr, wrong)
+            };
+            assert!(!prove_implies(&c, &assume, bad), "{op:?} by {amt} (w64): wrong result provable");
+        }
+    }
 }
 
 /// The division circuits must be **total** on a zero divisor, matching SMT-LIB:

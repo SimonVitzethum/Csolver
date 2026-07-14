@@ -169,9 +169,12 @@ impl<'c> Blaster<'c> {
             BvOp::Mul => self.cnf.mul(a, b),
             BvOp::And | BvOp::Or | BvOp::Xor => self.cnf.bitwise(op, a, b),
             BvOp::Shl | BvOp::LShr | BvOp::AShr => {
-                // Only constant shift amounts are bit-blasted.
-                let k = self.ctx.as_const(b_id)?.unsigned();
-                self.shift_const(op, a, k, w)
+                // A constant amount collapses to wiring (cheapest); a symbolic amount uses the
+                // barrel shifter. Both are exact and width-clamped.
+                match self.ctx.as_const(b_id) {
+                    Some(k) => self.shift_const(op, a, k.unsigned(), w),
+                    None => self.cnf.shift_var(op, a, b),
+                }
             }
             BvOp::UDiv => self.cnf.udivrem(a, b).0,
             BvOp::URem => self.cnf.udivrem(a, b).1,

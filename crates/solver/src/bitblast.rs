@@ -14,10 +14,10 @@
 //!
 //! Supported: constants, symbols, `Add`/`Sub`/`Mul`, `UDiv`/`SDiv`/`URem`/`SRem`
 //! (restoring long division, SMT-LIB-total on a zero divisor), bitwise `And`/`Or`/`Xor`,
-//! constant-amount `Shl`/`LShr`/`AShr`, all comparisons, `Not`/`And`/`Or`/`Ite`.
-//! Anything else — a *symbolic* shift amount, or a width above [`MAX_WIDTH`] — makes
-//! [`Blaster::encode_bool`] return `None`, so the caller soundly falls back (it never
-//! mis-encodes into a wrong answer).
+//! `Shl`/`LShr`/`AShr` with a **constant or symbolic** amount (a barrel shifter for the
+//! latter), all comparisons, `Not`/`And`/`Or`/`Ite`. Only a width above [`MAX_WIDTH`]
+//! makes [`Blaster::encode_bool`] return `None`, so the caller soundly falls back (it
+//! never mis-encodes into a wrong answer).
 
 use crate::expr::{BvOp, CmpOp, ExprCtx, ExprId, Node};
 use crate::sat::Lit;
@@ -312,6 +312,35 @@ impl Cnf {
         let neg_ur = self.negate(&ur);
         let rem = (0..w).map(|i| self.mux(sa, neg_ur[i], ur[i])).collect();
         (quot, rem)
+    }
+
+    /// A **symbolic-amount** shift (barrel shifter). `log2(w)` stages each conditionally shift
+    /// by `2^k` when amount bit `b[k]` is set; bits shifted in are 0 (`Shl`/`LShr`) or the sign
+    /// (`AShr`). An amount `≥ w` yields all-zero / all-sign — since every practical width is a
+    /// power of two, `2^stages == w`, so the low `stages` bits address exactly `0..w-1` and the
+    /// out-of-range case is precisely "some higher amount bit is set" (`b[stages..]`); a shift of
+    /// *exactly* `w` also falls out of the barrel as all-fill, so both routes agree.
+    fn shift_var(&mut self, op: BvOp, a: &[Lit], b: &[Lit]) -> Vec<Lit> {
+        let w = a.len();
+        let zero = self.lit_false();
+        let sign = a[w - 1];
+        let fill = if matches!(op, BvOp::AShr) { sign } else { zero };
+        let stages = if w <= 1 { 0 } else { (w - 1).ilog2() as usize + 1 };
+        let mut x = a.to_vec();
+        for (k, &ctrl) in b.iter().take(stages).enumerate() {
+            let amt = 1usize << k;
+            let shifted: Vec<Lit> = match op {
+                BvOp::Shl => (0..w).map(|i| if i >= amt { x[i - amt] } else { zero }).collect(),
+                BvOp::LShr | BvOp::AShr => {
+                    (0..w).map(|i| if i + amt < w { x[i + amt] } else { fill }).collect()
+                }
+                _ => unreachable!("shift_var called with non-shift op"),
+            };
+            x = (0..w).map(|i| self.mux(ctrl, shifted[i], x[i])).collect();
+        }
+        // Amount ≥ w (any bit above the barrel range) forces the all-fill result.
+        let oob = self.big_or(&b[stages.min(w)..]);
+        (0..w).map(|i| self.mux(oob, fill, x[i])).collect()
     }
 
     /// `a & b`, `a | b`, `a ^ b` bitwise.
