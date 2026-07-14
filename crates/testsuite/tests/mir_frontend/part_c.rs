@@ -502,3 +502,40 @@ fn ptr_offset_lowers_to_ptroffset_not_opaque() {
     assert!(matches!(po, Inst::PtrOffset { elem, .. } if elem.size_bytes(&csolver_ir::DataLayout::LP64) == Some(4)));
     assert!(insts.iter().any(|i| matches!(i, Inst::Store { .. })), "the store through it is modelled");
 }
+
+/// A `&mut *_p` reborrow emits a `csolver.retag.mut` marker (for the opt-in aliasing model);
+/// a shared `&(*_p)` does NOT. Validates the parser (mutability capture) + the lowering.
+pub(crate) const REBORROW_MUT: &str = r#"
+fn f(_1: *mut i32) -> () {
+    let mut _2: &mut i32;
+    bb0: {
+        _2 = &mut (*_1);
+        (*_2) = const 5_i32;
+        return;
+    }
+}
+"#;
+
+pub(crate) const REBORROW_SHARED: &str = r#"
+fn g(_1: *const i32) -> i32 {
+    let mut _2: &i32;
+    let mut _0: i32;
+    bb0: {
+        _2 = &(*_1);
+        _0 = (*_2);
+        return;
+    }
+}
+"#;
+
+#[test]
+fn mut_reborrow_emits_a_retag_marker_shared_does_not() {
+    use csolver_ir::Inst;
+    let has_retag = |src, name| {
+        let m = lower(src, name);
+        m.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Intrinsic { name, .. } if name == "csolver.retag.mut"))
+    };
+    assert!(has_retag(REBORROW_MUT, "f"), "&mut *_p emits a retag marker");
+    assert!(!has_retag(REBORROW_SHARED, "g"), "shared &(*_p) emits no retag marker");
+}

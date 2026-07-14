@@ -95,7 +95,8 @@ pub(crate) enum Rvalue {
     /// Field `.0` is the arithmetic result, `.1` the overflow flag.
     CheckedBin(BinKind, Operand, Operand),
     Len(Place),
-    Ref(Place),
+    /// `&PLACE` / `&mut PLACE`; the bool is `true` for `&mut` (a mutable borrow).
+    Ref(Place, bool),
     Cast(Operand),
     /// `discriminant(PLACE)` — reads an enum's tag. The value is opaque (so a
     /// `switchInt` on it soundly explores every arm); lowering still checks the

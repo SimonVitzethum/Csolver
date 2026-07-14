@@ -100,6 +100,28 @@ impl Explorer<'_> {
             .filter(|id| edges.iter().all(|e| e.pred_state.nonnull_provs.contains(id)))
             .collect();
 
+        // Borrow stacks (aliasing model) survive a join only when **all** incoming paths agree
+        // exactly on a region's stack; otherwise the region is *poisoned* (`None`), which skips
+        // its aliasing checks downstream — sound (an ambiguous merge never drives a false FAIL).
+        let region_borrows: FxHashMap<usize, Option<Vec<RegId>>> = {
+            let mut keys: Vec<usize> = Vec::new();
+            for e in edges {
+                keys.extend(e.pred_state.region_borrows.keys().copied());
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            keys.into_iter()
+                .map(|rid| {
+                    let mut it = edges.iter().map(|e| e.pred_state.region_borrows.get(&rid).cloned().flatten());
+                    let first = it.next().flatten();
+                    let agree = first.is_some() && edges.iter().all(|e| {
+                        e.pred_state.region_borrows.get(&rid).cloned().flatten() == first
+                    });
+                    (rid, if agree { first } else { None })
+                })
+                .collect()
+        };
+
         // Scalar taint survives the join by the same **meet**: a register keeps a taint label
         // only if every incoming edge has it — so a sink refutes only on a *definitely*-tainted
         // value (no false FAIL under a partly-tainted phi). Under-taints (a value tainted on one
@@ -215,6 +237,7 @@ impl Explorer<'_> {
             ref_regions: FxHashMap::default(),
             opaque_labels,
             nonnull_provs,
+            region_borrows,
             tainted,
             typestates,
             refcounts,

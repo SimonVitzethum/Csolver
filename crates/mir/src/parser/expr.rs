@@ -115,9 +115,14 @@ impl Parser {
     pub(crate) fn rvalue(&mut self) -> Result<Rvalue> {
         // `&PLACE` / `&mut PLACE` / `&raw const PLACE` / `&raw const (fake) PLACE`.
         if self.eat_punct('&') {
-            let _ = self.eat_word("mut");
+            let mut mutable = self.eat_word("mut"); // `&mut PLACE`
             if self.eat_word("raw") {
-                let _ = self.eat_word("const") || self.eat_word("mut");
+                // `&raw mut PLACE` is mutable; `&raw const PLACE` is not.
+                if self.eat_word("mut") {
+                    mutable = true;
+                } else {
+                    let _ = self.eat_word("const");
+                }
             }
             // Skip a parenthesised borrow-kind annotation `(fake)` / `(shallow)`
             // — distinguished from the place `(*_p)` by its leading keyword.
@@ -127,7 +132,7 @@ impl Parser {
                 self.pos += 1;
                 self.skip_balanced_paren();
             }
-            return Ok(Rvalue::Ref(self.place()?));
+            return Ok(Rvalue::Ref(self.place()?, mutable));
         }
         if let Tok::Word(w) = self.peek().clone() {
             // `Len(PLACE)`.

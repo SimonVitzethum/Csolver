@@ -166,6 +166,72 @@ pub(crate) fn load_derived_regs(f: &Function) -> HashSet<RegId> {
     derived
 }
 
+/// The static borrow-tag derivation for the opt-in aliasing model. A **borrow tag** is the
+/// register a `csolver.retag.mut` marker created (a `&mut` reborrow); every pointer register
+/// derived from it by copy/cast/`PtrOffset`/`FieldPtr` belongs to that borrow. `parent` is the
+/// derivation tree over borrows: `parent[tag]` is the borrow the retag reborrowed from (`None`
+/// for a root — a reborrow of an untracked pointer such as a `&mut` parameter). SSA-static: a
+/// register's borrow is fixed by its definition, so the dynamic executor only tracks which tags
+/// are *live* per region (see `PathState.region_borrows`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BorrowInfo {
+    /// Pointer register → the borrow tag (retag-dst register) it belongs to.
+    pub(crate) of: HashMap<RegId, RegId>,
+    /// Borrow tag → its parent borrow (`None` = a root reborrow of an untracked pointer).
+    pub(crate) parent: HashMap<RegId, Option<RegId>>,
+}
+
+/// Compute [`BorrowInfo`] for `f`: seed each `csolver.retag.mut` dst as a sealed borrow tag,
+/// propagate the borrow through copies/casts/`PtrOffset`/`FieldPtr` to a fixpoint, then resolve
+/// each retag's parent to the parent pointer's borrow tag.
+pub(crate) fn borrow_info(f: &Function) -> BorrowInfo {
+    // Sealed borrow tags (a retag dst never inherits another borrow) + each retag's parent reg.
+    let mut retag_parent_reg: HashMap<RegId, RegId> = HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Inst::Intrinsic { name, args, .. } = inst {
+                if name == "csolver.retag.mut" {
+                    if let (Some(d), Some(p)) = (args.first().and_then(|o| o.as_reg()), args.get(1).and_then(|o| o.as_reg())) {
+                        retag_parent_reg.insert(d, p);
+                    }
+                }
+            }
+        }
+    }
+    let mut of: HashMap<RegId, RegId> = HashMap::new();
+    for &d in retag_parent_reg.keys() {
+        of.insert(d, d); // a retag dst is its own borrow (sealed — never overwritten below)
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let (dst, src) = match inst {
+                    Inst::Assign { dst, value: RValue::Use(o) | RValue::Cast { operand: o, .. }, .. } => (*dst, o.as_reg()),
+                    Inst::PtrOffset { dst, base, .. } => (*dst, base.as_reg()),
+                    Inst::FieldPtr { dst, base, .. } => (*dst, base.as_reg()),
+                    _ => continue,
+                };
+                if retag_parent_reg.contains_key(&dst) {
+                    continue; // sealed
+                }
+                if let Some(tag) = src.and_then(|r| of.get(&r).copied()) {
+                    if of.insert(dst, tag) != Some(tag) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Resolve each retag's parent borrow: the parent pointer's borrow tag, or None (root).
+    let mut parent: HashMap<RegId, Option<RegId>> = HashMap::new();
+    for (&d, &p) in &retag_parent_reg {
+        parent.insert(d, of.get(&p).copied());
+    }
+    BorrowInfo { of, parent }
+}
+
 /// The pointer registers derived from a genuine **shared borrow** (`&T`) — a
 /// `RefWitness { writable: false, assumed: false }` and anything computed from it by a copy,
 /// a pointer cast, a `PtrOffset`, or a `FieldPtr`. A `Store` through such a register is a

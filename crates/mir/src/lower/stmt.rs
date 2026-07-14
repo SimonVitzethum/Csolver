@@ -160,7 +160,7 @@ impl Ctx {
                 out.push(assign(dst, RValue::Use(value)));
                 Ok(())
             }
-            Rvalue::Ref(place) => {
+            Rvalue::Ref(place, mutable) => {
                 // `&(*_p)[i]` is the element address; `&(*_p)` is the pointer
                 // itself; other refs (a stack local's address) are opaque.
                 match place {
@@ -189,6 +189,21 @@ impl Ctx {
                         }
                     }
                     _ => out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef)))),
+                }
+                // A `&mut *_p` reborrow through a pointer local emits a **retag** marker
+                // AFTER the value is set: `dst` is a new mutable borrow derived from `_p`, so
+                // the opt-in borrow-stack can invalidate a sibling `&mut` of the same location.
+                // A no-op unless `--aliasing-model` is on (the executor ignores it otherwise).
+                if *mutable {
+                    if let Place::Deref(inner) = place {
+                        if let Place::Local(p) = inner.as_ref() {
+                            out.push(Inst::Intrinsic {
+                                dst: None,
+                                name: "csolver.retag.mut".into(),
+                                args: vec![IrOp::Reg(dst), IrOp::Reg(RegId(*p))],
+                            });
+                        }
+                    }
                 }
                 Ok(())
             }

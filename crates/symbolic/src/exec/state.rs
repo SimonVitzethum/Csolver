@@ -61,6 +61,15 @@ pub(crate) struct PathState {
     /// pointer may still dangle). Seeded at entry, meet-joined at merges. A fact about the
     /// value, not memory (not cleared on havoc).
     pub(crate) nonnull_provs: FxHashSet<u32>,
+    /// **Borrow-stack per region** for the opt-in Rust aliasing model (`--aliasing-model`):
+    /// `region id → the live borrow tags (retag-dst registers), innermost last`. A `&mut`
+    /// reborrow pushes a tag (invalidating siblings by popping above its parent); a write
+    /// through a tag pops the tags above it. Accessing through a tag no longer on its region's
+    /// stack is a **use-after-invalidation** (`NoAliasingViolation`). `None` = the stack is
+    /// *poisoned* (paths disagreed at a merge, or a parent was already gone) — checks are then
+    /// skipped for that region (sound: no detection, never a false FAIL). Empty unless the model
+    /// is on.
+    pub(crate) region_borrows: FxHashMap<usize, Option<Vec<RegId>>>,
     /// **Scalar taint labels** per SSA register (the directional taint lattice, G6-family J/F/D):
     /// interned taint-label ids a register's value carries, sourced by a `taint-source` contract
     /// or a load from a labelled region, propagated through arithmetic/casts, checked by a
@@ -309,5 +318,8 @@ pub(crate) struct Explorer<'f> {
     /// through a shared reference, an unambiguous Rust aliasing (borrow-stack) violation. Empty
     /// unless the aliasing model is on (see [`shared_borrow_regs`]).
     pub(crate) shared_borrow_regs: HashSet<RegId>,
+    /// Static borrow-tag derivation for the aliasing model (empty unless it is on). See
+    /// [`BorrowInfo`] / [`borrow_info`].
+    pub(crate) borrow_info: BorrowInfo,
     pub(crate) f: &'f Function,
 }

@@ -220,6 +220,9 @@ impl Explorer<'_> {
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidRead, state);
+                if self.limits.aliasing_model {
+                    self.check_borrow_access((block, idx), ptr, false, &p, state);
+                }
                 // An atomic/volatile read (`READ_ONCE`/`atomic_read`) is race-free by
                 // construction — excluded from the data-race pass.
                 if !*volatile {
@@ -316,17 +319,18 @@ impl Explorer<'_> {
                 // Rust aliasing model (opt-in): a write through a pointer derived from a shared
                 // `&T` borrow is an unambiguous borrow-stack violation. Refuted only on a
                 // feasible path (record_temporal gates on a feasibility witness) — no false FAIL.
-                if self.limits.aliasing_model
-                    && ptr.as_reg().is_some_and(|r| self.shared_borrow_regs.contains(&r))
-                {
-                    self.record_temporal(
-                        (block, idx),
-                        SafetyProperty::NoAliasingViolation,
-                        true,
-                        state,
-                        "no write through a shared (&T) reference",
-                        "write through a shared reference (Rust aliasing violation)",
-                    );
+                if self.limits.aliasing_model {
+                    if ptr.as_reg().is_some_and(|r| self.shared_borrow_regs.contains(&r)) {
+                        self.record_temporal(
+                            (block, idx),
+                            SafetyProperty::NoAliasingViolation,
+                            true,
+                            state,
+                            "no write through a shared (&T) reference",
+                            "write through a shared reference (Rust aliasing violation)",
+                        );
+                    }
+                    self.check_borrow_access((block, idx), ptr, true, &p, state);
                 }
                 // An atomic/volatile write (`WRITE_ONCE`/`atomic_set`) is race-free by
                 // construction — excluded from the data-race pass.
@@ -402,6 +406,15 @@ impl Explorer<'_> {
                         }
                     }
                 }
+            }
+            // A `&mut` reborrow marker (opt-in aliasing model). `args = [new-borrow reg, parent
+            // pointer]`. Push the new borrow tag onto the parent pointer's region borrow stack,
+            // popping the parent's other descendants (which the reborrow invalidates). A no-op
+            // unless the model is on. See `step_retag`.
+            Inst::Intrinsic { name, args, .. }
+                if self.limits.aliasing_model && name == "csolver.retag.mut" =>
+            {
+                self.step_retag(args, state);
             }
             Inst::Intrinsic { dst: Some(d), .. } => {
                 let s = self.fresh_scalar(PTR_WIDTH);

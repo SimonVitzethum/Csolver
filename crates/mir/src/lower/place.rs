@@ -323,7 +323,7 @@ impl Ctx {
         let src = match rv {
             Rvalue::Use(Operand::Copy(Place::Local(p)) | Operand::Move(Place::Local(p)))
             | Rvalue::Cast(Operand::Copy(Place::Local(p)) | Operand::Move(Place::Local(p))) => Some(*p),
-            Rvalue::Ref(Place::Deref(inner)) => match inner.as_ref() {
+            Rvalue::Ref(Place::Deref(inner), _) => match inner.as_ref() {
                 Place::Local(p) => Some(*p),
                 _ => None,
             },

@@ -335,4 +335,80 @@ impl Explorer<'_> {
         let upper = self.ctx.cmp(SCmp::Sle, offset, size);
         [lower, upper]
     }
+
+    /// A `&mut` reborrow (`csolver.retag.mut`), for the opt-in aliasing model. `args[0]` is the
+    /// new borrow tag (register), `args[1]` the parent pointer. Push the tag onto the parent
+    /// pointer's region borrow stack, popping the parent's other descendants — a reborrow
+    /// invalidates its siblings (Stacked/Tree-Borrows). A root reborrow (parent has no tag —
+    /// e.g. a `&mut` parameter) invalidates every prior borrow of the region. If the parent is
+    /// no longer live, the region is *poisoned* (checks skipped — sound, never a false FAIL).
+    pub(crate) fn step_retag(&mut self, args: &[Operand], state: &mut PathState) {
+        let (Some(new_tag), Some(parent_op)) =
+            (args.first().and_then(|o| o.as_reg()), args.get(1).cloned())
+        else {
+            return;
+        };
+        let Prov::Region(rid) = self.eval_pointer(&parent_op, state).prov else {
+            return;
+        };
+        if matches!(state.region_borrows.get(&rid), Some(None)) {
+            return; // already poisoned
+        }
+        let parent_tag = self.borrow_info.parent.get(&new_tag).copied().flatten();
+        let mut stack = state.region_borrows.get(&rid).cloned().flatten().unwrap_or_default();
+        let new_val = match parent_tag {
+            None => Some(vec![new_tag]), // root reborrow — invalidates all prior borrows
+            Some(pt) => match stack.iter().position(|&t| t == pt) {
+                Some(pos) => {
+                    stack.truncate(pos + 1);
+                    stack.push(new_tag);
+                    Some(stack)
+                }
+                None => None, // parent no longer live → poison (sound)
+            },
+        };
+        state.region_borrows.insert(rid, new_val);
+    }
+
+    /// Check an access through `ptr` against its region's borrow stack (opt-in aliasing model).
+    /// If the accessing pointer's borrow tag is no longer live on the region — it was popped by
+    /// an aliasing `&mut` reborrow or write — the access is a **use-after-invalidation** (UB).
+    /// A write also pops the borrows created after the accessed tag (they are invalidated).
+    /// Only fires on a definitely-invalidated tag over a *tracked* region — sound, no false FAIL.
+    pub(crate) fn check_borrow_access(
+        &mut self,
+        at: (BlockId, usize),
+        ptr: &Operand,
+        is_write: bool,
+        p: &SymPointer,
+        state: &mut PathState,
+    ) {
+        let (Some(reg), Prov::Region(rid)) = (ptr.as_reg(), &p.prov) else {
+            return;
+        };
+        let Some(&tag) = self.borrow_info.of.get(&reg) else {
+            return; // pointer is not a tracked borrow
+        };
+        let rid = *rid;
+        let Some(Some(stack)) = state.region_borrows.get(&rid) else {
+            return; // region untracked or poisoned
+        };
+        match stack.iter().position(|&t| t == tag) {
+            Some(pos) => {
+                if is_write {
+                    if let Some(Some(s)) = state.region_borrows.get_mut(&rid) {
+                        s.truncate(pos + 1);
+                    }
+                }
+            }
+            None => self.record_temporal(
+                at,
+                SafetyProperty::NoAliasingViolation,
+                true,
+                state,
+                "no use of a mutable borrow after it was invalidated",
+                "use of a &mut borrow after an aliasing &mut invalidated it (Rust borrow-stack violation)",
+            ),
+        }
+    }
 }

@@ -251,6 +251,89 @@ fn wide_cfg_is_processed_once_per_block_not_per_path() {
     assert_eq!(r.outcome(BlockId(32), 0), Some(SymOutcome::Proven), "final check verified");
 }
 
+/// A retag-marker instruction: `dst_borrow` becomes a new `&mut` reborrow of `parent`.
+fn retag(dst_borrow: RegId, parent: RegId) -> Inst {
+    Inst::Intrinsic {
+        dst: None,
+        name: "csolver.retag.mut".into(),
+        args: vec![Operand::Reg(dst_borrow), Operand::Reg(parent)],
+    }
+}
+
+/// Build: `r0 = alloc`; two independent `&mut` reborrows of it (`r1`, `r2`); then a store
+/// through the chosen one. If `use_first` the store is through `r1` — which the creation of
+/// `r2` invalidated (two live `&mut` to the same place) → a use-after-invalidation. If not,
+/// the store is through `r2` (the currently-valid borrow) → safe.
+fn two_mut_borrows(use_first: bool) -> Function {
+    let (r0, r1, r2) = (RegId(0), RegId(1), RegId(2));
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: r0,
+        region: RegionKind::Heap,
+        elem: Type::int(8),
+        count: Operand::int(64, 8),
+        align: 8,
+    });
+    // r1 = &mut *r0  (root reborrow)
+    bb0.insts.push(Inst::Assign { dst: r1, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb0.insts.push(retag(r1, r0));
+    // r2 = &mut *r0  (a second, sibling root reborrow — invalidates r1)
+    bb0.insts.push(Inst::Assign { dst: r2, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb0.insts.push(retag(r2, r0));
+    let via = if use_first { r1 } else { r2 };
+    bb0.insts.push(Inst::Store {
+        ty: Type::int(64),
+        ptr: Operand::Reg(via),
+        value: Operand::int(64, 5),
+        align: 8,
+        volatile: false,
+    });
+    Function { id: FuncId(0), name: "two_mut".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) }
+}
+
+#[test]
+fn use_of_mut_borrow_after_sibling_invalidated_it_is_flagged() {
+    let f = two_mut_borrows(true); // store through the invalidated first borrow
+    let store = (BlockId(0), 5usize);
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    let d = on
+        .mem_decision(store.0, store.1, SafetyProperty::NoAliasingViolation)
+        .expect("aliasing obligation recorded");
+    assert!(!d.proven && d.refutation.is_some(), "using r1 after r2 invalidated it is a borrow-stack violation");
+    // Off by default: nothing checked.
+    let off = discharge_with(&f, crate::ExecLimits::default());
+    assert!(off.mem_decision(store.0, store.1, SafetyProperty::NoAliasingViolation).is_none());
+}
+
+#[test]
+fn use_of_the_currently_valid_borrow_is_not_flagged() {
+    // Store through r2 (the live borrow) — no violation, even with the model on.
+    let f = two_mut_borrows(false);
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    let d = on.mem_decision(BlockId(0), 5, SafetyProperty::NoAliasingViolation);
+    assert!(d.is_none() || d.is_some_and(|d| d.proven), "the valid borrow's write must not be flagged");
+}
+
+#[test]
+fn legitimate_reborrow_chain_is_not_flagged() {
+    // r1 = &mut *r0 (root); r2 = &mut *r1 (child); *r2 then *r1 — a normal nested reborrow.
+    let (r0, r1, r2) = (RegId(0), RegId(1), RegId(2));
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc { dst: r0, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 8 });
+    bb0.insts.push(Inst::Assign { dst: r1, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
+    bb0.insts.push(retag(r1, r0));
+    bb0.insts.push(Inst::Assign { dst: r2, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r1)) });
+    bb0.insts.push(retag(r2, r1)); // child of r1
+    bb0.insts.push(Inst::Store { ty: Type::int(64), ptr: Operand::Reg(r2), value: Operand::int(64, 5), align: 8, volatile: false });
+    bb0.insts.push(Inst::Store { ty: Type::int(64), ptr: Operand::Reg(r1), value: Operand::int(64, 6), align: 8, volatile: false });
+    let f = Function { id: FuncId(0), name: "reborrow".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) };
+    let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
+    for idx in [5usize, 6] {
+        let d = on.mem_decision(BlockId(0), idx, SafetyProperty::NoAliasingViolation);
+        assert!(d.is_none() || d.is_some_and(|d| d.proven), "a legitimate reborrow chain must not be flagged (idx {idx})");
+    }
+}
+
 /// A write through a shared `&T` borrow: materialise a shared reference, then (via a copy)
 /// store through it. This is the unambiguous Rust aliasing (borrow-stack) violation.
 fn write_through_shared_ref(writable: bool) -> Function {

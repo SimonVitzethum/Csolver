@@ -195,8 +195,10 @@ pub(crate) fn discharge_inner(
         race_accesses: HashSet::new(),
         load_derived: load_derived_regs(f),
         race_trace: Vec::new(),
-        // Opt-in Rust aliasing model: the shared-borrow register set (empty otherwise).
+        // Opt-in Rust aliasing model: the shared-borrow register set + borrow-tag derivation
+        // (both empty/default otherwise, so the model is inert when the flag is off).
         shared_borrow_regs: if limits.aliasing_model { shared_borrow_regs(f) } else { HashSet::new() },
+        borrow_info: if limits.aliasing_model { borrow_info(f) } else { BorrowInfo::default() },
         f,
     };
 
@@ -412,6 +414,7 @@ pub(crate) fn discharge_inner(
         ref_regions: FxHashMap::default(),
         opaque_labels: FxHashMap::default(),
         nonnull_provs,
+        region_borrows: FxHashMap::default(),
         tainted: FxHashMap::default(),
         typestates: FxHashMap::default(),
         refcounts: FxHashMap::default(),
