@@ -921,7 +921,7 @@ fn opaque_call() -> Inst {
 
 pub(super) fn bridge_unmodeled(code: &[u8], pos: usize, err: CoreError) -> csolver_core::Result<Decoded> {
     match decode_instruction(code, pos) {
-        Ok(d) if d.length > 0 && !is_control_flow(&d.instruction) => {
+        Ok(d) if d.length > 0 && !is_control_flow(&d.instruction) && !touches_memory(&d.instruction) => {
             let mut insts = vec![Inst::Call {
                 dst: None,
                 callee: csolver_ir::Callee::Symbol("<x86 unmodeled>".into()),
@@ -941,6 +941,69 @@ pub(super) fn bridge_unmodeled(code: &[u8], pos: usize, err: CoreError) -> csolv
             Ok(Decoded { insts, next: pos + d.length, ctrl: Ctrl::Fall })
         }
         _ => Err(err),
+    }
+}
+
+/// Whether a typed instruction **reads or writes memory** — either an explicit
+/// `X86Operand::Mem` in any operand, or an implicit memory access (the stack for
+/// `push`/`pop`/`pushf`/`popf`, `[rsi]`/`[rdi]` for the string ops). Such an
+/// instruction must NOT be havoc-bridged: `bridge_unmodeled` only havocs registers,
+/// so skipping a memory-touching instruction would silently drop its access — and a
+/// dropped unchecked load/store through an invalid pointer could yield a **false PASS**.
+/// So a memory-touching unmodeled instruction declines the bridge (the function drops to
+/// UNKNOWN — sound). `lea` is NOT a memory access (it computes an address). Exhaustive by
+/// design: a new `Instruction` variant breaks the build, forcing an explicit safe/unsafe
+/// classification rather than defaulting into the havoc path.
+fn touches_memory(i: &Instruction) -> bool {
+    use Instruction as I;
+    let m = |o: &X86Operand| matches!(o, X86Operand::Mem(..));
+    match i {
+        // Implicit memory: the stack and the string operations.
+        I::Push(_) | I::Pop(_) | I::Pushf | I::Popf
+        | I::Movs(_) | I::Stos(_) | I::Lods(_) | I::Scas(_) | I::Cmps(_) => true,
+        // `lea` computes an effective address; it performs no memory access.
+        I::Lea(..) => false,
+        // Two-operand instructions: memory iff either operand is a memory operand.
+        I::Mov(a, b) | I::Movzx(a, b) | I::Movsx(a, b) | I::Movsxd(a, b) | I::Add(a, b)
+        | I::Sub(a, b) | I::Xor(a, b) | I::And(a, b) | I::Or(a, b) | I::Cmp(a, b) | I::Test(a, b)
+        | I::Xchg(a, b) | I::Bsf(a, b) | I::Bsr(a, b) | I::Bt(a, b) | I::Bts(a, b) | I::Btr(a, b)
+        | I::Btc(a, b) | I::Movaps(a, b) | I::Movapd(a, b) | I::Movups(a, b) | I::Movupd(a, b)
+        | I::Movdqa(a, b) | I::Movdqu(a, b) | I::Movss(a, b) | I::Movsd(a, b) | I::Movq(a, b)
+        | I::Movd(a, b) | I::Addps(a, b) | I::Addss(a, b) | I::Addpd(a, b) | I::Addsd(a, b)
+        | I::Subps(a, b) | I::Subss(a, b) | I::Subpd(a, b) | I::Subsd(a, b) | I::Mulps(a, b)
+        | I::Mulss(a, b) | I::Mulpd(a, b) | I::Mulsd(a, b) | I::Divps(a, b) | I::Divss(a, b)
+        | I::Divpd(a, b) | I::Divsd(a, b) | I::Andps(a, b) | I::Andpd(a, b) | I::Orps(a, b)
+        | I::Orpd(a, b) | I::Xorps(a, b) | I::Xorpd(a, b) | I::Andnps(a, b) | I::Andnpd(a, b)
+        | I::Sqrtps(a, b) | I::Sqrtss(a, b) | I::Sqrtpd(a, b) | I::Sqrtsd(a, b) | I::Unpcklps(a, b)
+        | I::Unpckhps(a, b) | I::Unpcklpd(a, b) | I::Unpckhpd(a, b) | I::Cvtps2dq(a, b)
+        | I::Cvtdq2ps(a, b) | I::Cvttps2dq(a, b) | I::Cvtsi2ss(a, b) | I::Cvtsi2sd(a, b)
+        | I::Cvtss2si(a, b) | I::Cvtsd2si(a, b) | I::Cvttss2si(a, b) | I::Cvttsd2si(a, b)
+        | I::Maxps(a, b) | I::Minps(a, b) | I::Maxpd(a, b) | I::Minpd(a, b) | I::Maxss(a, b)
+        | I::Minss(a, b) | I::Maxsd(a, b) | I::Minsd(a, b) | I::Comiss(a, b) | I::Comisd(a, b)
+        | I::Ucomiss(a, b) | I::Ucomisd(a, b) | I::Pxor(a, b) | I::Paddq(a, b) | I::Psubq(a, b)
+        | I::Pand(a, b) | I::Por(a, b) | I::Pshufb(a, b) | I::Phaddw(a, b) | I::Phaddd(a, b)
+        | I::Phaddsw(a, b) | I::Pabsb(a, b) | I::Pabsw(a, b) | I::Pabsd(a, b) | I::Pmovsxbw(a, b)
+        | I::Pmovsxbd(a, b) | I::Pmovsxbq(a, b) | I::Pmovsxwd(a, b) | I::Pmovsxwq(a, b)
+        | I::Pmovsxdq(a, b) | I::Pmovzxbw(a, b) | I::Pmovzxbd(a, b) | I::Pmovzxbq(a, b)
+        | I::Pmovzxwd(a, b) | I::Pmovzxwq(a, b) | I::Pmovzxdq(a, b) | I::Pmuldq(a, b)
+        | I::Pmulld(a, b) | I::Pcmpeqq(a, b) | I::Pcmpgtq(a, b) | I::Pminsb(a, b) | I::Pminsd(a, b)
+        | I::Pminuw(a, b) | I::Pminud(a, b) | I::Pmaxsb(a, b) | I::Pmaxsd(a, b) | I::Pmaxuw(a, b)
+        | I::Pmaxud(a, b) | I::Phminposuw(a, b) => m(a) || m(b),
+        // Three-operand (imm8) forms.
+        I::Cmpps(a, b, _) | I::Cmppd(a, b, _) | I::Cmpss(a, b, _) | I::Cmpsd(a, b, _)
+        | I::Shufps(a, b, _) | I::Shufpd(a, b, _) | I::Roundps(a, b, _) | I::Roundpd(a, b, _)
+        | I::Roundss(a, b, _) | I::Roundsd(a, b, _) | I::Palignr(a, b, _) | I::Pinsrb(a, b, _)
+        | I::Pinsrd(a, b, _) | I::Pinsrq(a, b, _) | I::Pextrb(a, b, _) | I::Pextrd(a, b, _)
+        | I::Pextrq(a, b, _) => m(a) || m(b),
+        I::Cmovcc(_, a, b) => m(a) || m(b),
+        // One-operand data-processing.
+        I::Neg(a) | I::Not(a) | I::Inc(a) | I::Dec(a) | I::Mul(a) | I::Imul(a) | I::Div(a)
+        | I::Idiv(a) | I::Call(a) | I::Jmp(a) | I::Setcc(_, a) => m(a),
+        I::Shl(a, _) | I::Shr(a, _) | I::Sar(a, _) | I::Rol(a, _) | I::Ror(a, _) | I::Rcl(a, _)
+        | I::Rcr(a, _) => m(a),
+        // No memory: no-operand / flag / register-implicit instructions.
+        I::Nop | I::Ret | I::Syscall | I::Cdqe | I::Cqo | I::Int3 | I::Jcc(..) | I::Stc | I::Clc
+        | I::Cmc | I::Std | I::Cld | I::Lahf | I::Sahf => false,
     }
 }
 
