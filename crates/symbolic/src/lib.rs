@@ -87,6 +87,9 @@ pub struct ExecLimits {
     /// (unsound in general: a moving pointer can walk off its object, a list node can be
     /// freed); surfaced as `valid-loop-ptrs`.
     pub assume_valid_loop_ptrs: bool,
+    /// Honour a C `(buf, len)` parameter pairing recovered by the frontend. Unsound in
+    /// general: C guarantees no such pairing, so a wrong one could prove an overrun safe.
+    pub assume_param_buffer_len: bool,
     /// **Rust aliasing (borrow-stack) model.** When on, track each pointer's originating
     /// borrow (from `RefWitness`) and flag a `NoAliasingViolation` — currently a write
     /// through a shared `&T` reference. Off by default (the reference model is only
@@ -113,6 +116,7 @@ impl Default for ExecLimits {
             assume_valid_params: false,
             assume_valid_returns: false,
             assume_valid_loop_ptrs: false,
+            assume_param_buffer_len: false,
             aliasing_model: false,
             flat_memory: false,
         }

@@ -58,6 +58,9 @@ const GLOBAL_MEMORY: &str = "global-memory";
 /// is *assumed* to designate a valid object of the type its use recovers. The
 /// `--assume-valid-params` opt-in; unsound in general (such a pointer may dangle or be null).
 const PARAM_VALID: &str = "param-valid";
+/// A C `(buf, len)` parameter pairing: the length parameter really does describe the
+/// buffer. A convention, not an ABI guarantee (unlike Rust's `slice-abi`) — opt-in only.
+const PARAM_BUFFER_LEN: &str = "param-buffer-len";
 /// A `&T`/`&mut T` value is a valid reference to its pointee (Rust's reference
 /// invariant), even when the analysis cannot see where it came from.
 const VALID_REFERENCE: &str = "valid-reference";
@@ -213,7 +216,7 @@ pub fn discharge_with_fields(
     discharge_with_scalars(
         f, summaries, &HashMap::new(), contracts, field_contracts, &[], globals, prov_grants,
         &HashMap::new(), None, ExecLimits::default().time_budget, bug_finding, exported,
-        assume_valid_params, false, false, false, false, &HashMap::new(),
+        assume_valid_params, false, false, false, false, false, &HashMap::new(),
     )
 }
 
@@ -242,11 +245,12 @@ pub fn discharge_with_scalars(
     flat_memory: bool,
     assume_valid_returns: bool,
     assume_valid_loop_ptrs: bool,
+    assume_param_buffer_len: bool,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
 ) -> SymbolicReport {
     let limits = ExecLimits {
         bug_finding, exported, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs,
-        aliasing_model, flat_memory, time_budget, ..ExecLimits::default()
+        assume_param_buffer_len, aliasing_model, flat_memory, time_budget, ..ExecLimits::default()
     };
     discharge_inner(
         f, limits, summaries, name_summaries, contracts, field_contracts, scalar_pre, globals,

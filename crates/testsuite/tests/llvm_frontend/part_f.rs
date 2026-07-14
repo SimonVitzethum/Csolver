@@ -464,3 +464,47 @@ entry:
   ret i64 %r
 }
 "#;
+
+/// A C `(buf, len)` parameter pair: the body reads `buf[len - 4]`, so the index into the
+/// buffer is *derived from* the length. C guarantees no such pairing, so the contract exists
+/// only under `--assume-param-buffer-len`; without it the access stays soundly UNKNOWN.
+const C_BUFFER_LEN: &str = r#"
+define i32 @tail4(ptr noundef %0, i32 noundef %1) {
+  %3 = icmp ult i32 %1, 4
+  br i1 %3, label %8, label %4
+
+4:
+  %5 = add i32 %1, -4
+  %6 = zext i32 %5 to i64
+  %7 = getelementptr i8, ptr %0, i64 %6
+  %v = load i32, ptr %7, align 1
+  ret i32 %v
+
+8:
+  ret i32 0
+}
+"#;
+
+#[test]
+fn c_buffer_length_pairing_is_opt_in() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: C_BUFFER_LEN.into(), name: "buf".into() })
+        .expect("lower");
+
+    // Off by default: the length parameter is not assumed to describe the buffer, so the
+    // trailing read is not proved. Sound — a caller may pass a length longer than the buffer.
+    assert_ne!(
+        verify_module(&module, &Config::default()).verdict,
+        Verdict::Pass,
+        "the pairing must not be assumed on the default path"
+    );
+
+    // Under the opt-in flag the buffer is `len` bytes, the guard `len >= 4` rules out the
+    // underflow, and the 4-byte read at `len - 4` is exactly the last element: proved.
+    let cfg = Config { assume_param_buffer_len: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "with the pairing assumed, the guarded trailing read is in bounds"
+    );
+}

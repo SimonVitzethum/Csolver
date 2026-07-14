@@ -209,6 +209,25 @@ pub(crate) fn discharge_inner(
     let mut env: FxHashMap<RegId, SymValue> = FxHashMap::default();
     let mut regions: Vec<SymRegion> = Vec::new();
     let mut facts: Vec<ExprId> = Vec::new();
+    // A C `(buf, len)` pairing is a *convention*, not an ABI guarantee: a caller may pass a
+    // length that does not describe the buffer, and the contract is trusted (it can prove an
+    // access in bounds), so honouring it by default could turn a real overrun into a false PASS.
+    // Off by default, therefore: drop the contract and let the parameter be uncontracted, which
+    // is precisely the behaviour before the pairing existed. Rust's `SizeSpec::ParamElements`
+    // (assumption `slice-abi`, no override) is unaffected — there the ABI does guarantee it.
+    let gated: Vec<Option<PtrContract>>;
+    let contracts: &[Option<PtrContract>] = if limits.assume_param_buffer_len {
+        contracts
+    } else {
+        gated = contracts
+            .iter()
+            .map(|c| match c {
+                Some(c) if c.assumption == Some(PARAM_BUFFER_LEN) => None,
+                other => *other,
+            })
+            .collect();
+        &gated
+    };
     // Pass 1: every parameter without a pointer contract (so length parameters
     // a slice contract refers to are available in pass 2).
     for (i, (reg, ty)) in f.params.iter().enumerate() {
@@ -313,6 +332,16 @@ pub(crate) fn discharge_inner(
                 let len_e = match env.get(&len_reg) {
                     Some(SymValue::Scalar(e)) => *e,
                     _ => ex.fresh_scalar(PTR_WIDTH),
+                };
+                // Rust's slice length is a `usize`, already pointer-width; a C length is
+                // typically a narrower `int`/`u32`. Widen it before the multiply, or the size
+                // expression mixes widths and no bound over it can be proved. Zero-extension is
+                // the right widening: a length is unsigned, and the pointer arithmetic the
+                // access performs zero-extends it the same way.
+                let len_e = if ex.ctx.width(len_e) < PTR_WIDTH {
+                    ex.ctx.zext(len_e, PTR_WIDTH)
+                } else {
+                    len_e
                 };
                 let es = ex.ctx.int(PTR_WIDTH, elem_size as u128);
                 let size = ex.ctx.bin(BvOp::Mul, len_e, es);

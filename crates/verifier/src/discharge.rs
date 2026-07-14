@@ -41,6 +41,7 @@ pub(crate) fn verify_function_with(
             matches!(config.level, csolver_core::SourceLevel::Elf | csolver_core::SourceLevel::Asm),
             config.assume_valid_returns,
             config.assume_valid_loop_ptrs,
+            config.assume_param_buffer_len,
             reg_ptr_hints,
         ),
         None => discharge_function(f),

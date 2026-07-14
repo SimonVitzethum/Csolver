@@ -175,6 +175,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     // `--assume-valid-returns` -- it proves liveness through a moving iterator, so it is not a
     // scan default (it would hide UAF-through-iterator bugs).
     let assume_valid_loop_ptrs = args.iter().any(|a| a == "--assume-valid-loop-ptrs");
+    let assume_param_buffer_len = args.iter().any(|a| a == "--assume-param-buffer-len");
     let aliasing_model = args.iter().any(|a| a == "--aliasing-model");
     // Scan-only flags (`--cross-file`, `--whole-program`, `--auto-entries`) are parsed inside
     // the `scan` branch with opt-out defaults; `--reachable` stays opt-in (it batches findings).
@@ -225,7 +226,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--") && !flag_values.contains(&a.as_str()))
                 .ok_or("`verify` needs a path argument")?;
-            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, aliasing_model, pre_file.as_deref(), entry_patterns)
+            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, assume_param_buffer_len, aliasing_model, pre_file.as_deref(), entry_patterns)
         }
         "scan" => {
             let dir = args
@@ -277,10 +278,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     eprintln!("--reachable: no --entries given — deriving the attacker surface automatically");
                     derive_auto_entries(Path::new(dir), None)
                 });
-                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, aliasing_model, entry_patterns: Some(pats.clone()), time_budget, ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, assume_param_buffer_len, aliasing_model, entry_patterns: Some(pats.clone()), time_budget, ..Config::default() };
                 scan_reachable(Path::new(dir), &config, &pats)
             } else {
-                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, aliasing_model, entry_patterns, time_budget, ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, assume_param_buffer_len, aliasing_model, entry_patterns, time_budget, ..Config::default() };
                 scan_dir(Path::new(dir), &config, cross_file, whole_program)
             }
         }

@@ -123,7 +123,11 @@ pub fn apply(module: &mut Module, preconds: &[Precondition]) -> Result<usize, St
             .get(p.function.as_str())
             .ok_or_else(|| format!("precondition names unknown function `{}`", p.function))?;
         let key = (fid, p.param);
-        if module.param_contracts.contains_key(&key) {
+        // An explicit precondition outranks a contract the frontend *guessed* (the opt-in C
+        // `(buf, len)` pairing), but never one the IR actually declares (`dereferenceable`, a
+        // Rust slice): those are facts, not heuristics, and the sidecar must not weaken them.
+        let guessed = |c: &PtrContract| c.assumption == Some("param-buffer-len");
+        if module.param_contracts.get(&key).is_some_and(|c| !guessed(c)) {
             continue;
         }
         module.param_contracts.insert(

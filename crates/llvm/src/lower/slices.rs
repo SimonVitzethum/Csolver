@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 /// Post-pass: inject the two obligation checks that are not tied to a specific call —
 /// **resource-leak** checks (K) before every `Return`, and **secret-dependence** checks (L)
@@ -357,6 +358,101 @@ pub(crate) fn detect_slice(f: &LFunc, idx: usize) -> Option<(u32, u64)> {
     }
     let elem_size = slice_elem_size(f, &p.name)?;
     Some(((idx + 1) as u32, elem_size))
+}
+
+/// Detect a **C buffer/length parameter pair** — `f(const u8 *key, u32 keylen)` — where
+/// [`detect_slice`] cannot: C has no slice ABI, so the pointer carries no `align` attribute
+/// and the length need not sit immediately after it. Returns `(length parameter index,
+/// element size)`.
+///
+/// Unlike Rust's `&[T]`, this pairing is **not guaranteed by any ABI** — it is a convention,
+/// and a caller may well pass a length that does not describe the buffer. The contract it
+/// produces is therefore emitted under its own assumption id (`param-buffer-len`) and honoured
+/// only under the opt-in flag; with the flag off the parameter stays uncontracted, exactly as
+/// today. That is what keeps a wrong pairing from becoming a false PASS on the default path.
+///
+/// The evidence required is the same as for a Rust slice, and for the same reasons: the integer
+/// must *bound* an index into the pointer ([`used_as_length`]) and must not itself be a
+/// dereferenced index ([`pointer_indexed_and_dereferenced_by`]) — an `f(buf, i)` index argument
+/// mistaken for a length would size the region by the access and refute every access.
+pub(crate) fn detect_c_buffer(f: &LFunc, idx: usize) -> Option<(u32, u64)> {
+    let p = &f.params[idx];
+    if p.name.is_empty() || !matches!(p.ty, LType::Ptr) {
+        return None;
+    }
+    for (j, len) in f.params.iter().enumerate() {
+        if j == idx || len.name.is_empty() || !matches!(len.ty, LType::Int(_)) {
+            continue;
+        }
+        if pointer_indexed_and_dereferenced_by(f, &p.name, &len.name) {
+            continue;
+        }
+        // Either the Rust-grade evidence, or — the shape C code actually takes — an index into
+        // the buffer that is *computed from* the length (`buf[len - 4]`, `buf + len/2`). The
+        // latter is deliberately NOT folded into `used_as_length`: that is also the evidence for
+        // Rust's `slice-abi` contract, which is *trusted*, and admitting a derived index there
+        // could turn an index parameter into a phantom length and prove a real overrun safe.
+        if !used_as_length(f, &p.name, &len.name)
+            && !pointer_index_derived_from(f, &p.name, &len.name)
+        {
+            continue;
+        }
+        // A byte buffer (`gep i8`) gives element size 1, which is exactly right: the length
+        // then counts bytes. Without any gep on the pointer there is no access to bound.
+        let elem_size = slice_elem_size(f, &p.name)?;
+        return Some((j as u32, elem_size));
+    }
+    None
+}
+
+/// Whether some `getelementptr ptr_name, IDX` has an `IDX` that is *computed from* `cand`
+/// — the ubiquitous C shape `buf[len - 4]`, `buf + len`, `buf + len * 2`, where the index is
+/// derived from the length by arithmetic rather than being the length itself.
+///
+/// A bounded backward walk over the defining instructions (casts and integer arithmetic), so
+/// a cyclic or deep chain terminates. Only ever *positive* evidence for the opt-in C pairing.
+fn pointer_index_derived_from(f: &LFunc, ptr_name: &str, cand: &str) -> bool {
+    // `dst -> operands` for the value-producing integer ops a length flows through.
+    let mut def: HashMap<&str, Vec<&str>> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst {
+            LInst::Cast { dst, val: LValue::Local(a), .. } => {
+                def.insert(dst.as_str(), vec![a.as_str()]);
+            }
+            LInst::Bin { dst, a, b, .. } => {
+                let mut ops = Vec::new();
+                if let LValue::Local(x) = a {
+                    ops.push(x.as_str());
+                }
+                if let LValue::Local(y) = b {
+                    ops.push(y.as_str());
+                }
+                def.insert(dst.as_str(), ops);
+            }
+            _ => {}
+        }
+    }
+    let derives_from_cand = |start: &str| {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut work = vec![start];
+        while let Some(v) = work.pop() {
+            if v == cand {
+                return true;
+            }
+            if !seen.insert(v) || seen.len() > 64 {
+                continue;
+            }
+            if let Some(ops) = def.get(v) {
+                work.extend(ops.iter().copied());
+            }
+        }
+        false
+    };
+    f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+        matches!(inst,
+            LInst::Gep { base: LValue::Local(base), index: LValue::Local(ix), .. }
+            if base == ptr_name && derives_from_cand(ix))
+    })
 }
 
 /// Whether some `getelementptr ptr_name, cand` has its result loaded or stored —

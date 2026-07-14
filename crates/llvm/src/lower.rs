@@ -281,6 +281,24 @@ fn lower_function(
                         sentinel: None,
                     },
                 ));
+            } else if let Some((len_param, elem_size)) = detect_c_buffer(f, idx) {
+                // A C `(buf, len)` pair: the body indexes `buf` by something `len` bounds.
+                // C guarantees no such pairing (unlike Rust's slice ABI), so this rests on its
+                // own assumption id and is honoured only under `--assume-param-buffer-len`;
+                // with the flag off the executor drops the contract and the parameter stays
+                // uncontracted, exactly as before.
+                contracts.push((
+                    idx as u32,
+                    PtrContract {
+                        assumption: Some("param-buffer-len"),
+                        refutable: true,
+                        size: SizeSpec::ParamElements { len_param, elem_size },
+                        align: p.align.unwrap_or(1),
+                        readable: !p.writeonly,
+                        writable: !p.readonly,
+                        sentinel: None,
+                    },
+                ));
             } else if let Some((size, align)) = f
                 .dbg
                 .and_then(|sp| debuginfo.param_raw_ptr(sp, idx as u32 + 1))

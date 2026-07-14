@@ -113,6 +113,9 @@ pub struct Config {
     /// intrusive-container / iterator discipline (`list_for_each_entry` walks live nodes).
     /// Surfaced as the `valid-loop-ptrs` assumption.
     pub assume_valid_loop_ptrs: bool,
+    /// Honour a C `(buf, len)` parameter pairing recovered by the frontend. Unsound in
+    /// general: C guarantees no such pairing, so a wrong one could prove an overrun safe.
+    pub assume_param_buffer_len: bool,
     /// **Rust aliasing (borrow-stack) model.** Opt-in Stacked/Tree-Borrows checking: flag a
     /// `NoAliasingViolation` (currently a write through a shared `&T` reference). Off by
     /// default — the reference model is only partially reconstructed from the frontends, so
@@ -168,6 +171,7 @@ impl Default for Config {
             assume_valid_params: false,
             assume_valid_returns: false,
             assume_valid_loop_ptrs: false,
+            assume_param_buffer_len: false,
             aliasing_model: false,
             entry_patterns: None,
             time_budget: Some(std::time::Duration::from_secs(30)),

@@ -1,5 +1,39 @@
 # Todo — Schwächen & Risiken aus dem Code-Review (2026-07-13)
 
+## MESSFEHLER korrigiert (2026-07-14) — Benchmark-Sample war unrepräsentativ
+
+Zwei Fehler in der eigenen Auswertung, beide korrigiert:
+
+1. **Kaputtes Residual-Parsing.** Der Residual-Text hat *verschachtelte* Klammern
+   (`… (scalar-as-pointer (copy root unclassified: …))`). Ein `awk`, das die letzte
+   Klammergruppe nahm, ordnete Ursachen systematisch falsch zu. Immer die **erste**
+   öffnende Klammer nach `residual:` bis zum Zeilenende nehmen.
+2. **Unrepräsentatives Sample.** Das 50-Datei-Kernel-Sample hatte nur **10 %** Debug-Info,
+   das Korpus hat **98 %** (36.779/37.594 `.ll` mit `DICompositeType`). Es war also genau
+   gegen die DWARF-Recovery verzerrt. Auf einem repräsentativen Sample (48/50 mit DWARF):
+   **307 PASS / 16 FAIL / 523 UNKNOWN → Decided-Rate 38 %** (nicht 45 %).
+
+**Konsequenz für die Priorisierung:** Es gibt **keinen Solo-Hebel**. 439 der 523 UNKNOWN
+(84 %) hängen an *mehreren* Ursachen gleichzeitig. Häufigkeit über die UNKNOWN-Funktionen:
+`bounds` 376 (72 %), `offset` 361 (69 %), `null?` 192, `loaded` 109, `align` 94.
+`bounds`/`offset` sind **keine** Provenance-Lücken — Region und Größe sind bekannt, nur der
+Index ist nicht beweisbar. Der Engpass ist also **Bounds-Präzision**, nicht Typinfo.
+
+- [x] **C `(buf, len)`-Paarung** → `--assume-param-buffer-len` (Flagge, `param-buffer-len`).
+  Erkennt auch den Fall, wo der Index aus der Länge *abgeleitet* ist (`buf[len-4]`). Bewusst
+  NICHT in `used_as_length` gefaltet: das ist auch die Evidenz für Rusts *vertrauten*
+  `slice-abi`-Contract, und ein abgeleiteter Index könnte dort einen Index-Parameter zur
+  Phantom-Länge machen → false PASS. Nebenbei gefixt: C-Längen sind meist 32-bit, der
+  Slice-Contract erwartete 64-bit `usize` → Breiten-Mismatch, `zext` vor der Multiplikation.
+  **Wirkung auf dem Kernel-Sample: 0 Funktionen** (die Paarung greift, aber die betroffenen
+  Funktionen blockieren an anderer Ursache).
+- [ ] **NÄCHSTES: „Kontext hinter der Struktur"-Idiom.** Der dominante `bounds`-Blocker im
+  Kernel ist `gep %struct.T, ptr %p, i64 1` — ein Zugriff *hinter* dem Struct-Ende
+  (`crypto_skcipher_ctx`, `netdev_priv`, `tfm + 1`). Gegen eine Region von exakt
+  `sizeof(struct T)` prinzipiell unbeweisbar; braucht ein Modell „Objekt ist größer als sein
+  deklarierter Typ" (Allokation trägt Struct + Kontext). Vermutlich der größte verbleibende
+  Einzelhebel für `bounds`/`offset`.
+
 ## Einheitliches Typ-Sizing für JEDEN opaken Zeiger (2026-07-14) — Abschluss
 
 Ein Prinzip, überall angewandt (`Explorer::size_hinted_pointer`, unter `--assume-valid-params`):
