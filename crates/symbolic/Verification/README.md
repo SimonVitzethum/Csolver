@@ -146,13 +146,20 @@ Zig `*T`) is not a region: its provenance id is held in `PathState.nonnull_provs
 gep/copy-derived pointers carrying the id — as non-null, so only `NoNullDeref`
 proves while bounds/liveness stay unknown (a `nonnull` pointer may still dangle).
 
-**Rust aliasing model (opt-in `--aliasing-model`).** A static per-function pre-pass
-(`shared_borrow_regs`) marks every pointer register derived — through copies, casts,
-`PtrOffset`, `FieldPtr` — from a genuine shared borrow (`RefWitness{writable:false,
-assumed:false}`); a `Store` through such a register is a **write through a shared
-`&T`** (`NoAliasingViolation`), refuted only on a feasible path (no false FAIL). Off
-by default; the full borrow-stack (use-after-invalidation of `&mut`, a reborrow
-derivation tree, protectors) is future work — see `Todo.md`.
+**Rust aliasing model (opt-in `--aliasing-model`).** Two `NoAliasingViolation` classes,
+both refuted only on a feasible path (no false FAIL), off by default:
+(1) **write through a shared `&T`** — a static pre-pass (`shared_borrow_regs`) marks every
+pointer register derived (copy/cast/`PtrOffset`/`FieldPtr`) from a `RefWitness{writable:false}`;
+a `Store` through one is flagged.
+(2) **use-after-invalidation of a `&mut`** — the MIR frontend emits a `csolver.retag.mut` marker
+for a `&mut *_p` reborrow; a static `borrow_info` pre-pass assigns each reborrow a **tag**
+(register-as-tag) with a **derivation tree** (`parent`), and the dynamic `PathState.region_borrows`
+holds each region's live borrow-tag stack. A reborrow pushes its tag, popping the parent's other
+descendants (siblings are invalidated); a root reborrow invalidates all prior borrows; a write pops
+the tags above it; an access through a tag no longer on the stack is the violation. A merge keeps a
+region's stack only if all incoming paths agree, else poisons it (checks skipped — sound).
+The remaining borrow-stack (two-phase/`&raw` retags, protectors, shared-read tags, `SymPointer`-carried
+tags) is future work — see `Todo.md`.
 
 ## Interprocedural summaries (increment 5)
 Each function gets a [`Summary`] (`summary.rs`): its **effects** (`writes` /

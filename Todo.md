@@ -2,24 +2,26 @@
 
 ## Rust-Aliasing-Modell (Borrow-Stack, `--aliasing-model`) — Restarbeit
 
-Der Opt-in-Detektor deckt aktuell nur die **eindeutige** Klasse ab: ein Schreibzugriff
-durch eine geteilte `&T`-Referenz (`SafetyProperty::NoAliasingViolation`, sound, kein
-False-FAIL, nur auf feasibler Pfad refutiert). Für ein vollständiges Stacked/Tree-Borrows
-fehlt (jeweils Frontend- **und** Executor-Arbeit, nicht ohne Design entscheidbar):
+Der Opt-in-Detektor (`SafetyProperty::NoAliasingViolation`, sound, kein False-FAIL, nur auf
+feasiblem Pfad refutiert) deckt jetzt **zwei** Klassen ab:
 
-- [ ] **Retag-Events im Frontend.** Der MIR-Frontend senkt `Rvalue::Ref` zu einer reinen
-  Registerkopie und verwirft die Mutabilität; nur `RefWitness` trägt `writable`. Für das
-  volle Modell muss der Frontend `-Zmir-emit-retag`-`Retag(...)`-Statements als explizite
-  Borrow-Events (mit `&`/`&mut`/Two-Phase/Raw) emittieren.
-- [ ] **Use-after-invalidation von `&mut`.** Zwei gleichzeitig lebende `&mut` auf dieselbe
-  Stelle bzw. Nutzung eines `&mut`, das durch einen aliasenden Zugriff invalidiert wurde —
-  braucht einen **Ableitungsbaum** (Reborrow-Kette), sonst False-FAILs auf legitimen
-  Reborrows (`&mut *a`). Pro Region ein Borrow-Stack aus getaggten Einträgen.
-- [ ] **Protectors** für Funktionsargumente (ein an eine Funktion übergebenes `&mut` bleibt
-  für deren Dauer eindeutig) und **Interior Mutability** (`UnsafeCell`) exakt statt über die
-  aktuelle „Raw-Pointer-aus-Call trägt kein Tag“-Heuristik.
-- [ ] Der Tag müsste am `SymPointer` hängen (fließt durch `gep`/Kopie), aus `PartialEq`
-  ausgeschlossen wie `POrigin` — 31 Konstruktionsstellen, daher als eigener Schritt.
+- [x] **Write-through-`&T`** (geteilte Referenz beschrieben).
+- [x] **Use-after-invalidation von `&mut`** (6f4db67): der MIR-Parser erfasst `&mut` vs `&`,
+  ein `&mut *_p`-Reborrow emittiert ein `csolver.retag.mut`-Marker-Intrinsic; der Executor
+  führt einen **Per-Region-Borrow-Stack** mit **Ableitungsbaum** (Register-als-Tag) — ein
+  Reborrow invalidiert Geschwister, ein Root-Reborrow alle vorigen, ein Write poppt darüber;
+  Nutzung eines invalidierten Tags = Verletzung. Merge poisont bei Uneinigkeit (sound). Kein
+  False-FAIL auf legitimen Reborrow-Ketten (getestet).
+
+Für ein **vollständiges** Stacked/Tree-Borrows fehlt noch:
+- [ ] **Two-Phase-Borrows** und `&raw`-Retags (aktuell nur `&mut *_p` durch ein Pointer-Local).
+- [ ] **Protectors** für Funktionsargumente (ein übergebenes `&mut` bleibt für die Call-Dauer
+  eindeutig) und **Interior Mutability** (`UnsafeCell`) exakt statt heuristisch.
+- [ ] **Lese-Reborrow-Nuancen** (SharedReadOnly-Tags im Stack; aktuell werden nur `&mut`-Tags
+  verfolgt, Reads prüfen nur Liveness).
+- [ ] Für Präzision über Kopien hinweg, die der Register-Tag-Vorabpass nicht sieht (z.B. durch
+  Speicher/Phi geführte Borrows), müsste der Tag am `SymPointer` hängen — aus `PartialEq`
+  ausgeschlossen wie `POrigin`, 31 Konstruktionsstellen.
 
 ## Sound-Coverage-Lücken — Status & warum offen (2026-07-14 geprüft)
 
