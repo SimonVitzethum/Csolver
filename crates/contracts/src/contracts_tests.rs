@@ -263,3 +263,22 @@ fn default_kernel_sync_contract_loads() {
         Effect::TypestateYield { protocol, .. } if protocol == "reclaim"
     )));
 }
+
+#[test]
+fn ordered_cmpxchg_carries_both_cas_and_ordering_barrier() {
+    let c = Contracts::defaults();
+    // A **release** CAS publishes: ABA (`cas`) plus a write barrier ordering prior stores
+    // before it, so a lock-free publish/consume is seen as ordered (no false weak-memory bug).
+    let rel = &c.lookup("cmpxchg_release").unwrap().effects;
+    assert!(rel.contains(&Effect::Cas { arg: 0 }), "release CAS keeps ABA detection");
+    assert!(rel.contains(&Effect::Barrier { kind: 1 }), "release CAS orders prior stores (W→W)");
+    // An **acquire** CAS consumes: `cas` plus a read barrier ordering later loads after it.
+    let acq = &c.lookup("cmpxchg_acquire").unwrap().effects;
+    assert!(acq.contains(&Effect::Cas { arg: 0 }));
+    assert!(acq.contains(&Effect::Barrier { kind: 2 }), "acquire CAS orders later loads (R→R)");
+    // The relaxed / plain forms stay `cas`-only (no ordering claimed — the conservative
+    // direction: at worst a false positive, never a hidden barrier bug).
+    let relaxed = &c.lookup("cmpxchg_relaxed").unwrap().effects;
+    assert_eq!(relaxed, &vec![Effect::Cas { arg: 0 }]);
+    assert!(!c.lookup("cmpxchg").unwrap().effects.iter().any(|e| matches!(e, Effect::Barrier { .. })));
+}

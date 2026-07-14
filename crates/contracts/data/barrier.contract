@@ -20,7 +20,8 @@ barrier read
 # read barrier). Deliberately weaker than smp_mb — they do NOT fix the store-buffer W->R — so a
 # store-buffer (SB) pattern still flags. Modelling release/acquire as the *weaker* fence is the safe
 # direction for a bug-finder: it removes only the reorderings they genuinely order (fewer false
-# positives) and never hides a bug that needs a full barrier. (cmpxchg_acquire/_release stay `cas`.)
+# positives) and never hides a bug that needs a full barrier. (The ordered CAS variants
+# `cmpxchg_acquire`/`_release` carry BOTH `cas` and this barrier — see lifetime.contract.)
 [smp_store_release atomic_set_release atomic64_set_release atomic_fetch_add_release atomic_fetch_sub_release atomic_fetch_or_release atomic_fetch_and_release atomic_fetch_xor_release atomic_add_return_release atomic_sub_return_release atomic_inc_return_release atomic_dec_return_release atomic_xchg_release atomic64_xchg_release atomic64_fetch_sub_release]
 barrier write
 

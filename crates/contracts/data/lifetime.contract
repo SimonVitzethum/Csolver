@@ -57,5 +57,20 @@ refcount-dec arg0 lifetime
 
 # --- Compare-and-swap (ABA detection) ------------------------------------------------------
 # A lock-free CAS on the location; a concurrent modification (A->B->A) is the ABA problem.
-[atomic_cmpxchg cmpxchg try_cmpxchg atomic_try_cmpxchg atomic64_cmpxchg atomic_cmpxchg_relaxed cmpxchg_relaxed cmpxchg_acquire cmpxchg_release]
+[atomic_cmpxchg cmpxchg try_cmpxchg atomic_try_cmpxchg atomic64_cmpxchg atomic_cmpxchg_relaxed cmpxchg_relaxed]
 cas arg0
+
+# The **ordered** CAS variants carry BOTH the ABA (`cas`) effect AND a weak-memory ordering
+# barrier, so a lock-free publish/consume built on them (`cmpxchg_release` to publish a node,
+# `cmpxchg_acquire` to consume it) is seen as ordered and the SC-robustness pass does not
+# falsely flag a missing barrier. A **release** orders prior stores before it (write barrier);
+# an **acquire** orders later loads after it (read barrier) — the *weakest* correct fence, so
+# no genuine full-barrier bug is hidden. One name = one contract entry, so both effect lines
+# live in the same block (a later duplicate registration would overwrite, not merge).
+[cmpxchg_release atomic_cmpxchg_release atomic64_cmpxchg_release try_cmpxchg_release]
+cas arg0
+barrier write
+
+[cmpxchg_acquire atomic_cmpxchg_acquire atomic64_cmpxchg_acquire try_cmpxchg_acquire]
+cas arg0
+barrier read

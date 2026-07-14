@@ -48,10 +48,9 @@ Weitere abgeschlossene Teile (8a671fc):
   intraprozeduralen Parameter-Protektor abgedeckt, wenn der Callee analysiert wird.
 
 Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
-- [ ] **`UnsafeCell`/Interior Mutability exakt**: aktuell sound (Cell-Writes gehen durch einen
-  untagged Raw-Pointer aus `UnsafeCell::get` → ein `&Cell`-Shared-Tag wird im Caller nie
-  beschrieben → kein realer False-FAIL). Exaktes Interior-Mutable-Region-Typing bräuchte
-  MIR-Typnamen-Erfassung (`Cell`/`UnsafeCell` werden heute zu `MType::Other`).
+- [x] **`UnsafeCell`/Interior Mutability exakt** (2bb39ae): `MType::InteriorMut` — der
+  MIR-Parser erkennt `Cell`/`UnsafeCell`/`Mutex`/`Atomic*`, das Lowering unterdrückt Retags
+  für deren Reborrows. War vorher schon sound (untagged Raw-Pointer), jetzt exakt getypt.
 
 ## Sound-Coverage-Lücken — Status & warum offen (2026-07-14 geprüft)
 
@@ -84,23 +83,13 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
 - [ ] **LZMS** (selten, `/compress:recovery`) und **PDB** (separate `.pdb`-Datei, per GUID von der
   PE referenziert — nicht im Installations-ISO; braucht Windows-Buildumgebung + MSF/Stream-Parser).
 
-## Struktur / Wartbarkeit
+## Struktur / Wartbarkeit — ERLEDIGT
 
-- [ ] **`crates/symbolic/src/exec.rs` (8314 Zeilen) aufteilen.** Monolith trägt
-  Speichermodell, Loop-Summaries, Taint, Typestate, Locks/RCU/IRQ, Refcounts und
-  Provenance in einer Datei/einem Typ. Höchstes Review- und Regressionsrisiko.
-  → Aufteilung in Submodule über einer schmaleren Executor-API.
-- [ ] **`crates/asm/src/x86.rs` (5835 Zeilen) aufteilen** (Decoder-Tabellen,
-  Lowering, Tests trennen).
-- [ ] Weitere Dateien > 500 Zeilen modularisieren: `verifier/contracts.rs` (2825),
-  `llvm/parser.rs` (2677), `elf/lib.rs` (2221), `cli/main.rs` (2016),
-  `verifier/interleave.rs` (1982), `llvm/lower.rs` (1884), `symbolic/summary.rs`
-  (1366), `mir/parser.rs` (1323), `testsuite/lib.rs` (1173), `verifier/lib.rs`
-  (996), `mir/lower.rs` (964), `solver/sat.rs` (956), `contracts/lib.rs` (894),
-  `absint/analysis.rs` (841), `llvm/lib.rs` (793), `ir/inst.rs` (727),
-  `solver/bitblast.rs` (716), `absint/induction.rs` (607), `solver/expr.rs` (590),
-  `asm/att.rs` (550), `ir/func.rs` (548), `llvm/debuginfo.rs` (510); Tests:
-  `testsuite/tests/llvm_frontend.rs` (4642), `mir_frontend.rs` (1368).
+- [x] Datei-Refactor abgeschlossen (Commits d7815c2 … 2f09fce): `exec.rs` (8314),
+  `x86.rs` (5835), `contracts.rs`, `llvm/parser.rs`, `elf/lib.rs`, `cli/main.rs`,
+  `interleave.rs`, `llvm/lower.rs`, `summary.rs`, `mir/parser.rs` u.a. in Submodule
+  gesplittet. Größte verbleibende Datei: `asm/x86/lower.rs` (~1022 Z., Einzelfunktion
+  `decode_one`, nicht mechanisch teilbar). Fast alle anderen < 550 Zeilen.
 
 ## Technische Schuld
 
