@@ -142,6 +142,69 @@ fn indirect_call_through_null_fn_ptr_is_refuted() {
     assert!(d.refutation.is_some(), "the null call is refuted with a witness");
 }
 
+/// A CFI slice: an indirect call **into a stack region** (executing data as code — the
+/// classic jump-to-injected-shellcode) is a definite `ValidIndirectTarget` violation, while
+/// an indirect call through an opaque parameter pointer (unknown but assumed valid) is not.
+#[test]
+fn indirect_call_into_stack_data_is_refuted() {
+    use std::collections::HashMap;
+    let empty_grants = HashMap::new();
+    let run = |f: &Function| {
+        discharge_inner(
+            f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[],
+            &HashMap::new(), &empty_grants, &HashMap::new(), None,
+        )
+    };
+    // `%p = alloca i32; call %p()` — calling the address of a stack local as code.
+    let p = RegId(0);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: p,
+        region: csolver_core::RegionKind::Stack,
+        elem: Type::int(32),
+        count: Operand::int(64, 1),
+        align: 4,
+    });
+    bb0.insts.push(Inst::Call {
+        dst: None,
+        callee: csolver_ir::Callee::Indirect(Operand::Reg(p)),
+        args: vec![],
+        ret_ty: Type::Unit,
+        ret_ref: None,
+    });
+    let f = Function {
+        id: FuncId(0), name: "callstack".into(), params: vec![],
+        ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0),
+    };
+    let rf = run(&f);
+    let d = rf
+        .mem_decision(BlockId(0), 1, SafetyProperty::ValidIndirectTarget)
+        .expect("valid-target obligation recorded");
+    assert!(!d.proven, "calling a stack address as code must not be proven valid");
+    assert!(d.refutation.is_some(), "the stack-data call is refuted with a witness");
+
+    // Negative control: an indirect call through an opaque parameter pointer is assumed valid
+    // (an ordinary callback) — it must NOT be flagged.
+    let fp = RegId(0);
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb.insts.push(Inst::Call {
+        dst: None,
+        callee: csolver_ir::Callee::Indirect(Operand::Reg(fp)),
+        args: vec![],
+        ret_ty: Type::Unit,
+        ret_ref: None,
+    });
+    let g = Function {
+        id: FuncId(0), name: "callparam".into(),
+        params: vec![(fp, Type::ptr(Type::Unit))],
+        ret_ty: Type::Unit, blocks: vec![bb], entry: BlockId(0),
+    };
+    let rg = run(&g);
+    let d2 = rg.mem_decision(BlockId(0), 0, SafetyProperty::ValidIndirectTarget);
+    // Either proven valid or left open — but never refuted (no false CFI FAIL on a callback).
+    assert!(d2.is_none_or(|d| d.refutation.is_none()), "an opaque callback pointer must not be refuted");
+}
+
 /// A1 (IR-intrinsic read-only): a store into a `constant` global — a `.rodata`
 /// write that faults at runtime — is a refutable violation (FAIL), while a store
 /// into a writable global proves. General and sound: it rests only on the module's

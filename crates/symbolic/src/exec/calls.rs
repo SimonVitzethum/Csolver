@@ -175,21 +175,35 @@ impl Explorer<'_> {
             }
             _ => None,
         };
-        // Valid indirect target (a CFI slice): an indirect call through a function
-        // pointer that is provably null is a definite control-flow-integrity bug
-        // (calling through a null/uninit callback). A devirtualised or non-null
-        // pointer is fine; an opaque (unknown-but-assumed-valid) pointer is not
-        // flagged. Bug-finding-only, refuted with a witness on a feasible path.
+        // Valid indirect target (a CFI slice): an indirect call is a definite control-flow-
+        // integrity bug when the target pointer is provably (a) **null** (a null/uninit
+        // callback) or (b) into a **stack or heap region** — executing data as code (the
+        // classic jump-to-injected-shellcode). Stack/heap are never legitimately executable
+        // (a trampoline needs an explicitly mprotect'd stack we do not model), so a data-
+        // region target is a genuine violation; a devirtualised, symbol, or opaque
+        // (unknown-but-assumed-valid) pointer is NOT flagged. Bug-finding-only, refuted with a
+        // witness on a feasible path.
         if let Callee::Indirect(op) = callee {
-            let null_target = resolved_fid.is_none()
-                && matches!(self.eval_value(op, state), SymValue::Ptr(p) if matches!(p.prov, Prov::Null));
+            let mut violation = false;
+            if resolved_fid.is_none() {
+                if let SymValue::Ptr(p) = self.eval_value(op, state) {
+                    violation = match &p.prov {
+                        Prov::Null => true,
+                        Prov::Region(rid) => matches!(
+                            state.regions.get(*rid).map(|r| r.kind),
+                            Some(RegionKind::Stack | RegionKind::Heap)
+                        ),
+                        _ => false,
+                    };
+                }
+            }
             self.record_temporal(
                 (block, idx),
                 SafetyProperty::ValidIndirectTarget,
-                null_target,
+                violation,
                 state,
                 "indirect call target is a valid function pointer",
-                "indirect call through a null/uninitialised function pointer",
+                "indirect call through a null pointer or into non-executable stack/heap data",
             );
         }
 
