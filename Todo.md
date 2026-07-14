@@ -63,6 +63,13 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
   (keine Bounds-FP) + initialisiert geseedet (keine Uninit-FP); Unbekannt-Größe bleibt opak
   (keine Perturbation). Der LLVM-`llvm.lifetime.end`-Pfad (eef91eb) und dangling-return (ec8914a)
   waren bereits da.
+- [x] **Interprozedurale dangling-stack Escape** (29ff588): ein Callee, der auf jedem Pfad
+  einen Zeiger in den eigenen Stack-Frame zurückgibt, summiert als `RetSummary::DanglingStack`
+  (neuer `AbsVal::LocalStack`, konservativ gejoint → nie falsche Claim); am Call-Site wird der
+  Rückgabewert als frische **freed** Region materialisiert, sodass ein Caller-Deref = definitive
+  UAF über die normale Liveness-Maschinerie. Negativ-Kontrolle (Rückgabe eines Param-Zeigers)
+  bleibt sicher. STILL OPEN: Escape über Out-Parameter-Store und Propagation durch einen Wrapper,
+  der das dangling Callee-Resultat weiterreicht (Summary-Evaluator behandelt Call-Resultat opak).
 - [ ] **StackIntegrity / ValidStackFrame (ROP)** — im Binär-Pfad ist ein Store über das
   Frame-Ende (Rücksprungadresse) bereits als InBounds-OOB gefangen; eine **dedizierte** Property
   bräuchte ein Rücksprungadress-/Canary-Modell im Binär-Pfad. Kein kleiner sound Slice, gering
@@ -99,8 +106,11 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
 
 - [ ] `csolver-smt` ist ein `NullSolver`; `solver::encode` gibt `Unsupported`
   zurück (bewusste pure-Rust-Entscheidung; externes Backend = Opt-in-Frage).
-- [ ] Bit-Blaster: `udiv`/`sdiv`/`urem`/`srem` und symbolische Shift-Amounts
-  werden nicht gebitblastet (Fallback auf linear/UNKNOWN).
+- [x] Bit-Blaster: `udiv`/`sdiv`/`urem`/`srem` gebitblastet (107748c) — Restoring
+  Long Division (w+1-Bit-Teilrest), signiert via Betrag+Vorzeichen-Korrektur;
+  Division-durch-0 SMT-LIB-total; gegen unabhängiges Orakel exhaustiv (4-Bit
+  always-on, 6-Bit on-demand) + 0-Divisor-Totalitätstest verifiziert. Verbleibend:
+  nur noch **symbolische** Shift-Amounts (Fallback auf linear/UNKNOWN, sound).
 - [x] ~~Textueller Intel-Syntax-x86- und AArch64-Assembler fehlen~~ → beide
   ergänzt: `x86text` deckt jetzt **AT&T und Intel** x86-64 über ein uniformes
   Operand-Modell (`TextOp`, AT&T-interne Reihenfolge) ab, `arm64_text` das
