@@ -6,16 +6,15 @@ Nach den Batches (SMT entfernt, 128-Bit, x86-ALU-mem+LOCK, interproc-Escape, CFI
 acquire/release, div/rem+Shifts). Alles Übrige ist **sound** (degradiert zu UNKNOWN, nie
 false PASS). Geordnet nach *sound machbar × Wert*.
 
-**Tier 1 — sound & begrenzt (echter Wert, umsetzbar):**
-- [ ] **x86 MSIR: restliche Speicheroperand-Formen** (`decode_one`) — noch abgelehnt:
-  `cmp/test [mem]` (read-only, einfach), `inc/dec [mem]` und `<op> [mem], imm` (Group-1) und
-  `xchg [mem]` (RMW, wie ALU-mem lösbar), `cmovcc [mem]` (bedingter Load). Jede fügt echte
-  Binär-Coverage hinzu (Zugriff wird geprüft statt verworfen).
-- [ ] **Typed-Decoder ALU-mem** — der *typed* Decoder (`decode.rs`, Länge/Differential) lehnt
-  `<alu> [mem], r` weiter ab; nachziehen, damit der Längenpfad die Form auch kennt.
-- [ ] **Interproc-Escape: Out-Parameter-Store** (`void bad(int** out){int x; *out=&x;}`) — der
-  Return-basierte + Wrapper-Fall sind erledigt; der Escape via Store in ein Caller-Out-Param
-  fehlt (braucht Escape-durch-Store im Summary).
+**Tier 1 — sound & begrenzt — ERLEDIGT 2026-07-14:**
+- [x] **x86 MSIR restliche Speicheroperand-Formen** (508d324): `cmp/test [mem]`, `inc/dec [mem]`,
+  `<op> [mem], imm` (Group-1), `call/jmp [mem]` (Group-5), `xchg [mem]` (atomar = Barrier+RMW),
+  `cmovcc [mem]` — Zugriff wird jetzt geprüft statt verworfen.
+- [x] **Typed-Decoder ALU-mem** (43378a8): `<alu> [mem], r` dekodiert (Länge + typed Operand).
+- [x] **Interproc-Escape: Out-Parameter-Store** (a913ccd): `*out = &x` → `Summary.escapes_stack`
+  (nur Entry-Block = unbedingt, kein false FAIL); Call-Site setzt dangling Wert an argK; Caller-
+  Deref = UAF. Komplettiert das Escape-Trio (Return, Wrapper, Out-Param). Offen: bedingter Escape
+  in einem Nicht-Entry-Block (sound gemisst) und Wrapper-Propagation von `escapes_stack`.
 
 **Tier 2 — braucht ein anderes Modell (Klasse „E", bewusst zurückgestellt):**
 - [ ] **TBAA / Strict-Aliasing / Union-Punning** — kein sound Refutations-Slice ohne Typ-Lattice
