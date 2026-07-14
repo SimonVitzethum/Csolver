@@ -242,14 +242,19 @@ fn cmp(
     }
 }
 
-/// Translate a formula into SMT assertions on `solver` (M0 stub).
+/// Translate a formula into assertions on an **external** [`SmtSolver`] — deliberately
+/// unwired.
 ///
-/// The real encoder maps [`Term`] to bit-vector terms and [`Formula`] to
-/// boolean terms, declaring variables on first use. For now it declares the
-/// variables (so backends see the signature) and returns a placeholder.
+/// This is **not** a missing feature on the critical path: the verifier decides every
+/// obligation with the in-house bit-precise engine ([`crate::bitprecise::prove_implies`] —
+/// the CDCL SAT core + bit-blaster, which now covers all arithmetic including div/rem and
+/// symbolic shifts) plus the linear fallback. The [`SmtSolver`] trait and [`csolver_smt`]
+/// exist only so an embedder could *opt in* to an external backend (Z3/CVC5); bridging to one
+/// would add a non-Rust dependency and so is left out under the project's zero-dependency
+/// stance. Returning `unsupported` keeps that door open without pulling anything in.
 pub fn encode(_solver: &mut dyn SmtSolver, _f: &Formula) -> Result<SmtTerm, csolver_core::Error> {
     Err(csolver_core::Error::unsupported(
-        "SMT encoding is not implemented yet (planned milestone M2)",
+        "external SMT encoding is intentionally unwired; the in-house bit-precise solver decides all obligations",
     ))
 }
 

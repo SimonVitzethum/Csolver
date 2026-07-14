@@ -70,14 +70,24 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
   UAF über die normale Liveness-Maschinerie. Negativ-Kontrolle (Rückgabe eines Param-Zeigers)
   bleibt sicher. STILL OPEN: Escape über Out-Parameter-Store und Propagation durch einen Wrapper,
   der das dangling Callee-Resultat weiterreicht (Summary-Evaluator behandelt Call-Resultat opak).
-- [ ] **StackIntegrity / ValidStackFrame (ROP)** — im Binär-Pfad ist ein Store über das
-  Frame-Ende (Rücksprungadresse) bereits als InBounds-OOB gefangen; eine **dedizierte** Property
-  bräuchte ein Rücksprungadress-/Canary-Modell im Binär-Pfad. Kein kleiner sound Slice, gering
-  im Wert (schon durch InBounds subsumiert).
+- [x] **CFI-Slice: Call in Stack/Heap-Daten** (7d7b45f) — ein indirekter Call, dessen Ziel
+  beweisbar in eine Stack- oder Heap-Region zeigt (Daten als Code ausführen = klassisches
+  Jump-to-Shellcode), ist eine definitive `ValidIndirectTarget`-Verletzung. Stack/Heap sind nie
+  legitim ausführbar → sound; devirtualisiert/Symbol/opak nicht geflaggt. Der sound-bare Teil
+  des StackIntegrity-Punkts.
+- [ ] **StackIntegrity / ValidStackFrame (Rücksprungadresse/Canary)** — der Store über das
+  Frame-Ende ist bereits als InBounds-OOB gefangen und der Call-in-Daten-Fall jetzt oben; eine
+  **dedizierte** RA-/Canary-Property bräuchte ein ABI-Rücksprungadress-Modell im Binär-Pfad, das
+  RA-Slot von legitimem Caller-Arg-Zugriff sound trennt (aktuell UNKNOWN, um FP zu vermeiden).
+  **Bewertung 2026-07-14: kein weiterer kleiner sound Slice; Rest durch InBounds subsumiert.**
 - [ ] **Type-Confusion / Strict-Aliasing / Union-Punning** — partiell abgedeckt
-  (Provenance-Labels + objtype-Contracts, 3a992a1). Volles TBAA/Strict-Aliasing ist
-  FP-anfällig (legitime `repr`-Reinterpretation vs. UB nur mit Typ-Lattice sound
-  trennbar); bewusst nicht halb gebaut (soundness-first).
+  (Provenance-Labels + objtype-Contracts, 3a992a1). **Bewertung 2026-07-14: kein sound-barer
+  Refutations-Slice ohne Typ-Lattice.** Eine TBAA-Verletzung (Load Typ T' von einem Store Typ T am
+  selben Ort) ist nicht sound refutierbar, weil legitime `repr`-Reinterpretation (bytemuck, Union,
+  `memcpy`-Roundtrip) genau dieselbe Form hat — nur ein Typ-Lattice + LLVM-`!tbaa`-Metadaten
+  (Parser erfasst sie nicht) könnten beides trennen, und ein halber Bau wäre eine False-FAIL-Quelle.
+  Bewusst zurückgestellt (soundness-first); die Provenance-basierte Teilabdeckung ist die sound
+  Approximation.
 
 ## Windows-ISO-Pipeline (UDF + WIM LZX) — ERLEDIGT
 
@@ -87,8 +97,31 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
 - [x] **WIM LZX** (4dfd91d, `crates/elf/src/lzx.rs`): **byte-exakt** — gegen 1475 echte `boot.wim`-
   Resourcen per gespeicherter SHA-1 verifiziert (0 Mismatches). Blocker (Testkorpus) gelöst: das
   Korpus sind die WIMs der ISO selbst, erreicht via den UDF-Reader.
-- [ ] **LZMS** (selten, `/compress:recovery`) und **PDB** (separate `.pdb`-Datei, per GUID von der
-  PE referenziert — nicht im Installations-ISO; braucht Windows-Buildumgebung + MSF/Stream-Parser).
+- [ ] **LZMS** (selten, `/compress:recovery`) — **Bewertung 2026-07-14: blockiert auf Testkorpus.**
+  Die Windows-ISO nutzt durchweg LZX, enthält also keine LZMS-Resource; ein LZMS-Decoder (LZ77 +
+  Range-Coder + Delta-Modelle) wäre umfangreich UND nicht byte-exakt verifizierbar (genau die
+  Disziplin, mit der LZX akzeptiert wurde: 1475 SHA-1-Abgleiche). Einen unverifizierbaren Decoder
+  zu shippen widerspräche soundness-first; das aktuelle saubere `Unsupported` ist sound (nie Müll).
+- [ ] **PDB** — **Bewertung 2026-07-14: blockiert auf Umgebung.** Separate `.pdb`-Datei (per GUID
+  von der PE referenziert, nicht im Installations-ISO); braucht Windows-Buildumgebung + MSF/Stream-
+  Parser zum Testen. Ohne Testartefakt nicht verifizierbar.
+
+## Solver-Präzision (2026-07-14 Batch) — ERLEDIGT
+
+- [x] **Interproc-Escape Wrapper-Propagation** (642ac4e): ein Wrapper `w(){ return leak() }` erbt
+  `DanglingStack` über den Cross-Fn-Fixpunkt (finalize + summarize_module in Lockstep, Losslessness-
+  Oracle hält). Nur DanglingStack komponiert (arg-unabhängig). Offen: Out-Parameter-Store-Escape.
+- [x] **Symbolischer Barrel-Shifter** (ac41781): `Shl`/`LShr`/`AShr` mit symbolischem Amount jetzt
+  exakt geblastet (log₂(w)-Stufen + OOB-Guard). Gegen Orakel verifiziert (4/6-Bit + w=64-Grenzen).
+- [x] **release/acquire Flag-Access** (731d9b2): `smp_store_release`/`smp_load_acquire` emittieren
+  den Flag-Write/Read zusätzlich zur Barriere → MP-Handoff modelliert (fehlende Acquire jetzt
+  fangbar), release+acquire bleibt robust (kein FP). RMW-Atomic-Helfer bleiben bare Fences.
+- [ ] **ABA value-aware & Refcount „last reference"** — **Bewertung 2026-07-14: nicht sound im
+  aktuellen Trace-Modell.** Der Lockset-Trace trägt nur Location-*Klassen*, keine Werte/Tags. Ein
+  echtes ABA braucht, dass der CAS-Wert tatsächlich zu A rekurriert, und der Standard-Fix (Generation-
+  Counter) ist unsichtbar; „last reference"/Count-erreicht-0 braucht Refcount-*Wert*-Tracking. Eine
+  Trace-only-Heuristik würde entweder Bugs verstecken (unsound) oder bedeutungslos feuern. Zurückgestellt
+  auf wert-bewusste Modellierung (Frontend-Wertinfo); bleiben Kandidaten. Siehe [[open-todos]].
 
 ## Struktur / Wartbarkeit — ERLEDIGT
 
@@ -106,11 +139,10 @@ Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
 
 - [ ] `csolver-smt` ist ein `NullSolver`; `solver::encode` gibt `Unsupported`
   zurück (bewusste pure-Rust-Entscheidung; externes Backend = Opt-in-Frage).
-- [x] Bit-Blaster: `udiv`/`sdiv`/`urem`/`srem` gebitblastet (107748c) — Restoring
-  Long Division (w+1-Bit-Teilrest), signiert via Betrag+Vorzeichen-Korrektur;
-  Division-durch-0 SMT-LIB-total; gegen unabhängiges Orakel exhaustiv (4-Bit
-  always-on, 6-Bit on-demand) + 0-Divisor-Totalitätstest verifiziert. Verbleibend:
-  nur noch **symbolische** Shift-Amounts (Fallback auf linear/UNKNOWN, sound).
+- [x] Bit-Blaster: `udiv`/`sdiv`/`urem`/`srem` (107748c) + **symbolische Shift-Amounts**
+  (ac41781, log₂(w)-Stufen-Barrel-Shifter) gebitblastet — beide gegen unabhängiges Orakel
+  exhaustiv verifiziert. **Einzige nicht geblastete Konstruktion jetzt: Breite > `MAX_WIDTH`
+  (64)** — sound (Fallback auf linear/UNKNOWN, nie Fehlkodierung).
 - [x] ~~Textueller Intel-Syntax-x86- und AArch64-Assembler fehlen~~ → beide
   ergänzt: `x86text` deckt jetzt **AT&T und Intel** x86-64 über ein uniformes
   Operand-Modell (`TextOp`, AT&T-interne Reihenfolge) ab, `arm64_text` das
