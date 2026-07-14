@@ -35,12 +35,23 @@ Weitere abgeschlossene Teile (9231b06):
   discharge.rs fragt es jetzt pro Load/Store unter `--aliasing-model` explizit ab. **Das macht
   das gesamte Aliasing-Modell end-to-end über die CLI wirksam.**
 
-Restliche Präzision (KEIN Soundness-Loch, rein Detection):
-- [ ] **Two-Phase-Borrows exakt** (aktuell konservativ unterdrückt) + `UnsafeCell`/Interior
-  Mutability exakt statt heuristisch.
-- [ ] **Interprozedurale Protektoren** (ein an einen opaken Call übergebenes `&mut`): wir
-  analysieren Funktionen einzeln; `region_borrows` bleibt über Calls stale, aber sound (eine
-  ungesehene fremde Invalidierung = verpasster Bug, kein False-FAIL).
+Weitere abgeschlossene Teile (8a671fc):
+- [x] **Two-Phase-Borrows exakt** als **shared** Reborrow modelliert (war: unterdrückt): ein
+  Two-Phase-`&mut` ist während der Reservierung shared-artig (koexistiert) → `retag.shared`.
+  Sound (Shared poppt keine Geschwister), aber ein echter aliasing-`&mut`-Write darunter
+  invalidiert ihn weiterhin. `fake`/`shallow` bleiben Opaque.
+- [x] **Interprozedurale Protektoren**: das Übergeben eines Borrows an einen Call reborrowt ihn
+  (geschützte Nutzung) → ein Argument, dessen `&mut`-Tag bereits invalidiert war, ist eine
+  Use-after-invalidation. Call-Handler prüft getaggte Zeiger-Argumente (als Read → kein
+  False-FAIL); discharge.rs enumeriert `NoAliasingViolation` auch für Calls. Die volle
+  Protektor-Garantie (Callee kann seinen `&mut`-Param nicht invalidieren) ist bereits durch den
+  intraprozeduralen Parameter-Protektor abgedeckt, wenn der Callee analysiert wird.
+
+Verbleibend (rein Detection, KEIN Soundness-Loch, geringer Wert):
+- [ ] **`UnsafeCell`/Interior Mutability exakt**: aktuell sound (Cell-Writes gehen durch einen
+  untagged Raw-Pointer aus `UnsafeCell::get` → ein `&Cell`-Shared-Tag wird im Caller nie
+  beschrieben → kein realer False-FAIL). Exaktes Interior-Mutable-Region-Typing bräuchte
+  MIR-Typnamen-Erfassung (`Cell`/`UnsafeCell` werden heute zu `MType::Other`).
 
 ## Sound-Coverage-Lücken — Status & warum offen (2026-07-14 geprüft)
 
