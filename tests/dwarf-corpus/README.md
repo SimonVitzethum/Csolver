@@ -25,7 +25,7 @@ guarantee, read from `DICompileUnit(language: DW_LANG_…)`:
 | C++   | `T&` (`DW_TAG_reference_type`)                   | `T*` |
 | C     | — (none)                                          | `T*` |
 | D     | `ref` (`DW_TAG_reference_type`)                   | `T*`, `class` refs (nullable) |
-| Zig   | — (emits `DW_LANG_C99`, indistinguishable from C) | `*const T` |
+| Zig   | non-null via LLVM `nonnull` attr (`*T` ⇒ NoNullDeref only) | `*const T` (may dangle — no size/liveness) |
 | Swift | `inout T` (LLVM `dereferenceable(N)` attribute)   | `class` refs (plain `ptr`, non-null by ABI but no IR evidence) |
 | ObjC  | — (`DW_LANG_ObjC`; object pointers are nullable)  | `T*`, `id`, `Class` |
 
@@ -33,6 +33,14 @@ So `sum_ref(Point&)` (C++) verifies PASS; `sum_pair(Pair*)` (C/D/Zig) is soundly
 UNKNOWN — never a false PASS. A `DW_TAG_reference_type` is a valid reference in
 every language that emits it, so it is recovered regardless of the language tag;
 the Rust `&…` naming rule is gated to `DW_LANG_Rust`.
+
+Beside the DWARF path, a **language-independent LLVM `nonnull` parameter attribute**
+is recovered too (`SizeSpec::NonNull`): a `nonnull` pointer with no `dereferenceable`
+size is a non-null *opaque* pointer — `NoNullDeref` proves, but bounds/liveness stay
+UNKNOWN (a `nonnull` pointer may still dangle). This is the primary lever for **Zig**
+(`zig_ptrs.ll`: a `*T` param is `ptr nonnull` ⇒ non-null; a `?*T` optional is not), and
+also covers any -O0 frontend that asserts non-null without a size. Julia/Swift emit
+`nonnull dereferenceable(N)` and are already recovered by the size path.
 
 Swift lowers every aggregate to a **packed struct** (`<{ … }>`, no inter-field
 padding); CSolver models packed layout exactly (`Type::Struct { packed: true }`),

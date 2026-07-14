@@ -77,6 +77,29 @@ start:
     assert!(report.assumptions.iter().any(|a| a.id == "debuginfo"));
 }
 
+/// Cross-language `nonnull` recovery on **real Zig output** (`tests/dwarf-corpus/zig_ptrs.ll`,
+/// emitted by zig 0.16): a `*T` param is `ptr nonnull` → NoNullDeref proves; a `?*T` optional
+/// has no `nonnull` → it stays UNKNOWN. Pins the real Zig attribute convention end-to-end.
+#[test]
+fn llvm_recovers_zig_nonnull_from_real_corpus() {
+    let src = include_str!("../../../../tests/dwarf-corpus/zig_ptrs.ll");
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "zig".into() })
+        .expect("lower real zig .ll");
+    let report = verify_module(&module, &Config::default());
+    // Whether the named function proves NoNullDeref (`deref` = `*T`, `deref_opt` = `?*T`).
+    let proves_non_null = |suffix: &str| {
+        report.functions.iter().filter(|f| f.function.ends_with(suffix)).any(|f| {
+            f.outcomes.iter().any(|o| {
+                o.obligation.property == csolver_core::SafetyProperty::NoNullDeref
+                    && matches!(o.result, csolver_core::ObligationResult::Proven(_))
+            })
+        })
+    };
+    assert!(proves_non_null("deref"), "Zig `*T` (ptr nonnull) proves non-null");
+    assert!(!proves_non_null("deref_opt"), "Zig `?*T` optional is nullable — must not prove");
+}
+
 /// Language-aware soundness: a `*const T` pointer named `&`-style would be a
 /// Rust reference, but under a *non-Rust* compile unit (C/D/Zig emit
 /// `DW_TAG_pointer_type` for raw pointers) it must NOT be recovered — those
