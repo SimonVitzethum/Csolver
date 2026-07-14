@@ -126,6 +126,18 @@ pub(crate) fn verify_one_function(
         // the `param-valid` assumption (the framework passes a valid pointer at entry).
         if slot.is_none() && config.assume_valid_params {
             if let Some(&(size, align)) = module.raw_ptr_hints.get(&(f.id, i as u32)) {
+                // The C "context behind the struct" idiom (`crypto_skcipher_ctx(tfm)` is
+                // `tfm + 1`): the code navigates *past* the declared type, so the object is an
+                // allocation of the struct plus a trailing context. Debug info only ever names
+                // the struct, so the pointee size alone stops at its end and every access into
+                // the tail stays UNKNOWN. Under `--assume-struct-tail` the region covers the
+                // reach the code itself takes (`PtrHint::tail`, keyed by the parameter's
+                // register). Off by default — the tail's real size is known only at the
+                // allocation site, which per-file kernel IR does not contain.
+                let size = match module.reg_ptr_hints.get(&(f.id, f.params[i].0)) {
+                    Some(h) if config.assume_struct_tail => size.max(h.tail),
+                    _ => size,
+                };
                 // A valid instance is naturally aligned; when debug info omits the
                 // alignment, derive it from the size (a type's size is a multiple of
                 // its alignment) — the largest power of two dividing it, capped at 16

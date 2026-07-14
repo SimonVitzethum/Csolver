@@ -236,6 +236,47 @@ pub(crate) fn typed_gep_field_loads(
     out
 }
 
+/// The **trailing-context extent** of each pointer register: the byte extent reached through
+/// `getelementptr %struct.T, ptr %p, i64 k` with a constant `k >= 1` — the C idiom where an
+/// allocation holds a struct *followed by* a context of its own (`crypto_skcipher_ctx(tfm)` is
+/// `tfm + 1`; `netdev_priv(dev)` is `dev + 1`). LLVM's leading gep index strides over the whole
+/// pointee, so such a gep navigates into element `k`, whose end is `(k + 1) * sizeof(T)`.
+///
+/// The object is therefore larger than its declared type, by an amount only the *allocation
+/// site* knows — and in per-file kernel IR that site is in another translation unit. Recording
+/// the extent the code itself reaches is the best available bound; it is honoured only under
+/// `--assume-struct-tail`.
+pub(crate) fn struct_tail_extents(f: &LFunc) -> HashMap<&str, u64> {
+    let mut out: HashMap<&str, u64> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        // Both gep shapes carry the idiom: `gep %T, ptr %p, i64 1` alone (a bare `tfm + 1`,
+        // parsed as `Gep` because it has a single index) and `gep %T, ptr %p, i64 1, i32 k`
+        // (a field *of* the trailing element, parsed as `GepChain`).
+        let (agg_ty, b, lead) = match inst {
+            LInst::GepChain { agg_ty, base: LValue::Local(b), indices, .. } => {
+                (agg_ty, b, indices.first())
+            }
+            LInst::Gep { elem, base: LValue::Local(b), index, .. } => (elem, b, Some(index)),
+            _ => continue,
+        };
+        let Some(LValue::Int(k)) = lead else { continue };
+        let Ok(k) = u64::try_from(*k) else { continue };
+        if k == 0 {
+            continue; // the ordinary in-struct navigation, not the tail idiom
+        }
+        let agg = lower_type(agg_ty);
+        if !matches!(agg, Type::Struct { .. }) {
+            continue;
+        }
+        let Some(size) = agg.size_bytes(&LAYOUT).filter(|&s| s > 0) else { continue };
+        if let Some(extent) = k.checked_add(1).and_then(|n| n.checked_mul(size)) {
+            let e = out.entry(b.as_str()).or_insert(0);
+            *e = (*e).max(extent);
+        }
+    }
+    out
+}
+
 /// The byte alignment each pointer register is **asserted** to have, recovered from the
 /// `align N` clang puts on every load/store. Real kernel IR carries no debug info at all
 /// (no `!DICompositeType`), so the pointee type's declared alignment — the natural source —
@@ -260,8 +301,24 @@ pub(crate) fn asserted_base_aligns(f: &LFunc) -> HashMap<&str, u32> {
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
         match inst {
             LInst::GepChain { dst, agg_ty, base: LValue::Local(b), indices, .. } => {
-                if let Some(k) = gepchain_const_offset(&lower_type(agg_ty), indices) {
-                    off_of.insert(dst.as_str(), (b.as_str(), k));
+                // LLVM's *leading* gep index strides over the whole pointee (`gep %T, ptr %p,
+                // i64 1` is `p + sizeof(T)`); only `indices[1..]` navigate *into* the aggregate.
+                // Feeding the leading index to `gepchain_const_offset` would read it as a field
+                // index and yield a wrong offset — which here could make `K % align == 0` hold
+                // spuriously and *raise* an alignment claim, i.e. a false PASS.
+                let agg = lower_type(agg_ty);
+                let stride = agg.size_bytes(&LAYOUT);
+                if let (Some(lead), Some(stride), Some(inner)) = (
+                    indices.first().and_then(|v| match v {
+                        LValue::Int(k) if *k >= 0 => u64::try_from(*k).ok(),
+                        _ => None,
+                    }),
+                    stride,
+                    gepchain_const_offset(&agg, &indices[1..]),
+                ) {
+                    if let Some(k) = lead.checked_mul(stride).and_then(|o| o.checked_add(inner)) {
+                        off_of.insert(dst.as_str(), (b.as_str(), k));
+                    }
                 }
             }
             LInst::Gep { dst, elem, base: LValue::Local(b), index: LValue::Int(i) } => {

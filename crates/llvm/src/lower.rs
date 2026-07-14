@@ -403,6 +403,7 @@ fn lower_function(
     // a struct read byte-wise carries `align 1` and says nothing about the struct's own
     // alignment. It therefore may only ever *raise* the size-derived alignment, never lower it.
     let asserted = asserted_base_aligns(f);
+    let tails = struct_tail_extents(f);
     let derived = |size: u64| 1u32 << size.trailing_zeros().min(4);
     let mut reg_ptr_hints: HashMap<RegId, PtrHint> = HashMap::new();
     for (local, var) in &f.dbg_values {
@@ -415,7 +416,8 @@ fn lower_function(
                 } else {
                     asserted.get(local.as_str()).map_or(0, |&a| a.max(derived(size)))
                 };
-                reg_ptr_hints.insert(r, PtrHint { size, align });
+                let tail = tails.get(local.as_str()).copied().unwrap_or(0);
+                reg_ptr_hints.insert(r, PtrHint { size, align, tail });
             }
         }
     }
@@ -425,7 +427,8 @@ fn lower_function(
                 .and_then(|n| debuginfo.composite_align_by_llvm_name(n))
                 .or_else(|| asserted.get(local).map(|&a| a.max(derived(size))))
                 .unwrap_or(0);
-            reg_ptr_hints.insert(r, PtrHint { size, align });
+            let tail = tails.get(local).copied().unwrap_or(0);
+            reg_ptr_hints.insert(r, PtrHint { size, align, tail });
         }
     }
     let reg_ptr_hints: Vec<(RegId, PtrHint)> = reg_ptr_hints.into_iter().collect();

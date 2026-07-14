@@ -27,12 +27,24 @@ Index ist nicht beweisbar. Der Engpass ist also **Bounds-Präzision**, nicht Typ
   Slice-Contract erwartete 64-bit `usize` → Breiten-Mismatch, `zext` vor der Multiplikation.
   **Wirkung auf dem Kernel-Sample: 0 Funktionen** (die Paarung greift, aber die betroffenen
   Funktionen blockieren an anderer Ursache).
-- [ ] **NÄCHSTES: „Kontext hinter der Struktur"-Idiom.** Der dominante `bounds`-Blocker im
-  Kernel ist `gep %struct.T, ptr %p, i64 1` — ein Zugriff *hinter* dem Struct-Ende
-  (`crypto_skcipher_ctx`, `netdev_priv`, `tfm + 1`). Gegen eine Region von exakt
-  `sizeof(struct T)` prinzipiell unbeweisbar; braucht ein Modell „Objekt ist größer als sein
-  deklarierter Typ" (Allokation trägt Struct + Kontext). Vermutlich der größte verbleibende
-  Einzelhebel für `bounds`/`offset`.
+- [x] **„Kontext hinter der Struktur"-Idiom** → `--assume-struct-tail` (Flagge, `struct-tail`).
+  `gep %struct.T, ptr %p, i64 k` (k≥1) navigiert *in* Element k, dessen Ende bei
+  `(k+1)·sizeof(T)` liegt → Region auf diese Reichweite vergrößern. Beide gep-Formen nötig:
+  ein-indiziges `Gep` (`tfm + 1`) **und** `GepChain` (`tfm[1].feld`). Eingehängt an *drei*
+  Stellen, weil ein Parameter je nach Herkunft unterschiedliche Pfade nimmt:
+  `run.rs` (DWARF-`raw_ptr_hints` → Contract — der Pfad, der real greift), `driver.rs`
+  (uncontracted Param) und `calls.rs` (`size_hinted_pointer`).
+  **Nicht vakuum:** konstante Offsets werden durch eine `assumed`-Region ohnehin nie
+  widerlegt, also geht keine Bug-Findung verloren — nur UNKNOWN → PASS. Risiko (im README):
+  ein *symbolischer* Index könnte in den angenommenen Tail überlaufen.
+  **Wirkung (repräsentatives Sample, zusammen mit `--assume-param-buffer-len`):
+  307 → 314 PASS, FAIL unverändert 16, Default bit-identisch.**
+
+- [ ] **Rest von `bounds`/`offset`.** Nach struct-tail bleiben die Fälle mit *echt*
+  unbeschränktem Index: MMIO-Basis + Offset aus einem Struct-Feld
+  (`xgene_clk_pll_is_enabled`: `reg + zext(pll_offset)`, u32 aus einem Feld, nirgends
+  beschränkt). Ohne Wissen über die Größe des Registerfensters prinzipiell unbeweisbar —
+  braucht Contracts für `ioremap`-artige APIs (Größe der Mapping-Region), keine Solver-Präzision.
 
 ## Einheitliches Typ-Sizing für JEDEN opaken Zeiger (2026-07-14) — Abschluss
 

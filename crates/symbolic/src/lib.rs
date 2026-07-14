@@ -90,6 +90,10 @@ pub struct ExecLimits {
     /// Honour a C `(buf, len)` parameter pairing recovered by the frontend. Unsound in
     /// general: C guarantees no such pairing, so a wrong one could prove an overrun safe.
     pub assume_param_buffer_len: bool,
+    /// Size an object that the code navigates past its declared struct type to cover that
+    /// reach (the C trailing-context idiom). Unsound in general: the tail's real size is
+    /// known only at the allocation site.
+    pub assume_struct_tail: bool,
     /// **Rust aliasing (borrow-stack) model.** When on, track each pointer's originating
     /// borrow (from `RefWitness`) and flag a `NoAliasingViolation` — currently a write
     /// through a shared `&T` reference. Off by default (the reference model is only
@@ -117,6 +121,7 @@ impl Default for ExecLimits {
             assume_valid_returns: false,
             assume_valid_loop_ptrs: false,
             assume_param_buffer_len: false,
+            assume_struct_tail: false,
             aliasing_model: false,
             flat_memory: false,
         }

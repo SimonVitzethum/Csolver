@@ -244,7 +244,14 @@ pub(crate) fn discharge_inner(
                 // is not refuted (no false FAIL when the object is embedded in a larger one).
                 match reg_ptr_hints.get(reg).copied().filter(|h| h.size > 0) {
                     Some(hint) if limits.assume_valid_params => {
-                        let size_e = ex.ctx.int(PTR_WIDTH, hint.size as u128);
+                        // The C "context behind the struct" idiom (`tfm + 1`): under
+                        // `--assume-struct-tail` the object is sized to cover the reach the code
+                        // itself takes past the declared type, instead of stopping at it.
+                        let tail = limits.assume_struct_tail && hint.tail > hint.size;
+                        if tail {
+                            ex.assumptions.insert(STRUCT_TAIL);
+                        }
+                        let size_e = ex.ctx.int(PTR_WIDTH, hint.region_size(tail) as u128);
                         let zero = ex.ctx.int(PTR_WIDTH, 0);
                         let nonneg = ex.ctx.cmp(SCmp::Sle, zero, size_e);
                         facts.push(nonneg);

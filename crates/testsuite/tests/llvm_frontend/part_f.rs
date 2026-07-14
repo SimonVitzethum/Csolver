@@ -508,3 +508,47 @@ fn c_buffer_length_pairing_is_opt_in() {
         "with the pairing assumed, the guarded trailing read is in bounds"
     );
 }
+
+/// The C "context behind the struct" idiom: `crypto_skcipher_ctx(tfm)` is `tfm + 1`, i.e.
+/// `gep %struct.T, ptr %p, i64 1` — the allocation holds the struct *followed by* a context.
+/// Debug info only ever names the struct, so the object looks `sizeof(T)` big and the tail
+/// access is out of bounds. Only `--assume-struct-tail` sizes the object to the reach the
+/// code takes; by default the access stays soundly UNKNOWN.
+const STRUCT_TAIL_IR: &str = r#"
+%struct.tfm = type { i64, i64 }
+
+define i64 @ctx_read(ptr noundef %0) {
+  ; a field read types %0 as a `%struct.tfm` (this is what sizes its region) …
+  %1 = getelementptr inbounds %struct.tfm, ptr %0, i64 0, i32 1
+  %2 = load i64, ptr %1, align 8
+  ; … and this reads the trailing context at `%0 + sizeof(struct tfm)`.
+  %3 = getelementptr inbounds %struct.tfm, ptr %0, i64 1
+  %4 = load i64, ptr %3, align 8
+  %5 = add i64 %2, %4
+  ret i64 %5
+}
+"#;
+
+#[test]
+fn struct_tail_context_is_opt_in() {
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: STRUCT_TAIL_IR.into(), name: "tail".into() })
+        .expect("lower");
+
+    // By default the object is exactly `sizeof(struct tfm)` = 16 bytes, so the read at
+    // offset 16 is past its end and is not proved. Sound: the tail's size is unknown.
+    let base = Config { assume_valid_params: true, ..Config::default() };
+    assert_ne!(
+        verify_module(&module, &base).verdict,
+        Verdict::Pass,
+        "the trailing context must not be assumed on the default path"
+    );
+
+    // Under the opt-in the object covers element 1 as well (32 bytes), so the read proves.
+    let cfg = Config { assume_struct_tail: true, ..base };
+    assert_eq!(
+        verify_module(&module, &cfg).verdict,
+        Verdict::Pass,
+        "with the trailing context assumed, the `tfm + 1` read is in bounds"
+    );
+}

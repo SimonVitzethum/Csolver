@@ -527,7 +527,11 @@ impl Explorer<'_> {
             return v;
         };
         self.assumptions.insert(PARAM_VALID);
-        let rid = self.materialize_ref_region(Some(hint.size), true, true, state);
+        let tail = self.limits.assume_struct_tail && hint.tail > hint.size;
+        if tail {
+            self.assumptions.insert(STRUCT_TAIL);
+        }
+        let rid = self.materialize_ref_region(Some(hint.region_size(tail)), true, true, state);
         let align = hint.region_align();
         state.regions[rid].base_align = align;
         SymValue::Ptr(SymPointer {

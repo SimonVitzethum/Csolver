@@ -42,6 +42,7 @@ pub(crate) fn verify_function_with(
             config.assume_valid_returns,
             config.assume_valid_loop_ptrs,
             config.assume_param_buffer_len,
+            config.assume_struct_tail,
             reg_ptr_hints,
         ),
         None => discharge_function(f),

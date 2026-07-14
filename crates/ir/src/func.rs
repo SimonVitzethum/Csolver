@@ -307,9 +307,31 @@ pub struct PtrHint {
     /// Declared byte alignment of the pointee type; `0` when debug info does not record
     /// it, in which case the consumer derives a conservative alignment from the size.
     pub align: u32,
+    /// **Trailing-context extent**: the byte extent the code itself reaches through the C
+    /// "context behind the struct" idiom — `getelementptr %struct.T, ptr %p, i64 k` with
+    /// `k >= 1`, i.e. `p + k * sizeof(T)`, as in `crypto_skcipher_ctx(tfm)` (`tfm + 1`) or
+    /// `netdev_priv(dev)`. Such a pointer designates an allocation that is *larger than its
+    /// declared type*: the struct followed by a context whose size only the allocation site
+    /// knows. Navigating into element `k` reaches at most `(k + 1) * sizeof(T)`, so that is
+    /// the extent recorded here. `0` when the function never uses the idiom on this pointer.
+    ///
+    /// Honoured only under `--assume-struct-tail`; otherwise the region keeps `size` and every
+    /// access into the tail stays UNKNOWN — soundly, since the tail's real size is unknown.
+    pub tail: u64,
 }
 
 impl PtrHint {
+    /// The byte size to give the pointee's region. With `struct_tail` (the `--assume-struct-tail`
+    /// opt-in) an object the code navigates past its own type — the C "context behind the struct"
+    /// idiom — is sized to cover that reach; otherwise it is exactly the declared type.
+    pub fn region_size(&self, struct_tail: bool) -> u64 {
+        if struct_tail {
+            self.size.max(self.tail)
+        } else {
+            self.size
+        }
+    }
+
     /// The alignment to give the pointee's region: the type's declared one when debug info
     /// recorded it, else derived from the size — a type's size is a multiple of its alignment,
     /// so the size's trailing zeros are a lower bound on it. The derived form is capped at 16

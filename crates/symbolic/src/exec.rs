@@ -61,6 +61,12 @@ const PARAM_VALID: &str = "param-valid";
 /// A C `(buf, len)` parameter pairing: the length parameter really does describe the
 /// buffer. A convention, not an ABI guarantee (unlike Rust's `slice-abi`) — opt-in only.
 const PARAM_BUFFER_LEN: &str = "param-buffer-len";
+/// A pointer whose code navigates *past* its declared struct type (`gep %struct.T, ptr %p,
+/// i64 1` — `crypto_skcipher_ctx`, `netdev_priv`) designates an allocation holding the struct
+/// plus a trailing context. Its real size is known only at the allocation site; the extent the
+/// code reaches is assumed to be within it. Opt-in: a symbolic index could overrun into the
+/// assumed tail without being refuted.
+const STRUCT_TAIL: &str = "struct-tail";
 /// A `&T`/`&mut T` value is a valid reference to its pointee (Rust's reference
 /// invariant), even when the analysis cannot see where it came from.
 const VALID_REFERENCE: &str = "valid-reference";
@@ -216,7 +222,7 @@ pub fn discharge_with_fields(
     discharge_with_scalars(
         f, summaries, &HashMap::new(), contracts, field_contracts, &[], globals, prov_grants,
         &HashMap::new(), None, ExecLimits::default().time_budget, bug_finding, exported,
-        assume_valid_params, false, false, false, false, false, &HashMap::new(),
+        assume_valid_params, false, false, false, false, false, false, &HashMap::new(),
     )
 }
 
@@ -246,11 +252,13 @@ pub fn discharge_with_scalars(
     assume_valid_returns: bool,
     assume_valid_loop_ptrs: bool,
     assume_param_buffer_len: bool,
+    assume_struct_tail: bool,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
 ) -> SymbolicReport {
     let limits = ExecLimits {
         bug_finding, exported, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs,
-        assume_param_buffer_len, aliasing_model, flat_memory, time_budget, ..ExecLimits::default()
+        assume_param_buffer_len, assume_struct_tail, aliasing_model, flat_memory, time_budget,
+        ..ExecLimits::default()
     };
     discharge_inner(
         f, limits, summaries, name_summaries, contracts, field_contracts, scalar_pre, globals,
