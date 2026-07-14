@@ -90,6 +90,16 @@ impl Explorer<'_> {
             })
             .collect();
 
+        // Non-null opaque-provenance ids survive by the same **meet**: an id is non-null on
+        // the join only if every incoming edge marks it non-null (entry-seeded, so it survives
+        // on all paths). Dropping one is sound (a null-deref just falls back to UNKNOWN).
+        let nonnull_provs: FxHashSet<u32> = first
+            .nonnull_provs
+            .iter()
+            .copied()
+            .filter(|id| edges.iter().all(|e| e.pred_state.nonnull_provs.contains(id)))
+            .collect();
+
         // Scalar taint survives the join by the same **meet**: a register keeps a taint label
         // only if every incoming edge has it — so a sink refutes only on a *definitely*-tainted
         // value (no false FAIL under a partly-tainted phi). Under-taints (a value tainted on one
@@ -204,6 +214,7 @@ impl Explorer<'_> {
             unwritten_reads: FxHashMap::default(),
             ref_regions: FxHashMap::default(),
             opaque_labels,
+            nonnull_provs,
             tainted,
             typestates,
             refcounts,

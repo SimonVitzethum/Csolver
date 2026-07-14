@@ -4,11 +4,12 @@ impl Parser {
     /// Parse a parameter's attributes (up to its `%name` / `,` / `)`),
     /// capturing the memory-safety-relevant ones and skipping the rest.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn param_attrs(&mut self) -> Result<(Option<u64>, Option<u32>, bool, bool, Option<LType>)> {
+    pub(crate) fn param_attrs(&mut self) -> Result<(Option<u64>, Option<u32>, bool, bool, bool, Option<LType>)> {
         let mut deref = None;
         let mut align = None;
         let mut readonly = false;
         let mut writeonly = false;
+        let mut nonnull = false;
         let mut abi_buf = None;
         loop {
             match self.peek() {
@@ -45,6 +46,10 @@ impl Parser {
                         }
                         "readonly" => readonly = true,
                         "writeonly" => writeonly = true,
+                        // `nonnull`: the pointer is guaranteed non-null (no size/liveness
+                        // guarantee — a `nonnull` pointer may still dangle). Recovered as a
+                        // non-null-only contract (Zig `*T`, and any frontend that asserts it).
+                        "nonnull" => nonnull = true,
                         // `dereferenceable_or_null`, `byval(T)`, `captures(...)`,
                         // etc.: skip, including any parenthesized payload.
                         _ => {
@@ -57,7 +62,7 @@ impl Parser {
                 _ => self.pos += 1,
             }
         }
-        Ok((deref, align, readonly, writeonly, abi_buf))
+        Ok((deref, align, readonly, writeonly, nonnull, abi_buf))
     }
 
     /// Skip a call argument's attributes up to its operand. Crucially, `align

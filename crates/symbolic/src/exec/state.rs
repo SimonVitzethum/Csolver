@@ -54,6 +54,13 @@ pub(crate) struct PathState {
     /// so it cannot introduce a false PASS. Persistent (a fact about the SSA value, not memory),
     /// so not cleared on havoc.
     pub(crate) opaque_labels: FxHashMap<u32, FxHashSet<u32>>,
+    /// **Non-null opaque-provenance ids** (from a `SizeSpec::NonNull` / LLVM `nonnull`
+    /// pointer parameter): an opaque pointer whose provenance id is here is guaranteed
+    /// non-null, so `NoNullDeref` is discharged through it (and anything derived by
+    /// `gep`/copy, which carries the id) — while bounds/liveness stay unknown (a `nonnull`
+    /// pointer may still dangle). Seeded at entry, meet-joined at merges. A fact about the
+    /// value, not memory (not cleared on havoc).
+    pub(crate) nonnull_provs: FxHashSet<u32>,
     /// **Scalar taint labels** per SSA register (the directional taint lattice, G6-family J/F/D):
     /// interned taint-label ids a register's value carries, sourced by a `taint-source` contract
     /// or a load from a labelled region, propagated through arithmetic/casts, checked by a

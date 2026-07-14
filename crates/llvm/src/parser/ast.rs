@@ -84,6 +84,8 @@ pub struct LParam {
     pub readonly: bool,
     /// `writeonly`.
     pub writeonly: bool,
+    /// `nonnull`: the pointer is guaranteed non-null (no size/liveness guarantee).
+    pub nonnull: bool,
 }
 
 /// A parsed basic block.

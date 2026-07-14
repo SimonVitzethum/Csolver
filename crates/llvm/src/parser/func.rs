@@ -25,7 +25,7 @@ impl Parser {
                     break;
                 }
                 let ty = self.ltype()?;
-                let (deref, align, readonly, writeonly, abi_buf) = self.param_attrs()?;
+                let (deref, align, readonly, writeonly, nonnull, abi_buf) = self.param_attrs()?;
                 let name = if let Tok::Local(_) = self.peek() {
                     self.local()?
                 } else {
@@ -39,6 +39,7 @@ impl Parser {
                     align,
                     readonly,
                     writeonly,
+                    nonnull,
                 });
                 if matches!(self.peek(), Tok::Punct(',')) {
                     self.pos += 1;

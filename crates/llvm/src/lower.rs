@@ -279,6 +279,24 @@ fn lower_function(
                 // the parameter is used: `gep %struct.T, ptr %p, 0, …` reveals that
                 // `%p` points at a `%struct.T`.
                 raw_ptr_hints.push((idx as u32, (size, align)));
+            } else if p.nonnull {
+                // Last resort: a `nonnull` pointer parameter with no recoverable size (Zig
+                // `*T`, and any -O0 frontend that asserts non-null but not `dereferenceable`).
+                // A `SizeSpec::NonNull` contract makes it a non-null *opaque* pointer — only
+                // `NoNullDeref` is discharged through it, bounds/liveness stay UNKNOWN (a
+                // `nonnull` pointer may still dangle). Language-independent and always sound.
+                contracts.push((
+                    idx as u32,
+                    PtrContract {
+                        assumption: None,
+                        refutable: false,
+                        size: SizeSpec::NonNull,
+                        align: p.align.unwrap_or(1),
+                        readable: !p.writeonly,
+                        writable: !p.readonly,
+                        sentinel: None,
+                    },
+                ));
             }
         }
     }

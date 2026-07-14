@@ -36,8 +36,11 @@ impl Explorer<'_> {
             return;
         }
 
-        // Null.
-        let non_null = matches!(p.prov, Prov::Region(_));
+        // Null. A tracked region is non-null; so is an opaque pointer whose provenance id is
+        // marked `nonnull` (an LLVM `nonnull` parameter, e.g. Zig `*T`) — the mark flows through
+        // gep/copy on the id, so a derived access is non-null too (only NoNullDeref, not bounds).
+        let non_null = matches!(p.prov, Prov::Region(_))
+            || matches!(p.prov, Prov::Unknown(_, Some(id)) if state.nonnull_provs.contains(&id));
         self.record(block, idx, NoNullDeref, non_null, "pointer is non-null", "pointer may be null or have opaque provenance");
 
         let Prov::Region(rid) = p.prov else {

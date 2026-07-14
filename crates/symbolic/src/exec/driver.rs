@@ -241,11 +241,24 @@ pub(crate) fn discharge_inner(
     // installed as the path's initial heap so the first load of each seeded field
     // reads back a valid pointer.
     let mut initial_heap: Vec<StoreRecord> = Vec::new();
+    // Non-null opaque-provenance ids seeded from `SizeSpec::NonNull` contracts.
+    let mut nonnull_provs: FxHashSet<u32> = FxHashSet::default();
     // Pass 2: contracted pointer parameters become known live regions.
-    for (i, (reg, _ty)) in f.params.iter().enumerate() {
+    for (i, (reg, ty)) in f.params.iter().enumerate() {
         let Some(c) = contracts.get(i).and_then(|c| c.as_ref()) else {
             continue;
         };
+        // A `nonnull`-only parameter is NOT a region — it is a non-null opaque pointer:
+        // its provenance id is recorded so `NoNullDeref` proves through it (and derived
+        // pointers), while bounds/liveness stay unknown (a `nonnull` pointer may dangle).
+        if c.size == SizeSpec::NonNull {
+            let v = ex.fresh_value(ty, POrigin::Param);
+            if let SymValue::Ptr(SymPointer { prov: Prov::Unknown(_, Some(id)), .. }) = &v {
+                nonnull_provs.insert(*id);
+            }
+            env.insert(*reg, v);
+            continue;
+        }
         let (size, assumption, nowrap) = match c.size {
             // A concrete byte size cannot wrap; nothing extra is needed (`true`).
             SizeSpec::Bytes(n) => {
@@ -269,6 +282,8 @@ pub(crate) fn discharge_inner(
             // are proved in bounds by construction (`struct-abi`), so the region is
             // prove-only (no refutation — `size_nowrap = None`).
             SizeSpec::Opaque => (ex.fresh_scalar(PTR_WIDTH), STRUCT_ABI, None),
+            // Handled above (a non-region, non-null opaque pointer) — never reaches here.
+            SizeSpec::NonNull => continue,
         };
         // A precondition-style contract (internal function / closure /
         // synthesized minimum) proves but never refutes: `size_nowrap = None`
@@ -396,6 +411,7 @@ pub(crate) fn discharge_inner(
         unwritten_reads: FxHashMap::default(),
         ref_regions: FxHashMap::default(),
         opaque_labels: FxHashMap::default(),
+        nonnull_provs,
         tainted: FxHashMap::default(),
         typestates: FxHashMap::default(),
         refcounts: FxHashMap::default(),

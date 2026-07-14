@@ -168,6 +168,13 @@ pub enum SizeSpec {
     /// field access through it is proved in bounds by construction (the field lies
     /// within the aggregate), never by a reconstructed byte offset.
     Opaque,
+    /// **Non-null only** — the pointer is guaranteed non-null (an LLVM `nonnull`
+    /// parameter attribute: Zig `*T`, and any frontend that asserts it) but carries
+    /// *no* size or liveness guarantee (a `nonnull` pointer may still dangle or be
+    /// out of bounds). Modelled as a non-null **opaque** pointer, NOT a region: only
+    /// `NoNullDeref` is discharged through it; bounds/liveness stay `UNKNOWN` (sound —
+    /// no false PASS, since `nonnull` promises nothing spatial or temporal).
+    NonNull,
 }
 
 /// A caller-guaranteed contract on a pointer parameter (from a frontend, e.g.

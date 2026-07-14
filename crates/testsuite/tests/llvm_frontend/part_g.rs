@@ -1,5 +1,78 @@
 use super::*;
 
+/// A `nonnull` pointer parameter with **no** `dereferenceable` size (Zig `*T`, and any
+/// frontend that asserts non-null but not a size): `NoNullDeref` through it is proven, while
+/// `NoUseAfterFree` / `InBounds` stay unproven — a `nonnull` pointer may still dangle or be
+/// out of bounds. Language-independent recovery from the LLVM `nonnull` attribute.
+#[test]
+fn nonnull_param_proves_no_null_deref_but_not_liveness_or_bounds() {
+    let src = r#"
+define i32 @deref(ptr nonnull align 4 %0) {
+entry:
+  %v = load i32, ptr %0, align 4
+  ret i32 %v
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "nn".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    let outs = &report.functions[0].outcomes;
+    let proven = |p| {
+        outs.iter().any(|o| {
+            o.obligation.property == p
+                && matches!(o.result, csolver_core::ObligationResult::Proven(_))
+        })
+    };
+    assert!(proven(csolver_core::SafetyProperty::NoNullDeref), "nonnull ⇒ non-null proven");
+    // Sound: nonnull promises nothing spatial/temporal — these must NOT be proven.
+    assert!(!proven(csolver_core::SafetyProperty::NoUseAfterFree), "nonnull may still dangle");
+    assert!(!proven(csolver_core::SafetyProperty::InBounds), "nonnull gives no size bound");
+}
+
+/// A real **Julia** signature (`julia -g` / `code_llvm`): `swiftcc` + a GC-array parameter
+/// `ptr noundef nonnull align 8 dereferenceable(24)`. The language-independent
+/// `dereferenceable(N)` recovery already makes it a live region, so the two in-bounds field
+/// loads verify PASS — no Julia-specific rule needed. Locks in cross-language attribute coverage.
+#[test]
+fn julia_dereferenceable_gc_pointer_verifies() {
+    let src = r#"
+define swiftcc i64 @julia_f(ptr nonnull swiftself %pgcstack, ptr noundef nonnull align 8 dereferenceable(24) %a) {
+top:
+  %v1 = load i64, ptr %a, align 8
+  %p2 = getelementptr inbounds i8, ptr %a, i64 8
+  %v2 = load i64, ptr %p2, align 8
+  %s = add i64 %v1, %v2
+  ret i64 %s
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "julia".into() })
+        .expect("lower");
+    assert_eq!(verify_module(&module, &Config::default()).verdict, Verdict::Pass, "Julia GC array param verifies");
+}
+
+/// Soundness control: WITHOUT `nonnull`, a plain pointer parameter must NOT prove non-null.
+#[test]
+fn plain_pointer_param_does_not_prove_non_null() {
+    let src = r#"
+define i32 @deref(ptr align 4 %0) {
+entry:
+  %v = load i32, ptr %0, align 4
+  ret i32 %v
+}
+"#;
+    let module = LlvmFrontend
+        .lower(LlvmInput { source: src.into(), name: "plain".into() })
+        .expect("lower");
+    let report = verify_module(&module, &Config::default());
+    let proven_nn = report.functions[0].outcomes.iter().any(|o| {
+        o.obligation.property == csolver_core::SafetyProperty::NoNullDeref
+            && matches!(o.result, csolver_core::ObligationResult::Proven(_))
+    });
+    assert!(!proven_nn, "a pointer without `nonnull` may be null — must stay unproven");
+}
+
 #[test]
 fn heap_merge_joins_differing_but_valid_pointer_stores() {
     let module = LlvmFrontend
