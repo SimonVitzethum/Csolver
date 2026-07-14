@@ -11,7 +11,6 @@ description = "Constraint IR, simplification, and translation of obligations int
 [dependencies]
 csolver-core.workspace = true
 csolver-memory.workspace = true
-csolver-smt.workspace = true
 
 [lints]
 workspace = true

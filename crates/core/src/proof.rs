@@ -1,7 +1,7 @@
 //! Proof trees and counterexamples — the evidence behind a verdict.
 //!
 //! For a `PASS`, a [`ProofTree`] records *why* an obligation holds, down to the
-//! axioms, abstract-interpretation invariants, and SMT `unsat` results it rests
+//! axioms, abstract-interpretation invariants, and `unsat` results it rests
 //! on. For a `FAIL`, a [`CounterExample`] gives a concrete [`Model`] (a value
 //! for every relevant symbol) and an optional trace. Both are designed to be
 //! rendered by `csolver-report` and to be machine-checkable in principle.
@@ -24,10 +24,11 @@ pub enum Justification {
         /// The invariant as rendered (e.g. "0 <= i <= len").
         invariant: String,
     },
-    /// Established because an SMT query was unsatisfiable (the negation of the
-    /// goal has no model), optionally with an unsat core.
-    SmtUnsat {
-        /// The solver backend that decided it.
+    /// Established because the negation of the goal was found **unsatisfiable** by the
+    /// in-house decision engine (the CDCL/bit-precise or linear procedure), optionally
+    /// with an unsat core.
+    Unsat {
+        /// The decision procedure that decided it (e.g. `internal-linear`, `symbolic-memory`).
         solver: String,
         /// The relevant subset of asserted facts, if extracted.
         unsat_core: Vec<String>,
@@ -169,7 +170,7 @@ mod tests {
                 ),
                 ProofStep::leaf(
                     "step case",
-                    Justification::SmtUnsat {
+                    Justification::Unsat {
                         solver: "internal".into(),
                         unsat_core: vec![],
                     },

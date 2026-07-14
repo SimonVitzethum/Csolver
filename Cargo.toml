@@ -13,7 +13,6 @@ members = [
     "crates/memory",
     "crates/absint",
     "crates/symbolic",
-    "crates/smt",
     "crates/solver",
     "crates/verifier",
     "crates/report",
@@ -47,7 +46,6 @@ csolver-elf = { path = "crates/elf", version = "0.0.1" }
 csolver-memory = { path = "crates/memory", version = "0.0.1" }
 csolver-absint = { path = "crates/absint", version = "0.0.1" }
 csolver-symbolic = { path = "crates/symbolic", version = "0.0.1" }
-csolver-smt = { path = "crates/smt", version = "0.0.1" }
 csolver-solver = { path = "crates/solver", version = "0.0.1" }
 csolver-verifier = { path = "crates/verifier", version = "0.0.1" }
 csolver-report = { path = "crates/report", version = "0.0.1" }

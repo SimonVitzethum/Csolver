@@ -16,7 +16,6 @@ csolver-memory.workspace = true
 csolver-absint.workspace = true
 csolver-symbolic.workspace = true
 csolver-solver.workspace = true
-csolver-smt.workspace = true
 
 [lints]
 workspace = true

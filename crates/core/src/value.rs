@@ -3,7 +3,7 @@
 //! [`BitVector`] is a fixed-width, two's-complement integer value used for
 //! constants and for the assignments inside a [`crate::CounterExample`]. It is
 //! intentionally concrete (not symbolic): symbolic values live in the
-//! `csolver-solver` / `csolver-smt` crates. Widths up to 128 bits are stored
+//! `csolver-solver` crate. Widths up to 128 bits are stored
 //! inline; this covers every scalar that occurs in MIR/LLVM/x86-64/AArch64.
 
 use std::fmt;

@@ -243,7 +243,7 @@ pub(crate) fn proven_by_intervals(predicate: &str, note: &str) -> ObligationResu
 pub(crate) fn proven_by_symbolic(predicate: &str, note: &str) -> ObligationResult {
     let tree = ProofTree::new(ProofStep::leaf(
         predicate.to_string(),
-        Justification::SmtUnsat {
+        Justification::Unsat {
             solver: "internal-linear".into(),
             unsat_core: vec![format!("path condition implies `{predicate}` ({note})")],
         },
@@ -255,7 +255,7 @@ pub(crate) fn proven_by_symbolic(predicate: &str, note: &str) -> ObligationResul
 pub(crate) fn proven_by_symbolic_memory(predicate: &str, assumptions: &[String]) -> ObligationResult {
     let tree = ProofTree::new(ProofStep::leaf(
         predicate.to_string(),
-        Justification::SmtUnsat {
+        Justification::Unsat {
             solver: "symbolic-memory".into(),
             unsat_core: vec![predicate.to_string()],
         },

@@ -83,7 +83,7 @@ fn justification_line(tree: &csolver_core::ProofTree) -> String {
         AbstractInterpretation { domain, invariant } => {
             format!("by {domain} abstract interpretation: {invariant}")
         }
-        SmtUnsat { solver, .. } => format!("SMT ({solver}) found the negation unsatisfiable"),
+        Unsat { solver, .. } => format!("{solver} found the negation unsatisfiable"),
         CaseSplit { cases } => format!("case split over {} cases", cases.len()),
         ByAssumption { assumption_id } => format!("by assumption {assumption_id}"),
         _ => "by a justification not yet rendered".to_string(),

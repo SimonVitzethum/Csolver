@@ -1,13 +1,11 @@
-//! # csolver-solver — constraint IR and simplification (M0 partial)
+//! # csolver-solver — constraint IR, simplification, and the decision engine
 //!
-//! A small bit-vector constraint language ([`Term`] / [`Formula`]) that sits
-//! between the analyses and the raw SMT layer. Its jobs are to (a) build the
-//! verification conditions from proof obligations, (b) simplify them cheaply
-//! (constant folding, trivial identities) so the SMT solver sees less, and
-//! (c) translate the residue into [`csolver_smt`] queries.
-//!
-//! M0 implements the constraint language and constant-folding simplifier with
-//! tests; SMT translation ([`encode`]) is a documented stub.
+//! A small bit-vector constraint language ([`Term`] / [`Formula`]) plus the
+//! **self-contained** decision engine: a constant-folding simplifier, the CDCL SAT
+//! core ([`sat`]) with a bit-blaster ([`bitblast`], all arithmetic incl. div/rem and
+//! symbolic shifts), the bit-precise front door ([`bitprecise`]), and a linear
+//! fallback ([`linear`]). Every proof obligation is decided here in pure Rust — there
+//! is no external SMT backend (a deliberate zero-dependency choice).
 
 pub mod bitblast;
 pub mod bitprecise;
@@ -94,7 +92,6 @@ pub fn prove_implies_method(
 }
 
 use csolver_core::BitVector;
-use csolver_smt::{SmtSolver, SortKind, Term as SmtTerm};
 
 /// A bit-vector term.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,27 +237,6 @@ fn cmp(
         (Some(x), Some(y)) if x.width() == y.width() => Formula::Bool(rel(x, y)),
         _ => rebuild(a, b),
     }
-}
-
-/// Translate a formula into assertions on an **external** [`SmtSolver`] — deliberately
-/// unwired.
-///
-/// This is **not** a missing feature on the critical path: the verifier decides every
-/// obligation with the in-house bit-precise engine ([`crate::bitprecise::prove_implies`] —
-/// the CDCL SAT core + bit-blaster, which now covers all arithmetic including div/rem and
-/// symbolic shifts) plus the linear fallback. The [`SmtSolver`] trait and [`csolver_smt`]
-/// exist only so an embedder could *opt in* to an external backend (Z3/CVC5); bridging to one
-/// would add a non-Rust dependency and so is left out under the project's zero-dependency
-/// stance. Returning `unsupported` keeps that door open without pulling anything in.
-pub fn encode(_solver: &mut dyn SmtSolver, _f: &Formula) -> Result<SmtTerm, csolver_core::Error> {
-    Err(csolver_core::Error::unsupported(
-        "external SMT encoding is intentionally unwired; the in-house bit-precise solver decides all obligations",
-    ))
-}
-
-#[allow(dead_code)]
-fn declare_width(solver: &mut dyn SmtSolver, width: u32) {
-    let _ = solver.declare_sort(SortKind::BitVec(width));
 }
 
 #[cfg(test)]
