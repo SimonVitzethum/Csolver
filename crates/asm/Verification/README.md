@@ -72,12 +72,23 @@ over-approximation of the real `rsp` arithmetic for frame-local accesses (under
 ## Soundness by graceful degradation
 Decoding is **recursive descent**: only bytes reachable from the entry are decoded
 (a worklist over `jmp`/`jcc` targets and fall-through), so trailing padding or data
-between functions is never mis-decoded. An unrecognized **non-control-flow** opcode is
+between functions is never mis-decoded. An unrecognized **register-only, non-control-flow** opcode is
 no longer fatal to the function — it is **bridged** to an opaque call + a general-purpose
 register/flags havoc (`bridge_unmodeled`), a sound over-approximation, so a stripped or
 padded binary is still analysed instead of dropped wholesale. A `call` is modelled as an
-opaque call with fall-through. Only a genuinely undecodable control-flow shape leaves the
-function `unanalyzed` (`UNKNOWN`). A decoder that silently *mis-modelled* an instruction
+opaque call with fall-through. An unmodeled instruction that **touches memory** (an explicit
+memory operand, or the implicit stack/string accesses — checked by an exhaustive
+`touches_memory`) is **NOT** bridged: havocing registers would silently drop its memory access,
+which could hide an unsafe load/store and yield a false PASS, so it declines the bridge and the
+function drops to `UNKNOWN`. Only a genuinely undecodable / memory-touching shape leaves the
+function `unanalyzed`.
+
+**Automatic decoder validation.** The decoder's byte length — the property recursive descent
+and the bridge both depend on — is differentially tested against **llvm-objdump** over ~1k real
+instructions (`tests/x86_length_diff.rs`, corpus in `tests/data/`, regen via `regen.sh`): every
+decoded instruction's length must equal the true length (a mismatch desyncs the stream), asserted
+as **0 mismatches**. This directly de-risks the hand-written decoder — the project's highest
+residual false-`PASS` surface. A decoder that silently *mis-modelled* an instruction
 could fabricate a false `PASS` — the one outcome a verifier must never produce — so a
 handled opcode is modelled exactly or bridged, never guessed. End-to-end: a real ELF `xor
 eax,eax; ret` verifies `PASS`; a raw-pointer store (`mov [rdi], rsi`) is `UNKNOWN` (no
