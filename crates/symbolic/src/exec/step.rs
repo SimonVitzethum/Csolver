@@ -25,9 +25,8 @@ impl Explorer<'_> {
                     // LLVM). Only the flagged form carries an obligation — plain wrapping
                     // arithmetic raises nothing. The no-overflow goal is built with
                     // same-width sign predicates (signed add/sub) and a double-width
-                    // zero-extended product (unsigned mul); signed mul would need a
-                    // sign-extend the expr layer doesn't expose, so it is conservatively
-                    // left unchecked (a missed bug, never a false FAIL).
+                    // product for BOTH mul forms — signed via `sext`, unsigned via `zext`
+                    // (see `arith_no_overflow`), so signed *and* unsigned mul are checked.
                     if (flags.nsw || flags.nuw)
                         && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                     {
