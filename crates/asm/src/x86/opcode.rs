@@ -42,26 +42,29 @@ pub(crate) fn decode_typed_opcode(
         0x31 | 0x01 | 0x29 | 0x21 | 0x09 => {
             let m = read_modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: ALU with a memory operand"));
-            }
-            let dst = Reg::from_idx(m.rm)
-                .ok_or_else(|| CoreError::parse("x86: invalid dst register in ALU"))?;
             let src = Reg::from_idx(m.reg)
                 .ok_or_else(|| CoreError::parse("x86: invalid src register in ALU"))?;
+            // The destination is a register (mod 11) or a memory operand (`<alu> [mem], r`).
+            let dst = if m.mode == 0b11 {
+                let d = Reg::from_idx(m.rm)
+                    .ok_or_else(|| CoreError::parse("x86: invalid dst register in ALU"))?;
+                reg_op(d)
+            } else {
+                X86Operand::Mem(read_mem(code, &mut p, &m, rex_x, rex_b)?, width)
+            };
             let inst = match op {
                 0x31 => {
-                    if m.rm == m.reg {
+                    if m.mode == 0b11 && m.rm == m.reg {
                         // xor r, r → zero idiom
-                        Instruction::Mov(reg_op(dst), X86Operand::Imm(0))
+                        Instruction::Mov(dst, X86Operand::Imm(0))
                     } else {
-                        Instruction::Xor(reg_op(dst), reg_op(src))
+                        Instruction::Xor(dst, reg_op(src))
                     }
                 }
-                0x01 => Instruction::Add(reg_op(dst), reg_op(src)),
-                0x29 => Instruction::Sub(reg_op(dst), reg_op(src)),
-                0x21 => Instruction::And(reg_op(dst), reg_op(src)),
-                0x09 => Instruction::Or(reg_op(dst), reg_op(src)),
+                0x01 => Instruction::Add(dst, reg_op(src)),
+                0x29 => Instruction::Sub(dst, reg_op(src)),
+                0x21 => Instruction::And(dst, reg_op(src)),
+                0x09 => Instruction::Or(dst, reg_op(src)),
                 _ => unreachable!(),
             };
             Ok((inst, p))

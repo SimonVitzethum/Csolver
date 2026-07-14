@@ -110,11 +110,11 @@ fn typed_sib_scale8() {
 }
 
 #[test]
-fn typed_error_memory_alu_unsupported() {
-    // add [rax], ecx = 01 08  (mod=00, reg=001→rcx, rm=000→rax)
-    let r = decode_instruction(&[0x01, 0x08], 0);
-    assert!(r.is_err());
-    assert!(r.unwrap_err().to_string().contains("memory operand"));
+fn typed_memory_alu_decodes() {
+    // add [rax], ecx = 01 08  (mod=00, reg=001→rcx, rm=000→rax) — now decoded, not declined.
+    let d = decode_instruction(&[0x01, 0x08], 0).expect("memory-destination add decodes");
+    assert_eq!(d.length, 2);
+    assert!(matches!(d.instruction, Instruction::Add(X86Operand::Mem(..), X86Operand::Reg(..))));
 }
 
 #[test]

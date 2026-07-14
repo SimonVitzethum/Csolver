@@ -41,11 +41,11 @@ fn rejects_lea_with_register_form() {
 }
 
 #[test]
-fn rejects_alu_memory_operand() {
-    // 01 08 = add [rax], ecx
-    let r = decode_instruction(&[0x01, 0x08], 0);
-    assert!(r.is_err());
-    assert!(matches!(r.unwrap_err(), CoreError::Unsupported { .. }));
+fn decodes_alu_memory_operand() {
+    // 01 08 = add [rax], ecx — the typed decoder now accepts the memory-destination ALU form.
+    let d = decode_instruction(&[0x01, 0x08], 0).expect("add [rax], ecx decodes");
+    assert!(matches!(d.instruction, Instruction::Add(X86Operand::Mem(..), X86Operand::Reg(..))));
+    assert_eq!(d.length, 2);
 }
 
 #[test]
