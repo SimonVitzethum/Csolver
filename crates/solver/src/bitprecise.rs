@@ -23,7 +23,14 @@ use csolver_core::{Assignment, BitVector, Model};
 /// Upper bound on the bit-blasted CNF size. Past this we decline (return "not
 /// proved") rather than hand the SAT solver a formula large enough to dominate
 /// the analysis time — the linear procedure is the right tool for those goals.
-const MAX_CLAUSES: usize = 60_000;
+/// Sized to fit a full **128-bit** adder/multiplier and every cheaper op (~200k clauses for a
+/// 128-bit `mul`) so the common wide-integer arithmetic — `add`/`sub`/`mul`/shifts/bitwise/
+/// comparisons on `i128`/`u128` — is decided bit-precisely rather than declined. A 128-bit
+/// **`udiv`/`sdiv`/`urem`/`srem`** builds a larger (~370k-clause) restoring divider that stays
+/// above this cap and so falls back soundly to the linear procedure (rare in memory-safety
+/// code, and never a wrong answer — the cap only ever loses precision). The 250 ms per-query
+/// wall-clock is the real time bound regardless.
+const MAX_CLAUSES: usize = 300_000;
 
 /// Try to prove `assumptions ⟹ goal` bit-precisely. Returns `true` only when
 /// the implication is established for all machine values (see soundness note).

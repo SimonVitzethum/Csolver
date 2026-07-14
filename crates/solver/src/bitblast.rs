@@ -23,9 +23,12 @@ use crate::expr::{BvOp, CmpOp, ExprCtx, ExprId, Node};
 use crate::sat::Lit;
 use csolver_core::FxHashMap;
 
-/// The widest bit-vector we bit-blast. Memory-safety quantities are `i1`..`i64`;
-/// capping keeps every query bounded.
-pub const MAX_WIDTH: u32 = 64;
+/// The widest bit-vector we bit-blast. Covers `i1`..`i128` — the full concrete domain
+/// ([`csolver_core::BitVector`] holds up to 128 bits, and the frontends clamp there), so
+/// a `mul`/`udiv`/shift on an `i128`/`u128` is decided bit-precisely instead of falling back
+/// to the linear abstraction. The cap keeps every query bounded (a 128-bit multiplier/divider
+/// is ~4× the 64-bit gate count — still small); a wider width degrades soundly to linear.
+pub const MAX_WIDTH: u32 = 128;
 
 /// A CNF under construction, with Tseitin gate helpers.
 #[derive(Default)]

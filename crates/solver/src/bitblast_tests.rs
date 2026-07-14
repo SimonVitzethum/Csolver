@@ -259,6 +259,55 @@ fn symbolic_shift_at_width_64_boundaries() {
     }
 }
 
+/// Full **128-bit** width (`MAX_WIDTH`): the adder, shift-add multiplier, barrel shifter,
+/// bitwise and comparison circuits must all stay exact at the widest blastable width — the
+/// small sweeps never reach it. Two pinned `i128`-range operands are checked against plain
+/// `u128` wrapping arithmetic. (128-bit `udiv`/`urem` build a ~370k-clause divider that
+/// exceeds the CNF cap and fall back soundly to the linear procedure, so they are not asserted
+/// here — see `MAX_CLAUSES`.)
+#[test]
+fn wide_ops_at_width_128_are_bit_precise() {
+    let w = 128;
+    let av = 0x1234_5678_9abc_def0_0fed_cba9_8765_4321u128;
+    let bv = 0x0000_0000_dead_beef_0000_0000_cafe_babeu128;
+    let checks: [(BvOp, u128); 6] = [
+        (BvOp::Add, av.wrapping_add(bv)),
+        (BvOp::Sub, av.wrapping_sub(bv)),
+        (BvOp::Mul, av.wrapping_mul(bv)),
+        (BvOp::And, av & bv),
+        (BvOp::Or, av | bv),
+        (BvOp::Xor, av ^ bv),
+    ];
+    for (op, want) in checks {
+        let mut c = ExprCtx::new();
+        let a = c.symbol("a", w);
+        let b = c.symbol("b", w);
+        let ca = c.int(w, av);
+        let cb = c.int(w, bv);
+        let assume = [c.cmp(CmpOp::Eq, a, ca), c.cmp(CmpOp::Eq, b, cb)];
+        let expr = c.bin(op, a, b);
+        let k = c.int(w, want);
+        let goal = c.cmp(CmpOp::Eq, expr, k);
+        assert!(prove_implies(&c, &assume, goal), "{op:?} at w128: {want:#x} not provable");
+        let bad = c.int(w, want.wrapping_add(1));
+        let badgoal = c.cmp(CmpOp::Eq, expr, bad);
+        assert!(!prove_implies(&c, &assume, badgoal), "{op:?} at w128: wrong result provable");
+    }
+    // A symbolic 128-bit shift (barrel shifter) by a pinned amount, and an unsigned compare.
+    let mut c = ExprCtx::new();
+    let a = c.symbol("a", w);
+    let b = c.symbol("b", w);
+    let ca = c.int(w, av);
+    let cb = c.int(w, 100);
+    let assume = [c.cmp(CmpOp::Eq, a, ca), c.cmp(CmpOp::Eq, b, cb)];
+    let shl = c.bin(BvOp::Shl, a, b);
+    let k = c.int(w, av << 100); // 100 < 128, well-defined
+    let goal = c.cmp(CmpOp::Eq, shl, k);
+    assert!(prove_implies(&c, &assume, goal), "shl by 100 at w128 not provable");
+    let cmp = c.cmp(CmpOp::Ugt, a, b); // av > 100
+    assert!(prove_implies(&c, &assume, cmp), "128-bit unsigned compare not decided");
+}
+
 /// The division circuits must be **total** on a zero divisor, matching SMT-LIB:
 /// `bvudiv a 0 = ~0` (all ones) and `bvurem a 0 = a`. This pins the corner the
 /// exhaustive sweep skips, so a term is never left under-constrained even absent
