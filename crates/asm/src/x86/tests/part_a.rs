@@ -114,6 +114,28 @@ fn decodes_alu_read_modify_write_on_memory() {
 }
 
 #[test]
+fn decodes_memory_operand_forms_that_were_previously_declined() {
+    // Each of these reads (and some write) memory; previously the whole instruction was
+    // declined, so the access went unmodelled. Now the load/store carries its obligations.
+    let has = |code: &[u8], want: &dyn Fn(&Inst) -> bool| {
+        let m = decode_function("f", &[code, &[0xc3]].concat());
+        assert!(m.unanalyzed.is_empty(), "decoded {code:?}: {:?}", m.unanalyzed);
+        assert!(m.functions[0].blocks[0].insts.iter().any(want), "expected inst in {code:?}");
+    };
+    // cmp [rdi], eax (39 07) — a load feeding the flags.
+    has(&[0x39, 0x07], &|i| matches!(i, Inst::Load { .. }));
+    // add [rdi], 5 (83 07 05) — a read-modify-write (load + store).
+    has(&[0x83, 0x07, 0x05], &|i| matches!(i, Inst::Store { .. }));
+    // inc dword [rdi] (ff 07) — a read-modify-write.
+    has(&[0xff, 0x07], &|i| matches!(i, Inst::Store { .. }));
+    // xchg [rdi], eax (87 07) — an atomic swap: barrier + load + store.
+    has(&[0x87, 0x07], &|i| matches!(i, Inst::Barrier { .. }));
+    has(&[0x87, 0x07], &|i| matches!(i, Inst::Store { .. }));
+    // cmovne eax, [rdi] (0f 45 07) — the source load is checked.
+    has(&[0x0f, 0x45, 0x07], &|i| matches!(i, Inst::Load { .. }));
+}
+
+#[test]
 fn decodes_a_stack_frame_and_its_access() {
     // 48 83 ec 10        sub rsp, 16        (allocate a 16-byte frame)
     // 89 44 24 08        mov [rsp+8], eax   (store within the frame)

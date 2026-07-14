@@ -205,7 +205,36 @@ pub(crate) fn decode_one(
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
             if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: group-1 with a memory operand is unsupported"));
+                // `<op> [mem], imm8` — the imm8 follows the SIB/displacement, so parse the memory
+                // operand first, then the immediate at `mem.next`. add/or/and/sub/xor are a
+                // read-modify-write on memory; cmp (/7) is a read-only load feeding the flags.
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let imm_raw = read_imm(code, mem.next, 1)?;
+                let imm = (imm_raw as u8 as i8 as i128) as u128;
+                let next = mem.next + 1;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                let bin = match m.reg & 7 {
+                    0 => BinOp::Add,
+                    1 => BinOp::Or,
+                    4 => BinOp::And,
+                    5 => BinOp::Sub,
+                    6 => BinOp::Xor,
+                    7 => {
+                        // cmp [mem], imm8 — read-only; record the operands for a following `jcc`.
+                        *flags = Some((Operand::Reg(loaded), Operand::int(width, imm)));
+                        return done(insts, next);
+                    }
+                    d => return Err(CoreError::unsupported(format!("x86: unsupported group-1 /digit {d} with a memory operand"))),
+                };
+                insts.push(Inst::Assign {
+                    dst: loaded,
+                    ty: ty.clone(),
+                    value: RValue::Bin { op: bin, lhs: Operand::Reg(loaded), rhs: Operand::int(width, imm), flags: Default::default() },
+                });
+                insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::Reg(loaded), align: 1, volatile: false });
+                return done(insts, next);
             }
             let imm_raw = read_imm(code, p, 1)?; // imm8, value 0..255
             p += 1;
@@ -242,24 +271,38 @@ pub(crate) fn decode_one(
               }
           }
           // cmp r/m, r — record operands for a following `jcc` (reg/reg form).
-          0x39 => {
-              let m = modrm(code, p, rex_r, rex_b)?;
-              p += 1;
-              if m.mode != 0b11 {
-                  return Err(CoreError::unsupported("x86: cmp with a memory operand"));
+        0x39 => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode == 0b11 {
+                *flags = Some((Operand::Reg(reg(m.rm)), Operand::Reg(reg(m.reg))));
+                done(vec![], p)
+            } else {
+                // cmp [mem], r — reads memory (the load carries the access obligations), sets flags.
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                *flags = Some((Operand::Reg(loaded), Operand::Reg(reg(m.reg))));
+                done(insts, mem.next)
             }
-            *flags = Some((Operand::Reg(reg(m.rm)), Operand::Reg(reg(m.reg))));
-            done(vec![], p)
         }
-        // cmp r, r/m (reg/reg form).
+        // cmp r, r/m (reg source or memory source).
         0x3b => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: cmp with a memory operand"));
+            if m.mode == 0b11 {
+                *flags = Some((Operand::Reg(reg(m.reg)), Operand::Reg(reg(m.rm))));
+                done(vec![], p)
+            } else {
+                // cmp r, [mem] — model the memory read, then compare.
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                *flags = Some((Operand::Reg(reg(m.reg)), Operand::Reg(loaded)));
+                done(insts, mem.next)
             }
-            *flags = Some((Operand::Reg(reg(m.reg)), Operand::Reg(reg(m.rm))));
-            done(vec![], p)
         }
         // cmp eax, imm32.
         0x3d => {
@@ -271,12 +314,23 @@ pub(crate) fn decode_one(
         0x85 => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            *flags = if m.mode == 0b11 && m.rm == m.reg {
-                Some((Operand::Reg(reg(m.rm)), Operand::int(width, 0)))
+            if m.mode != 0b11 {
+                // test [mem], r — model the memory read (the AND-flags are not tracked, as for
+                // the reg-reg non-self case), so the access carries its obligations.
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                *flags = None;
+                done(insts, mem.next)
             } else {
-                None
-            };
-            done(vec![], p)
+                *flags = if m.rm == m.reg {
+                    Some((Operand::Reg(reg(m.rm)), Operand::int(width, 0)))
+                } else {
+                    None
+                };
+                done(vec![], p)
+            }
         }
         // jmp rel8 / rel32.
         0xeb => {
@@ -428,24 +482,34 @@ pub(crate) fn decode_one(
                 p,
             )
         }
-        // xchg r/m, r (0x87, reg-reg only).
+        // xchg r/m, r (0x87): register swap, or an atomic swap with memory.
         0x87 => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: xchg with a memory operand"));
-            }
             let ra = reg(m.reg);
-            let rb = reg(m.rm);
-            let t = temp_reg(pos);
-            done(
-                vec![
-                    Inst::Assign { dst: t, ty: ty.clone(), value: RValue::Use(Operand::Reg(ra)) },
-                    Inst::Assign { dst: ra, ty: ty.clone(), value: RValue::Use(Operand::Reg(rb)) },
-                    Inst::Assign { dst: rb, ty, value: RValue::Use(Operand::Reg(t)) },
-                ],
-                p,
-            )
+            if m.mode == 0b11 {
+                let rb = reg(m.rm);
+                let t = temp_reg(pos);
+                done(
+                    vec![
+                        Inst::Assign { dst: t, ty: ty.clone(), value: RValue::Use(Operand::Reg(ra)) },
+                        Inst::Assign { dst: ra, ty: ty.clone(), value: RValue::Use(Operand::Reg(rb)) },
+                        Inst::Assign { dst: rb, ty, value: RValue::Use(Operand::Reg(t)) },
+                    ],
+                    p,
+                )
+            } else {
+                // xchg [mem], r — implicitly LOCKed (a full barrier): `t = [mem]; [mem] = r; r = t`.
+                // The load and store carry the memory-access obligations.
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let t = RegId(3000 + pos as u32);
+                insts.push(Inst::Barrier { kind: 0, access: None });
+                insts.push(Inst::Load { dst: t, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Store { ty: ty.clone(), ptr: Operand::Reg(ptr), value: Operand::Reg(ra), align: 1, volatile: false });
+                insts.push(Inst::Assign { dst: ra, ty, value: RValue::Use(Operand::Reg(t)) });
+                done(insts, mem.next)
+            }
         }
         // cdqe (0x98 with REX.W) — sign-extend eax to rax.
         0x98 => {
@@ -668,39 +732,65 @@ pub(crate) fn decode_one(
                 _ => Err(CoreError::unsupported(format!("x86: unsupported group-3 /digit {}", m.reg & 7))),
             }
         }
-        // Group 4 inc/dec r/m8 (0xfe, reg-reg only).
+        // Group 4 inc/dec r/m8 (0xfe): register or an 8-bit memory read-modify-write.
         0xfe => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: inc/dec with a memory operand"));
-            }
-            let target = reg(m.rm);
             let bin_op = match m.reg & 7 {
                 0 => BinOp::Add,
                 1 => BinOp::Sub,
                 _ => return Err(CoreError::unsupported(format!("x86: unsupported group-4 /digit {}", m.reg & 7))),
             };
-            done(
-                vec![Inst::Assign {
-                    dst: target,
-                    ty: Type::int(8),
-                    value: RValue::Bin {
-                        op: bin_op,
-                        lhs: Operand::Reg(target),
-                        rhs: Operand::int(8, 1),
-                    flags: Default::default(),
-                    },
-                }],
-                p,
-            )
+            let inc = |lhs| RValue::Bin { op: bin_op, lhs, rhs: Operand::int(8, 1), flags: Default::default() };
+            if m.mode == 0b11 {
+                let target = reg(m.rm);
+                done(vec![Inst::Assign { dst: target, ty: Type::int(8), value: inc(Operand::Reg(target)) }], p)
+            } else {
+                // inc/dec byte [mem] — load, ±1, store back (the access carries its obligations).
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Assign { dst: loaded, ty: Type::int(8), value: inc(Operand::Reg(loaded)) });
+                insts.push(Inst::Store { ty: Type::int(8), ptr: Operand::Reg(ptr), value: Operand::Reg(loaded), align: 1, volatile: false });
+                done(insts, mem.next)
+            }
         }
-        // Group 5 (0xff, reg-reg only): inc/dec/call/jmp.
+        // Group 5 (0xff): inc/dec/call/jmp — register, or a memory operand.
         0xff => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
             if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: group-5 with a memory operand"));
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                return match m.reg & 7 {
+                    // inc/dec [mem] — a read-modify-write.
+                    d @ (0 | 1) => {
+                        let bin = if d == 0 { BinOp::Add } else { BinOp::Sub };
+                        insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                        insts.push(Inst::Assign {
+                            dst: loaded,
+                            ty: ty.clone(),
+                            value: RValue::Bin { op: bin, lhs: Operand::Reg(loaded), rhs: Operand::int(width, 1), flags: Default::default() },
+                        });
+                        insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::Reg(loaded), align: 1, volatile: false });
+                        done(insts, mem.next)
+                    }
+                    // call [mem] — load the target pointer (the read is checked), then an opaque
+                    // call that falls through (havocs caller-saved + rax), as for the reg form.
+                    2 => {
+                        insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                        insts.push(opaque_call());
+                        Ok(Decoded { insts, next: mem.next, ctrl: Ctrl::Fall })
+                    }
+                    // jmp [mem] — load the target (checked), then stop (tail/switch; conservative).
+                    4 => {
+                        insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                        Ok(Decoded { insts, next: mem.next, ctrl: Ctrl::Ret })
+                    }
+                    d => Err(CoreError::unsupported(format!("x86: unsupported group-5 /digit {d} with a memory operand"))),
+                };
             }
             let target = reg(m.rm);
             match m.reg & 7 {
@@ -763,22 +853,24 @@ fn decode_two_byte(
         // cmovcc r, r/m (`0f 40..4f`) — conditional move. Reg-reg only; the moved
         // value depends on flags we do not model precisely, so the destination
         // becomes an unknown (sound over-approximation) rather than dropping the
-        // whole function. A memory-operand form is rejected (its load would need
-        // its own obligations).
+        // whole function. The memory-operand form loads the source (the read is checked)
+        // and still leaves the destination unknown (the move is flag-conditional).
         0x40..=0x4f => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            if m.mode != 0b11 {
-                return Err(CoreError::unsupported("x86: cmovcc with a memory operand"));
+            let undef = RValue::Use(Operand::Const(csolver_ir::Const::Undef));
+            if m.mode == 0b11 {
+                done(vec![Inst::Assign { dst: reg(m.reg), ty, value: undef }], p)
+            } else {
+                // cmovcc r, [mem] — the load happens unconditionally (its access is checked);
+                // the destination stays unknown since the move depends on flags we do not model.
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Assign { dst: reg(m.reg), ty, value: undef });
+                done(insts, mem.next)
             }
-            done(
-                vec![Inst::Assign {
-                    dst: reg(m.reg),
-                    ty,
-                    value: RValue::Use(Operand::Const(csolver_ir::Const::Undef)),
-                }],
-                p,
-            )
         }
         // jcc rel32.
         0x80..=0x8f => {
