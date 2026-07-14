@@ -170,6 +170,11 @@ pub(crate) enum AbsVal {
     /// returning path yields anything else, so `DanglingStack` is claimed only when the
     /// pointer is a local on *every* returning path (a definite escape, no false FAIL).
     LocalStack,
+    /// The **result of the observable call** at this index (in body-call order, matching
+    /// `SummaryFacts`' collection). Used only to propagate a callee's `DanglingStack`
+    /// return through a wrapper (`fn w() { return leak() }`): the cross-function fixpoint
+    /// resolves the callee and, if it returns a dangling stack pointer, so does the wrapper.
+    Call(usize),
     Opaque,
 }
 

@@ -149,5 +149,49 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
         }
     }
 
+    // Propagate a dangling-stack return through wrappers (mirrors `SummaryFacts::finalize`
+    // step 4, so the link-free and linked summaries stay equal): a function that returns a
+    // Direct callee's result inherits `DanglingStack` when that callee does. Only the dangling
+    // case composes without argument remapping; `PtrFromArg` stays Unknown (sound).
+    let ret_callee: HashMap<FuncId, Option<FuncId>> = module
+        .functions
+        .iter()
+        .map(|f| {
+            let g = returned_call_index(f).and_then(|ci| {
+                f.blocks
+                    .iter()
+                    .filter(|b| observable(b))
+                    .flat_map(|b| &b.insts)
+                    .filter_map(|i| match i {
+                        Inst::Call { callee, .. } => Some(callee),
+                        _ => None,
+                    })
+                    .nth(ci)
+                    .and_then(|c| match c {
+                        Callee::Direct(g) => Some(*g),
+                        _ => None,
+                    })
+            });
+            (f.id, g)
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for f in &module.functions {
+            let inherits = map.get(&f.id).is_some_and(|s| s.ret == RetSummary::Unknown)
+                && ret_callee[&f.id]
+                    .is_some_and(|g| map.get(&g).is_some_and(|s| s.ret == RetSummary::DanglingStack));
+            if inherits {
+                if let Some(s) = map.get_mut(&f.id) {
+                    s.ret = RetSummary::DanglingStack;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     map
 }

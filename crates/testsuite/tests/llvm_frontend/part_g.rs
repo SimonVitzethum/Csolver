@@ -283,6 +283,14 @@ fn caller_side_deref_of_returned_local_is_flagged() {
         "define void @caller2(ptr %m) {\nb:\n  %q = call ptr @id(ptr %m)\n  store i32 7, ptr %q, align 4\n  ret void\n}\n",
     ));
     assert_ne!(verdict_of(&ok, "caller2"), Verdict::Fail, "dereferencing a returned parameter pointer is safe");
+    // Wrapper propagation: @wrap just forwards @leak's dangling result; a caller of @wrap must
+    // still be caught (the callee's DanglingStack return composes through the wrapper summary).
+    let wrapped = lower(concat!(
+        "define ptr @leak2() {\nb:\n  %p = alloca i32, align 4\n  ret ptr %p\n}\n",
+        "define ptr @wrap() {\nb:\n  %q = call ptr @leak2()\n  ret ptr %q\n}\n",
+        "define void @caller3() {\nb:\n  %r = call ptr @wrap()\n  store i32 7, ptr %r, align 4\n  ret void\n}\n",
+    ));
+    assert_eq!(verdict_of(&wrapped, "caller3"), Verdict::Fail, "a dangling return forwarded through a wrapper is still a use-after-free at the caller");
 }
 
 /// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the

@@ -27,7 +27,7 @@ pub(crate) fn summarize_fn(f: &Function) -> Summary {
     }
 
     Summary {
-        ret: ret_of_fn(f),
+        ret: ret_of_fn(f).0,
         writes,
         frees,
         frees_arg: derive_frees_arg(f),
@@ -196,8 +196,36 @@ pub(crate) fn local_alloc_regs(f: &Function) -> std::collections::HashSet<RegId>
 /// rustc's guard shape — `entry: cond ? panic-block : ok-block; ok: ret p+off` —
 /// where the panic block never returns and thus never joins: the summary comes
 /// from the agreeing return sites alone.
-pub(crate) fn ret_of_fn(f: &Function) -> RetSummary {
+/// Whether the function's return value is, on every returning path, exactly the result of
+/// one observable call — its index in body-call order (matching `SummaryFacts`' collection,
+/// which skips `Unreachable`-terminated blocks). Lets the cross-function fixpoint propagate a
+/// callee's `DanglingStack` return through a wrapper.
+pub(crate) fn returned_call_index(f: &Function) -> Option<usize> {
+    ret_of_fn(f).1
+}
+
+pub(crate) fn ret_of_fn(f: &Function) -> (RetSummary, Option<usize>) {
     use csolver_ir::Terminator;
+
+    // dst-register → observable-call index, in the exact order (and Unreachable-skip) that
+    // `SummaryFacts::push_module` numbers calls, so an index here names the same call there.
+    let mut call_index: HashMap<RegId, usize> = HashMap::new();
+    {
+        let mut idx = 0usize;
+        for b in &f.blocks {
+            if matches!(b.term, Terminator::Unreachable) {
+                continue;
+            }
+            for inst in &b.insts {
+                if let Inst::Call { dst, .. } = inst {
+                    if let Some(d) = dst {
+                        call_index.insert(*d, idx);
+                    }
+                    idx += 1;
+                }
+            }
+        }
+    }
 
     let mut env: HashMap<RegId, AbsVal> = HashMap::new();
     for (k, (reg, ty)) in f.params.iter().enumerate() {
@@ -251,6 +279,12 @@ pub(crate) fn ret_of_fn(f: &Function) -> RetSummary {
                     // A stack allocation of this frame: its address is a local whose
                     // lifetime ends at return. Returning it is a dangling-stack escape.
                     Inst::Alloc { dst, .. } => (*dst, AbsVal::LocalStack),
+                    // A call result: tracked as `Call(index)` so a wrapper that returns it
+                    // can inherit the callee's dangling-stack return in the cross-fn fixpoint.
+                    Inst::Call { dst: Some(d), .. } => {
+                        let v = call_index.get(d).map_or(AbsVal::Opaque, |&i| AbsVal::Call(i));
+                        (*d, v)
+                    }
                     other => match other.defined_reg() {
                         Some(dst) => (dst, AbsVal::Opaque),
                         None => continue,
@@ -300,15 +334,18 @@ pub(crate) fn ret_of_fn(f: &Function) -> RetSummary {
                 }
             }
             return match ret {
-                Some(AbsVal::PtrArg { arg, off }) => RetSummary::PtrFromArg { arg, offset: off },
-                Some(AbsVal::Scalar(a)) => RetSummary::Scalar(a),
-                Some(AbsVal::LocalStack) => RetSummary::DanglingStack,
-                _ => RetSummary::Unknown,
+                Some(AbsVal::PtrArg { arg, off }) => (RetSummary::PtrFromArg { arg, offset: off }, None),
+                Some(AbsVal::Scalar(a)) => (RetSummary::Scalar(a), None),
+                Some(AbsVal::LocalStack) => (RetSummary::DanglingStack, None),
+                // The return is a bare call result — no local RetSummary, but the callee index
+                // is handed to the cross-function fixpoint for dangling-return propagation.
+                Some(AbsVal::Call(i)) => (RetSummary::Unknown, Some(i)),
+                _ => (RetSummary::Unknown, None),
             };
         }
     }
     // Pass cap hit (pathological CFG): degrade, never loop or guess.
-    RetSummary::Unknown
+    (RetSummary::Unknown, None)
 }
 
 pub(crate) fn eval_rvalue(rv: &RValue, env: &HashMap<RegId, AbsVal>) -> AbsVal {

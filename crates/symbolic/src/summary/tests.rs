@@ -114,6 +114,78 @@ fn summarize_program_equals_summarize_of_the_linked_module() {
     assert!(want[&FuncId(3)].writes, "b_wrapper inherits via Direct");
 }
 
+/// A wrapper that returns a callee's dangling-stack result inherits `DanglingStack`
+/// through the cross-function fixpoint, so the wrapper's callers are caught too — for
+/// both an in-module `Direct` and a cross-module `Symbol` edge. A wrapper around a
+/// benign callee (returns a parameter pointer) must NOT be flagged.
+#[test]
+fn wrapper_inherits_callee_dangling_stack_return() {
+    use csolver_ir::merge_modules;
+    let a = RegId(0);
+    let q = RegId(1);
+    // leak(): { %a = alloca i32; ret %a }
+    let mut leak_bb = BasicBlock::new(BlockId(0), Terminator::Return(Some(Operand::Reg(a))));
+    leak_bb.insts.push(Inst::Alloc {
+        dst: a,
+        region: csolver_core::RegionKind::Stack,
+        elem: Type::int(32),
+        count: Operand::int(64, 1),
+        align: 4,
+    });
+    // id(p): { ret p } — benign (returns its parameter).
+    let p = RegId(0);
+    let id_bb = BasicBlock::new(BlockId(0), Terminator::Return(Some(Operand::Reg(p))));
+    // wrap(): { %q = call <callee>(); ret %q }
+    let wrap = |callee: Callee| {
+        let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(Some(Operand::Reg(q))));
+        bb.insts.push(Inst::Call {
+            dst: Some(q),
+            callee,
+            args: vec![],
+            ret_ty: Type::ptr(Type::int(32)),
+            ret_ref: None,
+        });
+        bb
+    };
+    let func = |id: u32, name: &str, params: Vec<(RegId, Type)>, bb: BasicBlock| Function {
+        id: FuncId(id),
+        name: name.into(),
+        params,
+        ret_ty: Type::ptr(Type::int(32)),
+        blocks: vec![bb],
+        entry: BlockId(0),
+    };
+    let pp = || vec![(p, Type::ptr(Type::int(32)))];
+
+    // Module B holds leak + an in-module Direct wrapper around it; module A a cross-module
+    // Symbol wrapper around leak, and a benign wrapper around `id`.
+    let mut b = Module::new("b");
+    b.functions.push(func(0, "leak", vec![], leak_bb));
+    b.functions.push(func(1, "b_wrap", vec![], wrap(Callee::Direct(FuncId(0)))));
+    let mut aa = Module::new("a");
+    aa.functions.push(func(0, "a_wrap", vec![], wrap(Callee::Symbol("leak".into()))));
+    aa.functions.push(func(1, "id", pp(), id_bb));
+    aa.functions.push(func(2, "benign_wrap", vec![], wrap(Callee::Symbol("id".into()))));
+
+    let linked = merge_modules(vec![aa.clone(), b.clone()], "linked");
+    let want = summarize_module(&linked);
+    // Streaming/link-free must agree with the linked result (the losslessness oracle).
+    assert_eq!(summarize_program(&[&aa, &b]), want);
+
+    // Ids in the linked module: a_wrap=0, id=1, benign_wrap=2, leak=3, b_wrap=4.
+    assert_eq!(want[&FuncId(3)].ret, RetSummary::DanglingStack, "leak returns a local");
+    assert_eq!(want[&FuncId(4)].ret, RetSummary::DanglingStack, "Direct wrapper inherits it");
+    assert_eq!(want[&FuncId(0)].ret, RetSummary::DanglingStack, "Symbol wrapper inherits it");
+    assert_eq!(
+        want[&FuncId(1)].ret,
+        RetSummary::PtrFromArg { arg: 0, offset: Affine::constant(0) },
+        "id returns its parameter"
+    );
+    // The benign wrapper must NOT be claimed dangling — only `DanglingStack` composes through
+    // a wrapper; a `PtrFromArg` callee result stays Unknown (sound: the caller havocs).
+    assert_ne!(want[&FuncId(2)].ret, RetSummary::DanglingStack, "benign wrapper is not dangling");
+}
+
 /// The streaming property: feeding modules one at a time and **dropping each**
 /// right after `push_module` yields the same summaries as the linked module —
 /// so a whole-program pass never needs the IR resident. Uses `atgt`/`writer`

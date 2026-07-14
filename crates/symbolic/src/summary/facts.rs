@@ -23,6 +23,10 @@ pub struct SummaryFacts {
     param_of: Vec<HashMap<RegId, usize>>,
     /// Per function: its *observable* calls, callee unresolved until `finalize`.
     calls: Vec<Vec<(CalleeRef, Vec<Operand>)>>,
+    /// Per function: the index (into `calls`) of the observable call whose result the
+    /// function returns on every path, if any — for propagating a callee's `DanglingStack`
+    /// return through a wrapper. `None` when the return is not a bare call result.
+    ret_call: Vec<Option<usize>>,
 }
 
 /// A call's callee before cross-module name resolution.
@@ -65,6 +69,7 @@ impl SummaryFacts {
             }
             self.base.push(summarize_fn(f));
             self.param_of.push(ptr_param_of(f));
+            self.ret_call.push(returned_call_index(f));
             let mut calls = Vec::new();
             for b in &f.blocks {
                 if matches!(b.term, csolver_ir::Terminator::Unreachable) {
@@ -98,6 +103,7 @@ impl SummaryFacts {
         }
         self.base.extend(other.base);
         self.param_of.extend(other.param_of);
+        self.ret_call.extend(other.ret_call);
         self.calls.extend(other.calls.into_iter().map(|mut calls| {
             for (cr, _) in &mut calls {
                 if let CalleeRef::Id(g) = cr {
@@ -117,8 +123,11 @@ impl SummaryFacts {
         let mut edges: Vec<Vec<FuncId>> = vec![Vec::new(); n];
         let mut opaque: Vec<bool> = vec![false; n];
         let mut prov_calls: Vec<Vec<(FuncId, Vec<Operand>)>> = vec![Vec::new(); n];
+        // The resolved callee of each function's returned call (if its return is a bare call
+        // result), for the dangling-return wrapper fixpoint.
+        let mut ret_callee: Vec<Option<FuncId>> = vec![None; n];
         for (gid, calls) in self.calls.into_iter().enumerate() {
-            for (cr, args) in calls {
+            for (ci, (cr, args)) in calls.into_iter().enumerate() {
                 let resolved = match cr {
                     CalleeRef::Id(g) => Some(g),
                     CalleeRef::Name(nm) if nm == "<inline asm nomem>" => None,
@@ -137,6 +146,9 @@ impl SummaryFacts {
                 if let Some(g) = resolved {
                     edges[gid].push(g);
                     prov_calls[gid].push((g, args));
+                }
+                if self.ret_call[gid] == Some(ci) {
+                    ret_callee[gid] = resolved;
                 }
             }
         }
@@ -196,6 +208,25 @@ impl SummaryFacts {
                 summ[gid].prov.labels.extend(add.labels);
                 dedup(&mut summ[gid].prov);
                 if (summ[gid].prov.transfers.len(), summ[gid].prov.labels.len()) != before {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // 4. propagate a dangling-stack return through wrappers to a fixpoint: a function that
+        //    returns a callee's result inherits `DanglingStack` when that callee does. Only the
+        //    dangling case composes trivially (a dangling pointer is dangling regardless of the
+        //    wrapper's arguments); `PtrFromArg` would need argument remapping and stays Unknown
+        //    (sound — the caller havocs). Monotone (`Unknown → DanglingStack` only), so it ends.
+        loop {
+            let mut changed = false;
+            for gid in 0..n {
+                if summ[gid].ret == RetSummary::Unknown
+                    && ret_callee[gid].is_some_and(|g| summ[g.0 as usize].ret == RetSummary::DanglingStack)
+                {
+                    summ[gid].ret = RetSummary::DanglingStack;
                     changed = true;
                 }
             }
