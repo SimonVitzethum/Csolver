@@ -114,6 +114,37 @@ fn message_passing_without_wmb_is_a_weak_memory_bug() {
     assert!(good.weak_memory_bugs().is_empty(), "smp_wmb + smp_rmb fix the publish protocol");
 }
 
+/// The **combined** release/acquire calls (`smp_store_release`/`smp_load_acquire`) now carry
+/// the flag access, not just the fence — so the message-passing handoff is modelled from one
+/// call. Both together are robust (the negative control: the added flag access must not
+/// fabricate a bug), but a release publish read by a *plain* load (a missing acquire) is a real
+/// R→R-reorder bug that was invisible before (the producer never modelled the flag write).
+#[test]
+fn release_acquire_calls_model_the_flag_and_catch_a_missing_acquire() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let module = |consumer_load: &str| {
+        let src = format!(
+            "@data = global i32 0, align 4\n@flag = global i32 0, align 4\n\
+             declare void @smp_store_release(ptr, i32)\ndeclare i32 @smp_load_acquire(ptr)\n\
+             define void @producer() {{\n  store i32 42, ptr @data, align 4\n  \
+               call void @smp_store_release(ptr @flag, i32 1)\n  ret void\n}}\n\
+             define i32 @consumer() {{\n  {consumer_load}  \
+               %d = load i32, ptr @data, align 4\n  ret i32 %d\n}}\n"
+        );
+        let m = LlvmFrontend.lower(LlvmInput { source: src, name: "ra".into() }).expect("lower");
+        verify_module(&m, &cfg)
+    };
+    // Release publish + acquire consume → ordered on both sides → robust (no false bug from
+    // the newly-modelled flag access).
+    let good = module("%f = call i32 @smp_load_acquire(ptr @flag)\n");
+    assert!(good.weak_memory_bugs().is_empty(), "release + acquire is SC-robust");
+    // Release publish + a PLAIN load of the flag (no acquire) → the consumer's two reads
+    // reorder (ARM R→R), so it can see the flag set but the data stale — a real bug now that
+    // the producer's release models the flag write.
+    let bad = module("%f = load i32, ptr @flag, align 4\n");
+    assert_eq!(bad.weak_memory_bugs().len(), 1, "a release read by a plain load misses the acquire barrier");
+}
+
 /// **Happens-before via thread create/join (operational weak memory).** A store-buffer shape is
 /// a weak-memory bug when the two functions run concurrently — but not when one is `pthread_create`d
 /// and `pthread_join`ed by the other: the join orders the child before the parent's later read.

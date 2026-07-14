@@ -1,6 +1,13 @@
 use super::*;
 
 impl Explorer<'_> {
+    /// Append one `(kind, class)` event to the bounded interleaving trace (no-op past the cap).
+    fn push_race_event(&mut self, kind: u8, class: String) {
+        if self.race_trace.len() < self.race_trace_cap {
+            self.race_trace.push((kind, class));
+        }
+    }
+
     /// The contract-driven instruction arms of [`Explorer::step`] (provenance, taint,
     /// typestate, refcount, concurrency events) — split out mechanically.
     #[allow(clippy::too_many_lines)]
@@ -213,9 +220,27 @@ impl Explorer<'_> {
             }
             // A memory barrier: record a fence in the interleaving trace (weak-memory model).
             // Trace kind 4 = full (`smp_mb`), 5 = write (`smp_wmb`), 6 = read (`smp_rmb`).
-            Inst::Barrier { kind } => {
-                if self.race_trace.len() < self.race_trace_cap {
-                    self.race_trace.push((4 + *kind, String::new()));
+            // For a `smp_store_release`/`smp_load_acquire` the call also accesses the flag: a
+            // **release** (write barrier) fences prior stores THEN writes the flag (order
+            // [fence, write]); an **acquire** (read barrier) reads the flag THEN fences later
+            // loads (order [read, fence]) — matching the inlined-atomic lowering in block.rs.
+            Inst::Barrier { kind, access } => {
+                let class = access
+                    .as_ref()
+                    .and_then(|v| crate::lockclass::lock_class_of_arg(&self.lock_classes, v));
+                match (*kind, class) {
+                    // release store: fence, then the flag write.
+                    (1, Some(cls)) => {
+                        self.push_race_event(5, String::new());
+                        self.push_race_event(3, cls);
+                    }
+                    // acquire load: the flag read, then the fence.
+                    (2, Some(cls)) => {
+                        self.push_race_event(2, cls);
+                        self.push_race_event(6, String::new());
+                    }
+                    // a standalone fence (or an unclassifiable location): just the barrier.
+                    (k, _) => self.push_race_event(4 + k, String::new()),
                 }
             }
             // Thread spawn/join: record a happens-before event (kind 7 = spawn with the child's

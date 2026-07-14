@@ -282,8 +282,16 @@ pub(crate) fn emit_contract(
             // Leak-state declarations are collected globally and injected before returns
             // (see `inject_leak_and_secret_checks`), not emitted at a call.
             Effect::TypestateLeak { .. } => {}
-            // A memory barrier: recorded in the interleaving trace as a fence.
-            Effect::Barrier { kind } => insts.push(Inst::Barrier { kind: *kind }),
+            // A memory barrier: recorded in the interleaving trace as a fence, plus — for a
+            // `smp_store_release`/`smp_load_acquire` (`access = Some(arg)`) — the flag access
+            // the fence orders, so the message-passing handoff is modelled. If the argument is
+            // missing the barrier still lowers as a bare fence (sound).
+            Effect::Barrier { kind, access } => {
+                let access = access
+                    .and_then(|i| args.get(i))
+                    .and_then(|a| ctx.operand(a, 64).ok());
+                insts.push(Inst::Barrier { kind: *kind, access });
+            }
             // Thread spawn/join (happens-before). The child function name comes from the
             // function-pointer argument (a global symbol); skip if it is not a direct symbol.
             Effect::Spawn { arg } => {

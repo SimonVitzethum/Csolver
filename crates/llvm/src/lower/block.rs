@@ -85,13 +85,15 @@ pub(crate) fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<Basi
         // its memory-safety obligations are unchanged; only the fence is added.
         match inst {
             LInst::Store { ordering: ord @ (LOrdering::Release | LOrdering::AcqRel | LOrdering::SeqCst), .. } => {
-                insts.push(Inst::Barrier { kind: if *ord == LOrdering::SeqCst { 0 } else { 1 } });
+                // The real store follows and records the flag access, so the fence itself
+                // carries no access (`None`) — otherwise the location would be double-counted.
+                insts.push(Inst::Barrier { kind: if *ord == LOrdering::SeqCst { 0 } else { 1 }, access: None });
                 insts.push(lower_inst(ctx, inst)?);
                 continue;
             }
             LInst::Load { ordering: ord @ (LOrdering::Acquire | LOrdering::AcqRel | LOrdering::SeqCst), .. } => {
                 insts.push(lower_inst(ctx, inst)?);
-                insts.push(Inst::Barrier { kind: if *ord == LOrdering::SeqCst { 0 } else { 2 } });
+                insts.push(Inst::Barrier { kind: if *ord == LOrdering::SeqCst { 0 } else { 2 }, access: None });
                 continue;
             }
             _ => {}

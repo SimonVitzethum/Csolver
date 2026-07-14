@@ -22,8 +22,20 @@ barrier read
 # direction for a bug-finder: it removes only the reorderings they genuinely order (fewer false
 # positives) and never hides a bug that needs a full barrier. (The ordered CAS variants
 # `cmpxchg_acquire`/`_release` carry BOTH `cas` and this barrier — see lifetime.contract.)
-[smp_store_release atomic_set_release atomic64_set_release atomic_fetch_add_release atomic_fetch_sub_release atomic_fetch_or_release atomic_fetch_and_release atomic_fetch_xor_release atomic_add_return_release atomic_sub_return_release atomic_inc_return_release atomic_dec_return_release atomic_xchg_release atomic64_xchg_release atomic64_fetch_sub_release]
+# The canonical release/acquire store/load ALSO access the flag at arg 0 (the pointer): a
+# store-release writes it, a load-acquire reads it. Modelling the flag access — not just the
+# fence — lets the message-passing handoff be reasoned about (a plain read on the consumer side
+# without the acquire is then a real, catchable missing-barrier bug), while the fence still
+# supplies the ordering. The RMW atomic helpers below stay bare fences (they order; their
+# location access is a further, unmodelled refinement — sound, just less precise).
+[smp_store_release]
+barrier write arg0
+
+[smp_load_acquire]
+barrier read arg0
+
+[atomic_set_release atomic64_set_release atomic_fetch_add_release atomic_fetch_sub_release atomic_fetch_or_release atomic_fetch_and_release atomic_fetch_xor_release atomic_add_return_release atomic_sub_return_release atomic_inc_return_release atomic_dec_return_release atomic_xchg_release atomic64_xchg_release atomic64_fetch_sub_release]
 barrier write
 
-[smp_load_acquire atomic_read_acquire atomic64_read_acquire atomic_fetch_add_acquire atomic_fetch_sub_acquire atomic_add_return_acquire atomic_sub_return_acquire atomic_xchg_acquire atomic64_xchg_acquire]
+[atomic_read_acquire atomic64_read_acquire atomic_fetch_add_acquire atomic_fetch_sub_acquire atomic_add_return_acquire atomic_sub_return_acquire atomic_xchg_acquire atomic64_xchg_acquire]
 barrier read

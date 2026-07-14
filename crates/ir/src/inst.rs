@@ -344,6 +344,11 @@ pub enum Inst {
     Barrier {
         /// 0 = full, 1 = write, 2 = read.
         kind: u8,
+        /// `Some(ptr)` when the barrier call also accesses this location (a
+        /// `smp_store_release`/`smp_load_acquire`: `kind` 1 ⇒ a write, `kind` 2 ⇒ a read),
+        /// so the message-passing flag is recorded, not just the ordering. `None` = a
+        /// standalone fence.
+        access: Option<Operand>,
     },
     /// **Thread spawn** (weak-memory happens-before): recorded in the interleaving trace so the
     /// model gates the child thread (`child` is its function name). No memory-safety effect.

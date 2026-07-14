@@ -130,7 +130,11 @@ pub(crate) fn parse_effect(line: &str) -> Result<Effect, String> {
         "join" => Ok(Effect::Join),
         // `cas arg<k>` — a compare-and-swap on the location pointed to by arg k.
         "cas" => Ok(Effect::Cas { arg: parse_arg(rest.first().copied().unwrap_or(""))? }),
-        // `barrier [write|read]` — a full (default), write, or read memory barrier.
+        // `barrier [full|write|read] [arg<k>]` — a full (default), write, or read memory
+        // barrier, optionally also accessing the location at arg k (a `smp_store_release` /
+        // `smp_load_acquire`: the flag write/read the fence orders, so the message-passing
+        // handoff is modelled, not just the ordering). `write` ⇒ the access is a write
+        // (release store), `read` ⇒ a read (acquire load).
         "barrier" => {
             let kind = match rest.first().copied() {
                 None | Some("full") => 0,
@@ -138,7 +142,11 @@ pub(crate) fn parse_effect(line: &str) -> Result<Effect, String> {
                 Some("read") => 2,
                 Some(other) => return Err(format!("unknown barrier kind `{other}`")),
             };
-            Ok(Effect::Barrier { kind })
+            let access = match rest.get(1).copied() {
+                None => None,
+                Some(tok) => Some(parse_arg(tok)?),
+            };
+            Ok(Effect::Barrier { kind, access })
         }
         // `lock-acquire arg<k> [spin]` — an unconditional lock acquire; `spin` marks
         // atomic (preemption-off) context. `blocking`, `irq-disable`/`irq-enable`,

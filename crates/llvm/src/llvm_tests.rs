@@ -182,7 +182,7 @@ fn acquire_release_atomics_lower_to_barriers() {
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
         .filter_map(|i| match i {
-            Inst::Barrier { kind } => Some(*kind),
+            Inst::Barrier { kind, .. } => Some(*kind),
             _ => None,
         })
         .collect();
@@ -213,14 +213,14 @@ fn inlined_atomic_ordering_lowers_to_barriers() {
         .flat_map(|b| &b.insts)
         .collect();
     let kinds: Vec<u8> = seq.iter().filter_map(|i| match i {
-        Inst::Barrier { kind } => Some(*kind),
+        Inst::Barrier { kind, .. } => Some(*kind),
         _ => None,
     }).collect();
     assert!(kinds.contains(&1), "release store → write barrier (kind 1): {kinds:?}");
     assert!(kinds.contains(&2), "acquire load → read barrier (kind 2): {kinds:?}");
     assert!(kinds.contains(&0), "seq_cst store → full barrier (kind 0): {kinds:?}");
     // A release write barrier precedes its store; an acquire read barrier follows its load.
-    let bpos = seq.iter().position(|i| matches!(i, Inst::Barrier { kind: 1 })).unwrap();
+    let bpos = seq.iter().position(|i| matches!(i, Inst::Barrier { kind: 1, .. })).unwrap();
     let spos = seq.iter().position(|i| matches!(i, Inst::Store { .. })).unwrap();
     assert!(bpos < spos, "write barrier is emitted before the release store");
 }
@@ -243,7 +243,7 @@ fn rcu_assign_pointer_lowers_to_a_write_barrier() {
         .iter()
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::Barrier { kind: 1 }));
+        .any(|i| matches!(i, Inst::Barrier { kind: 1, .. }));
     assert!(has_wbarrier, "rcu_assign_pointer publishes with release (write-barrier) ordering");
 }
 

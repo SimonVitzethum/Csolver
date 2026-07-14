@@ -277,6 +277,10 @@ pub enum Effect {
     Barrier {
         /// 0 = full (`smp_mb`), 1 = write (`smp_wmb`), 2 = read (`smp_rmb`).
         kind: u8,
+        /// `Some(arg)` when the call also **accesses** the location at that argument (a
+        /// `smp_store_release`/`smp_load_acquire`: `kind` picks write vs. read). `None` for a
+        /// standalone fence (`smp_mb`/`smp_wmb`/`smp_rmb`), which orders but touches no location.
+        access: Option<usize>,
     },
     /// **Thread spawn** (weak-memory / happens-before, subsystem 4): the call creates a thread
     /// running the function named by argument `arg` (a function pointer — `pthread_create`'s

@@ -164,12 +164,21 @@ fn yield_refcount_and_leak_effects_parse() {
     c3.parse_str("[pthread_create]\nspawn arg2\n[pthread_join]\njoin\n", "t").unwrap();
     assert_eq!(c3.lookup("pthread_create").unwrap().effects, vec![Effect::Spawn { arg: 2 }]);
     assert_eq!(c3.lookup("pthread_join").unwrap().effects, vec![Effect::Join]);
-    // Barrier effects: full (default), write, read.
+    // Barrier effects: full (default), write, read — bare fences (no location access).
     let mut c2 = Contracts::default();
     c2.parse_str("[smp_mb]\nbarrier\n[smp_wmb]\nbarrier write\n[smp_rmb]\nbarrier read\n", "t").unwrap();
-    assert_eq!(c2.lookup("smp_mb").unwrap().effects, vec![Effect::Barrier { kind: 0 }]);
-    assert_eq!(c2.lookup("smp_wmb").unwrap().effects, vec![Effect::Barrier { kind: 1 }]);
-    assert_eq!(c2.lookup("smp_rmb").unwrap().effects, vec![Effect::Barrier { kind: 2 }]);
+    assert_eq!(c2.lookup("smp_mb").unwrap().effects, vec![Effect::Barrier { kind: 0, access: None }]);
+    assert_eq!(c2.lookup("smp_wmb").unwrap().effects, vec![Effect::Barrier { kind: 1, access: None }]);
+    assert_eq!(c2.lookup("smp_rmb").unwrap().effects, vec![Effect::Barrier { kind: 2, access: None }]);
+    // A release/acquire store/load ALSO accesses the flag at the given arg.
+    let mut c4 = Contracts::default();
+    c4.parse_str("[sr]\nbarrier write arg0\n[la]\nbarrier read arg1\n", "t").unwrap();
+    assert_eq!(c4.lookup("sr").unwrap().effects, vec![Effect::Barrier { kind: 1, access: Some(0) }]);
+    assert_eq!(c4.lookup("la").unwrap().effects, vec![Effect::Barrier { kind: 2, access: Some(1) }]);
+    // The shipped defaults wire smp_store_release/smp_load_acquire to the flag access.
+    let d = Contracts::defaults();
+    assert_eq!(d.lookup("smp_store_release").unwrap().effects, vec![Effect::Barrier { kind: 1, access: Some(0) }]);
+    assert_eq!(d.lookup("smp_load_acquire").unwrap().effects, vec![Effect::Barrier { kind: 2, access: Some(0) }]);
 }
 
 #[test]
@@ -271,11 +280,11 @@ fn ordered_cmpxchg_carries_both_cas_and_ordering_barrier() {
     // before it, so a lock-free publish/consume is seen as ordered (no false weak-memory bug).
     let rel = &c.lookup("cmpxchg_release").unwrap().effects;
     assert!(rel.contains(&Effect::Cas { arg: 0 }), "release CAS keeps ABA detection");
-    assert!(rel.contains(&Effect::Barrier { kind: 1 }), "release CAS orders prior stores (W→W)");
+    assert!(rel.contains(&Effect::Barrier { kind: 1, access: None }), "release CAS orders prior stores (W→W)");
     // An **acquire** CAS consumes: `cas` plus a read barrier ordering later loads after it.
     let acq = &c.lookup("cmpxchg_acquire").unwrap().effects;
     assert!(acq.contains(&Effect::Cas { arg: 0 }));
-    assert!(acq.contains(&Effect::Barrier { kind: 2 }), "acquire CAS orders later loads (R→R)");
+    assert!(acq.contains(&Effect::Barrier { kind: 2, access: None }), "acquire CAS orders later loads (R→R)");
     // The relaxed / plain forms stay `cas`-only (no ordering claimed — the conservative
     // direction: at worst a false positive, never a hidden barrier bug).
     let relaxed = &c.lookup("cmpxchg_relaxed").unwrap().effects;
