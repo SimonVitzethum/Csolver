@@ -73,13 +73,21 @@ impl Explorer<'_> {
         self.scalarize(v)
     }
 
-    /// A symbolic value as a scalar expression: a pointer of null provenance is
-    /// `0`, any other pointer a fresh unknown (its numeric address is unknown).
+    /// A symbolic value as a scalar expression: a null-provenance pointer is `0`; an
+    /// **opaque pointer with a provenance id** gets a *stable* address symbol keyed by that
+    /// id (not a fresh one), so its numeric address has a consistent identity across uses.
+    /// This is what lets a `p != null` branch guard carry over to a later dereference: the
+    /// guard and the deref scalarise the same opaque pointer to the *same* symbol, so the
+    /// path condition `ptr#id != 0` proves `NoNullDeref` (see `check_access`). An idless
+    /// opaque pointer stays a fresh unknown. Sound and strictly more precise: a stable symbol
+    /// only adds equalities the guard genuinely established; `ptr#…` is not an `arg…` genuine
+    /// input, so it never makes an over-approximated goal refutable.
     pub(crate) fn scalarize(&mut self, v: SymValue) -> ExprId {
         match v {
             SymValue::Scalar(e) => e,
             SymValue::Ptr(p) => match p.prov {
                 Prov::Null => self.ctx.int(PTR_WIDTH, 0),
+                Prov::Unknown(_, Some(id)) => self.ctx.symbol(format!("ptr#{id}"), PTR_WIDTH),
                 _ => self.fresh_scalar(PTR_WIDTH),
             },
         }

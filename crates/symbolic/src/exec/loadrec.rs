@@ -258,18 +258,25 @@ impl Explorer<'_> {
     /// needed. Params/heap (`Region(Heap)`) and globals are never flagged.
     pub(crate) fn check_return(&mut self, block: BlockId, op: &Operand, state: &PathState) {
         let idx = self.f.block(block).map_or(0, |b| b.insts.len());
-        if let SymValue::Ptr(p) = self.eval_value(op, state) {
-            if self.points_into_frame_stack(&p, state) {
-                self.record_temporal(
-                    (block, idx),
-                    SafetyProperty::NoDanglingDeref,
-                    true,
-                    state,
-                    "does not return a pointer into this frame's stack",
-                    "returns a pointer into a local stack allocation (dangling after return)",
-                );
-            }
-        }
+        // Record the obligation on **every** return, not only on a violation. A scalar cannot
+        // dangle, and a pointer that does not resolve into this frame's stack does not either —
+        // both are a *proof*, and recording it is what discharges the obligation the verifier
+        // enumerates at each `Return(Some(_))`. Recording only the violating case left every
+        // **safe** return with no decision at all, so its `no_dangling_deref` obligation fell to
+        // `UNKNOWN` ("reached but not decided") and — being one undecided obligation — gated the
+        // whole function to `UNKNOWN`. That was the single dominant residual class.
+        let dangling = match self.eval_value(op, state) {
+            SymValue::Ptr(p) => self.points_into_frame_stack(&p, state),
+            SymValue::Scalar(_) => false,
+        };
+        self.record_temporal(
+            (block, idx),
+            SafetyProperty::NoDanglingDeref,
+            dangling,
+            state,
+            "does not return a pointer into this frame's stack",
+            "returns a pointer into a local stack allocation (dangling after return)",
+        );
     }
 
     /// Whether `p`'s provenance resolves to a stack region of the current frame

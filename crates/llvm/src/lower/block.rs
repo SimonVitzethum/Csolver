@@ -68,7 +68,7 @@ pub(crate) fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<Basi
         // emitting a PtrOffset chain — the leading index strides by `sizeof(agg)`,
         // a struct field or a constant array index folds into a byte offset, and a
         // *variable* array index emits its own scaled PtrOffset.
-        if let LInst::GepChain { dst, agg_ty, base, indices } = inst {
+        if let LInst::GepChain { dst, agg_ty, base, indices, .. } = inst {
             let out = lower_gep_chain(ctx, dst, lower_type(agg_ty), base, indices)?;
             insts.extend(out);
             continue;

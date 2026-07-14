@@ -1,5 +1,350 @@
 # Todo — Schwächen & Risiken aus dem Code-Review (2026-07-13)
 
+## Einheitliches Typ-Sizing für JEDEN opaken Zeiger (2026-07-14) — Abschluss
+
+Ein Prinzip, überall angewandt (`Explorer::size_hinted_pointer`, unter `--assume-valid-params`):
+**ein Zeiger, den seine Nutzung typt (`gep %struct.T, ptr %r` → `Module::reg_ptr_hints`),
+designiert ein valides Objekt dieser Größe** → sizierte `assumed`-Region statt opakem Zeiger.
+Angewandt an *allen* Definitionsstellen: **Load** (Feld-Zeiger), **Assign/inttoptr** (`current`
+per-cpu, `container_of`), **Call-Ergebnis** (unsummierter Callee) und **uncontracted Parameter**.
+
+| Metrik (50-Datei-Kernel-Sample) | Start | Ende |
+|---|---|---|
+| **Funktionen PASS** | 213 | **248 (+35, +16 %)** |
+| Funktionen FAIL (echte Funde) | 10 | **14 (+4)** |
+| opaque call result | 10426 | **0** |
+| int-to-pointer cast | 4923 | **980 (−80 %)** |
+| in-bounds | 2822 | **1092 (−61 %)** |
+| alignment | 2561 | ~860 (−66 %) |
+| loop-havocked pointer | 5823 | **0** (Flag) |
+
+**Soundness:** 792 Tests, Clippy 0, Miri- + C-Orakel SOUND; die C-Corpus-FAILs unter dem Flag sind
+**echte** Bugs (`f_double_free`, `f_user_copy_oob`), kein false FAIL. Default-Pfad unverändert.
+
+**Verbleibender Rest (keine Typquelle mehr — ehrliche Grenze):**
+- [ ] **loaded value (4348)** — geladene Zeiger, die *nirgends* getypt sind (nie als typisierte-gep-
+  Basis benutzt, kein DWARF-Feld). Ohne Typ keine Größe; ein unsized Region würde nur null/UAF
+  entscheiden, nicht bounds → würde Funktionen kaum un-gaten.
+- [x] **reached-but-not-decided (4162)** — **ERLEDIGT (2026-07-14), aber die Diagnose oben war
+  falsch.** Es lag *nicht* an Loop-/Merge-Präzision: Die Klasse war fast vollständig die Property
+  `no_dangling_deref`. Der Verifier enumeriert sie an *jedem* `Return(Some(_))` (discharge.rs:176),
+  aber `check_return` (`exec/loadrec.rs`) hat sie **nur bei Verletzung** aufgezeichnet — ein
+  *sicherer* Return erzeugte also gar keine Entscheidung, fiel auf UNKNOWN und hat über das
+  worst-obligation-Gating die **ganze Funktion** auf UNKNOWN gezogen. Fix: `check_return` recordet
+  jetzt immer (Skalar kann nicht dangeln; ein Zeiger, der beweisbar nicht in den eigenen
+  Frame-Stack zeigt, ist ein *Beweis*, kein Schweigen). Sound, Default-Pfad.
+  **Wirkung (50-Datei-Sample): PASS 248 → 748, FAIL 14 (unverändert, keine neuen false FAILs),
+  UNKNOWN 1412 → 912; Decided-Rate 16 % → 45 %.** Miri- + C-Orakel weiter SOUND.
+  *Lektion:* eine „unentschieden"-Restklasse kann ein fehlendes **Record** sein, nicht fehlende
+  Präzision — erst die Property der Residuen ansehen, bevor man die Engine ausbaut.
+- [ ] **uncontracted param (1734)** — Params ohne DWARF-Pointee *und* ohne typisierte gep-Nutzung.
+
+## Generalisiertes Typ-Sizing für geladene Zeiger (2026-07-14) — teils
+
+- [x] **Sizing für geladene Zeiger (unter `--assume-valid-params`)** — die `reg_ptr_hints`-Map
+  (Register→Pointee-Größe, aus dem indizierenden gep ODER dem DWARF-Local-Typ) wird jetzt **nicht
+  mehr nur am Loop-Header** konsumiert, sondern auch im **Load-Handler**: ein geladener Zeiger mit
+  bekanntem Typ bekommt eine sizierte `assumed`-Region → bounds/null/alignment/liveness durch ihn
+  entscheidbar. Verifiziert: `deep(o){ p=o->in; return p->v; }` → **PASS** (war UNKNOWN); Default-
+  Pfad unberührt (Miri+C SOUND, 792 Tests, Clippy 0).
+- [ ] **Kein Effekt auf den -O2-Kernel — ehrlich.** Grund gemessen: die Kernel-`.ll` (`make LLVM=1`,
+  -O2) haben **0 `#dbg_value`-Records**, also feuert die DWARF-Local-Quelle dort nie; die
+  typisierte-gep-Quelle ist für die *typed-gep-Basen* bereits vom RefWitness-Pfad abgedeckt (mein
+  Change feuert dort, ist aber redundant). Der Gewinn liegt bei **`-g`/-O1-Code** (dbg_value
+  vorhanden, Struct-gep zu Byte-gep kanonisiert → nur DWARF-Local rettet den Typ). Der loop-ptr-
+  Bounds-Fall (gleiche Infrastruktur) hat dagegen gezogen (Residual 5823→0).
+- [x] **lever 1b — `%struct.T`-Name → DWARF-Composite-id (UMGESETZT).** Die beiden Blocker gelöst:
+  (a) `DebugInfo` indiziert `DICompositeType`-Namen (`by_name`, `composite_by_llvm_name`);
+  (b) der gep-Parser erfasst den Struct-Namen aus dem *unaufgelösten* Typ (`ltype_raw` +
+  `struct_name` an `GepChain`). `dwarf_field_loads` seedet `struct_of[base]` aus dem gep-Namen →
+  Feld-Pointees laden jetzt durch **jede** typisierte Basis (Feld-Load / Call-Result / Global,
+  nicht nur param-verwurzelt). **Wirkung:** in-bounds −65% (2822→986), alignment −67% (2561→857).
+- [x] **Kernel-Idiome (#3, unter `--assume-valid-params`) — UMGESETZT.** Elegante Wiederverwendung:
+  `current` (`inttoptr` vom per-cpu-Base) und `container_of` sind beide **typed-gep-Basen**, also
+  hat `reg_ptr_hints` sie schon. Die hinted-Sizing (`size_hinted_pointer`) wurde von „nur Loads"
+  auf **Assign/inttoptr** ausgeweitet → jeder durch seine Nutzung getypte Zeiger bekommt eine
+  sizierte Region. **Wirkung:** int-to-pointer −80% (4923→980); **+7 Funktionen auf PASS (217→224)**
+  — die Funktions-decided-Rate bewegt sich endlich (kombinierte Hebel un-gaten ganze Funktionen).
+  792 Tests, Clippy 0, Miri + C-Orakel SOUND.
+
+## Umsetzung #1–#7 (2026-07-14) — was gebaut wurde, was flag-gated ist, was offen bleibt
+
+**Sound & Default (kein Flag):**
+- [x] **#1 (Teil): `RetSummary::Alloc`** — ein Allocator-Wrapper (`foo_alloc(){ return kmalloc(N); }`)
+  summiert jetzt als *frische, sizierte Heap-Region* statt `Unknown`. Am Call-Site bekommt der
+  Caller eine lebende Region → Zugriffe werden geprüft statt opak. Fixt zugleich einen **latenten
+  Bug**: `ret_of_fn` behandelte *jeden* `Inst::Alloc` (auch Heap!) als `LocalStack` → ein
+  malloc-Wrapper wäre fälschlich als DanglingStack-Rückgabe markiert worden. Jetzt nach
+  `RegionKind` gesplittet. Verifiziert: `use_oob(i){ p=wrap(); return p[i]; }` → **FAIL** (war
+  UNKNOWN); geguardete Variante refutiert nicht.
+- [x] **#4 null/opaque** — stabiles Adress-Symbol pro opakem Zeiger (`ptr#<id>`) + Null-Guard-Beweis;
+  `if(p!=null)` trägt jetzt zum Deref. **−24 % null-Residual.**
+
+**Flag-gated (unsound in general, im README dokumentiert):**
+- [x] **`--assume-valid-returns`** (#1 Rest) — der interprozedurale Zwilling von
+  `--assume-valid-params`: ein Zeiger aus einem *unsummierten* Call (externer Callee) gilt als
+  valide + non-null. Beweist `no_null_deref` + `no_use_after_free` durch das Call-Ergebnis;
+  **Bounds bleiben UNKNOWN** (für einen externen Callee ist nirgends eine Größe bekannt).
+  Unsound in general (Call kann NULL / `ERR_PTR` / dangling liefern) → Assumption `valid-returns`.
+  **Bewusst KEIN Scan-Default** — es würde genau die Null/UAF-Bugs verstecken, die ein
+  Bug-Finding-Scan sucht.
+
+- [x] **`--assume-valid-loop-ptrs`** (#2) — ein *loop-getragener* Zeiger (bewegter Iterator,
+  `iter = iter->next`) wird am Loop-Header statt als opak als **valide lebende Region** (unbekannte
+  Größe) materialisiert. Beweist `no_use_after_free` + `no_null_deref` durch den Iterator;
+  **Bounds bleiben UNKNOWN** (das Objekt eines bewegten Zeigers hat keine statisch bekannte Größe).
+  Unsound in general (Cursor kann aus dem Objekt laufen; ein Listenknoten kann bereits freed sein)
+  → Assumption `valid-loop-ptrs`. **Kein Scan-Default.** Verifiziert an einer `list_for_each`-
+  Traversierung: ohne Flag alles UNKNOWN, mit Flag null+UAF PASS.
+
+- [x] **#2 Bounds (unter `--assume-valid-loop-ptrs`)** — der loop-getragene Zeiger bekommt jetzt
+  die **Größe** seines Objekts, aus zwei Quellen: (a) dem typisierten gep, der ihn indexiert
+  (`gep %struct.T, ptr %it`), und (b) — wo clang das zu einem Byte-gep kanonisiert hat (`-O1`/`-O2`) —
+  aus der **DWARF-Local-Typ**-Kette (`#dbg_value(<local>, !V)` → `!DILocalVariable(type:)` →
+  Pointee-Größe). Neu: Parser erfasst `#dbg_value`-Records, `DebugInfo::local_pointee_bytes`,
+  `Module::reg_ptr_hints` bis zum Loop-Havoc durchgereicht. Alignment aus der Größe abgeleitet.
+  **Ergebnis:** eine `list_for_each`-Traversierung verifiziert **vollständig PASS**; auf dem
+  50-Datei-Kernel-Sample fällt das `loop-havocked pointer`-Residual **5823 → 0**, +4 PASS.
+  792 Tests, Clippy 0, Miri + C-Orakel SOUND.
+
+**Offen (bewusste Grenze):**
+- [ ] Bounds nur soweit ein Typ bekannt ist (typed-gep ODER DWARF-Local). Ein völlig
+  typloser bewegter Zeiger bleibt unsized (Liveness/Null trotzdem bewiesen).
+- [ ] **#3 int-to-pointer** — `current`/per-cpu/`container_of` als Kernel-Idiom-Contracts hinter
+  einem Flag. Roadmap-Phase 2. (Beliebigen Int als Zeiger anzunehmen bleibt ohne Idiom unsound.)
+- [ ] **#5 loaded value / #6 reached-but-not-decided / #7 uncontracted param** — Restmengen nach
+  den bereits gebauten Recoveries; inkrementell bzw. brauchen DWARF-Rückgabetyp-Import.
+- [ ] **Bounds für `--assume-valid-returns`** — bräuchte den DWARF-Pointee des Callee-Rückgabetyps.
+
+**Messung (sortiertes 50-Datei-Kernel-Sample):** Verdikte unverändert (213 PASS / 10 FAIL / 1451
+UNKNOWN) — die *Obligations*-Ebene gewinnt (null −24 %), die *Funktions*-Ebene nicht, weil eine
+Funktion durch ihre **schlechteste** Obligation gedeckelt ist und `RetSummary::Alloc` nur echte
+Allocator-Wrapper trifft (im Kernel eine Minderheit). **Soundness:** 792 Tests, Clippy 0,
+Miri + C-`--bugs`-Orakel SOUND.
+
+## ROADMAP: Decided-Rate ≥ 95 % → `docs/decided-rate-roadmap.md`
+
+Phasenplan (0 Fundament reiche Ret-Provenance-Summaries → 1 Return-Provenance #1 → 2 Kernel-Idiome
+#3 → 3 Container/Loop #2 → 4 Guards #4 → 5 Long Tail). Trajektorie ~15 % → 40–55 → 60–72 → 72–82 →
+80–88 → 85–93 %; die letzten Prozente auf 95 % stoßen an eine Soundness-Decke (ein Rest bleibt
+korrekt „known-unknown"). Jede Phase einzeln sound + gegen Orakel/`mm`-Scan validiert.
+
+## AKTUELLER STATUS: ELF- vs. LLVM-Pfad (Stand 2026-07-14)
+
+Gemessen mit Scan-Defaults (`--bugs --assume-valid-params --closed-world`), ohne harte Timeouts.
+
+### LLVM-Pfad (reif) — UNKNOWN-Ursachen #1–#7 bearbeitet (2026-07-14)
+
+Jede der 7 dominanten UNKNOWN-Ursachen einzeln auf sound Machbarkeit geprüft. Ergebnis: **#4
+umgesetzt** (sound), der Rest ist bereits adressiert oder eine bewusste Soundness-Grenze (ein
+erzwungener „Fix" würde false PASS/FAIL erzeugen — soundness-first).
+
+- [x] **#4 null/opaque provenance (~4300) — UMGESETZT & sound.** Ursache war: `scalarize` gab für
+  einen opaken Zeiger ein *frisches* Symbol → ein `if(p!=null)`-Guard und der spätere Deref
+  nutzten verschiedene Symbole, der Guard griff nicht. Fix: **stabiles Adress-Symbol pro opaker
+  Zeiger-id** (`ptr#<id>`) + Null-Guard-Beweis in `check_access` (prove `ptr#id != 0` aus der
+  Pfadbedingung). Prove-only (ungeguardeter Deref bleibt UNKNOWN → kein false FAIL). **−24 %
+  null-Residual** (6743→5152, sortiertes 50-Sample), Verdikte identisch (Obligations-Gewinn, kein
+  Funktions-Decided-Sprung — worst-obligation gated). 792 Tests, Miri+C-Orakel SOUND. Der Zig-
+  `?*T`-Optional-Deref (echter Guard) beweist jetzt korrekt NoNullDeref (Test aktualisiert).
+- [ ] **#1 opaque call result (~6300) — zurückgestellt.** Im echten Scan durch `--whole-program`/
+  `--reachable`-Summaries großteils aufgelöst; Kernel-IR trägt **keine** `dereferenceable/nonnull`-
+  Return-Attribute (geprüft: 0 Treffer), ein Return-Attribut-Import hätte also null Kernel-Wert.
+  Rest = genuine externe/unsummierte Calls (inhärent opak).
+- [ ] **#2 loop-havocked pointer (~5800) — zurückgestellt (sound-Grenze).** Der `modified`-Set ist
+  **präzise** (loop-invariante Zeiger behalten schon ihre Provenance); der Rest sind *echt* im Loop
+  modifizierte Zeiger (Listen-/Baum-Traversal `iter=iter->next`), die keinen statischen Bound haben.
+  Der Array-Stride-Fall (`iter+=k; iter!=end`) ist bereits per Pointer-Walk-Induktion abgedeckt.
+- [ ] **#3 int-to-pointer cast (~5800) — zurückgestellt (bewusste Grenze).** Einen beliebigen Int
+  als gültigen Zeiger anzunehmen wäre unsound (false PASS). `current` per per-cpu-asm bleibt opak.
+- [ ] **#5 loaded value (~2200) — zurückgestellt.** Bereits von ~20500 gesenkt (transitive/typed-
+  gep/offset-0-Recovery, [[loaded-pointer-provenance]]); der Rest braucht tiefere Provenance.
+- [ ] **#6 reached-but-not-decided (~1300) — zurückgestellt (inkrementell).** Loop-Body großteils
+  per Induktion gelöst; „unsupported op" = einzelne Frontend/Decoder-Lücken, wachsen monoton.
+- [ ] **#7 uncontracted pointer parameter (~970) — zurückgestellt (sound-Grenze).**
+  `--assume-valid-params` deckt das Gros; der Rest hat keine DWARF-Pointee-Größe (ein `nonnull`
+  ohne Größe beweist nur NoNullDeref, keine Bounds/Liveness).
+
+### ELF-/Binär-Pfad (geringere Präzision, jetzt Contracts + fs/gs)
+C-Corpus als saubere ELF-Testmenge:
+- **`-O1` (sound Baseline):** 4 PASS / 12 UNKNOWN, 0 false FAIL. UNKNOWN dominiert von
+  **`scalar-as-pointer`** (flacher Byte-Speicher, keine Typen — ein Zeiger ist ein Skalar).
+  Verbleibende Decoder-Reste: 1 `unsupported opcode` (nicht 0x64) + `dangling branch target`.
+- **`-O0`:** **5 false FAIL** — der **vorbestehende Frame-/Spill-Provenance-Bug** (siehe Punkt 3),
+  nicht durch die neuen Contracts verursacht (Baseline reproduziert ihn).
+- Neu & sound: Heap-Contracts (Punkt 1) + fs/gs-Präfixe (Punkt 2), siehe Batch unten.
+
+Recall-Hierarchie bleibt **ISO ⊆ ELF ⊆ LLVM**; ELF=LLVM nur für `-g`-Binaries erreichbar,
+stripped bleibt inhärent schwächer (keine Typen). Siehe [[binary-path-parity]].
+
+## OFFEN — Punkt 3: Binär-Register-/Frame-Provenance (PRIORITÄT für Binär-Pfad)
+
+- [ ] **Frame-Modell-false-FAIL (vorbestehender -O0-Soundness-Bug) — zuerst fixen.** Ein
+  legitimer `[rbp-k]`-Zugriff im eigenen Frame refutiert bei `-O0` fälschlich `in_bounds`
+  (`dfree` hat gar keinen Array-Zugriff, FAILt aber). Ursache: `mov rbp,rsp` erfasst rsp **vor**
+  dem `sub rsp,N`, das die Frame-Region baut, + Call-Havoc-Interaktion. Echter Soundness-Bug.
+- [ ] **Spill-Round-Trip-Provenance.** Ein zu einem Stack-Slot gespillter und neu geladener
+  Zeiger verliert/verwechselt seine Provenance (loaded value vs. Stack-Frame).
+- [ ] **Danach Punkt 3 i. e. S.: DWARF-Feld-Pointee auf Binär-Load-Adressen** (flaches Analogon
+  zu [[loaded-pointer-provenance]]) — baut auf den beiden obigen Fixes auf. Erst dann wird der
+  Nutzen der Heap-Contracts (Punkt 1) sichtbar (UAF/OOB/double-free am Binär refutierbar).
+
+  Reihenfolge bewusst so: ein halber Provenance-Fix birgt false-PASS-Risiko (soundness-first),
+  daher nicht spekulativ implementiert. Siehe [[binary-path-parity]].
+
+## Externe Validierung & Vollscan-Ergonomie (2026-07-14 Batch)
+
+- [x] **memsafety-Benchmarks laufen gelassen** (die vorhandenen Differential-Orakel als
+  Benchmark-Suite): Rust↔Miri = **SOUND** (0 false PASS; 20 präzise PASS, 12 UB gefangen/UNKNOWN);
+  C↔ASan/UBSan strikt = **SOUND** (0/0, 2 Bugs), `--bugs` = **SOUND** (0/0, **8/8 Bugs**).
+- [x] **Differential-Harness-Scoping gefixt** (`differential/c/run.sh`): ein reiner
+  `no_arith_overflow`-FAIL (arithmetische UB, die das memory-safety-Orakel bewusst ausschließt)
+  wurde im `--bugs`-Lauf fälschlich als „false FAIL" gezählt → `f_signed_ovf` erschien als
+  Scheinregression. Neu: `fail_is_arith_only` klassifiziert einen ausschließlich-arithmetischen
+  FAIL als „out of scope" statt False Positive. Stellt die dokumentierte 0-FP-Eigenschaft wieder
+  her (CSolver selbst war korrekt — es fand einen *echten* signed overflow).
+- [x] **`scan` = kompletter Kernel-Scan per Default** (`crates/cli/src/main.rs`): die Vollscan-
+  Features (`--bugs --assume-valid-params --closed-world --cross-file --whole-program
+  --auto-entries --aliasing-model`) sind für `scan` jetzt **opt-out** — ein blankes
+  `solver scan <dir>` fährt die maximale Recall-Konfiguration und streamt jeden Bug live
+  (`[FOUND #n]`). Jede Einzel-Deaktivierung per **Anti-Flag** `--no-<name>`. `verify` bleibt der
+  strikte, opt-in, soundness-first Pfad (unverändert). Helper `flag(args, name, default)`.
+- [x] **Kernel-Scan-Skript mit Live-Feed** (`scaling/kernel/full-scan.sh`): baut das Release-
+  Binary, zeigt auf `Kerneltests/linux` (37.597 `.ll`) per Default, streamt Bugs live und tee't
+  ein Log. Nimmt ein alternatives Verzeichnis + durchgereichte Anti-Flags. End-to-end getestet
+  (ipc-Subset: 108 Handler via auto-entries, Whole-Program-2-Pass, 6 DataRace live gestreamt).
+
+## Decided-Rate (Punkt 3) — Zeiger-Provenance aus geladenen Feldern (2026-07-14)
+
+Diagnose (ohne harte Timeouts, `solver scan`/verify-zu-Ende): die dominante UNKNOWN-Ursache
+im Kernel ist **nicht** das Frontend-Droppen (0 dropped), sondern nicht-getrackte Zeiger-
+Provenance. Mit Scan-Defaults (`--assume-valid-params`) killt das die „uncontracted param"-
+Klasse (25643→1249); danach dominiert **„loaded value (no store-load provenance)"** — ein aus
+dem Speicher geladener Zeiger (`p->a->b`, `current->cred->…`), dessen Provenance verloren geht.
+
+- [x] **Transitive DWARF-Member-Provenance** (`member_pointee` + Seeding in `dwarf_field_loads`):
+  ein geladenes Zeiger-Feld, das auf einen Struct zeigt, seedet `struct_of[dst]` → die nächste
+  Feld-Ebene löst auch auf (`a->b->c`). Vorher nur eine Ebene tief.
+- [x] **Offset-0-Feld-Loads** (`dwarf_field_loads`): clang emittiert für das *erste* Feld ein
+  blankes `load ptr, ptr %base` ohne gep — vorher komplett verpasst, jetzt als Feld-Load bei
+  Offset 0 erkannt (nur für Pointer-Loads, kein Scalar-Fehlgriff).
+- [x] **Typ-gerichtete gep-Recovery** (`typed_gep_field_loads`, DWARF-frei): ein
+  `gep %struct.T, ptr %b` beweist, dass `%b` auf `%struct.T` (bekannte LLVM-Größe) zeigt — das
+  erreicht den **dominanten realen Fall**, wo der Basiszeiger *nicht* aus einem Parameter stammt
+  (Feld-Load off `current`, Container/Listen-Walk, Global). Als `assumed`-Feld: nur unter
+  `--assume-valid-params`, als `param-valid` ausgewiesen; ohne Opt-in **kein** Verhaltenswechsel
+  (strikter `verify`-Pfad unverändert — Miri-Orakel identisch). `assumed`-Region unterdrückt
+  Konstant-Offset-Refutation → kein false FAIL.
+
+**Wirkung** (25-Datei-Sample, 479 Funktionen, beide Binaries zu Ende gelaufen, kein harter
+Timeout): loaded-value-Residuals **2945→680 (−77%)**; Verdikte 69/5/405 → **71 PASS / 6 FAIL /
+402 UNKNOWN** (+2 PASS, +1 neu gefundener Bug). Decided-*Rate* steigt moderat (Funktion ist erst
+decided, wenn *alle* Obligationen es sind — verbleibende Klassen: opaque-call-result, loop-havock).
+Sound: Miri strict = 0 false PASS (unverändert), C `--bugs` = 0/0, 8/8 Bugs; 792 Tests grün.
+Verbleibender Haupthebel: **opaque call result** (interprozedural — durch `--whole-program`/
+`--reachable` im echten Scan teils aufgelöst) und **loop-havocked pointer**.
+
+### Experiment: Scan ganz ohne Zeitlimit (2026-07-14)
+
+`scan` hat jetzt **kein per-Funktion-Wall-Clock-Limit mehr als Default** (`time_budget = None`;
+`--time-limit <sek>` als optionaler Cap). Begründung: ein Wall-Clock-Cap ist genau der harte
+Timeout, der eine langsam-aber-beweisbare Funktion zu UNKNOWN verwirft; Terminierung ist ohnehin
+per Konstruktion beschränkt (Merge-Exploration besucht jeden Block einmal + SAT-Decision/CNF-Budget).
+
+**Messung (mm-Subtree, 4907 Funktionen, das zeigerlastigste Subsystem):**
+- mit 30s-Limit:  665 decided (13,6%), 35 Bugs, 453s Wall, **0 Deferrals**.
+- ohne Limit:     665 decided (13,6%), 35 Bugs, 457s Wall, **0 Deferrals**.
+
+**Byte-identische Verdikte, gleiche Bugs, gleiche Wall-Zeit.** Bestätigt empirisch, was der
+`ExecLimits`-Doc behauptet: das Zeitbudget greift auf realem Kernel-Code **nie**. Keine Funktion
+läuft pathologisch lang, keine entscheidet mit mehr Zeit zusätzlich. **Konsequenz für Punkt 3:**
+die 86% UNKNOWN sind *präzisions*-limitiert (unbekannte Provenance, opake Calls), **nicht**
+zeit-limitiert — mehr Rechenzeit hebt die decided-Rate nicht, nur besseres Modellieren.
+
+### Experiment: ISO-/Binär-Scan vs. LLVM-Scan des gleichen Codes (2026-07-14)
+
+Gleicher C-Code (`differential/c/corpus.c`) in drei Repräsentationen, alle mit
+`--bugs --assume-valid-params`:
+- **LLVM-IR**: **6 Bugs (FAIL)** gefunden (f_heap_oob, f_use_after_free, f_unchecked_get,
+  f_negative_index, f_user_copy_oob, f_asm_then_oob), 10 UNKNOWN.
+- **ELF-Objekt**: **0 Bugs**, 4 PASS, 12 UNKNOWN.
+- **ISO** (mit dem ELF-Objekt, via `xorriso`): identisch zum ELF (der ISO-Pfad entpackt nur +
+  `lower_elf`) — Verdikt Unknown, **0 Bugs**.
+
+**Ergebnis: ja, der ISO-/Binär-Scan findet strikt weniger** (0 vs. 6). Zwei Ursachen, beide dem
+Binär-Pfad inhärent: (1) Decoder-Lücke — 4 Funktionen ganz gedroppt an `x86 opcode 0x64` (das
+`%fs:`/`%gs:`-Segment-Präfix für TLS/Stack-Canary, in Kompilat allgegenwärtig); (2) dominanter
+Präzisionsverlust — flacher Byte-Speicher ohne Typen/Allokationsmodell, ein Zeiger ist nur ein
+Skalar (Residuals „scalar-as-pointer"), also fehlt die Pointee-Größe/Heap-Allokation, die der
+LLVM-Pfad aus Typen + DWARF + Allocator-Contracts hat → OOB/UAF nicht refutierbar. Bestätigt die
+dokumentierte Präzisionshierarchie (STATUS.md): Recall ISO ⊆ ELF ⊆ LLVM.
+
+### Roadmap: was nötig wäre für ISO = ELF = LLVM (Recall-Parität) (2026-07-14)
+
+`ISO = ELF` ist für ein gegebenes Objekt **bereits erfüllt** — der ISO-Pfad entpackt nur +
+`lower_elf` (inkl. DWARF-`parameter_pointee_sizes`), identisches Verdikt. Die ISO-spezifische
+Restarbeit ist reine Container-Abdeckung (welche Objekte extrahiert werden: LZMS/PDB), nicht
+Präzision. Die ganze Lücke ist **ELF → LLVM**. Priorisiert nach Wert × Machbarkeit:
+
+1. **Allocator/Dealloc/User-Copy-Contracts auf Binär-Calls** (größter Hebel, gut machbar).
+   `crates/asm` hat **keinen** Contract-Lookup: jeder `call` → `opaque_call()` (havoct nur Heap).
+   Der LLVM-Pfad matcht `malloc/kmalloc/free/copy_from_user/…` gegen `crates/contracts` und baut
+   sizierte Heap-/Freed-/User-Tainted-Regionen — genau das fehlt binär. Der Callee-Name ist im
+   Binär da (Reloc des `call rel32` / PLT), wird aber verworfen. Nötig: (a) Call-Ziel-Symbol per
+   `resolve` (existiert schon für Globals) auflösen, (b) SysV/Win64-ABI Arg-Register→Contract-Param
+   (rdi/rsi/… — der Decoder modelliert rdi..r9 bereits als Params), (c) statt `opaque_call` ein
+   `Alloc`/`Dealloc`/`MemIntrinsic` emittieren. Reused die gesamte Contract+Allokations-Maschinerie.
+   Holt f_heap_oob, f_use_after_free, f_user_copy_oob (3 der 6 Corpus-Bugs).
+2. **Decoder-Segment-Präfixe (0x64/0x65 = fs/gs)** + Opcode-Abdeckung (inkrementell, begrenzt).
+   Das fs/gs-Präfix droppt ganze Funktionen (TLS/Stack-Canary). Als opaken Skalar-Read modellieren
+   (der Wert treibt keine Memory-Safety) → Funktion bleibt analysierbar statt gedroppt.
+3. **Feld-Load-Provenance im flachen Speicher** (tief, nur teils schließbar). `p->a->b` ist binär
+   `mov rax,[rdi]; mov rbx,[rax+8]` ohne Typ. Das binäre Analogon zur `typed_gep`-Recovery bräuchte
+   DWARF-Struct-Member-Info auf die Load-Adresse gemappt + Typ-Propagation durch Register (viel
+   schwerer als durch SSA). Nur für `-g`-Binaries; teils schließbar.
+4. **Inhärente Grenze (stripped Binaries):** ohne DWARF gibt es **keine** Typen — nur strukturelle
+   Fakten (Stack-Frames aus Prologen, Globals aus Relocations). Heap-/Param-Pointee-Größen sind
+   unrekonstruierbar. `ELF = LLVM` ist nur für `-g`-Binaries erreichbar; stripped bleibt echt
+   schwächer (siehe [[verify-without-pointers]]). Der Binär-Pfad ist immer sound, nie false PASS —
+   er sieht nur weniger.
+
+## Binär→LLVM-Parität (ISO=ELF=LLVM) — Umsetzung Punkt 1–3 (2026-07-14)
+
+- [x] **Punkt 1 — Allocator/Dealloc/User-Copy-Contracts auf Binär-Calls.** Der x86-Decoder löst
+  jetzt das Ziel eines `call rel32` per Reloc auf (`CallResolver`) und emittiert einen **benannten**
+  Call mit den SysV-Arg-Registern als Argumenten (`named_call`); ein Post-Pass in `lower_elf`
+  (`apply_binary_call_contracts`) matcht den Namen gegen `crates/contracts` und ersetzt ihn durch
+  `Alloc`/`Dealloc`/`MemIntrinsic` — dieselbe Maschinerie wie der LLVM-Pfad. **Sound & validiert**
+  (792 Tests, Miri+C-Orakel SOUND, kein Regress ggü. Baseline). Nachweislich wirksam: ein
+  Fill-Loop-Store *beweist* jetzt in-bounds gegen die Malloc-Region (vorher opak/UNKNOWN).
+  Zusätzlich `ExecLimits.flat_memory`: Binär-Heap-Regionen sind **prove-only für Bounds** (der
+  flache Registermodell-Pfad kann einen Heap-Index-Guard nicht zuverlässig rekonstruieren →
+  Bounds-Refutation würde false FAIL riskieren), temporal (UAF/double-free) bleibt refutierbar.
+- [x] **Punkt 2 — fs/gs-Segment-Präfixe (0x64/0x65).** Statt die Funktion zu droppen wird der
+  Folge-Befehl dekodiert und sein Segment-Zugriff **neutralisiert** (Load→opaker Wert, Store→
+  verworfen) — Segment-Speicher (Canary `%fs:0x28`, per-CPU `%gs:`) ist ein separater Adressraum
+  außerhalb des Modells, seine Werte treiben keine Memory-Safety. **Sound & validiert**: 0 statt 4
+  Funktionen auf `opcode 0x64` gedroppt; canary-geschützte (`-fstack-protector-all`) Funktionen
+  werden analysiert.
+- [ ] **Punkt 3 — Feld-Load-Provenance im flachen Speicher: DEEP, dokumentiert statt halb gebaut.**
+  Bei der Umsetzung von Punkt 1 aufgedeckt: der Binär-Pfad hat **fundamentalere** Provenance-Lücken
+  als Punkt 3 adressiert, die Punkt 1s Nutzen maskieren und einen **vorbestehenden -O0-Soundness-Bug**
+  bilden:
+  1. **Spill-Round-Trip-Provenance**: ein zu einem Stack-Slot gespillter und neu geladener Zeiger
+     verliert/verwechselt seine Provenance (loaded value vs. Stack-Frame).
+  2. **Frame-Modell-false-FAIL (vorbestehend, Baseline reproduziert)**: bei `-O0` refutiert ein
+     legitimer `[rbp-k]`-Zugriff im eigenen Frame fälschlich `in_bounds` (z. B. `dfree` hat gar
+     keinen Array-Zugriff, FAILt aber). Ursache: `mov rbp,rsp` erfasst rsp **vor** dem
+     `sub rsp,N`, das die Frame-Region baut, plus Call-Havoc-Interaktion. **Das ist ein echter
+     Soundness-Bug im Binär-Pfad bei -O0** und der eigentliche nächste Schritt — wichtiger als
+     Punkt 3, und mit ihm die gemeinsame Wurzel (Binär-Register/Frame-Provenance).
+  3. **-O1**: Provenance geht über Fill-Loops verloren (Register am Loop-Merge gehavoct).
+
+  Ein halber Provenance-Fix birgt false-PASS-Risiko (Soundness-first), daher **bewusst nicht**
+  spekulativ implementiert. Reihenfolge für später: erst (2) Frame-Modell + (1) Spill-Provenance
+  sound fixen, dann wird Punkt 1 sichtbar wirksam und Punkt 3 (DWARF-Feld-Pointee auf Load-Adressen)
+  baut darauf auf. Siehe [[object-loader-multiformat]], [[verify-without-pointers]].
+
 ## → WAS IST JETZT NOCH ZU TUN (Stand 2026-07-14, priorisiert)
 
 Nach den Batches (SMT entfernt, 128-Bit, x86-ALU-mem+LOCK, interproc-Escape, CFI-Slice,

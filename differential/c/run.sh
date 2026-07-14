@@ -73,7 +73,29 @@ clang -O0 -g $SAN_FLAGS "$DIR/corpus.c" "$DIR/drive.c" -o "$DIR/drive" 2>/dev/nu
     || { echo "sanitizer build failed"; exit 2; }
 
 echo "== ASan+UBSan: fuzzing each function ($FUZZ_CASES cases) — CSolver mode: $MODE =="
-violations=0; false_pos=0; precise=0; miss=0; bug_found=0; sound_miss=0
+# The property names CSolver reports for the arithmetic UB this oracle deliberately
+# EXCLUDES (signed overflow, shifts, divide-by-zero — see SAN_FLAGS). A CSolver FAIL whose
+# failing obligations are *only* these is an arithmetic-overflow finding out of this
+# memory-safety benchmark's scope, not a memory-safety false positive. `--bugs` enables the
+# exact-path refutation for `no_arith_overflow`, so f_signed_ovf (a genuine `x+2` past
+# INT64_MAX) legitimately FAILs there while the memory-scoped sanitizer stays CLEAN.
+ARITH_PROPS="no_arith_overflow no_shift_overflow no_div_by_zero"
+# True iff every failing obligation of function $1 is an excluded-arithmetic property.
+fail_is_arith_only() {
+    local props; props="$(echo "$CS_OUT" | awk -v fn="$1" '
+        $0 ~ "fn "fn" :" {inb=1; next}
+        inb && /^  fn / {inb=0}
+        inb && /FAIL PO/ { if (match($0, /\[[a-z_]+\]/)) print substr($0, RSTART+1, RLENGTH-2) }
+    ')"
+    [ -z "$props" ] && return 1
+    local p
+    for p in $props; do
+        case " $ARITH_PROPS " in *" $p "*) ;; *) return 1;; esac
+    done
+    return 0
+}
+
+violations=0; false_pos=0; precise=0; miss=0; bug_found=0; sound_miss=0; arith=0
 printf "%-20s %-9s %-7s  %s\n" "function" "CSolver" "Sanitizer" "result"
 printf -- "------------------------------------------------------------\n"
 for fn in $FNS; do
@@ -89,6 +111,8 @@ for fn in $FNS; do
 
     if [ "$san" = "UB" ] && [ "$cs" = "PASS" ]; then
         res="!! SOUNDNESS VIOLATION (false PASS)"; violations=$((violations+1))
+    elif [ "$san" = "CLEAN" ] && [ "$cs" = "FAIL" ] && fail_is_arith_only "$fn"; then
+        res="ok (arithmetic-overflow FAIL — out of memory-safety scope)"; arith=$((arith+1))
     elif [ "$san" = "CLEAN" ] && [ "$cs" = "FAIL" ]; then
         res="!! FALSE POSITIVE (false FAIL on safe code)"; false_pos=$((false_pos+1))
     elif [ "$san" = "UB" ] || [ "$san" = "CRASH" ]; then
@@ -113,6 +137,7 @@ echo "bugs FOUND (FAIL + witness)      : $bug_found"
 echo "UB sound-but-missed  (UNKNOWN)   : $sound_miss"
 echo "safe & precise (PASS)            : $precise"
 echo "safe & unknown                   : $miss"
+echo "arith-overflow FAIL (out of scope): $arith   (real UB the oracle excludes, not a false FAIL)"
 bad=$((violations + false_pos))
 [ "$bad" -eq 0 ] && echo "RESULT: SOUND (no false PASS, no false FAIL on this corpus)" \
                  || echo "RESULT: UNSOUND — $violations false PASS, $false_pos false FAIL"

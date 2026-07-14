@@ -279,6 +279,17 @@ pub struct Module {
     /// an opaque havoc. Only external references that resolve to a defined
     /// function are kept; the rest stay opaque (sound).
     pub global_fn_ptrs: HashMap<String, Vec<(u64, FuncId)>>,
+    /// **Pointee byte size of a register**, recovered from the struct type of the `gep` that
+    /// indexes it: a `getelementptr %struct.T, ptr %r, …` proves `%r` designates a `%struct.T`,
+    /// so `sizeof(%struct.T)` bounds every access through `%r`. Keyed by `(function, register)`.
+    ///
+    /// Used to give a **loop-carried pointer** a size: at a loop header a moving iterator
+    /// (`iter = iter->next`) is havoc'd and would otherwise become an *unsized* region, leaving
+    /// its `in_bounds` obligations UNKNOWN. Consulted only under `--assume-valid-loop-ptrs`
+    /// (which already assumes the iterator designates a valid live object); the type then says
+    /// how big that object is. Empty for frontends that carry no type information — the sound
+    /// default (the region stays unsized).
+    pub reg_ptr_hints: HashMap<(FuncId, RegId), u64>,
 }
 
 /// A global/static definition: what the analysis may assume about the memory
@@ -308,6 +319,7 @@ impl Module {
             raw_ptr_hints: HashMap::new(),
             prov_grants: HashMap::new(),
             global_fn_ptrs: HashMap::new(),
+            reg_ptr_hints: HashMap::new(),
         }
     }
 
@@ -402,6 +414,9 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         }
         for ((fid, idx), h) in m.raw_ptr_hints {
             merged.raw_ptr_hints.insert((remap[&fid], idx), h);
+        }
+        for ((fid, reg), size) in m.reg_ptr_hints {
+            merged.reg_ptr_hints.insert((remap[&fid], reg), size);
         }
         for (k, v) in m.globals {
             merged.globals.entry(k).or_insert(v);

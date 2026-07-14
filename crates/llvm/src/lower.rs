@@ -77,12 +77,15 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);
         match lower_function(f, fid, &func_ids, &m.debuginfo) {
-            Ok((func, contracts, raw_ptr_hints)) => {
+            Ok((func, contracts, raw_ptr_hints, reg_ptr_hints)) => {
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
                 }
                 for (idx, hint) in raw_ptr_hints {
                     module.raw_ptr_hints.insert((fid, idx), hint);
+                }
+                for (reg, size) in reg_ptr_hints {
+                    module.reg_ptr_hints.insert((fid, reg), size);
                 }
                 if f.internal {
                     module.internal.insert(fid);
@@ -189,7 +192,7 @@ fn lower_function(
     id: FuncId,
     func_ids: &HashMap<String, FuncId>,
     debuginfo: &crate::debuginfo::DebugInfo,
-) -> Result<(Function, Vec<(u32, PtrContract)>, Vec<(u32, (u64, u32))>)> {
+) -> Result<(Function, Vec<(u32, PtrContract)>, Vec<(u32, (u64, u32))>, Vec<(RegId, u64)>)> {
     let mut ctx = Ctx {
         regs: HashMap::new(),
         next_reg: 0,
@@ -197,7 +200,18 @@ fn lower_function(
         func: f,
         func_ids,
         checked_arith: checked_arith_map(f),
-        field_ref_loads: dwarf_field_loads(f, debuginfo),
+        field_ref_loads: {
+            // DWARF member-provenance (distinguishes valid-ref from raw, unconditional where
+            // the type says `&T`), then the type-directed gep recovery for the loads DWARF did
+            // not reach (a base pointer rooted in a call/global/`current`, not a parameter —
+            // the dominant real-kernel case). DWARF wins on a conflict (it is the more precise
+            // source); the gep recovery only fills loads DWARF left uncovered.
+            let mut m = dwarf_field_loads(f, debuginfo);
+            for (dst, rec) in typed_gep_field_loads(f) {
+                m.entry(dst).or_insert(rec);
+            }
+            m
+        },
     };
 
     // Pre-pass: assign block ids and register ids for every defined value
@@ -346,7 +360,33 @@ fn lower_function(
         entry: BlockId(0),
     };
     inject_leak_and_secret_checks(&mut function);
-    Ok((function, contracts, raw_ptr_hints))
+    // Pointee size of each register that is used as a TYPED struct-gep base: `gep %struct.T,
+    // ptr %r` proves `%r` designates a `%struct.T`. Carried on the module so a loop-carried
+    // pointer (a moving iterator) can be given that size when it is havoc'd at the loop header
+    // (see `Module::reg_ptr_hints`, `--assume-valid-loop-ptrs`); without it its region would be
+    // unsized and every `in_bounds` through the iterator would stay UNKNOWN.
+    // Two independent sources, because neither alone survives every optimisation level:
+    //  * the **typed gep** (`gep %struct.T, ptr %r`) — authoritative where it survives (real
+    //    kernel `-O2` IR keeps it for nested structs), but clang canonicalises a simple
+    //    `gep %struct.T, ptr %p, 0, k` into a byte `gep i8, ptr %p, off`, erasing the type;
+    //  * the **`#dbg_value` → `!DILocalVariable` → declared type** chain, which survives that
+    //    canonicalisation and is what recovers `struct node *it` at `-O1`/`-O2`.
+    // The gep wins on a conflict (it reflects the access the code actually performs).
+    let mut reg_ptr_hints: HashMap<RegId, u64> = HashMap::new();
+    for (local, var) in &f.dbg_values {
+        if let (Some(&r), Some(size)) = (ctx.regs.get(local), debuginfo.local_pointee_bytes(*var)) {
+            if size > 0 {
+                reg_ptr_hints.insert(r, size);
+            }
+        }
+    }
+    for (local, size) in typed_gep_pointee_sizes(f) {
+        if let Some(&r) = ctx.regs.get(local) {
+            reg_ptr_hints.insert(r, size);
+        }
+    }
+    let reg_ptr_hints: Vec<(RegId, u64)> = reg_ptr_hints.into_iter().collect();
+    Ok((function, contracts, raw_ptr_hints, reg_ptr_hints))
 }
 
 

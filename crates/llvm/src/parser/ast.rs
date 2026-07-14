@@ -62,6 +62,11 @@ pub struct LFunc {
     /// The `!dbg !N` `DISubprogram` metadata id, if the function carries debug
     /// info — the key into [`crate::debuginfo`] for recovering pointee types.
     pub dbg: Option<u32>,
+    /// `#dbg_value(<local>, !V, …)` records: `(local name, !DILocalVariable id)`. Ties an SSA
+    /// value to the source variable it holds, so the variable's *declared type* — and hence a
+    /// pointer's pointee size — is recoverable at `-O1`/`-O2`, where the struct type is
+    /// canonicalised out of the `getelementptr`. See `DebugInfo::local_pointee_bytes`.
+    pub dbg_values: Vec<(String, u32)>,
 }
 
 /// A parsed function parameter with the attributes relevant to memory safety.
@@ -338,6 +343,12 @@ pub enum LInst {
         agg_ty: LType,
         base: LValue,
         indices: Vec<LValue>,
+        /// The LLVM name of the aggregate type when it was a named struct/union
+        /// (`%struct.cred` ⇒ `Some("struct.cred")`), captured before `ltype` resolved the
+        /// reference away. Bridges the gep to its `DICompositeType` so field pointees load
+        /// through the base (see `DebugInfo::composite_by_llvm_name`). `None` for an anonymous
+        /// aggregate or a non-`-g` build.
+        struct_name: Option<String>,
     },
     /// A value the frontend models opaquely — e.g. `landingpad`'s exception
     /// object, which carries no memory-safety content. Lowered to `undef` (sound;

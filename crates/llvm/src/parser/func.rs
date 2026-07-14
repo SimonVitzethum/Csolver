@@ -1,5 +1,10 @@
 use super::*;
 
+/// A parsed function body: its blocks, plus the `#dbg_value(<local>, !V, …)` pairs found in
+/// them — `(local name, !DILocalVariable id)`, the only place a local's declared type survives
+/// at `-O1`/`-O2` (see [`LFunc::dbg_values`]).
+pub(crate) type ParsedBody = (Vec<LBlock>, Vec<(String, u32)>);
+
 impl Parser {
     pub(crate) fn function(&mut self) -> Result<LFunc> {
         self.expect_word("define")?;
@@ -63,7 +68,7 @@ impl Parser {
             self.pos += 1;
         }
         self.expect_punct('{')?;
-        let blocks = self.blocks(params.len())?;
+        let (blocks, dbg_values) = self.blocks(params.len())?;
         self.expect_punct('}')?;
         Ok(LFunc {
             name,
@@ -72,11 +77,14 @@ impl Parser {
             blocks,
             internal,
             dbg,
+            dbg_values,
         })
     }
 
-    pub(crate) fn blocks(&mut self, param_count: usize) -> Result<Vec<LBlock>> {
+    pub(crate) fn blocks(&mut self, param_count: usize) -> Result<ParsedBody> {
         let mut blocks = Vec::new();
+        // `#dbg_value(<local>, !V, …)` pairs collected across the whole body (see below).
+        let mut dbg_values: Vec<(String, u32)> = Vec::new();
         let mut auto = 0;
         loop {
             self.skip_newlines();
@@ -112,10 +120,33 @@ impl Parser {
             let mut insts = Vec::new();
             let term = loop {
                 self.skip_newlines();
-                // A `-g` debug record (`#dbg_declare(…)` / `#dbg_value(…)`) is
-                // interleaved in the instruction stream but is not an
-                // instruction — skip the whole line.
+                // A `-g` debug record (`#dbg_declare(…)` / `#dbg_value(…)`) is interleaved in
+                // the instruction stream but is not an instruction. It is not *lowered*, but
+                // `#dbg_value(<local>, !V, …)` ties an SSA value to its source variable — the
+                // only place a local's declared type survives at `-O1`/`-O2` — so capture the
+                // `(local, !DILocalVariable)` pair before dropping the line. Everything else
+                // (`#dbg_declare`, a constant-valued record) is skipped as before.
                 if matches!(self.peek(), Tok::Punct('#')) {
+                    if matches!(self.peek2(), Tok::Word(w) if w == "dbg_value") {
+                        let (mut local, mut var) = (None, None);
+                        let mut i = self.pos;
+                        while !matches!(self.toks.get(i), Some(Tok::Newline) | Some(Tok::Eof) | None) {
+                            match self.toks.get(i) {
+                                Some(Tok::Local(l)) if local.is_none() => local = Some(l.clone()),
+                                // The first `!<int>` after the value is the DILocalVariable ref.
+                                Some(Tok::Punct('!')) if local.is_some() && var.is_none() => {
+                                    if let Some(Tok::Int(n)) = self.toks.get(i + 1) {
+                                        var = u32::try_from(*n).ok();
+                                    }
+                                }
+                                _ => {}
+                            }
+                            i += 1;
+                        }
+                        if let (Some(l), Some(v)) = (local, var) {
+                            dbg_values.push((l, v));
+                        }
+                    }
                     self.skip_to_eol();
                     continue;
                 }
@@ -136,7 +167,7 @@ impl Parser {
                 term,
             });
         }
-        Ok(blocks)
+        Ok((blocks, dbg_values))
     }
 
     pub(crate) fn try_terminator(&mut self) -> Result<Option<LTerm>> {

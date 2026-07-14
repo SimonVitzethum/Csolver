@@ -93,6 +93,26 @@ pub struct Config {
     /// analysis whose dominant `UNKNOWN` cause is an uncontracted pointer parameter
     /// (per-TU kernel/driver code).
     pub assume_valid_params: bool,
+    /// **Assume unsummarised call results are valid pointers.** When a call returns a pointer
+    /// that no summary/contract/return-attribute characterises (an external or unanalysed
+    /// callee — the dominant `opaque call result` UNKNOWN cause), model it as a valid non-null
+    /// live region of *unknown* size instead of an opaque `POrigin::Call` pointer. Off by
+    /// default (**unsound in general** — a call may return null, an `ERR_PTR` error code, or a
+    /// dangling pointer); the interprocedural twin of [`assume_valid_params`], opt-in for
+    /// recall-first kernel/driver analysis. Surfaced as the `valid-returns` assumption. Bounds
+    /// stay prove-only (unknown size), so it can prove non-null / liveness / in-object access
+    /// but never *refutes* against a guessed size (no false FAIL from the guess).
+    pub assume_valid_returns: bool,
+    /// **Assume a loop-carried pointer stays valid.** At a loop header a pointer the body
+    /// modifies is havoc'd to an opaque value — it genuinely moves (`iter = iter->next`), so
+    /// its region/bounds provenance cannot be carried soundly. With this on it becomes a valid
+    /// live region of *unknown* size instead: liveness (`no_use_after_free`) and non-null are
+    /// provable through the iterator, while bounds stay `UNKNOWN` (nothing is refuted against a
+    /// guessed size, so no false FAIL). Off by default — **unsound in general**: a moving
+    /// pointer can walk off its object and a list node can already be freed. Models the kernel's
+    /// intrusive-container / iterator discipline (`list_for_each_entry` walks live nodes).
+    /// Surfaced as the `valid-loop-ptrs` assumption.
+    pub assume_valid_loop_ptrs: bool,
     /// **Rust aliasing (borrow-stack) model.** Opt-in Stacked/Tree-Borrows checking: flag a
     /// `NoAliasingViolation` (currently a write through a shared `&T` reference). Off by
     /// default — the reference model is only partially reconstructed from the frontends, so
@@ -146,6 +166,8 @@ impl Default for Config {
             closed_world: false,
             bug_finding: false,
             assume_valid_params: false,
+            assume_valid_returns: false,
+            assume_valid_loop_ptrs: false,
             aliasing_model: false,
             entry_patterns: None,
             time_budget: Some(std::time::Duration::from_secs(30)),

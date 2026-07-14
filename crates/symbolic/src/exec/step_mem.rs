@@ -13,7 +13,7 @@ impl Explorer<'_> {
                     return;
                 }
                 if *assumed {
-                    self.assumptions.insert("param-valid");
+                    self.assumptions.insert(PARAM_VALID);
                 }
                 // Field identity: if the reference was loaded from a known field address that
                 // resolves to a concrete `(base, offset)` — a tracked region OR an opaque

@@ -21,6 +21,7 @@ csolver-llvm.workspace = true
 csolver-mir.workspace = true
 csolver-asm.workspace = true
 csolver-elf.workspace = true
+csolver-contracts.workspace = true
 
 [lints]
 workspace = true

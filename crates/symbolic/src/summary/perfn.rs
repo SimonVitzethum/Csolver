@@ -336,9 +336,22 @@ pub(crate) fn ret_of_fn(f: &Function) -> (RetSummary, Option<usize>) {
                         };
                         (*dst, v)
                     }
-                    // A stack allocation of this frame: its address is a local whose
-                    // lifetime ends at return. Returning it is a dangling-stack escape.
-                    Inst::Alloc { dst, .. } => (*dst, AbsVal::LocalStack),
+                    // A **stack** allocation of this frame: its address is a local whose
+                    // lifetime ends at return, so returning it is a dangling-stack escape. A
+                    // **heap** allocation (a `kmalloc`/`malloc` wrapper) outlives the return —
+                    // it is a fresh live region for the caller, sized by a constant count.
+                    Inst::Alloc { dst, region: RegionKind::Stack, .. } => (*dst, AbsVal::LocalStack),
+                    Inst::Alloc { dst, region: RegionKind::Heap, elem, count, .. } => {
+                        let size = match count {
+                            Operand::Const(Const::Int(bv)) => {
+                                let stride = elem.stride_bytes(&LAYOUT).unwrap_or(1).max(1);
+                                u64::try_from(bv.unsigned()).ok().and_then(|c| c.checked_mul(stride))
+                            }
+                            _ => None,
+                        };
+                        (*dst, AbsVal::HeapAlloc { size })
+                    }
+                    Inst::Alloc { dst, .. } => (*dst, AbsVal::Opaque),
                     // A call result: tracked as `Call(index)` so a wrapper that returns it
                     // can inherit the callee's dangling-stack return in the cross-fn fixpoint.
                     Inst::Call { dst: Some(d), .. } => {
@@ -397,6 +410,7 @@ pub(crate) fn ret_of_fn(f: &Function) -> (RetSummary, Option<usize>) {
                 Some(AbsVal::PtrArg { arg, off }) => (RetSummary::PtrFromArg { arg, offset: off }, None),
                 Some(AbsVal::Scalar(a)) => (RetSummary::Scalar(a), None),
                 Some(AbsVal::LocalStack) => (RetSummary::DanglingStack, None),
+                Some(AbsVal::HeapAlloc { size }) => (RetSummary::Alloc { size }, None),
                 // The return is a bare call result — no local RetSummary, but the callee index
                 // is handed to the cross-function fixpoint for dangling-return propagation.
                 Some(AbsVal::Call(i)) => (RetSummary::Unknown, Some(i)),

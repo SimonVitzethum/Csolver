@@ -101,6 +101,7 @@ pub(crate) fn discharge_inner(
     prov_grants: &HashMap<u32, HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     analysis_in: Option<&IntervalAnalysis>,
+    reg_ptr_hints: &HashMap<RegId, u64>,
 ) -> SymbolicReport {
     // Reuse the caller's interval analysis when supplied (the verifier already
     // computes it for interval-based discharge), so it is not recomputed here —
@@ -161,8 +162,11 @@ pub(crate) fn discharge_inner(
         bug_finding: limits.bug_finding,
         exported: limits.exported,
         assume_valid_params: limits.assume_valid_params,
+        reg_ptr_hints,
         visits: 0,
         truncated: false,
+        pruned_succs: FxHashSet::default(),
+        visited_blocks: FxHashSet::default(),
         limits,
         // Trace length bound = the function's instruction count — the exact upper bound on how many
         // events a trace can hold (each event comes from one instruction), so it never truncates
@@ -212,7 +216,44 @@ pub(crate) fn discharge_inner(
             // Name scalar parameters `arg{i}` so a counterexample model is
             // readable; pointer parameters get the usual opaque placeholder.
             let v = if ty.is_ptr() {
-                ex.fresh_value(ty, POrigin::Param)
+                // **Typed-pointer sizing for an UNcontracted pointer parameter** (opt-in
+                // `--assume-valid-params`): when the body indexes it as `gep %struct.T, ptr %p`,
+                // the parameter designates a `struct T` of known size — the same rule already
+                // applied to a loaded field pointer, an `inttoptr`, and a call result. Gives the
+                // parameter a sized `assumed` region instead of an opaque pointer, so accesses
+                // through it are decided. `assumed` ⇒ a constant offset past the recovered size
+                // is not refuted (no false FAIL when the object is embedded in a larger one).
+                match reg_ptr_hints.get(reg).copied().filter(|&s| s > 0) {
+                    Some(size) if limits.assume_valid_params => {
+                        let size_e = ex.ctx.int(PTR_WIDTH, size as u128);
+                        let zero = ex.ctx.int(PTR_WIDTH, 0);
+                        let nonneg = ex.ctx.cmp(SCmp::Sle, zero, size_e);
+                        facts.push(nonneg);
+                        let truth = ex.ctx.boolean(true);
+                        let align = 1u64 << size.trailing_zeros().min(4);
+                        let rid = regions.len();
+                        regions.push(SymRegion {
+                            kind: RegionKind::Heap,
+                            size: size_e,
+                            base_align: align,
+                            state: LifetimeState::Live,
+                            perms: Permissions { read: true, write: true, exec: false },
+                            contract: Some(PARAM_VALID),
+                            size_nowrap: Some(truth),
+                            sentinel: None,
+                            user_controlled: false,
+                            assumed: true,
+                            prov_labels: FxHashSet::default(),
+                        });
+                        SymValue::Ptr(SymPointer {
+                            prov: Prov::Region(rid),
+                            offset: zero,
+                            align,
+                            borrow: None,
+                        })
+                    }
+                    _ => ex.fresh_value(ty, POrigin::Param),
+                }
             } else {
                 let width = type_width(ty);
                 let sym = ex.ctx.symbol(format!("arg{i}"), width);
@@ -482,5 +523,7 @@ pub(crate) fn discharge_inner(
         race_accesses,
         race_trace: ex.race_trace,
         truncated: false,
+        // Pruned into, never entered => every live path to it is proven infeasible.
+        dead_blocks: ex.pruned_succs.difference(&ex.visited_blocks).copied().collect(),
     }
 }

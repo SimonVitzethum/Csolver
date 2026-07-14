@@ -212,6 +212,14 @@ pub(crate) fn verify_one_function(
         &module.globals,
         &module.prov_grants,
         &module.global_fn_ptrs,
+        // This function's register→pointee-size hints (from the typed geps that index each
+        // register), used to size a loop-carried pointer under `--assume-valid-loop-ptrs`.
+        &module
+            .reg_ptr_hints
+            .iter()
+            .filter(|((fid, _), _)| *fid == f.id)
+            .map(|((_, r), s)| (*r, *s))
+            .collect(),
         config,
         exported,
         &mut local_id,

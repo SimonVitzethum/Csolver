@@ -112,19 +112,36 @@ pub(crate) fn dwarf_field_loads(
             LInst::Store { val: LValue::Local(src), ptr: LValue::Local(slot), .. } => {
                 spill_src.insert(slot.clone(), src.clone());
             }
-            LInst::Load { dst, ptr: LValue::Local(slot), .. } => {
+            LInst::Load { dst, ty, ptr: LValue::Local(slot), .. } => {
                 // A reload of a spilled struct pointer inherits the struct.
                 if let Some(s) = spill_src.get(slot).and_then(|src| struct_of.get(src)).copied() {
                     struct_of.insert(dst.clone(), s);
                 }
+                // The struct field this load reads: an explicit `gep`'d field, OR — when the
+                // slot is *itself* a struct pointer — the field at offset 0 (clang emits a bare
+                // `load ptr, ptr %base` for the first field, with no `getelementptr`). Handling
+                // offset 0 is essential: the first field of a struct is a very common link, and
+                // without it a `p->first->next` chain breaks at the first hop. Only for a pointer
+                // load, so a scalar read of offset 0 is never mistaken for a reference field.
+                let field = field_at.get(slot).copied().or_else(|| {
+                    (*ty == LType::Ptr).then(|| struct_of.get(slot).map(|&s| (s, 0u64))).flatten()
+                });
                 // A load of a recorded reference field: record its result. A valid
                 // reference (`&T`/`T&`) is unconditional; a raw pointer field is
                 // recovered only under the `assume_valid_params` opt-in (`assumed`).
-                if let Some(&(struct_id, off)) = field_at.get(slot) {
+                if let Some((struct_id, off)) = field {
                     if let Some(c) = di.member_ref(struct_id, off) {
                         out.insert(dst.clone(), (c.size, c.align, c.writable, false));
                     } else if let Some((size, align)) = di.member_raw_ptr(struct_id, off) {
                         out.insert(dst.clone(), (size, align, true, true));
+                    }
+                    // Transitive chaining: if the loaded field is a pointer/reference to a
+                    // struct, record that the loaded pointer `dst` points at that struct — so
+                    // a further field load off it (`p->field->next`) resolves too. This makes
+                    // the one-level recovery follow the deep `a->b->c->d` chains kernel code is
+                    // built from (the dominant `loaded value (no store-load provenance)` cause).
+                    if let Some(pointee) = di.member_pointee(struct_id, off) {
+                        struct_of.insert(dst.clone(), pointee);
                     }
                 }
             }
@@ -140,8 +157,15 @@ pub(crate) fn dwarf_field_loads(
                 }
             }
             // `gep %struct.T, ptr %base, 0, K` — the typed struct-field form modern
-            // opaque-pointer IR (`-O2`) emits. Record the field's byte offset.
-            LInst::GepChain { dst, agg_ty, base: LValue::Local(base), indices } => {
+            // opaque-pointer IR (`-O2`) emits. The named type bridges to the DWARF struct:
+            // this gep *proves* `%base` designates a `struct T`, so seed `struct_of[%base]`
+            // from the DWARF `DICompositeType` of that name — the key generalisation, since it
+            // reaches a base that is a field load / call result / global, not just a parameter.
+            // (First seed wins, so a parameter-rooted seed already present is not overwritten.)
+            LInst::GepChain { dst, agg_ty, base: LValue::Local(base), indices, struct_name } => {
+                if let Some(sid) = struct_name.as_deref().and_then(|n| di.composite_by_llvm_name(n)) {
+                    struct_of.entry(base.clone()).or_insert(sid);
+                }
                 if let Some(&s) = struct_of.get(base) {
                     if matches!(indices.first(), Some(LValue::Int(0))) {
                         if let Some(off) = gepchain_const_offset(&lower_type(agg_ty), &indices[1..]) {
@@ -151,6 +175,54 @@ pub(crate) fn dwarf_field_loads(
                 }
             }
             _ => {}
+        }
+    }
+    out
+}
+
+/// The byte size of the struct each local is **indexed as**: a `gep %struct.T, ptr %b, …`
+/// proves `%b` points at a `%struct.T`, so `sizeof(%struct.T)` bounds every access through
+/// `%b` — recovered straight from the IR, no DWARF needed. The type is authoritative for the
+/// accesses the code actually performs through that pointer.
+///
+/// Used twice: to size a **loaded** field pointer ([`typed_gep_field_loads`]) and to size a
+/// **loop-carried** pointer (a moving iterator, `iter = iter->next`), whose region is otherwise
+/// unsized — see `Module::reg_ptr_hints` and `--assume-valid-loop-ptrs`.
+pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, u64> {
+    let mut pointee: HashMap<&str, u64> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::GepChain { agg_ty, base: LValue::Local(b), .. } = inst {
+            let ty = lower_type(agg_ty);
+            if matches!(ty, Type::Struct { .. }) {
+                if let Some(sz) = ty.size_bytes(&LAYOUT).filter(|&s| s > 0) {
+                    pointee.entry(b.as_str()).or_insert(sz);
+                }
+            }
+        }
+    }
+    pointee
+}
+
+/// Recover a pointee size for a **loaded pointer** directly from the struct type of the gep
+/// that indexes it — no DWARF needed. A `gep %struct.T, ptr %b, …` proves `%b` points at a
+/// `%struct.T`, whose LLVM size bounds every access through it. This reaches the dominant
+/// real-kernel case the DWARF *parameter*-rooted recovery ([`dwarf_field_loads`]) cannot: a
+/// base pointer that is a field load off `current`, a container/list walk, or a global — not a
+/// parameter (`current->cred->…`, `sk->sk_prot->…`). Recorded as a raw-pointer field
+/// (`assumed = true`): valid only under `--assume-valid-params`, surfaced as the `param-valid`
+/// assumption, so it adds no false PASS without the opt-in and, being an `assumed` region,
+/// never refutes a constant field offset (no false FAIL from an under-sized pointee).
+pub(crate) fn typed_gep_field_loads(f: &LFunc) -> HashMap<String, (u64, u32, bool, bool)> {
+    let pointee = typed_gep_pointee_sizes(f);
+    // A pointer load whose result is used as such a struct base: size its region. Natural
+    // alignment derived from the size (a valid instance is naturally aligned), capped at 16.
+    let mut out = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::Load { dst, ty: LType::Ptr, .. } = inst {
+            if let Some(&sz) = pointee.get(dst.as_str()) {
+                let align = 1u32 << sz.trailing_zeros().min(4);
+                out.insert(dst.clone(), (sz, align, true, true));
+            }
         }
     }
     out

@@ -74,11 +74,33 @@ pub struct ExecLimits {
     /// Honour `RefWitness { assumed: true }` — a raw pointer field recovered from
     /// debug info, valid only under the `assume_valid_params` opt-in.
     pub assume_valid_params: bool,
+    /// **Assume an unsummarised call's pointer result is valid.** Model a pointer returned by
+    /// a call with no summary/contract/return-attribute as a valid non-null live region of
+    /// unknown size, instead of an opaque `POrigin::Call` pointer. Off by default (unsound in
+    /// general — a call may return null / an error pointer / a dangling pointer); the
+    /// interprocedural twin of `assume_valid_params`, surfaced as `valid-returns`.
+    pub assume_valid_returns: bool,
+    /// **Assume a loop-carried pointer stays valid.** At a loop header a pointer the body
+    /// modifies is havoc'd to an opaque value (it genuinely moves: `iter = iter->next`).
+    /// With this on, it becomes a valid live region of unknown size instead — liveness and
+    /// non-null are provable through the iterator, bounds stay UNKNOWN. Off by default
+    /// (unsound in general: a moving pointer can walk off its object, a list node can be
+    /// freed); surfaced as `valid-loop-ptrs`.
+    pub assume_valid_loop_ptrs: bool,
     /// **Rust aliasing (borrow-stack) model.** When on, track each pointer's originating
     /// borrow (from `RefWitness`) and flag a `NoAliasingViolation` — currently a write
     /// through a shared `&T` reference. Off by default (the reference model is only
     /// partially reconstructed from the frontends; opt-in until complete).
     pub aliasing_model: bool,
+    /// **Flat machine-code memory** (a binary / assembly front-end). Heap allocations
+    /// modelled from a call contract are then **prove-only for bounds**: the flat register
+    /// model cannot reliably reconstruct a bounds *guard* on a heap index (the guard often
+    /// compares a spilled stack local that is reloaded at the access), so refuting a heap
+    /// OOB would risk a false FAIL on guarded-safe code. The region is still created — so a
+    /// *temporal* violation (use-after-free / double-free, which needs no guard) is refuted
+    /// and a provably in-bounds access still proves — only its bounds are not refuted. Off
+    /// by default (source/IR front-ends have precise guards and stay fully refutable).
+    pub flat_memory: bool,
 }
 
 impl Default for ExecLimits {
@@ -89,7 +111,10 @@ impl Default for ExecLimits {
             bug_finding: false,
             exported: true,
             assume_valid_params: false,
+            assume_valid_returns: false,
+            assume_valid_loop_ptrs: false,
             aliasing_model: false,
+            flat_memory: false,
         }
     }
 }

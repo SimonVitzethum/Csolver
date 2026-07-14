@@ -15,6 +15,10 @@ impl Explorer<'_> {
                     }
                     _ => self.eval_rvalue(value, state),
                 };
+                // Typed-pointer sizing for a pointer-producing cast/copy (`inttoptr` for `current`,
+                // a `container_of` backward gep): if the register is typed by its use, give it a
+                // sized region under `--assume-valid-params` — same rule as a loaded field pointer.
+                let v = if ty.is_ptr() { self.size_hinted_pointer(*dst, v, state) } else { v };
                 state.env.insert(*dst, v);
                 // Division / modulo by zero: the divisor of a `/` or `%` must be provably non-zero
                 // (a zero divisor is UB / a hardware trap). Refuted with a witness when the divisor
@@ -109,6 +113,14 @@ impl Explorer<'_> {
                 // still refuted (see `check_access`). A constant-count `alloca`/`sub rsp, N`
                 // stays precise (refutable) as before.
                 let assumed = *region == RegionKind::Stack && !matches!(count, Operand::Const(_));
+                // A heap region modelled from a binary/asm call contract is **prove-only for
+                // bounds**: the flat register model cannot reliably reconstruct a bounds guard
+                // on a heap index (it typically compares a spilled stack local reloaded at the
+                // access), so refuting a heap OOB here would risk a false FAIL on guarded-safe
+                // code. `size_nowrap = None` disables *refutation* only — the concrete size
+                // still lets a provably in-bounds access PASS, and a temporal (use-after-free /
+                // double-free) violation is refuted through `LifetimeState`, needing no guard.
+                let refute_bounds = !(self.limits.flat_memory && *region == RegionKind::Heap);
                 let rid = state.regions.len();
                 state.regions.push(SymRegion {
                     kind: *region,
@@ -117,7 +129,7 @@ impl Explorer<'_> {
                     state: LifetimeState::Live,
                     perms,
                     contract: None,
-                    size_nowrap: Some(nowrap),
+                    size_nowrap: refute_bounds.then_some(nowrap),
                     sentinel: None,
                     user_controlled: false,
                     assumed,
@@ -232,7 +244,10 @@ impl Explorer<'_> {
                     self.record_shared_access(ptr, false, &p, state);
                 }
                 let exact_before = state.exact;
-                let (value, origin) = self.load_value(&p, asize, ty, state);
+                let (mut value, origin) = self.load_value(&p, asize, ty, state);
+                if ty.is_ptr() {
+                    value = self.size_hinted_pointer(*dst, value, state);
+                }
                 match origin {
                     LoadOrigin::Stored => {}
                     LoadOrigin::Uncertain => state.exact = false,

@@ -115,20 +115,61 @@ impl Explorer<'_> {
                         _ => FxHashSet::default(),
                     };
                     let offset = self.ctx.int(PTR_WIDTH, 0);
-                    let id = self.prov_ids;
-                    self.prov_ids += 1;
-                    if !labels.is_empty() {
-                        state.opaque_labels.insert(id, labels);
+                    // **Opt-in** (`--assume-valid-loop-ptrs`): assume a loop-carried pointer
+                    // still designates a valid, live object on every iteration — the kernel's
+                    // intrusive-container / iterator discipline (`list_for_each_entry` walks
+                    // live nodes; a moving cursor stays inside its buffer). Materialise a valid
+                    // live region of *unknown* size instead of an opaque pointer: liveness
+                    // (`no_use_after_free`) and non-null are then provable through the iterator,
+                    // while **bounds stay UNKNOWN** (no size is known, so nothing is refuted
+                    // against a guessed one — no false FAIL). Unsound in general: a moving
+                    // pointer can walk off its object, and a list node can already be freed.
+                    // Surfaced as the `valid-loop-ptrs` assumption.
+                    if self.limits.assume_valid_loop_ptrs {
+                        self.assumptions.insert("valid-loop-ptrs");
+                        // **Bounds for the iterator.** The type of the `gep` that indexes this
+                        // register says what it points at (`gep %struct.node, ptr %it, …` ⇒ a
+                        // `struct node`), so the region gets `sizeof(struct node)` instead of an
+                        // unsized (always-UNKNOWN) size — an access within the node then *proves*
+                        // in bounds. The region stays `assumed`, so a constant offset past the
+                        // recovered size is not refuted (no false FAIL if the node is embedded in
+                        // a larger object); only a genuine input-driven overrun is. `None` when
+                        // the frontend carries no type for it — the sound, unsized default.
+                        let size = self.reg_ptr_hints.get(&reg).copied();
+                        let rid = self.materialize_ref_region(size, true, true, state);
+                        state.regions[rid].prov_labels.extend(labels);
+                        // A valid object of `n` bytes is naturally aligned, so give the region
+                        // the alignment its size implies (capped at 16, `max_align_t`) — the same
+                        // rule the DWARF field/param recoveries use. Without it every access
+                        // through the iterator would stay UNKNOWN on `alignment` alone.
+                        if let Some(n) = size.filter(|&n| n > 0) {
+                            state.regions[rid].base_align = 1u64 << n.trailing_zeros().min(4);
+                        }
+                        state.env.insert(
+                            reg,
+                            SymValue::Ptr(SymPointer {
+                                prov: Prov::Region(rid),
+                                offset,
+                                align: 1,
+                                borrow: None,
+                            }),
+                        );
+                    } else {
+                        let id = self.prov_ids;
+                        self.prov_ids += 1;
+                        if !labels.is_empty() {
+                            state.opaque_labels.insert(id, labels);
+                        }
+                        state.env.insert(
+                            reg,
+                            SymValue::Ptr(SymPointer {
+                                prov: Prov::Unknown(POrigin::Loop, Some(id)),
+                                offset,
+                                align: 1,
+                                borrow: None,
+                            }),
+                        );
                     }
-                    state.env.insert(
-                        reg,
-                        SymValue::Ptr(SymPointer {
-                            prov: Prov::Unknown(POrigin::Loop, Some(id)),
-                            offset,
-                            align: 1,
-                            borrow: None,
-                        }),
-                    );
                 }
                 Some(SymValue::Scalar(_)) => {
                     // A unit-stride, single-exit counting induction reaches every value

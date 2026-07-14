@@ -16,6 +16,7 @@
 //! Everything here is parameter-relative data (no expressions / no solver); the
 //! caller instantiates a summary against its actual arguments.
 
+use csolver_core::RegionKind;
 use csolver_ir::{
     BinOp, BlockId, Callee, Const, DataLayout, FuncId, Function, Inst, Module, Operand, RValue,
     RegId,
@@ -107,6 +108,17 @@ pub enum RetSummary {
     /// use-after-free machinery — the interprocedural counterpart of `NoDanglingDeref`
     /// (which flags the escape at the callee's own `return`).
     DanglingStack,
+    /// The function returns a **fresh heap allocation** on every returning path (an
+    /// allocator wrapper, `foo_alloc() { return kmalloc(sizeof(struct foo)); }`), of `size`
+    /// bytes when known (else `None` = unsized). Applied at a call site as a fresh live heap
+    /// region, so a caller's access through the result is checked (bounds refutable when the
+    /// size is known) instead of falling to an opaque `POrigin::Call` — the dominant
+    /// `opaque call result` UNKNOWN cause. Rests on `alloc-succeeds` like a direct allocation.
+    Alloc {
+        /// The allocation's byte size when the count is a compile-time constant; `None`
+        /// leaves it unsized (a live, non-null region whose bounds stay prove-only).
+        size: Option<u64>,
+    },
 }
 
 /// A function's **provenance-transfer** summary: how a call moves provenance labels
@@ -178,6 +190,13 @@ pub(crate) enum AbsVal {
     /// returning path yields anything else, so `DanglingStack` is claimed only when the
     /// pointer is a local on *every* returning path (a definite escape, no false FAIL).
     LocalStack,
+    /// A pointer into a **fresh heap allocation** this function makes (a `kmalloc`/`malloc`
+    /// wrapper), of `size` bytes when the count is a compile-time constant (else `None` =
+    /// unsized). Unlike [`AbsVal::LocalStack`] the heap outlives the return, so returning it
+    /// is safe — it hands the caller a live region. `join` keeps it only when *every*
+    /// returning path yields a heap alloc of the same size (else `Opaque`), so it is claimed
+    /// only for a genuine allocator wrapper.
+    HeapAlloc { size: Option<u64> },
     /// The **result of the observable call** at this index (in body-call order, matching
     /// `SummaryFacts`' collection). Used only to propagate a callee's `DanglingStack`
     /// return through a wrapper (`fn w() { return leak() }`): the cross-function fixpoint

@@ -52,7 +52,7 @@ fn rip_relative_resolves_to_a_global_symbol() {
     // 8b 05 00000000  mov eax, [rip+disp32] ; c3 ret. The resolver maps the disp32
     // at function offset 2 to the global `g`, so the access uses `@g` as its base.
     let code = [0x8b, 0x05, 0x00, 0x00, 0x00, 0x00, 0xc3];
-    let m = decode_function_reloc("f", &code, &|pos| (pos == 2).then(|| ("g".to_string(), 0)));
+    let m = decode_function_reloc("f", &code, &|pos| (pos == 2).then(|| ("g".to_string(), 0)), &|_| None);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
     let has_sym = m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(i, Inst::Assign { value: RValue::Use(Operand::Const(csolver_ir::Const::Symbol(s))), .. } if s == "g")

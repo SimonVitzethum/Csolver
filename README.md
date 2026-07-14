@@ -111,6 +111,78 @@ is honest about the rest.
 The discharge pipeline is audited for false-PASS bugs ([docs/AUDIT.md](docs/AUDIT.md));
 the path to full Rust/assembly/binary coverage is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+### Sound by default; recall behind explicit flags
+
+Everything **on by default is sound**: it may answer `UNKNOWN`, but never a false
+`PASS`. Several UNKNOWN causes can only be closed by *assuming* something the code
+does not prove — a kernel/framework invariant. Those live behind **opt-in flags**,
+are **unsound in general**, and every proof that uses one names the assumption it
+rests on in its proof tree, so a `PASS` is never silently bought.
+
+| Flag | Assumes | Unsound if | Surfaced as |
+|---|---|---|---|
+| `--assume-valid-params` | a raw pointer **parameter** of known (DWARF) pointee size is valid | the caller passes a dangling/null pointer | `param-valid` |
+| `--assume-valid-returns` | a pointer returned by an **unsummarised call** (external/unanalysed callee) is valid + non-null | the callee returns `NULL`, an `ERR_PTR` error code, or a dangling pointer | `valid-returns` |
+| `--assume-valid-loop-ptrs` | a **loop-carried pointer** (a moving iterator, `iter = iter->next`) still designates a valid live object each iteration — the kernel's intrusive-container discipline | the cursor walks off its object, or a list node is already freed (UAF through the iterator) | `valid-loop-ptrs` |
+| `--bugs` | refute on over-approximated paths when the witness is a genuine input | a branch on an over-approximated value is actually infeasible (small false-FAIL risk) | bug-finding mode |
+| `--aliasing-model` | Rust borrow-stack (Stacked/Tree Borrows) reconstruction | the reference model is only partially recovered from the frontend | opt-in |
+| `--closed-world` | the module's call sites are *all* call sites | a library with unseen callers | opt-in |
+
+`--assume-valid-returns` proves `no_null_deref` and `no_use_after_free` through a call
+result; its **bounds stay `UNKNOWN`**, because no size for an external callee's return
+is known anywhere in the translation unit.
+
+`--assume-valid-loop-ptrs` covers the moving iterator *fully*, bounds included: the
+size of the object it designates is recovered from the type — either the `getelementptr`
+that indexes it (`gep %struct.node, ptr %it` ⇒ a `struct node`), or, where clang has
+canonicalised that into a byte `gep i8`, from the `#dbg_value` → `!DILocalVariable`
+declared type. A `list_for_each`-style traversal then verifies `PASS` outright.
+
+Neither is a `scan` default — assuming those pointers valid would hide exactly the
+null/UAF bugs a bug-finding scan exists to find.
+
+### Decided rate: where the UNKNOWNs come from
+
+A function is `PASS`/`FAIL` only when *every* one of its obligations is decided, so it is
+gated by its worst one. On a 50-file kernel sample (`--bugs --assume-valid-params
+--closed-world --assume-valid-loop-ptrs`) the decided rate is now **45 %** of functions
+(748 `PASS` / 14 `FAIL` / 912 `UNKNOWN` of 1674), up from 16 %. The dominant causes, and
+what is done about each, are tracked in
+[docs/decided-rate-roadmap.md](docs/decided-rate-roadmap.md):
+
+- **safe returns left `no_dangling_deref` undecided** — *closed (sound, default)*: the
+  verifier enumerates a `NoDanglingDeref` obligation at every `return`, but the executor
+  only recorded a decision when the returned pointer *did* dangle. A **safe** return
+  therefore produced no decision at all, so the obligation fell to `UNKNOWN` and gated the
+  whole function. `check_return` now records on every return: a scalar cannot dangle, and a
+  pointer that provably does not point into this frame's stack is a *proof*, not a silence.
+  This one fix moved 500 kernel functions from `UNKNOWN` to `PASS` (248 → 748) with **no**
+  new `FAIL`s and both differential oracles still `SOUND`.
+
+- **opaque call result** — *closed*: an allocator wrapper returns a sized live heap region
+  (`RetSummary::Alloc`, sound, default); and under `--assume-valid-params` a call result the
+  caller then indexes as `gep %struct.T` gets a sized region of that type. Whole-program
+  summaries (`--whole-program`) resolve cross-file callees. This residual class goes to **zero**
+  on a kernel sample.
+- **null / opaque provenance** — *closed*: a `if (p != null)` guard now carries to the
+  dereference (stable opaque-pointer address symbols), sound and on by default.
+- **loop-havocked pointer** — *closed behind a flag*: `--assume-valid-loop-ptrs` proves
+  liveness, non-null **and bounds** through a moving iterator (the object size comes from
+  the indexing gep's type, or the `#dbg_value` local's declared type). On a kernel sample
+  it drives this residual class to **zero**; a `list_for_each` traversal verifies `PASS`.
+  By default the class stays `UNKNOWN` — soundly, a moving list pointer has no proven object.
+- **int-to-pointer cast** — *closed under `--assume-valid-params` when the result is typed
+  by its use*: an `inttoptr` (kernel `current` read from the per-cpu base) or a
+  `container_of` backward-offset pointer that a `getelementptr %struct.T` indexes designates
+  a `struct T` of known size, so it gets a sized region. Drives this residual class down
+  ~80% on a kernel sample. A *type-less* int-to-pointer stays `UNKNOWN` — treating an
+  arbitrary integer as a valid pointer would be a false `PASS`.
+- **loaded value**, **uncontracted parameter** — largely closed by DWARF field/typed-gep
+  provenance recovery and `--assume-valid-params`. A typed `getelementptr %struct.T` now also
+  bridges to the DWARF struct *by name*, so field pointees load through **any** typed base
+  (a field load / call result / global, not only a parameter) — cutting the kernel in-bounds
+  and alignment residuals ~65%.
+
 ## Build & test
 
 ```sh

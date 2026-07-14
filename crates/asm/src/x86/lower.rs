@@ -7,6 +7,7 @@ pub(crate) fn decode_one(
     pos: usize,
     flags: &mut Option<(Operand, Operand)>,
     resolve: RelocResolver,
+    resolve_call: CallResolver,
 ) -> csolver_core::Result<Decoded> {
     let mut p = pos;
     // LOCK prefix (`f0`): the following instruction is an atomic read-modify-write. Its memory
@@ -15,7 +16,7 @@ pub(crate) fn decode_one(
     // full memory fence). This models `lock add [mem], r` / `lock xchg` / `lock cmpxchg` as the
     // RMW they are instead of declining the whole instruction.
     if code.get(p) == Some(&0xf0) {
-        let mut inner = decode_one(code, p + 1, flags, resolve)?;
+        let mut inner = decode_one(code, p + 1, flags, resolve, resolve_call)?;
         inner.insts.insert(0, Inst::Barrier { kind: 0, access: None });
         return Ok(inner);
     }
@@ -39,6 +40,18 @@ pub(crate) fn decode_one(
             mem_operand(code, p + 4, &m, false, false, resolve)?.next
         };
         return Ok(Decoded { insts: vec![], next, ctrl: Ctrl::Fall });
+    }
+    // Segment override prefix `fs`/`gs` (`0x64`/`0x65`): the memory operand addresses a
+    // *separate* thread-local address space — the stack canary (`%fs:0x28`), thread-local
+    // storage, or a per-CPU base (`%gs:…`) — not the tracked flat memory. Decode the rest of
+    // the instruction, then **neutralise its segment access**: a load yields an opaque value,
+    // a store is dropped. Sound: segment memory never aliases a tracked region, and its
+    // values (a canary, a per-CPU pointer) do not establish the safety of any tracked access.
+    // Without this the whole (canary-guarded) function would drop on the unknown prefix.
+    if matches!(code.get(p), Some(0x64 | 0x65)) {
+        let inner = decode_one(code, p + 1, flags, resolve, resolve_call)?;
+        let insts = inner.insts.into_iter().filter_map(neutralize_segment_access).collect();
+        return Ok(Decoded { insts, next: inner.next, ctrl: inner.ctrl });
     }
     // Optional REX prefix (0x40..0x4F): W=wide(64), R=reg ext, X=index ext,
     // B=rm/base ext.
@@ -344,7 +357,15 @@ pub(crate) fn decode_one(
         // recorded for stripped-binary function discovery (see `call_targets`).
         0xe8 => {
             let _rel = read_imm(code, p, 4)? as u32 as i32 as i64;
-            Ok(Decoded { insts: vec![opaque_call()], next: p + 4, ctrl: Ctrl::Fall })
+            // A direct call whose target the relocation names becomes a **named** call carrying
+            // the SysV argument registers as its args — so a post-pass can match it against an
+            // API contract (allocator / free / user-copy) and model its memory effect, exactly
+            // as the LLVM front-end does. An unnamed (unrelocated) call stays opaque.
+            let inst = match resolve_call(p) {
+                Some(name) => named_call(name),
+                None => opaque_call(),
+            };
+            Ok(Decoded { insts: vec![inst], next: p + 4, ctrl: Ctrl::Fall })
         }
         0xe9 => {
             let rel = read_imm(code, p, 4)? as u32 as i32 as i64;
@@ -1043,11 +1064,44 @@ fn decode_two_byte(
 /// skipped — a wrong CFG could be unsound — so it re-raises the original error (drop).
 /// An opaque call: havocs the heap and binds rax (reg 0) to an unknown result. Used for
 /// `call rel32`/`call r/m` so analysis continues past a call instead of dropping.
+/// Neutralise one instruction of a **segment-prefixed** (`fs`/`gs`) access: a `Load` of
+/// thread-local/per-CPU memory becomes an opaque value bound to the same register (we know
+/// nothing about a canary / per-CPU base), and a `Store` to it is dropped (segment memory is
+/// untracked and never aliases a tracked region). Every other instruction (the register
+/// arithmetic the segment operand fed) passes through unchanged. Returns `None` to drop.
+fn neutralize_segment_access(inst: Inst) -> Option<Inst> {
+    match inst {
+        Inst::Load { dst, ty, .. } => Some(Inst::Assign {
+            dst,
+            ty,
+            value: RValue::Use(Operand::Const(csolver_ir::Const::Undef)),
+        }),
+        Inst::Store { .. } => None,
+        other => Some(other),
+    }
+}
+
 fn opaque_call() -> Inst {
     Inst::Call {
         dst: Some(reg(0)),
         callee: Callee::Symbol("<x86 call>".into()),
         args: vec![],
+        ret_ty: Type::int(64),
+        ret_ref: None,
+    }
+}
+
+/// A **named** direct call: the resolved callee symbol, with the SysV integer argument
+/// registers (`rdi, rsi, …`) as its arguments and `rax` as its result. Carries enough to
+/// (a) match an API contract at a post-pass (the callee name + the size/pointer args) and
+/// (b) resolve to an in-module callee summary. For a callee with neither, the executor
+/// treats an unknown symbol exactly as the opaque call did (havoc), so this is never less
+/// sound — only more informative.
+fn named_call(name: String) -> Inst {
+    Inst::Call {
+        dst: Some(reg(0)),
+        callee: Callee::Symbol(name),
+        args: crate::x86::arg_operands(),
         ret_ty: Type::int(64),
         ret_ref: None,
     }

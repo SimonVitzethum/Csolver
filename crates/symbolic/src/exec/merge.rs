@@ -68,6 +68,7 @@ impl Explorer<'_> {
             if edges.is_empty() {
                 continue;
             }
+            self.visited_blocks.insert(block);
             self.visits += 1;
             // Truncate on the visit budget, or on the wall-clock budget (checked
             // here, between block visits, so the overrun is bounded by one block's
@@ -133,12 +134,18 @@ impl Explorer<'_> {
                     ce = self.ctx.cmp(SCmp::Ne, ce, zero);
                 }
                 let nce = self.ctx.not(ce);
+                if !self.is_back_edge(block, *then_blk) && self.branch_infeasible(ce, &state) {
+                    self.pruned_succs.insert(*then_blk);
+                }
                 if !self.is_back_edge(block, *then_blk) && !self.branch_infeasible(ce, &state) {
                     incoming.entry(*then_blk).or_default().push(EdgeState {
                         pred_state: state.clone(),
                         guard: Some(ce),
                         args: then_args.clone(),
                     });
+                }
+                if !self.is_back_edge(block, *else_blk) && self.branch_infeasible(nce, &state) {
+                    self.pruned_succs.insert(*else_blk);
                 }
                 if !self.is_back_edge(block, *else_blk) && !self.branch_infeasible(nce, &state) {
                     incoming.entry(*else_blk).or_default().push(EdgeState {

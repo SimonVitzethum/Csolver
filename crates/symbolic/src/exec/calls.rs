@@ -407,6 +407,20 @@ impl Explorer<'_> {
                         borrow: None,
                     })
                 }
+                // The callee returns a fresh heap allocation on every path (an allocator
+                // wrapper): hand the caller a live heap region of the recovered size, so its
+                // accesses are checked instead of falling to an opaque pointer. Rests on
+                // `alloc-succeeds`, exactly like a direct `kmalloc`.
+                Some(&RetSummary::Alloc { size }) => {
+                    self.assumptions.insert(ALLOC_SUCCEEDS);
+                    let rid = self.materialize_heap_region(size, state);
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Region(rid),
+                        offset: self.ctx.int(PTR_WIDTH, 0),
+                        align: 1,
+                        borrow: None,
+                    })
+                }
                 // No precise summary, but the result type is a reference: it is
                 // valid by Rust's type invariant (a safe callee cannot return a
                 // dangling `&T`). Materialise a valid-reference region instead of
@@ -425,8 +439,31 @@ impl Explorer<'_> {
                         borrow: None,
                     })
                 }
+                // Opt-in: assume an unsummarised call's pointer result is a valid pointer
+                // (external/unanalysed callee — the dominant `opaque call result` cause). A
+                // non-null live region of *unknown* size (bounds prove-only, so no false FAIL
+                // from a guessed size). Unsound in general (a call may return null / an error
+                // pointer); surfaced as `valid-returns`. Non-pointer results stay scalar.
+                _ if self.limits.assume_valid_returns && ret_ty.is_ptr() => {
+                    self.assumptions.insert("valid-returns");
+                    let rid = self.materialize_ref_region(None, true, true, state);
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Region(rid),
+                        offset: self.ctx.int(PTR_WIDTH, 0),
+                        align: 1,
+                        borrow: None,
+                    })
+                }
                 _ => self.fresh_value(ret_ty, POrigin::Call),
             };
+            // Typed-pointer sizing for a **call result**: an unsummarised callee's pointer that
+            // the caller then indexes as `gep %struct.T, ptr %r` designates a `struct T` of known
+            // size (`Module::reg_ptr_hints`). Give it a sized region under `--assume-valid-params`
+            // — the same rule as a loaded field pointer or an `inttoptr` — so accesses through it
+            // are decided instead of falling to the opaque `POrigin::Call` (the dominant residual).
+            // A precise summary (`PtrFromArg`/`Alloc`/…) already produced a region, which passes
+            // through untouched; only an *opaque* result is sized.
+            let value = self.size_hinted_pointer(*d, value, state);
             state.env.insert(*d, value);
         }
     }
@@ -464,6 +501,72 @@ impl Explorer<'_> {
             sentinel: None,
             user_controlled: false,
             assumed,
+            prov_labels: FxHashSet::default(),
+        });
+        rid
+    }
+
+    /// **Typed-pointer sizing** (opt-in `--assume-valid-params`): if `dst`'s register the
+    /// frontend typed (`Module::reg_ptr_hints` — from the `getelementptr` that indexes it, or a
+    /// DWARF local's declared type) and `v` is an *opaque* pointer, replace it with a sized
+    /// `assumed` region of that type. This decides accesses through it (bounds / null / alignment
+    /// / liveness) instead of leaving them UNKNOWN, and it is what covers the pervasive kernel
+    /// idioms whose result is typed by its use: a **loaded** field pointer, an **`inttoptr`**
+    /// result (`current` read from the per-cpu base), and a **`container_of`** result (a
+    /// backward-offset pointer used as `struct T *`). Non-opaque values (a real region already
+    /// recovered) pass through. `assumed` ⇒ a constant offset past the recovered size is not
+    /// refuted (no false FAIL when the object is embedded in a larger one); only a genuine
+    /// input-driven overrun is.
+    pub(crate) fn size_hinted_pointer(&mut self, dst: RegId, v: SymValue, state: &mut PathState) -> SymValue {
+        if !self.limits.assume_valid_params
+            || !matches!(v, SymValue::Ptr(SymPointer { prov: Prov::Unknown(..), .. }))
+        {
+            return v;
+        }
+        let Some(size) = self.reg_ptr_hints.get(&dst).copied().filter(|&s| s > 0) else {
+            return v;
+        };
+        self.assumptions.insert(PARAM_VALID);
+        let rid = self.materialize_ref_region(Some(size), true, true, state);
+        let align = 1u64 << size.trailing_zeros().min(4);
+        state.regions[rid].base_align = align;
+        SymValue::Ptr(SymPointer {
+            prov: Prov::Region(rid),
+            offset: self.ctx.int(PTR_WIDTH, 0),
+            align,
+            borrow: None,
+        })
+    }
+
+    /// Create a fresh **live heap region** modelling the result of an allocator wrapper
+    /// (`RetSummary::Alloc`): `size` bytes when known (bounds then refutable), else a fresh
+    /// non-negative unknown size (bounds prove-only). Read+write, live, non-null. In flat
+    /// machine-code memory (a binary front-end) bounds stay prove-only, mirroring the direct
+    /// heap-alloc rule (`ExecLimits::flat_memory`) so a heap OOB is not refuted where the
+    /// register model cannot reconstruct the bounds guard.
+    pub(crate) fn materialize_heap_region(&mut self, size: Option<u64>, state: &mut PathState) -> usize {
+        let (size_e, mut nowrap) = match size {
+            Some(n) => (self.ctx.int(PTR_WIDTH, n as u128), Some(self.ctx.boolean(true))),
+            None => (self.fresh_scalar(PTR_WIDTH), None),
+        };
+        if self.limits.flat_memory {
+            nowrap = None;
+        }
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let nonneg = self.ctx.cmp(SCmp::Sle, zero, size_e);
+        state.facts.push(nonneg);
+        let rid = state.regions.len();
+        state.regions.push(SymRegion {
+            kind: RegionKind::Heap,
+            size: size_e,
+            base_align: 1,
+            state: LifetimeState::Live,
+            perms: Permissions { read: true, write: true, exec: false },
+            contract: None,
+            size_nowrap: nowrap,
+            sentinel: None,
+            user_controlled: false,
+            assumed: false,
             prov_labels: FxHashSet::default(),
         });
         rid

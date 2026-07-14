@@ -38,6 +38,18 @@ pub(crate) struct DebugInfo {
     nodes: HashMap<u32, DiNode>,
     /// `(subprogram id, 1-based arg index) -> parameter's type node id`.
     params: HashMap<(u32, u32), u32>,
+    /// `!DILocalVariable id -> its declared type node id`, for **every** local (parameters
+    /// included). A `#dbg_value(ptr %r, !V, …)` record ties an SSA value to one of these, which
+    /// is how a *local's* declared type — and hence a pointer's pointee size — is recovered at
+    /// `-O1`/`-O2`, where the struct type is canonicalised out of the `getelementptr` (clang
+    /// rewrites `gep %struct.T, ptr %p, 0, k` into a byte `gep i8, ptr %p, off`). See
+    /// [`DebugInfo::local_pointee_bytes`].
+    locals: HashMap<u32, u32>,
+    /// `struct/union name -> its `DICompositeType` node id`. Keyed by the bare DWARF name
+    /// (`task_struct`), so an LLVM `getelementptr %struct.task_struct, …` can be mapped to the
+    /// DWARF struct — the bridge that lets [`super::lower::dwarf_field_loads`] recover field
+    /// pointees off *any* typed-gep base, not just a parameter-rooted one. First definition wins.
+    by_name: HashMap<String, u32>,
     /// The module's source language (`DICompileUnit(language:)`), which fixes
     /// what pointer kinds are *valid* — the recovery applies each language's own
     /// guarantee, not one hard-coded rule (see `is_valid_ref`).
@@ -218,6 +230,62 @@ impl DebugInfo {
         None
     }
 
+    /// The `DICompositeType` node id of a struct/union by its **LLVM type name** (`struct.cred`,
+    /// `union.foo`, or a quoted C++ `"class.Bar"`), stripping the `struct.`/`union.`/`class.`
+    /// prefix to the bare DWARF name. Lets a `getelementptr %struct.T, ptr %b` seed that `%b`
+    /// designates a `struct T`, so field pointees load through it (see `dwarf_field_loads`).
+    pub(crate) fn composite_by_llvm_name(&self, llvm_name: &str) -> Option<u32> {
+        let bare = llvm_name
+            .trim_matches('"')
+            .strip_prefix("struct.")
+            .or_else(|| llvm_name.trim_matches('"').strip_prefix("union."))
+            .or_else(|| llvm_name.trim_matches('"').strip_prefix("class."))
+            .unwrap_or(llvm_name.trim_matches('"'));
+        self.by_name.get(bare).copied()
+    }
+
+    /// The **pointee byte size** of a local variable's declared type, when that type is a
+    /// pointer or reference of statically-known pointee size (`struct node *` ⇒
+    /// `sizeof(struct node)`). `None` for a non-pointer local or an unsized pointee.
+    ///
+    /// This is what sizes a **loop-carried pointer** (a moving iterator) at `-O1`/`-O2`: there
+    /// the struct type is canonicalised out of the `getelementptr` (a byte `gep i8` remains),
+    /// so the type-directed gep recovery finds nothing — but the `#dbg_value` record still ties
+    /// the SSA value to its `!DILocalVariable`, whose declared type says exactly what it points
+    /// at. Used only under `--assume-valid-loop-ptrs` (which already assumes the iterator
+    /// designates a valid live object); the type then says how big that object is.
+    pub(crate) fn local_pointee_bytes(&self, var_id: u32) -> Option<u64> {
+        let ty = *self.locals.get(&var_id)?;
+        match self.nodes.get(&ty)? {
+            DiNode::Pointer { base, .. } | DiNode::Reference { base, .. } => self.sized_bytes(*base),
+            _ => None,
+        }
+    }
+
+    /// The **pointee type node** of a struct member at `offset`, when that member is a
+    /// pointer or reference (valid `&T`/`T&` OR raw `T*`). Used to make member-provenance
+    /// recovery **transitive**: a pointer loaded from `p->field` points at this type, so
+    /// field loads off *it* (`p->field->next`) resolve against it too. The ref-vs-raw
+    /// distinction (which governs the `assumed` opt-in) is decided per load by
+    /// [`member_ref`] / [`member_raw_ptr`]; this only recovers the pointee's type so the
+    /// next level can be looked up. `None` when the member is not a pointer/reference or
+    /// its pointee is not a known type node.
+    pub(crate) fn member_pointee(&self, struct_id: u32, offset: u64) -> Option<u32> {
+        let elements = self.composite_elements(struct_id)?;
+        let DiNode::Tuple(members) = self.nodes.get(&elements)? else { return None };
+        for &m in members {
+            if let Some(DiNode::Member { offset_bytes, base }) = self.nodes.get(&m) {
+                if *offset_bytes == offset {
+                    return match self.nodes.get(base)? {
+                        DiNode::Pointer { base: p, .. } | DiNode::Reference { base: p, .. } => Some(*p),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
+
     /// The elements-list id of a composite type, following typedef/qualifier
     /// chains to reach the `DICompositeType`.
     fn composite_elements(&self, mut id: u32) -> Option<u32> {
@@ -270,11 +338,14 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
                 di.lang = if l == "DW_LANG_Rust" { Lang::Rust } else { Lang::Other };
             }
         } else if let Some(args) = tag_body(body, "!DILocalVariable(") {
-            // `arg: k, scope: !N, type: !T` — only parameters (those with `arg:`).
-            if let (Some(arg), Some(scope), Some(ty)) =
-                (field_int(args, "arg:"), field_ref(args, "scope:"), field_ref(args, "type:"))
-            {
-                di.params.insert((scope, arg as u32), ty);
+            // `arg: k, scope: !N, type: !T`. Parameters (those with `arg:`) are keyed by
+            // (subprogram, index); *every* local — parameter or not — is also recorded by its
+            // own node id, so a `#dbg_value` naming it recovers its declared type.
+            if let Some(ty) = field_ref(args, "type:") {
+                di.locals.insert(id, ty);
+                if let (Some(arg), Some(scope)) = (field_int(args, "arg:"), field_ref(args, "scope:")) {
+                    di.params.insert((scope, arg as u32), ty);
+                }
             }
         } else if let Some(args) = tag_body(body, "!DIDerivedType(") {
             insert_derived(&mut di, id, args);
@@ -288,6 +359,10 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
                     align_bytes: bits_to_bytes_u32(args, "align:"),
                 },
             );
+            // Index it by name so an LLVM `%struct.<name>` gep can find it. First wins.
+            if let Some(name) = field_str(args, "name:") {
+                di.by_name.entry(name.to_string()).or_insert(id);
+            }
         } else if let Some(args) = tag_body(body, "!DIBasicType(") {
             di.nodes.insert(
                 id,

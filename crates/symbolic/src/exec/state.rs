@@ -214,8 +214,23 @@ pub(crate) struct Explorer<'f> {
     pub(crate) exported: bool,
     /// Honour `RefWitness { assumed }` (a raw pointer field valid under the opt-in).
     pub(crate) assume_valid_params: bool,
+    /// Pointee byte size of a register, from the struct type of the `gep` that indexes it
+    /// (`Module::reg_ptr_hints`). Used to **size** a loop-carried pointer's region at the loop
+    /// header under `--assume-valid-loop-ptrs`, so accesses through a moving iterator get real
+    /// bounds instead of an unsized (always-UNKNOWN) region. Empty for typeless frontends.
+    pub(crate) reg_ptr_hints: &'f HashMap<RegId, u64>,
     pub(crate) visits: usize,
     pub(crate) truncated: bool,
+    /// Successors whose incoming edge a **visited** predecessor pruned as bit-precisely
+    /// infeasible, and the blocks actually visited. A block that was pruned into but never
+    /// visited has *every* live path to it proven unreachable, so it cannot execute — its
+    /// obligations are then vacuously satisfied (see `SymbolicReport::dead_blocks`). Kept apart
+    /// from "never even considered" (a block with no visited predecessor), which is left
+    /// UNKNOWN: that case cannot distinguish transitively-dead code from a back-edge-only
+    /// entry, and claiming it proven could be a false PASS.
+    pub(crate) pruned_succs: FxHashSet<BlockId>,
+    /// Blocks the merged exploration actually entered.
+    pub(crate) visited_blocks: FxHashSet<BlockId>,
     pub(crate) limits: ExecLimits,
     /// The interleaving-trace length bound, **derived from the function** (its basic-block count) —
     /// a trace can hold at most this many ordered events. Replaces a fixed magic length: a bigger

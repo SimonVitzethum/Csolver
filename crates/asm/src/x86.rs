@@ -27,15 +27,22 @@ use csolver_ir::{
 pub fn decode_function(name: &str, code: &[u8]) -> Module {
     // No relocations available (raw bytes): RIP-relative accesses resolve to nothing
     // and become opaque-global sentinels (the function still decodes).
-    decode_function_reloc(name, code, &|_| None)
+    decode_function_reloc(name, code, &|_| None, &|_| None)
 }
 
 /// As [`decode_function`], with a **relocation resolver**: `resolve(disp_pos)` maps a
 /// `disp32`'s function-relative byte position to `(global symbol, offset)` so a
-/// RIP-relative / absolute access is checked against that global's region.
-pub fn decode_function_reloc(name: &str, code: &[u8], resolve: RelocResolver) -> Module {
+/// RIP-relative / absolute access is checked against that global's region, and
+/// `resolve_call(disp_pos)` maps a `call rel32`'s position to the callee's name so a
+/// direct call to a contracted API is recognised (see [`CallResolver`]).
+pub fn decode_function_reloc(
+    name: &str,
+    code: &[u8],
+    resolve: RelocResolver,
+    resolve_call: CallResolver,
+) -> Module {
     let mut m = Module::new("bin");
-    match decode_cfg(code, resolve).and_then(build_blocks) {
+    match decode_cfg(code, resolve, resolve_call).and_then(build_blocks) {
         Ok((blocks, entry)) => m.functions.push(Function {
             id: FuncId(0),
             name: name.into(),
@@ -79,7 +86,11 @@ struct Decoded {
 /// and reset at each run's start: a `cmp; jcc` pair is always in one run (adjacent), so
 /// the condition stays exact; a block entered via a jump conservatively starts with no
 /// flags (its `jcc`, if any, uses the unconstrained fallback — sound).
-fn decode_cfg(code: &[u8], resolve: RelocResolver) -> csolver_core::Result<Vec<DecodedInsn>> {
+fn decode_cfg(
+    code: &[u8],
+    resolve: RelocResolver,
+    resolve_call: CallResolver,
+) -> csolver_core::Result<Vec<DecodedInsn>> {
     use std::collections::BTreeMap;
     let mut decoded: BTreeMap<usize, DecodedInsn> = BTreeMap::new();
     let mut work: Vec<usize> = vec![0];
@@ -91,7 +102,7 @@ fn decode_cfg(code: &[u8], resolve: RelocResolver) -> csolver_core::Result<Vec<D
             // decoder declines (group-1 imm-to-memory, …) — falls back to the typed
             // decoder for the instruction length + a conservative havoc, so one unmodeled
             // instruction does not drop the whole (reachable) function.
-            let d = match decode_one(code, pos, &mut flags, resolve) {
+            let d = match decode_one(code, pos, &mut flags, resolve, resolve_call) {
                 Ok(d) => d,
                 Err(e) => lower::bridge_unmodeled(code, pos, e)?,
             };
@@ -298,6 +309,22 @@ impl MemOperand {
 /// relocations. `None` when no relocation names it (then the access is modelled
 /// through an opaque sentinel symbol, so the function still decodes).
 pub type RelocResolver<'a> = &'a dyn Fn(usize) -> Option<(String, i64)>;
+
+/// Maps the function-relative byte position of a `call rel32`'s `disp32` to the **name of
+/// the called function symbol** — from the ELF/PLT relocation. Unlike [`RelocResolver`] this
+/// returns even a size-0 *undefined* symbol (an imported `malloc`/`free`/`copy_from_user`),
+/// because a call target is a function, not a sized data object. `None` when the target is
+/// not statically named (an unrelocated / indirect call → an opaque call, as before). Lets
+/// the binary path resolve a direct call's callee so the caller can match it against an API
+/// contract (allocator / deallocator / user-copy), exactly as the LLVM front-end does.
+pub type CallResolver<'a> = &'a dyn Fn(usize) -> Option<String>;
+
+/// The SysV integer argument registers as MSIR operands, in ABI order
+/// (`rdi, rsi, rdx, rcx, r8, r9`) — the actual arguments of a decoded `call`, so a
+/// contract can read its size/pointer arguments (`arg0 = rdi`, …) off the call site.
+pub(crate) fn arg_operands() -> Vec<Operand> {
+    [7u8, 6, 2, 1, 8, 9].iter().map(|&r| Operand::Reg(reg(r))).collect()
+}
 
 /// Decode the `[base + index*scale + disp]` memory operand of a ModR/M
 /// (mode ≠ 11), including a SIB byte. RIP-relative and base-less `disp32` forms

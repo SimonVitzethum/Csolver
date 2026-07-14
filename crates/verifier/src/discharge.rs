@@ -5,7 +5,7 @@ use super::*;
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
     verify_function_with(
         f, None, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(),
-        &HashMap::new(), config, true, next_id,
+        &HashMap::new(), &HashMap::new(), config, true, next_id,
     )
 }
 
@@ -22,6 +22,7 @@ pub(crate) fn verify_function_with(
     globals: &HashMap<String, csolver_ir::GlobalDef>,
     prov_grants: &HashMap<u32, std::collections::HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
+    reg_ptr_hints: &HashMap<csolver_ir::RegId, u64>,
     config: &Config,
     exported: bool,
     next_id: &mut u32,
@@ -34,6 +35,13 @@ pub(crate) fn verify_function_with(
             f, s, name_summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
             global_fn_ptrs, analysis.as_ref(), config.time_budget, config.bug_finding, exported,
             config.assume_valid_params, config.aliasing_model,
+            // Flat machine-code memory (a binary / assembly front-end): heap regions modelled
+            // from a call contract are prove-only for bounds (guards on a heap index are not
+            // reliably reconstructable from spilled registers), keeping temporal refutation.
+            matches!(config.level, csolver_core::SourceLevel::Elf | csolver_core::SourceLevel::Asm),
+            config.assume_valid_returns,
+            config.assume_valid_loop_ptrs,
+            reg_ptr_hints,
         ),
         None => discharge_function(f),
     });
@@ -120,6 +128,13 @@ pub(crate) fn verify_function_with(
                         Some(model) => refuted_by_symbolic(property, &predicate, model.clone()),
                         None => open_memory(property, &predicate, &d.residual),
                     },
+                    // No decision recorded. If the executor proved this block **unreachable**
+                    // (every live edge into it was bit-precisely infeasible), the obligation is
+                    // *vacuously satisfied*: no concrete execution runs the instruction, so it
+                    // cannot be violated. Otherwise the op was genuinely not decided.
+                    None if symbolic.as_ref().is_some_and(|r| r.dead_blocks.contains(&block.id)) => {
+                        proven_by_symbolic_memory(&predicate, &sym_assumptions)
+                    }
                     None => open_memory(property, &predicate, not_analyzed_reason(&symbolic)),
                 };
                 outcomes.push(ObligationOutcome { obligation, result });

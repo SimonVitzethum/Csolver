@@ -260,7 +260,11 @@ impl Parser {
     pub(crate) fn gep(&mut self, dst: String) -> Result<LInst> {
         // Flags: `inbounds`, `nuw`, `nusw` in any combination.
         while self.eat_word("inbounds") || self.eat_word("nuw") || self.eat_word("nusw") {}
-        let base_ty = self.ltype()?;
+        // Capture the aggregate's *name* (from the unresolved type) before resolving it — the
+        // struct name is otherwise substituted away, and it is the key into the DWARF struct.
+        let base_raw = self.ltype_raw()?;
+        let struct_name = if let LType::Named(n) = &base_raw { Some(n.clone()) } else { None };
+        let base_ty = self.resolve_named(&base_raw, 0)?;
         self.expect_punct(',')?;
         let _pty = self.ltype()?;
         let base = self.value()?;
@@ -293,6 +297,7 @@ impl Parser {
                     agg_ty: base_ty.clone(),
                     base,
                     indices,
+                    struct_name,
                 })
             }
             _ => Err(Error::unsupported(

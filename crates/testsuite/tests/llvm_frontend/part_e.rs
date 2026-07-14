@@ -78,8 +78,12 @@ start:
 }
 
 /// Cross-language `nonnull` recovery on **real Zig output** (`tests/dwarf-corpus/zig_ptrs.ll`,
-/// emitted by zig 0.16): a `*T` param is `ptr nonnull` → NoNullDeref proves; a `?*T` optional
-/// has no `nonnull` → it stays UNKNOWN. Pins the real Zig attribute convention end-to-end.
+/// emitted by zig 0.16): a `*T` param is `ptr nonnull` → NoNullDeref proves *unconditionally*
+/// (no guard in the body). A `?*T` optional carries no `nonnull`, so the attribute alone would
+/// leave it UNKNOWN — but Zig compiles an optional deref with an explicit `if (opt) |p|` null
+/// check, and the executor's null-guard tracking now proves NoNullDeref on that guarded deref
+/// path too (the deref is genuinely reachable only when non-null). Both prove, for two distinct
+/// reasons — the attribute vs. the branch guard — which this pins end-to-end.
 #[test]
 fn llvm_recovers_zig_nonnull_from_real_corpus() {
     let src = include_str!("../../../../tests/dwarf-corpus/zig_ptrs.ll");
@@ -96,8 +100,8 @@ fn llvm_recovers_zig_nonnull_from_real_corpus() {
             })
         })
     };
-    assert!(proves_non_null("deref"), "Zig `*T` (ptr nonnull) proves non-null");
-    assert!(!proves_non_null("deref_opt"), "Zig `?*T` optional is nullable — must not prove");
+    assert!(proves_non_null("deref"), "Zig `*T` (ptr nonnull) proves non-null via the attribute");
+    assert!(proves_non_null("deref_opt"), "Zig `?*T` deref is guarded by a null check → proves via the guard");
 }
 
 /// Language-aware soundness: a `*const T` pointer named `&`-style would be a

@@ -54,6 +54,10 @@ const SLICE_ABI: &str = "slice-abi";
 /// Proofs about accesses to global/static definitions rest on the module's
 /// declared global layout (size/alignment/mutability of `@name = global/constant …`).
 const GLOBAL_MEMORY: &str = "global-memory";
+/// A raw pointer — a parameter, a loaded field, an `inttoptr` (`current`), or a call result —
+/// is *assumed* to designate a valid object of the type its use recovers. The
+/// `--assume-valid-params` opt-in; unsound in general (such a pointer may dangle or be null).
+const PARAM_VALID: &str = "param-valid";
 /// A `&T`/`&mut T` value is a valid reference to its pointee (Rust's reference
 /// invariant), even when the analysis cannot see where it came from.
 const VALID_REFERENCE: &str = "valid-reference";
@@ -133,6 +137,14 @@ pub struct SymbolicReport {
     pub race_trace: Vec<(u8, String)>,
     /// Whether exploration was truncated (then no decisions are reported).
     pub truncated: bool,
+    /// Blocks proven **unreachable**: a visited predecessor pruned the edge into them as
+    /// bit-precisely infeasible, and no live edge ever reached them. No concrete execution
+    /// enters such a block, so every obligation inside it is **vacuously satisfied** — the
+    /// verifier discharges it `Proven` instead of leaving it `UNKNOWN` for want of a decision
+    /// (see `not_analyzed_reason`). A block merely *never considered* (no visited predecessor)
+    /// is deliberately NOT listed: that cannot distinguish transitively-dead code from a
+    /// back-edge-only entry, and claiming it proven could be a false PASS.
+    pub dead_blocks: HashSet<BlockId>,
 }
 
 impl SymbolicReport {
@@ -155,7 +167,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new())
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -164,7 +176,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new())
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -177,7 +189,7 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), contracts, &[], &[], globals, &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), contracts, &[], &[], globals, &HashMap::new(), &HashMap::new(), None, &HashMap::new())
 }
 
 /// As [`discharge_full`], plus interprocedural **member-provenance**:
@@ -201,7 +213,7 @@ pub fn discharge_with_fields(
     discharge_with_scalars(
         f, summaries, &HashMap::new(), contracts, field_contracts, &[], globals, prov_grants,
         &HashMap::new(), None, ExecLimits::default().time_budget, bug_finding, exported,
-        assume_valid_params, false,
+        assume_valid_params, false, false, false, false, &HashMap::new(),
     )
 }
 
@@ -227,12 +239,18 @@ pub fn discharge_with_scalars(
     exported: bool,
     assume_valid_params: bool,
     aliasing_model: bool,
+    flat_memory: bool,
+    assume_valid_returns: bool,
+    assume_valid_loop_ptrs: bool,
+    reg_ptr_hints: &HashMap<RegId, u64>,
 ) -> SymbolicReport {
-    let limits =
-        ExecLimits { bug_finding, exported, assume_valid_params, aliasing_model, time_budget, ..ExecLimits::default() };
+    let limits = ExecLimits {
+        bug_finding, exported, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs,
+        aliasing_model, flat_memory, time_budget, ..ExecLimits::default()
+    };
     discharge_inner(
         f, limits, summaries, name_summaries, contracts, field_contracts, scalar_pre, globals,
-        prov_grants, global_fn_ptrs, analysis_in,
+        prov_grants, global_fn_ptrs, analysis_in, reg_ptr_hints,
     )
 }
 
@@ -244,7 +262,7 @@ pub fn discharge_with_scalars(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None)
+    discharge_inner(f, limits, &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new())
 }
 
 /// Nesting depth of a `Select` provenance (to cap join growth).

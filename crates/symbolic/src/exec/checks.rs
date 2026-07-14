@@ -41,7 +41,17 @@ impl Explorer<'_> {
         // marked `nonnull` (an LLVM `nonnull` parameter, e.g. Zig `*T`) — the mark flows through
         // gep/copy on the id, so a derived access is non-null too (only NoNullDeref, not bounds).
         let non_null = matches!(p.prov, Prov::Region(_))
-            || matches!(p.prov, Prov::Unknown(_, Some(id)) if state.nonnull_provs.contains(&id));
+            || matches!(p.prov, Prov::Unknown(_, Some(id)) if state.nonnull_provs.contains(&id))
+            // A `if (p != null)` guard on the path proves non-null even for an opaque pointer:
+            // the guard scalarised `p` to the same stable `ptr#id` symbol (see `scalarize`), so
+            // if the path condition implies that address is non-zero the dereference is non-null.
+            // Prove-only — a pointer with no such guard stays UNKNOWN (never a false FAIL).
+            || (matches!(p.prov, Prov::Unknown(_, Some(_))) && {
+                let addr = self.scalarize(SymValue::Ptr(p.clone()));
+                let zero = self.ctx.int(PTR_WIDTH, 0);
+                let goal = self.ctx.cmp(SCmp::Ne, addr, zero);
+                self.prove(goal, state)
+            });
         self.record(block, idx, NoNullDeref, non_null, "pointer is non-null", "pointer may be null or have opaque provenance");
 
         let Prov::Region(rid) = p.prov else {

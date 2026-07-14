@@ -8,6 +8,8 @@ pub(crate) fn verify_path(
     closed_world: bool,
     bug_finding: bool,
     assume_valid_params: bool,
+    assume_valid_returns: bool,
+    assume_valid_loop_ptrs: bool,
     aliasing_model: bool,
     pre_file: Option<&Path>,
     entry_patterns: Option<Vec<String>>,
@@ -84,6 +86,8 @@ pub(crate) fn verify_path(
                 closed_world,
                 bug_finding,
                 assume_valid_params,
+                assume_valid_returns,
+                assume_valid_loop_ptrs,
                 aliasing_model,
                 entry_patterns,
                 ..Config::default()
@@ -413,8 +417,21 @@ pub(crate) fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module
             (!sec.name.is_empty() && !sec.executable)
                 .then(|| (sec.name.clone(), (target - sec.address) as i64))
         };
+        // Map a `call rel32`'s disp32 position to the callee's symbol name. Unlike `resolve`
+        // this accepts a size-0 *undefined* symbol — an imported `malloc`/`free`/`copy_from_user`
+        // has no size in the object, but a call target is a function, not a sized data region.
+        // (ELF only: a PE/Mach-O direct call needs a VA→symbol map, left opaque for now.)
+        let resolve_call = |disp_pos: usize| -> Option<String> {
+            if self_relative {
+                return None;
+            }
+            let at = func_off + disp_pos as u64;
+            let r = relocs.iter().find(|r| r.offset == at)?;
+            let t = image.symbols.get(r.symbol as usize)?;
+            (!t.name.is_empty()).then(|| t.name.clone())
+        };
         let m = match image.machine {
-            csolver_elf::EM_X86_64 => csolver_asm::x86::decode_function_reloc(&sym.name, code, &resolve),
+            csolver_elf::EM_X86_64 => csolver_asm::x86::decode_function_reloc(&sym.name, code, &resolve, &resolve_call),
             _ => csolver_asm::arm64::decode_function(&sym.name, code),
         };
         modules.push(m);
@@ -441,7 +458,86 @@ pub(crate) fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module
             }
         }
     }
+    // Model the memory effect of a direct call to a contracted API (allocator / free /
+    // user-copy) instead of leaving it an opaque havoc — the biggest binary-vs-LLVM recall gap.
+    apply_binary_call_contracts(&mut m);
     Ok(m)
+}
+
+/// Rewrite each decoded direct call to a **contracted API** (allocator / deallocator /
+/// user-copy) into the memory-effect MSIR the LLVM front-end emits for the same call, so the
+/// binary path models a heap allocation / free / user-copy instead of an opaque call. The
+/// call carries the SysV argument registers as its args (see the decoder's `named_call`), so a
+/// contract's `arg<k>` reads the k-th of them, and `rax` is its result. Only the memory
+/// effects (`Alloc`/`Free`/`Write`/`Read`) are applied; provenance/capability effects need the
+/// label machinery the binary path does not reconstruct, and a `Product` size needs a temp
+/// the flat decode has no allocator for — those leave the (named, still-summarisable) call in
+/// place: sound, only less precise. Reuses the same `crates/contracts` data as the LLVM path.
+fn apply_binary_call_contracts(m: &mut csolver_ir::Module) {
+    use csolver_contracts::{Contracts, Effect, Fill, ReadSink, SizeExpr};
+    use csolver_core::RegionKind;
+    use csolver_ir::{Callee, Inst, MemKind, Operand, Type};
+    static CONTRACTS: std::sync::OnceLock<Contracts> = std::sync::OnceLock::new();
+    let contracts = CONTRACTS.get_or_init(Contracts::defaults);
+    // A size that references only arguments / constants; a `Product` needs a temp register
+    // the flat decode cannot allocate, so it is treated as unresolvable (the call is kept).
+    let size_op = |size: &SizeExpr, args: &[Operand]| -> Option<Operand> {
+        match size {
+            SizeExpr::Arg(i) => args.get(*i).cloned(),
+            SizeExpr::Const(n) => Some(Operand::int(64, *n as u128)),
+            SizeExpr::Product(..) => None,
+        }
+    };
+    for f in &mut m.functions {
+        for b in &mut f.blocks {
+            let mut out = Vec::with_capacity(b.insts.len());
+            for inst in std::mem::take(&mut b.insts) {
+                let Inst::Call { dst, callee: Callee::Symbol(name), args, .. } = &inst else {
+                    out.push(inst);
+                    continue;
+                };
+                let Some(contract) = contracts.lookup(name) else {
+                    out.push(inst);
+                    continue;
+                };
+                let mut effects = Vec::new();
+                for effect in &contract.effects {
+                    match effect {
+                        Effect::Alloc { size, align } => {
+                            if let (Some(d), Some(count)) = (*dst, size_op(size, args)) {
+                                effects.push(Inst::Alloc { dst: d, region: RegionKind::Heap, elem: Type::int(8), count, align: *align });
+                            }
+                        }
+                        Effect::Free { ptr } => {
+                            if let Some(a) = args.get(*ptr) {
+                                effects.push(Inst::Dealloc { region: RegionKind::Heap, ptr: a.clone() });
+                            }
+                        }
+                        Effect::Write { ptr, len, fill, from } => {
+                            if let (Some(a), Some(len)) = (args.get(*ptr), size_op(len, args)) {
+                                let kind = match fill { Fill::User => MemKind::UserFill, Fill::Undef => MemKind::Set };
+                                let src = from.and_then(|k| args.get(k)).cloned();
+                                effects.push(Inst::MemIntrinsic { kind, dst: a.clone(), src, len });
+                            }
+                        }
+                        Effect::Read { ptr, len, sink } => {
+                            if let (Some(a), Some(len)) = (args.get(*ptr), size_op(len, args)) {
+                                let kind = match sink { ReadSink::Internal => MemKind::Set, ReadSink::User => MemKind::UserDrain };
+                                effects.push(Inst::MemIntrinsic { kind, dst: a.clone(), src: None, len });
+                            }
+                        }
+                        _ => {} // provenance / capability / typestate — not modelled in the binary path
+                    }
+                }
+                if effects.is_empty() {
+                    out.push(inst); // no applicable memory effect — keep the (named) call
+                } else {
+                    out.extend(effects);
+                }
+            }
+            b.insts = out;
+        }
+    }
 }
 
 /// Turnkey: compile a `.rs` file to MIR ourselves, verify it, and print a

@@ -37,15 +37,43 @@ USAGE:
                                     --assume-valid-params: assume a raw pointer parameter
                                     of known pointee size is valid (framework/kernel entry
                                     ABI — opt-in, unsound in general, surfaced as an assumption);
+                                    --assume-valid-returns: assume a pointer returned by an
+                                    UNSUMMARISED call (external/unanalysed callee) is a valid
+                                    non-null live pointer — proves no_null_deref / no_use_after_free
+                                    through it; bounds stay UNKNOWN (no size is known). The
+                                    interprocedural twin of --assume-valid-params: opt-in,
+                                    UNSOUND in general (a call may return null / an ERR_PTR /
+                                    a dangling pointer), surfaced as the `valid-returns`
+                                    assumption. NOT a scan default — it would hide the very
+                                    null/UAF bugs a bug-finding scan looks for;
+                                    --assume-valid-loop-ptrs: assume a LOOP-CARRIED pointer
+                                    (a moving iterator, `iter = iter->next`) still designates a
+                                    valid live object each iteration — proves no_use_after_free /
+                                    no_null_deref through it; bounds stay UNKNOWN. Opt-in, UNSOUND
+                                    in general (a moving pointer can walk off its object; a list
+                                    node can be freed), surfaced as `valid-loop-ptrs`. Models the
+                                    kernel's intrusive-container discipline. NOT a scan default;
                                     --aliasing-model: opt-in Rust borrow-stack checking —
                                     flag a write through a shared &T reference
                                     (no_aliasing_violation);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
-    solver scan <dir> [--bugs] [--assume-valid-params] [--closed-world] [--entries <file>] [--cross-file] [--whole-program] [--reachable]
+    solver scan <dir> [--no-bugs] [--no-assume-valid-params] [--no-closed-world] [--no-cross-file] [--no-whole-program] [--no-auto-entries] [--no-aliasing-model] [--entries <file>] [--reachable]
                                     verify EVERY .ll under <dir> without stopping, then
                                     report coverage (% of functions decided) and list
-                                    every memory-safety violation found, with a witness
+                                    every memory-safety violation found, with a witness.
+                                    COMPLETE SCAN BY DEFAULT: --bugs, --assume-valid-params,
+                                    --closed-world, --cross-file, --whole-program,
+                                    --auto-entries and --aliasing-model are all ON unless
+                                    their anti-flag (--no-<name>) turns them off — so a bare
+                                    `solver scan <dir>` runs the full recall-first kernel
+                                    scan and streams each bug live as it is found. Use the
+                                    --no-* flags to narrow it (e.g. --no-assume-valid-params
+                                    to drop the unsound framework-valid-parameter assumption,
+                                    --no-bugs for the strict refutation gate). Runs with NO
+                                    per-function wall-clock limit by default (termination is
+                                    bounded by construction); --time-limit <secs> restores a
+                                    per-function cap for a latency-bounded run.
                                     (--entries <file>: treat ONLY functions whose name
                                     matches a listed pattern — an exact name or a
                                     trailing-`*` prefix, one per line — as attacker
@@ -112,6 +140,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// A boolean flag with a chosen default. When `default` is `false` the flag is opt-in:
+/// ON only if `--<name>` is present (the historical behaviour, kept for `verify` — the
+/// strict, soundness-first path). When `default` is `true` the flag is opt-out: ON unless
+/// the **anti-flag** `--no-<name>` is present. This lets the `scan` command ship the full
+/// kernel-scan feature set enabled by default while a `--no-<name>` still switches any one
+/// feature off. An explicit `--<name>` is always accepted too (redundant when default-on).
+fn flag(args: &[String], name: &str, default: bool) -> bool {
+    let anti = format!("--no-{name}");
+    if args.contains(&anti) {
+        return false;
+    }
+    let pos = format!("--{name}");
+    default || args.contains(&pos)
+}
+
 fn run(args: &[String]) -> Result<ExitCode, String> {
     let Some(command) = args.first() else {
         print!("{HELP}");
@@ -119,14 +162,23 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     };
 
     let json = args.iter().any(|a| a == "--json");
+    // `verify` (strict) keeps every analysis flag OPT-IN (default off). `scan` overrides
+    // these below with opt-OUT defaults (the full-scan feature set on, `--no-*` to disable).
     let closed_world = args.iter().any(|a| a == "--closed-world");
     let bug_finding = args.iter().any(|a| a == "--bugs");
     let assume_valid_params = args.iter().any(|a| a == "--assume-valid-params");
+    // `--assume-valid-returns`: opt-in, unsound-in-general (see `Config`). Deliberately NOT a
+    // scan default — it proves non-null/liveness for every unsummarised call result, so making
+    // it default would *hide* the genuine null/UAF bugs a bug-finding scan exists to find.
+    let assume_valid_returns = args.iter().any(|a| a == "--assume-valid-returns");
+    // `--assume-valid-loop-ptrs`: opt-in, unsound-in-general (see `Config`). Same rationale as
+    // `--assume-valid-returns` -- it proves liveness through a moving iterator, so it is not a
+    // scan default (it would hide UAF-through-iterator bugs).
+    let assume_valid_loop_ptrs = args.iter().any(|a| a == "--assume-valid-loop-ptrs");
     let aliasing_model = args.iter().any(|a| a == "--aliasing-model");
-    let cross_file = args.iter().any(|a| a == "--cross-file");
-    let whole_program = args.iter().any(|a| a == "--whole-program");
+    // Scan-only flags (`--cross-file`, `--whole-program`, `--auto-entries`) are parsed inside
+    // the `scan` branch with opt-out defaults; `--reachable` stays opt-in (it batches findings).
     let reachable = args.iter().any(|a| a == "--reachable");
-    let auto_entries = args.iter().any(|a| a == "--auto-entries");
     // `--pre <file>`: an opt-in parameter-precondition sidecar.
     let pre_file = args
         .iter()
@@ -173,7 +225,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--") && !flag_values.contains(&a.as_str()))
                 .ok_or("`verify` needs a path argument")?;
-            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, aliasing_model, pre_file.as_deref(), entry_patterns)
+            verify_path(Path::new(path), json, closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, aliasing_model, pre_file.as_deref(), entry_patterns)
         }
         "scan" => {
             let dir = args
@@ -181,6 +233,33 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--") && entries_file.as_ref().and_then(|p| p.to_str()) != Some(a.as_str()))
                 .ok_or("`scan` needs a directory argument")?;
+            // A `scan` is a **complete kernel scan by default**: every feature that widens the
+            // analysis is enabled unless its anti-flag turns it off. This is the recall-first
+            // configuration (bug-finding, whole-program cross-module linking, auto-derived
+            // attacker surface, framework-valid parameters, Rust aliasing). `verify` stays the
+            // strict, opt-in, soundness-first path — only `scan` flips to opt-out here.
+            let bug_finding = flag(args, "bugs", true);
+            let assume_valid_params = flag(args, "assume-valid-params", true);
+            let aliasing_model = flag(args, "aliasing-model", true);
+            let closed_world = flag(args, "closed-world", true);
+            let cross_file = flag(args, "cross-file", true);
+            let whole_program = flag(args, "whole-program", true);
+            let auto_entries = flag(args, "auto-entries", true);
+            // **No wall-clock time limit by default.** A per-function clock is a hard timeout: on
+            // expiry the function truncates to UNKNOWN, dropping a slow-but-provable result for a
+            // resource reason. Termination is already guaranteed *by construction* — the merged
+            // exploration visits each block once (loop back-edges cut) and the SAT solver has its
+            // own decision/CNF budget — so a function's cost is bounded without a clock. Give every
+            // function full effort by default (`time_budget = None`); `--time-limit <secs>` restores
+            // a per-function cap for a latency-bounded run. (This is what the deferred second phase
+            // already did for budget-limited units; making it the default removes the two-phase
+            // detour and any wall-clock-driven UNKNOWN.)
+            let time_budget = args
+                .iter()
+                .position(|a| a == "--time-limit")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(std::time::Duration::from_secs);
             // `--auto-entries`: derive the entry set automatically — every syscall wrapper
             // (precise prefixes) UNION the registered indirect handlers discovered in the
             // ops-struct initialisers (devirtualisation). Covers all attacker-reachable APIs
@@ -198,10 +277,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     eprintln!("--reachable: no --entries given — deriving the attacker surface automatically");
                     derive_auto_entries(Path::new(dir), None)
                 });
-                let config = Config { closed_world, bug_finding, assume_valid_params, aliasing_model, entry_patterns: Some(pats.clone()), ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, aliasing_model, entry_patterns: Some(pats.clone()), time_budget, ..Config::default() };
                 scan_reachable(Path::new(dir), &config, &pats)
             } else {
-                let config = Config { closed_world, bug_finding, assume_valid_params, aliasing_model, entry_patterns, ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, aliasing_model, entry_patterns, time_budget, ..Config::default() };
                 scan_dir(Path::new(dir), &config, cross_file, whole_program)
             }
         }
