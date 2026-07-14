@@ -30,8 +30,22 @@ pub(crate) enum MType {
     Array(Box<MType>, u64),
     /// `[T]`.
     Slice(Box<MType>),
+    /// An **interior-mutable** named type (`UnsafeCell`/`Cell`/`RefCell`/`Mutex`/`RwLock`/
+    /// `Atomic*`, …): opaque like [`MType::Other`] for layout, but flagged so the aliasing model
+    /// does NOT track a `&`-borrow of it — interior mutability legitimately writes through a
+    /// shared reference, so treating such a borrow like an ordinary `&T` could false-FAIL.
+    InteriorMut,
     /// A type outside the modelled subset.
     Other,
+}
+
+/// Whether a type-path segment names an interior-mutable wrapper (the `UnsafeCell` family).
+pub(crate) fn is_interior_mut_name(n: &str) -> bool {
+    matches!(
+        n,
+        "UnsafeCell" | "SyncUnsafeCell" | "Cell" | "RefCell" | "OnceCell" | "LazyCell"
+            | "Mutex" | "RwLock" | "ReentrantMutex"
+    ) || n.starts_with("Atomic")
 }
 
 /// A MIR constant (the subset we model).

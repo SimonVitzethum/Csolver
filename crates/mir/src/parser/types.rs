@@ -88,8 +88,12 @@ impl Parser {
                 // tail so the type lowers to `Other`, not a parse error. The inner
                 // element types are not needed (the aggregate is opaque-size; a
                 // field access carries its own type ascription).
-                let ty = int_type(&w).unwrap_or(MType::Other);
-                self.skip_path_tail();
+                // An interior-mutable wrapper (`Cell`/`UnsafeCell`/`Mutex`/…) in the path — the
+                // first segment or any tail segment — flags the type so the aliasing model does
+                // not track a shared borrow of it (interior mutability writes through `&`).
+                let mut interior = is_interior_mut_name(&w);
+                interior |= self.skip_path_tail_interior();
+                let ty = if interior { MType::InteriorMut } else { int_type(&w).unwrap_or(MType::Other) };
                 Ok(ty)
             }
             // A qualified type `<T as Trait>::Assoc` starts with `<`; consume the
@@ -201,19 +205,30 @@ impl Parser {
     /// and turbofish `::<…>`, in any order — so `core::result::Result<…>` and
     /// `Foo<T>::Bar` are fully consumed (the type itself stays `Other`).
     pub(crate) fn skip_path_tail(&mut self) {
+        let _ = self.skip_path_tail_interior();
+    }
+
+    /// As [`skip_path_tail`], returning whether any consumed path segment is an interior-mutable
+    /// wrapper name (so `std::cell::Cell<i32>` is detected from its `Cell` tail segment).
+    pub(crate) fn skip_path_tail_interior(&mut self) -> bool {
+        let mut interior = false;
         loop {
             match self.peek() {
                 Tok::Punct('<') => self.skip_balanced_angle(),
                 Tok::Punct(':') if self.peek2() == &Tok::Punct(':') => {
                     self.pos += 2; // `::`
-                    match self.peek() {
+                    match self.peek().clone() {
                         Tok::Punct('<') => self.skip_balanced_angle(), // turbofish
-                        Tok::Word(_) => self.pos += 1,                 // a path segment
+                        Tok::Word(w) => {
+                            interior |= is_interior_mut_name(&w);
+                            self.pos += 1; // a path segment
+                        }
                         _ => {}
                     }
                 }
                 _ => break,
             }
         }
+        interior
     }
 }

@@ -128,7 +128,7 @@ pub(crate) fn mtype_to_ir(mty: &MType) -> Type {
     match mty {
         MType::Int { width, .. } => Type::int(*width),
         MType::Bool => Type::Bool,
-        MType::Unit | MType::Other => Type::Unit,
+        MType::Unit | MType::Other | MType::InteriorMut => Type::Unit,
         MType::Ref(inner, _) | MType::Ptr(inner, _) => Type::ptr(mtype_to_ir(inner)),
         MType::Array(elem, n) => Type::Array { elem: Box::new(mtype_to_ir(elem)), len: *n },
         // A bare slice is never a value type here; only its element is used.

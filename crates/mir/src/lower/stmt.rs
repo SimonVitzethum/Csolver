@@ -203,11 +203,20 @@ impl Ctx {
                 if let Some(name) = retag_name {
                     if let Place::Deref(inner) = place {
                         if let Place::Local(p) = inner.as_ref() {
-                            out.push(Inst::Intrinsic {
-                                dst: None,
-                                name: name.into(),
-                                args: vec![IrOp::Reg(dst), IrOp::Reg(RegId(*p))],
-                            });
+                            // Suppress the retag when `_p` points to an interior-mutable type
+                            // (`&UnsafeCell`/`&Cell`/`&Mutex`/…): interior mutability writes
+                            // through a shared reference, so tracking such a borrow could false-FAIL.
+                            let interior = matches!(
+                                self.local_types.get(p),
+                                Some(MType::Ref(inner, _) | MType::Ptr(inner, _)) if matches!(inner.as_ref(), MType::InteriorMut)
+                            );
+                            if !interior {
+                                out.push(Inst::Intrinsic {
+                                    dst: None,
+                                    name: name.into(),
+                                    args: vec![IrOp::Reg(dst), IrOp::Reg(RegId(*p))],
+                                });
+                            }
                         }
                     }
                 }

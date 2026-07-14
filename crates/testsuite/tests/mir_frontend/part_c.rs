@@ -604,3 +604,35 @@ fn f(_1: *mut i32) -> () {
     });
     assert_eq!(name.as_deref(), Some("csolver.retag.shared"), "two_phase &mut → shared retag");
 }
+
+/// A reborrow through a reference to an interior-mutable type (`&UnsafeCell`/`&Cell`/…) emits NO
+/// retag marker: interior mutability writes through a shared reference, so tracking such a borrow
+/// in the aliasing model could false-FAIL. A reborrow through a plain `&mut i32` still does.
+#[test]
+fn interior_mutable_reborrow_emits_no_retag() {
+    use csolver_ir::Inst;
+    let has_retag = |src, name| {
+        lower(src, name).functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Intrinsic { name, .. } if name.starts_with("csolver.retag.")))
+    };
+    let cell = r#"
+fn f(_1: &std::cell::UnsafeCell<i32>) -> () {
+    let mut _2: &std::cell::UnsafeCell<i32>;
+    bb0: {
+        _2 = &(*_1);
+        return;
+    }
+}
+"#;
+    let plain = r#"
+fn g(_1: &mut i32) -> () {
+    let mut _2: &mut i32;
+    bb0: {
+        _2 = &mut (*_1);
+        return;
+    }
+}
+"#;
+    assert!(!has_retag(cell, "f"), "a &UnsafeCell reborrow must not emit a retag");
+    assert!(has_retag(plain, "g"), "a plain &mut reborrow still emits a retag");
+}
