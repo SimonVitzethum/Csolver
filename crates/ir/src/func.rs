@@ -289,7 +289,40 @@ pub struct Module {
     /// (which already assumes the iterator designates a valid live object); the type then says
     /// how big that object is. Empty for frontends that carry no type information — the sound
     /// default (the region stays unsized).
-    pub reg_ptr_hints: HashMap<(FuncId, RegId), u64>,
+    pub reg_ptr_hints: HashMap<(FuncId, RegId), PtrHint>,
+}
+
+/// What a frontend recovered about the object a register points at: its byte size and,
+/// when debug info records it, the **declared alignment of the pointee type**.
+///
+/// The alignment is not an extra assumption on top of `--assume-valid-params`: that flag
+/// already assumes the pointer designates a *valid instance* of its pointee type, and a
+/// valid instance of `T` is aligned to `alignof(T)`. Taking the alignment from the type
+/// rather than guessing it from the size is what lets an over-aligned kernel struct
+/// (`____cacheline_aligned`, `alignof == 64`) discharge a `load … align 64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtrHint {
+    /// Byte size of the pointee type. Always `> 0` when a hint is recorded.
+    pub size: u64,
+    /// Declared byte alignment of the pointee type; `0` when debug info does not record
+    /// it, in which case the consumer derives a conservative alignment from the size.
+    pub align: u32,
+}
+
+impl PtrHint {
+    /// The alignment to give the pointee's region: the type's declared one when debug info
+    /// recorded it, else derived from the size — a type's size is a multiple of its alignment,
+    /// so the size's trailing zeros are a lower bound on it. The derived form is capped at 16
+    /// (`max_align_t`), because beyond that the size no longer implies the alignment: a struct
+    /// of size 64 need not be 64-aligned. A declared alignment carries no such cap, which is
+    /// what discharges a `load … align 64` off an over-aligned (`____cacheline_aligned`) struct.
+    pub fn region_align(&self) -> u64 {
+        if self.align > 0 {
+            u64::from(self.align)
+        } else {
+            1u64 << self.size.trailing_zeros().min(4)
+        }
+    }
 }
 
 /// A global/static definition: what the analysis may assume about the memory
@@ -415,8 +448,8 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         for ((fid, idx), h) in m.raw_ptr_hints {
             merged.raw_ptr_hints.insert((remap[&fid], idx), h);
         }
-        for ((fid, reg), size) in m.reg_ptr_hints {
-            merged.reg_ptr_hints.insert((remap[&fid], reg), size);
+        for ((fid, reg), hint) in m.reg_ptr_hints {
+            merged.reg_ptr_hints.insert((remap[&fid], reg), hint);
         }
         for (k, v) in m.globals {
             merged.globals.entry(k).or_insert(v);

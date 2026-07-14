@@ -12,7 +12,7 @@ use csolver_contracts::{ApiContract, Contracts, Effect, Fill, ReadSink, SizeExpr
 use csolver_core::{BitVector, Error, RegionKind, Result};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Const, DataLayout, FuncId, Function, Inst,
-    MemKind, Module, Operand, PtrContract, RValue, RegId, SizeSpec, Terminator, Type,
+    MemKind, Module, Operand, PtrContract, PtrHint, RValue, RegId, SizeSpec, Terminator, Type,
 };
 use std::sync::OnceLock;
 use std::collections::HashMap;
@@ -84,8 +84,8 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
                 for (idx, hint) in raw_ptr_hints {
                     module.raw_ptr_hints.insert((fid, idx), hint);
                 }
-                for (reg, size) in reg_ptr_hints {
-                    module.reg_ptr_hints.insert((fid, reg), size);
+                for (reg, hint) in reg_ptr_hints {
+                    module.reg_ptr_hints.insert((fid, reg), hint);
                 }
                 if f.internal {
                     module.internal.insert(fid);
@@ -192,7 +192,7 @@ fn lower_function(
     id: FuncId,
     func_ids: &HashMap<String, FuncId>,
     debuginfo: &crate::debuginfo::DebugInfo,
-) -> Result<(Function, Vec<(u32, PtrContract)>, Vec<(u32, (u64, u32))>, Vec<(RegId, u64)>)> {
+) -> Result<(Function, Vec<(u32, PtrContract)>, Vec<(u32, (u64, u32))>, Vec<(RegId, PtrHint)>)> {
     let mut ctx = Ctx {
         regs: HashMap::new(),
         next_reg: 0,
@@ -207,7 +207,7 @@ fn lower_function(
             // the dominant real-kernel case). DWARF wins on a conflict (it is the more precise
             // source); the gep recovery only fills loads DWARF left uncovered.
             let mut m = dwarf_field_loads(f, debuginfo);
-            for (dst, rec) in typed_gep_field_loads(f) {
+            for (dst, rec) in typed_gep_field_loads(f, debuginfo) {
                 m.entry(dst).or_insert(rec);
             }
             m
@@ -372,20 +372,45 @@ fn lower_function(
     //  * the **`#dbg_value` → `!DILocalVariable` → declared type** chain, which survives that
     //    canonicalisation and is what recovers `struct node *it` at `-O1`/`-O2`.
     // The gep wins on a conflict (it reflects the access the code actually performs).
-    let mut reg_ptr_hints: HashMap<RegId, u64> = HashMap::new();
+    // Each hint carries the pointee's byte size and, where debug info records it, the pointee
+    // type's declared alignment (`PtrHint`) — an over-aligned kernel struct then keeps its real
+    // alignment instead of one guessed from the size.
+    // Alignment has three sources, in decreasing authority: the pointee type's *declared*
+    // alignment from debug info; the alignment clang **asserts** on the accesses through the
+    // pointer (the only record left in real kernel IR, which carries no debug info at all); and,
+    // failing both, one derived from the size (`PtrHint::region_align`).
+    // A *declared* alignment is authoritative and used as-is (it can legitimately be lower than
+    // the size suggests: `struct { int; int; }` is size 8, align 4). An *asserted* one is only a
+    // lower bound — clang annotates each access with the alignment of the type being accessed, so
+    // a struct read byte-wise carries `align 1` and says nothing about the struct's own
+    // alignment. It therefore may only ever *raise* the size-derived alignment, never lower it.
+    let asserted = asserted_base_aligns(f);
+    let derived = |size: u64| 1u32 << size.trailing_zeros().min(4);
+    let mut reg_ptr_hints: HashMap<RegId, PtrHint> = HashMap::new();
     for (local, var) in &f.dbg_values {
-        if let (Some(&r), Some(size)) = (ctx.regs.get(local), debuginfo.local_pointee_bytes(*var)) {
+        if let (Some(&r), Some((size, declared))) =
+            (ctx.regs.get(local), debuginfo.local_pointee_bytes(*var))
+        {
             if size > 0 {
-                reg_ptr_hints.insert(r, size);
+                let align = if declared > 0 {
+                    declared
+                } else {
+                    asserted.get(local.as_str()).map_or(0, |&a| a.max(derived(size)))
+                };
+                reg_ptr_hints.insert(r, PtrHint { size, align });
             }
         }
     }
-    for (local, size) in typed_gep_pointee_sizes(f) {
+    for (local, (size, struct_name)) in typed_gep_pointee_sizes(f) {
         if let Some(&r) = ctx.regs.get(local) {
-            reg_ptr_hints.insert(r, size);
+            let align = struct_name
+                .and_then(|n| debuginfo.composite_align_by_llvm_name(n))
+                .or_else(|| asserted.get(local).map(|&a| a.max(derived(size))))
+                .unwrap_or(0);
+            reg_ptr_hints.insert(r, PtrHint { size, align });
         }
     }
-    let reg_ptr_hints: Vec<(RegId, u64)> = reg_ptr_hints.into_iter().collect();
+    let reg_ptr_hints: Vec<(RegId, PtrHint)> = reg_ptr_hints.into_iter().collect();
     Ok((function, contracts, raw_ptr_hints, reg_ptr_hints))
 }
 

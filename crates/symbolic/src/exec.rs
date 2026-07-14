@@ -20,8 +20,8 @@ use csolver_core::{Model, RegionKind, SafetyProperty};
 use crate::summary::{Affine, ProvTransfer, RetSummary, Summary};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Condition, Const, DataLayout, FieldContract,
-    FuncId, Function, GlobalDef, Inst, MemKind, Operand, PtrContract, RValue, RefResult, RegId,
-    SizeSpec, Terminator, Type, WrapFlags,
+    FuncId, Function, GlobalDef, Inst, MemKind, Operand, PtrContract, PtrHint, RValue, RefResult,
+    RegId, SizeSpec, Terminator, Type, WrapFlags,
 };
 use csolver_memory::{AliasResult, LifetimeState, Permissions};
 use csolver_solver::{
@@ -242,7 +242,7 @@ pub fn discharge_with_scalars(
     flat_memory: bool,
     assume_valid_returns: bool,
     assume_valid_loop_ptrs: bool,
-    reg_ptr_hints: &HashMap<RegId, u64>,
+    reg_ptr_hints: &HashMap<RegId, PtrHint>,
 ) -> SymbolicReport {
     let limits = ExecLimits {
         bug_finding, exported, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs,

@@ -523,12 +523,12 @@ impl Explorer<'_> {
         {
             return v;
         }
-        let Some(size) = self.reg_ptr_hints.get(&dst).copied().filter(|&s| s > 0) else {
+        let Some(hint) = self.reg_ptr_hints.get(&dst).copied().filter(|h| h.size > 0) else {
             return v;
         };
         self.assumptions.insert(PARAM_VALID);
-        let rid = self.materialize_ref_region(Some(size), true, true, state);
-        let align = 1u64 << size.trailing_zeros().min(4);
+        let rid = self.materialize_ref_region(Some(hint.size), true, true, state);
+        let align = hint.region_align();
         state.regions[rid].base_align = align;
         SymValue::Ptr(SymPointer {
             prov: Prov::Region(rid),

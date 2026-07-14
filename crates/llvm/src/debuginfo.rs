@@ -145,17 +145,27 @@ impl DebugInfo {
     /// The byte alignment of a type node (following typedef chains); 1 when not
     /// recorded (a conservative default — an alignment obligation then fails
     /// soundly rather than assuming).
-    fn sized_align(&self, mut id: u32) -> u32 {
+    fn sized_align(&self, id: u32) -> u32 {
+        self.sized_align_opt(id).unwrap_or(1)
+    }
+
+    /// The **recorded** byte alignment of a type node, or `None` when debug info does not
+    /// state one. Distinct from [`Self::sized_align`], whose `1` default is indistinguishable
+    /// from a genuinely 1-aligned type: a caller that wants to *fall back* to deriving the
+    /// alignment from the size must know the difference, or every type whose alignment clang
+    /// left implicit (the common case — clang emits `align:` only when it is not the natural
+    /// one) would be pinned to 1 and no alignment obligation could ever be discharged.
+    fn sized_align_opt(&self, mut id: u32) -> Option<u32> {
         for _ in 0..16 {
             match self.nodes.get(&id) {
-                Some(DiNode::Sized { align_bytes: Some(a), .. }) => return *a,
-                Some(DiNode::Composite { align_bytes: Some(a), .. }) => return *a,
+                Some(DiNode::Sized { align_bytes: Some(a), .. }) => return Some(*a),
+                Some(DiNode::Composite { align_bytes: Some(a), .. }) => return Some(*a),
                 Some(DiNode::Sized { align_bytes: None, follows: Some(next), .. }) => id = *next,
-                Some(DiNode::Pointer { .. } | DiNode::Reference { .. }) => return 8,
-                _ => return 1,
+                Some(DiNode::Pointer { .. } | DiNode::Reference { .. }) => return Some(8),
+                _ => return None,
             }
         }
-        1
+        None
     }
 
     /// The pointee byte size and alignment of a **raw** pointer parameter (`T*`) of
@@ -254,12 +264,24 @@ impl DebugInfo {
     /// the SSA value to its `!DILocalVariable`, whose declared type says exactly what it points
     /// at. Used only under `--assume-valid-loop-ptrs` (which already assumes the iterator
     /// designates a valid live object); the type then says how big that object is.
-    pub(crate) fn local_pointee_bytes(&self, var_id: u32) -> Option<u64> {
+    /// Returns the pointee's `(size, align)`; the alignment is the type's declared one, so an
+    /// over-aligned struct keeps its real alignment instead of one guessed from the size.
+    pub(crate) fn local_pointee_bytes(&self, var_id: u32) -> Option<(u64, u32)> {
         let ty = *self.locals.get(&var_id)?;
         match self.nodes.get(&ty)? {
-            DiNode::Pointer { base, .. } | DiNode::Reference { base, .. } => self.sized_bytes(*base),
+            DiNode::Pointer { base, .. } | DiNode::Reference { base, .. } => {
+                Some((self.sized_bytes(*base)?, self.sized_align_opt(*base).unwrap_or(0)))
+            }
             _ => None,
         }
+    }
+
+    /// The declared byte alignment of a struct named as LLVM names it (`%struct.T` ⇒ `T`),
+    /// or `None` when debug info records none. Lets a *type-directed* `gep %struct.T` hint
+    /// carry the struct's real alignment, which the LLVM type alone does not record — an
+    /// over-aligned (`____cacheline_aligned`) kernel struct then discharges a `load … align 64`.
+    pub(crate) fn composite_align_by_llvm_name(&self, name: &str) -> Option<u32> {
+        self.sized_align_opt(self.composite_by_llvm_name(name)?)
     }
 
     /// The **pointee type node** of a struct member at `offset`, when that member is a

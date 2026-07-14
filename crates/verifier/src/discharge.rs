@@ -22,7 +22,7 @@ pub(crate) fn verify_function_with(
     globals: &HashMap<String, csolver_ir::GlobalDef>,
     prov_grants: &HashMap<u32, std::collections::HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
-    reg_ptr_hints: &HashMap<csolver_ir::RegId, u64>,
+    reg_ptr_hints: &HashMap<csolver_ir::RegId, csolver_ir::PtrHint>,
     config: &Config,
     exported: bool,
     next_id: &mut u32,

@@ -101,7 +101,7 @@ pub(crate) fn discharge_inner(
     prov_grants: &HashMap<u32, HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     analysis_in: Option<&IntervalAnalysis>,
-    reg_ptr_hints: &HashMap<RegId, u64>,
+    reg_ptr_hints: &HashMap<RegId, PtrHint>,
 ) -> SymbolicReport {
     // Reuse the caller's interval analysis when supplied (the verifier already
     // computes it for interval-based discharge), so it is not recomputed here —
@@ -223,14 +223,14 @@ pub(crate) fn discharge_inner(
                 // parameter a sized `assumed` region instead of an opaque pointer, so accesses
                 // through it are decided. `assumed` ⇒ a constant offset past the recovered size
                 // is not refuted (no false FAIL when the object is embedded in a larger one).
-                match reg_ptr_hints.get(reg).copied().filter(|&s| s > 0) {
-                    Some(size) if limits.assume_valid_params => {
-                        let size_e = ex.ctx.int(PTR_WIDTH, size as u128);
+                match reg_ptr_hints.get(reg).copied().filter(|h| h.size > 0) {
+                    Some(hint) if limits.assume_valid_params => {
+                        let size_e = ex.ctx.int(PTR_WIDTH, hint.size as u128);
                         let zero = ex.ctx.int(PTR_WIDTH, 0);
                         let nonneg = ex.ctx.cmp(SCmp::Sle, zero, size_e);
                         facts.push(nonneg);
                         let truth = ex.ctx.boolean(true);
-                        let align = 1u64 << size.trailing_zeros().min(4);
+                        let align = hint.region_align();
                         let rid = regions.len();
                         regions.push(SymRegion {
                             kind: RegionKind::Heap,

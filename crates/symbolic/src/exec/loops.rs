@@ -135,15 +135,16 @@ impl Explorer<'_> {
                         // recovered size is not refuted (no false FAIL if the node is embedded in
                         // a larger object); only a genuine input-driven overrun is. `None` when
                         // the frontend carries no type for it — the sound, unsized default.
-                        let size = self.reg_ptr_hints.get(&reg).copied();
-                        let rid = self.materialize_ref_region(size, true, true, state);
+                        let hint = self.reg_ptr_hints.get(&reg).copied();
+                        let rid =
+                            self.materialize_ref_region(hint.map(|h| h.size), true, true, state);
                         state.regions[rid].prov_labels.extend(labels);
-                        // A valid object of `n` bytes is naturally aligned, so give the region
-                        // the alignment its size implies (capped at 16, `max_align_t`) — the same
-                        // rule the DWARF field/param recoveries use. Without it every access
-                        // through the iterator would stay UNKNOWN on `alignment` alone.
-                        if let Some(n) = size.filter(|&n| n > 0) {
-                            state.regions[rid].base_align = 1u64 << n.trailing_zeros().min(4);
+                        // A valid object is aligned to its type's alignment, so give the region
+                        // that alignment — the same rule the DWARF field/param recoveries use.
+                        // Without it every access through the iterator would stay UNKNOWN on
+                        // `alignment` alone.
+                        if let Some(h) = hint.filter(|h| h.size > 0) {
+                            state.regions[rid].base_align = h.region_align();
                         }
                         state.env.insert(
                             reg,

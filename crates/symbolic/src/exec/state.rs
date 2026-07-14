@@ -218,7 +218,7 @@ pub(crate) struct Explorer<'f> {
     /// (`Module::reg_ptr_hints`). Used to **size** a loop-carried pointer's region at the loop
     /// header under `--assume-valid-loop-ptrs`, so accesses through a moving iterator get real
     /// bounds instead of an unsized (always-UNKNOWN) region. Empty for typeless frontends.
-    pub(crate) reg_ptr_hints: &'f HashMap<RegId, u64>,
+    pub(crate) reg_ptr_hints: &'f HashMap<RegId, PtrHint>,
     pub(crate) visits: usize,
     pub(crate) truncated: bool,
     /// Successors whose incoming edge a **visited** predecessor pruned as bit-precisely

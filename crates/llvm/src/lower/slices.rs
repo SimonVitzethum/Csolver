@@ -188,14 +188,14 @@ pub(crate) fn dwarf_field_loads(
 /// Used twice: to size a **loaded** field pointer ([`typed_gep_field_loads`]) and to size a
 /// **loop-carried** pointer (a moving iterator, `iter = iter->next`), whose region is otherwise
 /// unsized — see `Module::reg_ptr_hints` and `--assume-valid-loop-ptrs`.
-pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, u64> {
-    let mut pointee: HashMap<&str, u64> = HashMap::new();
+pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, (u64, Option<&str>)> {
+    let mut pointee: HashMap<&str, (u64, Option<&str>)> = HashMap::new();
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
-        if let LInst::GepChain { agg_ty, base: LValue::Local(b), .. } = inst {
+        if let LInst::GepChain { agg_ty, base: LValue::Local(b), struct_name, .. } = inst {
             let ty = lower_type(agg_ty);
             if matches!(ty, Type::Struct { .. }) {
                 if let Some(sz) = ty.size_bytes(&LAYOUT).filter(|&s| s > 0) {
-                    pointee.entry(b.as_str()).or_insert(sz);
+                    pointee.entry(b.as_str()).or_insert((sz, struct_name.as_deref()));
                 }
             }
         }
@@ -212,17 +212,85 @@ pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, u64> {
 /// (`assumed = true`): valid only under `--assume-valid-params`, surfaced as the `param-valid`
 /// assumption, so it adds no false PASS without the opt-in and, being an `assumed` region,
 /// never refutes a constant field offset (no false FAIL from an under-sized pointee).
-pub(crate) fn typed_gep_field_loads(f: &LFunc) -> HashMap<String, (u64, u32, bool, bool)> {
+pub(crate) fn typed_gep_field_loads(
+    f: &LFunc,
+    di: &crate::debuginfo::DebugInfo,
+) -> HashMap<String, (u64, u32, bool, bool)> {
     let pointee = typed_gep_pointee_sizes(f);
-    // A pointer load whose result is used as such a struct base: size its region. Natural
-    // alignment derived from the size (a valid instance is naturally aligned), capped at 16.
+    // A pointer load whose result is used as such a struct base: size its region. The alignment
+    // is the struct's declared one where debug info records it (so an over-aligned kernel struct
+    // keeps its real alignment), else derived from the size — a valid instance is aligned to its
+    // type's alignment, and a type's size is a multiple of that alignment.
     let mut out = HashMap::new();
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
         if let LInst::Load { dst, ty: LType::Ptr, .. } = inst {
-            if let Some(&sz) = pointee.get(dst.as_str()) {
-                let align = 1u32 << sz.trailing_zeros().min(4);
+            if let Some(&(sz, struct_name)) = pointee.get(dst.as_str()) {
+                let align = struct_name
+                    .and_then(|n| di.composite_align_by_llvm_name(n))
+                    .unwrap_or_else(|| 1u32 << sz.trailing_zeros().min(4));
                 out.insert(dst.clone(), (sz, align, true, true));
             }
+        }
+    }
+    out
+}
+
+/// The byte alignment each pointer register is **asserted** to have, recovered from the
+/// `align N` clang puts on every load/store. Real kernel IR carries no debug info at all
+/// (no `!DICompositeType`), so the pointee type's declared alignment — the natural source —
+/// simply does not exist there; clang's own access annotations are the only remaining record
+/// of it, and an over-aligned struct (`____cacheline_aligned`, `alignof == 64`) is otherwise
+/// unprovable: a size-derived guess is capped at `max_align_t` (16).
+///
+/// Two shapes contribute, both reading the assertion *backwards* to the base:
+///   * a direct access `load … ptr %r, align N` ⇒ `%r` is `N`-aligned;
+///   * an access through a **constant** offset `K` off `%r` with `align N`, when `K` is a
+///     multiple of `N` ⇒ `base + K ≡ 0 (mod N)` and `K ≡ 0 (mod N)`, hence `%r ≡ 0 (mod N)`.
+///     (When `K` is *not* a multiple of `N` the assertion says nothing about the base, so it
+///     is dropped — that is what keeps the inference from over-claiming.)
+///
+/// This learns the *type's* alignment; it does not assume anything about runtime state that
+/// `--assume-valid-params` (under which alone these regions exist) does not already assume:
+/// a valid instance of `T` is aligned to `alignof(T)`. Only ever *raises* an alignment, and
+/// only for a register the frontend already typed.
+pub(crate) fn asserted_base_aligns(f: &LFunc) -> HashMap<&str, u32> {
+    // `gep result -> (base local, constant byte offset)`, for both gep shapes.
+    let mut off_of: HashMap<&str, (&str, u64)> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst {
+            LInst::GepChain { dst, agg_ty, base: LValue::Local(b), indices, .. } => {
+                if let Some(k) = gepchain_const_offset(&lower_type(agg_ty), indices) {
+                    off_of.insert(dst.as_str(), (b.as_str(), k));
+                }
+            }
+            LInst::Gep { dst, elem, base: LValue::Local(b), index: LValue::Int(i) } => {
+                if let (Ok(i), Some(stride)) =
+                    (u64::try_from(*i), lower_type(elem).size_bytes(&LAYOUT))
+                {
+                    if let Some(k) = i.checked_mul(stride) {
+                        off_of.insert(dst.as_str(), (b.as_str(), k));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: HashMap<&str, u32> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        let (ptr, align) = match inst {
+            LInst::Load { ptr: LValue::Local(p), align, .. }
+            | LInst::Store { ptr: LValue::Local(p), align, .. } => (p.as_str(), *align),
+            _ => continue,
+        };
+        if !align.is_power_of_two() {
+            continue;
+        }
+        // The access is either on the base itself (offset 0) or through a constant offset.
+        let (base, k) = off_of.get(ptr).copied().unwrap_or((ptr, 0));
+        if k % u64::from(align) == 0 {
+            let e = out.entry(base).or_insert(0);
+            *e = (*e).max(align);
         }
     }
     out
