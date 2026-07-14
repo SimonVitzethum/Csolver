@@ -13,15 +13,24 @@ feasiblem Pfad refutiert) deckt jetzt **zwei** Klassen ab:
   Nutzung eines invalidierten Tags = Verletzung. Merge poisont bei Uneinigkeit (sound). Kein
   False-FAIL auf legitimen Reborrow-Ketten (getestet).
 
-Für ein **vollständiges** Stacked/Tree-Borrows fehlt noch:
-- [ ] **Two-Phase-Borrows** und `&raw`-Retags (aktuell nur `&mut *_p` durch ein Pointer-Local).
+Weitere abgeschlossene Teile (1fb77cf):
+- [x] **`&raw mut`/`&raw const`-Retags** (`&raw mut *_p` = unique, `&raw const` = shared).
+- [x] **Two-Phase/fake/shallow-Unterdrückung**: `Rvalue::Ref(Place, RefKind)`; `Opaque` emittiert
+  kein Retag (Two-Phase-Reservierung koexistiert legitim → sonst False-FAIL-Risiko). Sound.
+- [x] **Shared-Read-Tags**: `&(*_p)` emittiert `csolver.retag.shared`; ein Shared-Retag fügt
+  seinen Tag hinzu ohne Geschwister zu poppen (Under-Approx der SB-Lese-Effekte → nie False-FAIL);
+  ein `&mut`-Write darunter poppt ihn → Read durch invalidierten Shared-Borrow = Verletzung.
+
+Für ein **vollständiges** Stacked/Tree-Borrows fehlt noch (beides **KEIN** Soundness-Loch —
+das Modell ist ohne sie sound, sie fügen nur Detection/Präzision hinzu):
 - [ ] **Protectors** für Funktionsargumente (ein übergebenes `&mut` bleibt für die Call-Dauer
-  eindeutig) und **Interior Mutability** (`UnsafeCell`) exakt statt heuristisch.
-- [ ] **Lese-Reborrow-Nuancen** (SharedReadOnly-Tags im Stack; aktuell werden nur `&mut`-Tags
-  verfolgt, Reads prüfen nur Liveness).
-- [ ] Für Präzision über Kopien hinweg, die der Register-Tag-Vorabpass nicht sieht (z.B. durch
-  Speicher/Phi geführte Borrows), müsste der Tag am `SymPointer` hängen — aus `PartialEq`
-  ausgeschlossen wie `POrigin`, 31 Konstruktionsstellen.
+  eindeutig, Aliasing während des Calls ist UB). Genuin **interprozedural**: wir analysieren
+  Funktionen einzeln, ein Call ist opak; `region_borrows` bleibt über Calls stale, aber sound
+  (SSA-Tags bleiben gültig, eine ungesehene fremde Invalidierung = verpasster Bug, kein False-FAIL).
+- [ ] **Tag am `SymPointer`** für Borrows, die der Register-Tag-Vorabpass nicht sieht (durch
+  Speicher gespeichert+geladen, oder durch Phi/Block-Parameter geführt — Letztere werden aktuell
+  beim Merge konservativ *poisont*). Rein Präzision; invasiv (31 Konstruktionsstellen, aus
+  `PartialEq` auszuschließen wie `POrigin`), daher als eigener großer Schritt.
 
 ## Sound-Coverage-Lücken — Status & warum offen (2026-07-14 geprüft)
 
