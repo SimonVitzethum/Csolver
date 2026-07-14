@@ -6,10 +6,22 @@ impl Reg {
     /// (e.g. `low3 | if rex_bit { 8 } else { 0 }`).
     pub(crate) fn from_idx(idx: u8) -> Option<Reg> {
         match idx {
-            0 => Some(Reg::RAX), 1 => Some(Reg::RCX), 2 => Some(Reg::RDX), 3 => Some(Reg::RBX),
-            4 => Some(Reg::RSP), 5 => Some(Reg::RBP), 6 => Some(Reg::RSI), 7 => Some(Reg::RDI),
-            8 => Some(Reg::R8), 9 => Some(Reg::R9), 10 => Some(Reg::R10), 11 => Some(Reg::R11),
-            12 => Some(Reg::R12), 13 => Some(Reg::R13), 14 => Some(Reg::R14), 15 => Some(Reg::R15),
+            0 => Some(Reg::RAX),
+            1 => Some(Reg::RCX),
+            2 => Some(Reg::RDX),
+            3 => Some(Reg::RBX),
+            4 => Some(Reg::RSP),
+            5 => Some(Reg::RBP),
+            6 => Some(Reg::RSI),
+            7 => Some(Reg::RDI),
+            8 => Some(Reg::R8),
+            9 => Some(Reg::R9),
+            10 => Some(Reg::R10),
+            11 => Some(Reg::R11),
+            12 => Some(Reg::R12),
+            13 => Some(Reg::R13),
+            14 => Some(Reg::R14),
+            15 => Some(Reg::R15),
             _ => None,
         }
     }
@@ -54,7 +66,11 @@ impl Width {
     /// Infer the width from a REX.W bit and the operation code. For most
     /// ALU ops, !REX.W → 32-bit, REX.W → 64-bit.
     pub(crate) fn from_rex_w(rex_w: bool) -> Width {
-        if rex_w { Width::Q } else { Width::D }
+        if rex_w {
+            Width::Q
+        } else {
+            Width::D
+        }
     }
 }
 
@@ -76,23 +92,43 @@ pub struct Mem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum XmmReg {
-    XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3,
-    XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
-    XMM8 = 8, XMM9 = 9, XMM10 = 10, XMM11 = 11,
-    XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15,
+    XMM0 = 0,
+    XMM1 = 1,
+    XMM2 = 2,
+    XMM3 = 3,
+    XMM4 = 4,
+    XMM5 = 5,
+    XMM6 = 6,
+    XMM7 = 7,
+    XMM8 = 8,
+    XMM9 = 9,
+    XMM10 = 10,
+    XMM11 = 11,
+    XMM12 = 12,
+    XMM13 = 13,
+    XMM14 = 14,
+    XMM15 = 15,
 }
 
 impl XmmReg {
     pub(crate) fn from_idx(idx: u8) -> Option<XmmReg> {
         match idx {
-            0 => Some(XmmReg::XMM0), 1 => Some(XmmReg::XMM1),
-            2 => Some(XmmReg::XMM2), 3 => Some(XmmReg::XMM3),
-            4 => Some(XmmReg::XMM4), 5 => Some(XmmReg::XMM5),
-            6 => Some(XmmReg::XMM6), 7 => Some(XmmReg::XMM7),
-            8 => Some(XmmReg::XMM8), 9 => Some(XmmReg::XMM9),
-            10 => Some(XmmReg::XMM10), 11 => Some(XmmReg::XMM11),
-            12 => Some(XmmReg::XMM12), 13 => Some(XmmReg::XMM13),
-            14 => Some(XmmReg::XMM14), 15 => Some(XmmReg::XMM15),
+            0 => Some(XmmReg::XMM0),
+            1 => Some(XmmReg::XMM1),
+            2 => Some(XmmReg::XMM2),
+            3 => Some(XmmReg::XMM3),
+            4 => Some(XmmReg::XMM4),
+            5 => Some(XmmReg::XMM5),
+            6 => Some(XmmReg::XMM6),
+            7 => Some(XmmReg::XMM7),
+            8 => Some(XmmReg::XMM8),
+            9 => Some(XmmReg::XMM9),
+            10 => Some(XmmReg::XMM10),
+            11 => Some(XmmReg::XMM11),
+            12 => Some(XmmReg::XMM12),
+            13 => Some(XmmReg::XMM13),
+            14 => Some(XmmReg::XMM14),
+            15 => Some(XmmReg::XMM15),
             _ => None,
         }
     }
@@ -123,6 +159,20 @@ pub enum X86Operand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum Condition {
-    O, NO, B, AE, E, NE, BE, A,
-    S, NS, P, NP, L, GE, LE, G,
+    O,
+    NO,
+    B,
+    AE,
+    E,
+    NE,
+    BE,
+    A,
+    S,
+    NS,
+    P,
+    NP,
+    L,
+    GE,
+    LE,
+    G,
 }

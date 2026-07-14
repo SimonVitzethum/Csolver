@@ -16,7 +16,9 @@
 
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use csolver_core::{Error as CoreError, RegionKind};
-use csolver_ir::{BinOp, Callee, CastOp, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
+use csolver_ir::{
+    BinOp, Callee, CastOp, CmpOp, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type,
+};
 
 /// Decode an x86-64 function from its machine bytes into a one-function
 /// [`Module`], reconstructing its control-flow graph (branches/loops). On any
@@ -54,7 +56,10 @@ pub fn decode_function_reloc(name: &str, code: &[u8], resolve: RelocResolver) ->
 /// the SysV order (`rdi, rsi, rdx, rcx, r8, r9`), so the model names them
 /// `arg0..arg5`.
 pub(crate) fn arg_registers() -> Vec<(RegId, Type)> {
-    [7u8, 6, 2, 1, 8, 9].iter().map(|&r| (reg(r), Type::int(64))).collect()
+    [7u8, 6, 2, 1, 8, 9]
+        .iter()
+        .map(|&r| (reg(r), Type::int(64)))
+        .collect()
 }
 
 /// The result of decoding one instruction (before block assembly).
@@ -91,7 +96,15 @@ fn decode_cfg(code: &[u8], resolve: RelocResolver) -> csolver_core::Result<Vec<D
                 Err(e) => lower::bridge_unmodeled(code, pos, e)?,
             };
             let (next, ctrl) = (d.next, d.ctrl);
-            decoded.insert(pos, DecodedInsn { offset: pos, next, insts: d.insts, ctrl });
+            decoded.insert(
+                pos,
+                DecodedInsn {
+                    offset: pos,
+                    next,
+                    insts: d.insts,
+                    ctrl,
+                },
+            );
             match ctrl {
                 Ctrl::Ret => break,
                 Ctrl::Jmp(t) => {
@@ -114,19 +127,19 @@ pub(crate) fn reg(num: u8) -> RegId {
 }
 
 // --- module split (mechanical refactor) ---
-mod lower;
-mod typed;
 mod cond;
-mod display;
 mod decode;
+mod display;
+mod lower;
 mod opcode;
 mod sse;
-mod vex;
 #[cfg(test)]
 mod tests;
+mod typed;
+mod vex;
+use cond::*;
 pub use decode::*;
 pub use typed::*;
-use cond::*;
 
 use lower::*;
 use opcode::*;
@@ -152,7 +165,12 @@ fn add_imm(target: RegId, ty: Type, op: BinOp, imm: u128, width: u32) -> Inst {
     Inst::Assign {
         dst: target,
         ty,
-        value: RValue::Bin { op, lhs: Operand::Reg(target), rhs: Operand::int(width, imm) , flags: Default::default() },
+        value: RValue::Bin {
+            op,
+            lhs: Operand::Reg(target),
+            rhs: Operand::int(width, imm),
+            flags: Default::default(),
+        },
     }
 }
 
@@ -182,10 +200,18 @@ fn jcc(
         (Some(op), Some((a, b))) => (op, a.clone(), b.clone()),
         // Unknown flags / condition code: compare a never-defined register with
         // 0, an unconstrained boolean.
-        _ => (CmpOp::Ne, Operand::Reg(RegId(2000 + pos as u32)), Operand::int(64, 0)),
+        _ => (
+            CmpOp::Ne,
+            Operand::Reg(RegId(2000 + pos as u32)),
+            Operand::int(64, 0),
+        ),
     };
     Ok(Decoded {
-        insts: vec![Inst::Assign { dst: cond, ty: Type::Bool, value: RValue::Cmp { op, lhs, rhs } }],
+        insts: vec![Inst::Assign {
+            dst: cond,
+            ty: Type::Bool,
+            value: RValue::Cmp { op, lhs, rhs },
+        }],
         next: np,
         ctrl: Ctrl::Jcc(target, cond),
     })
@@ -291,7 +317,9 @@ fn mem_operand(
     let mut index = None;
     let rm_low = m.rm & 7;
     if rm_low == 4 {
-        let sib = *code.get(p).ok_or_else(|| CoreError::parse(format!("x86: truncated SIB at offset {p}")))?;
+        let sib = *code
+            .get(p)
+            .ok_or_else(|| CoreError::parse(format!("x86: truncated SIB at offset {p}")))?;
         p += 1;
         let scale = 1u8 << (sib >> 6);
         let index_field = (sib >> 3) & 7;
@@ -304,13 +332,25 @@ fn mem_operand(
         if m.mode == 0b00 && base_field & 7 == 5 {
             // base-less disp32: an absolute / global base (optionally `+ index`).
             let (name, off) = resolve(p).unwrap_or_else(|| ("<abs-unknown>".to_string(), 0));
-            return Ok(MemOperand { base: reg(0), index, disp: off, next: p + 4, symbol: Some(name) });
+            return Ok(MemOperand {
+                base: reg(0),
+                index,
+                disp: off,
+                next: p + 4,
+                symbol: Some(name),
+            });
         }
         base = base_field;
     } else if rm_low == 5 && m.mode == 0b00 {
         // RIP-relative `[rip + disp32]` → a global.
         let (name, off) = resolve(p).unwrap_or_else(|| ("<rip-unknown>".to_string(), 0));
-        return Ok(MemOperand { base: reg(0), index: None, disp: off, next: p + 4, symbol: Some(name) });
+        return Ok(MemOperand {
+            base: reg(0),
+            index: None,
+            disp: off,
+            next: p + 4,
+            symbol: Some(name),
+        });
     }
     let disp = match m.mode {
         0b00 => 0i64,
@@ -324,13 +364,25 @@ fn mem_operand(
             p += 4;
             d
         }
-        _ => return Err(CoreError::unsupported("x86: register operand has no memory form")),
+        _ => {
+            return Err(CoreError::unsupported(
+                "x86: register operand has no memory form",
+            ))
+        }
     };
-    Ok(MemOperand { base: reg(base), index, disp, next: p, symbol: None })
+    Ok(MemOperand {
+        base: reg(base),
+        index,
+        disp,
+        next: p,
+        symbol: None,
+    })
 }
 
 fn modrm(code: &[u8], at: usize, rex_r: bool, rex_b: bool) -> csolver_core::Result<ModRm> {
-    let b = *code.get(at).ok_or_else(|| CoreError::parse(format!("x86: truncated ModR/M at offset {at}")))?;
+    let b = *code
+        .get(at)
+        .ok_or_else(|| CoreError::parse(format!("x86: truncated ModR/M at offset {at}")))?;
     Ok(ModRm {
         mode: b >> 6,
         reg: ((b >> 3) & 7) + if rex_r { 8 } else { 0 },
@@ -341,7 +393,11 @@ fn modrm(code: &[u8], at: usize, rex_r: bool, rex_b: bool) -> csolver_core::Resu
 /// Read a little-endian immediate of `len` bytes (4 or 8), sign/zero handling
 /// left to the consumer (we keep the raw unsigned value).
 fn read_imm(code: &[u8], at: usize, len: usize) -> csolver_core::Result<u128> {
-    let bytes = code.get(at..at + len).ok_or_else(|| CoreError::parse(format!("x86: truncated immediate of len {len} at offset {at}")))?;
+    let bytes = code.get(at..at + len).ok_or_else(|| {
+        CoreError::parse(format!(
+            "x86: truncated immediate of len {len} at offset {at}"
+        ))
+    })?;
     let mut v: u128 = 0;
     for (i, &byte) in bytes.iter().enumerate() {
         v |= (byte as u128) << (8 * i);
@@ -357,9 +413,20 @@ fn read_imm(code: &[u8], at: usize, len: usize) -> csolver_core::Result<u128> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(missing_docs)]
 pub enum Reg {
-    RAX = 0, RCX = 1, RDX = 2, RBX = 3,
-    RSP = 4, RBP = 5, RSI = 6, RDI = 7,
-    R8 = 8, R9 = 9, R10 = 10, R11 = 11,
-    R12 = 12, R13 = 13, R14 = 14, R15 = 15,
+    RAX = 0,
+    RCX = 1,
+    RDX = 2,
+    RBX = 3,
+    RSP = 4,
+    RBP = 5,
+    RSI = 6,
+    RDI = 7,
+    R8 = 8,
+    R9 = 9,
+    R10 = 10,
+    R11 = 11,
+    R12 = 12,
+    R13 = 13,
+    R14 = 14,
+    R15 = 15,
 }
-

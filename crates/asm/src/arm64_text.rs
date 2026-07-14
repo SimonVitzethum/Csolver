@@ -14,7 +14,9 @@
 
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use csolver_core::{Error, RegionKind, Result};
-use csolver_ir::{BinOp, Callee, CmpOp, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
+use csolver_ir::{
+    BinOp, Callee, CmpOp, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type,
+};
 
 /// The stack-pointer register number (also `sp`/register 31 in the memory and
 /// add/sub-immediate forms).
@@ -33,7 +35,11 @@ pub fn decode(source: &str) -> Module {
     let mut m = Module::new("asm");
     for (name, body) in split_functions(source) {
         match decode_function_lines(&body) {
-            Ok(f) => m.functions.push(Function { id: FuncId(m.functions.len() as u32), name, ..f }),
+            Ok(f) => m.functions.push(Function {
+                id: FuncId(m.functions.len() as u32),
+                name,
+                ..f
+            }),
             Err(e) => m.unanalyzed.push((name, e.to_string())),
         }
     }
@@ -102,7 +108,14 @@ fn decode_function_lines(lines: &[String]) -> Result<Function> {
         decoded.push(lower_insn(ins, i, &labels, &mut flags)?);
     }
     let (blocks, entry) = build_blocks(decoded)?;
-    Ok(Function { id: FuncId(0), name: String::new(), params: arg_registers(), ret_ty: Type::Unit, blocks, entry })
+    Ok(Function {
+        id: FuncId(0),
+        name: String::new(),
+        params: arg_registers(),
+        ret_ty: Type::Unit,
+        blocks,
+        entry,
+    })
 }
 
 fn lower_insn(
@@ -112,26 +125,53 @@ fn lower_insn(
     flags: &mut Option<(Operand, Operand)>,
 ) -> Result<DecodedInsn> {
     let next = off + 1;
-    let fall = |insts: Vec<Inst>| DecodedInsn { offset: off, next, insts, ctrl: Ctrl::Fall };
+    let fall = |insts: Vec<Inst>| DecodedInsn {
+        offset: off,
+        next,
+        insts,
+        ctrl: Ctrl::Fall,
+    };
     let (mnem, rest) = match ins.split_once(char::is_whitespace) {
         Some((m, r)) => (m.trim(), r.trim()),
         None => (ins.trim(), ""),
     };
     let ops = split_operands(rest);
-    let width = |r: &str| if r.trim_start().starts_with('w') { 32 } else { 64 };
+    let width = |r: &str| {
+        if r.trim_start().starts_with('w') {
+            32
+        } else {
+            64
+        }
+    };
 
     match mnem {
-        "ret" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Ret }),
+        "ret" => Ok(DecodedInsn {
+            offset: off,
+            next,
+            insts: vec![],
+            ctrl: Ctrl::Ret,
+        }),
         "nop" => Ok(fall(vec![])),
         // A call (`bl sym`/`blr Xn`) returns and falls through: model it as an
         // opaque `Inst::Call` binding x0 (havocs caller-saved state), so analysis
         // continues past it. `svc`/`brk` trap — stop analysis (sound).
         "bl" | "blr" => Ok(fall(vec![lower_call(&ops)])),
-        "svc" | "brk" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Ret }),
-        "b" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Jmp(label(&ops, 0, labels)?) }),
+        "svc" | "brk" => Ok(DecodedInsn {
+            offset: off,
+            next,
+            insts: vec![],
+            ctrl: Ctrl::Ret,
+        }),
+        "b" => Ok(DecodedInsn {
+            offset: off,
+            next,
+            insts: vec![],
+            ctrl: Ctrl::Jmp(label(&ops, 0, labels)?),
+        }),
         // b.<cond> — the mnemonic carries the condition after the dot.
         _ if mnem.starts_with("b.") => {
-            let cc = cc_name(&mnem[2..]).ok_or_else(|| Error::unsupported(format!("arm64: cond `{mnem}`")))?;
+            let cc = cc_name(&mnem[2..])
+                .ok_or_else(|| Error::unsupported(format!("arm64: cond `{mnem}`")))?;
             branch(off, next, label(&ops, 0, labels)?, cc, flags.clone())
         }
         // cbz/cbnz Rn, label — compare-and-branch against zero.
@@ -144,10 +184,16 @@ fn lower_insn(
         "mov" => {
             let d = reg_of(&ops, 0)?;
             let src = value_operand(&ops, 1, width(ops[0]))?;
-            Ok(fall(vec![Inst::Assign { dst: d, ty: Type::int(width(ops[0])), value: RValue::Use(src) }]))
+            Ok(fall(vec![Inst::Assign {
+                dst: d,
+                ty: Type::int(width(ops[0])),
+                value: RValue::Use(src),
+            }]))
         }
         "add" | "sub" => lower_addsub(mnem, &ops).map(fall),
-        "and" | "orr" | "eor" | "lsl" | "lsr" | "asr" => lower_alu(mnem, &ops, width(ops[0])).map(fall),
+        "and" | "orr" | "eor" | "lsl" | "lsr" | "asr" => {
+            lower_alu(mnem, &ops, width(ops[0])).map(fall)
+        }
         "cmp" | "cmn" => {
             let a = Operand::Reg(reg_of(&ops, 0)?);
             let b = value_operand(&ops, 1, width(ops[0]))?;
@@ -190,18 +236,32 @@ fn value_operand(ops: &[&str], i: usize, width: u32) -> Result<Operand> {
     if let Some(imm) = parse_imm(tok) {
         return Ok(Operand::int(width, imm as u128));
     }
-    reg_number(tok).map(|n| Operand::Reg(reg(n))).ok_or_else(|| Error::unsupported(format!("arm64: operand `{tok}`")))
+    reg_number(tok)
+        .map(|n| Operand::Reg(reg(n)))
+        .ok_or_else(|| Error::unsupported(format!("arm64: operand `{tok}`")))
 }
 
 fn lower_addsub(mnem: &str, ops: &[&str]) -> Result<Vec<Inst>> {
-    let rd = reg_number(ops.first().copied().unwrap_or("")).ok_or_else(|| Error::unsupported("arm64: add/sub dst"))?;
-    let rn = reg_number(ops.get(1).copied().unwrap_or("")).ok_or_else(|| Error::unsupported("arm64: add/sub src"))?;
-    let width = if ops[0].trim_start().starts_with('w') { 32 } else { 64 };
+    let rd = reg_number(ops.first().copied().unwrap_or(""))
+        .ok_or_else(|| Error::unsupported("arm64: add/sub dst"))?;
+    let rn = reg_number(ops.get(1).copied().unwrap_or(""))
+        .ok_or_else(|| Error::unsupported("arm64: add/sub src"))?;
+    let width = if ops[0].trim_start().starts_with('w') {
+        32
+    } else {
+        64
+    };
     // `sub sp, sp, #N` allocates the frame; `add sp, sp, #N` tears it down.
     if rd == SP && rn == SP {
         if let Some(n) = ops.get(2).and_then(|o| parse_imm(o)) {
             return Ok(if mnem == "sub" {
-                vec![Inst::Alloc { dst: reg(SP), region: RegionKind::Stack, elem: Type::int(8), count: Operand::int(64, n as u128), align: 16 }]
+                vec![Inst::Alloc {
+                    dst: reg(SP),
+                    region: RegionKind::Stack,
+                    elem: Type::int(8),
+                    count: Operand::int(64, n as u128),
+                    align: 16,
+                }]
             } else {
                 vec![]
             });
@@ -210,15 +270,28 @@ fn lower_addsub(mnem: &str, ops: &[&str]) -> Result<Vec<Inst>> {
     // `add Rd, Rn, :lo12:sym` completes an adrp — keep Rn's symbol pointer.
     if let Some(third) = ops.get(2) {
         if third.trim().starts_with(":lo12:") || third.trim().starts_with(":got_lo12:") {
-            return Ok(vec![Inst::Assign { dst: reg(rd), ty: Type::ptr(Type::Unit), value: RValue::Use(Operand::Reg(reg(rn))) }]);
+            return Ok(vec![Inst::Assign {
+                dst: reg(rd),
+                ty: Type::ptr(Type::Unit),
+                value: RValue::Use(Operand::Reg(reg(rn))),
+            }]);
         }
     }
     let rhs = value_operand(ops, 2, width)?;
-    let op = if mnem == "sub" { BinOp::Sub } else { BinOp::Add };
+    let op = if mnem == "sub" {
+        BinOp::Sub
+    } else {
+        BinOp::Add
+    };
     Ok(vec![Inst::Assign {
         dst: reg(rd),
         ty: Type::int(width),
-        value: RValue::Bin { op, lhs: Operand::Reg(reg(rn)), rhs, flags: Default::default() },
+        value: RValue::Bin {
+            op,
+            lhs: Operand::Reg(reg(rn)),
+            rhs,
+            flags: Default::default(),
+        },
     }])
 }
 
@@ -235,7 +308,16 @@ fn lower_alu(mnem: &str, ops: &[&str], width: u32) -> Result<Vec<Inst>> {
         "asr" => BinOp::AShr,
         _ => unreachable!(),
     };
-    Ok(vec![Inst::Assign { dst: rd, ty: Type::int(width), value: RValue::Bin { op, lhs: rn, rhs, flags: Default::default() } }])
+    Ok(vec![Inst::Assign {
+        dst: rd,
+        ty: Type::int(width),
+        value: RValue::Bin {
+            op,
+            lhs: rn,
+            rhs,
+            flags: Default::default(),
+        },
+    }])
 }
 
 /// Lower a single load or store; the memory operand is the bracketed tail.
@@ -248,15 +330,29 @@ fn lower_load_store(mnem: &str, ops: &[&str], off: usize) -> Result<Vec<Inst>> {
         let value = if rt.trim() == "xzr" || rt.trim() == "wzr" {
             Operand::int(width, 0)
         } else {
-            Operand::Reg(reg(reg_number(rt).ok_or_else(|| Error::unsupported("arm64: str value reg"))?))
+            Operand::Reg(reg(
+                reg_number(rt).ok_or_else(|| Error::unsupported("arm64: str value reg"))?
+            ))
         };
-        insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value, align: 1, volatile: false });
+        insts.push(Inst::Store {
+            ty,
+            ptr: Operand::Reg(ptr),
+            value,
+            align: 1,
+            volatile: false,
+        });
     } else {
         let dst = match reg_number(rt) {
             Some(n) => reg(n),
             None => temp_reg(off + 900), // load into the zero register = discard
         };
-        insts.push(Inst::Load { dst, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+        insts.push(Inst::Load {
+            dst,
+            ty,
+            ptr: Operand::Reg(ptr),
+            align: 1,
+            volatile: false,
+        });
     }
     Ok(insts)
 }
@@ -271,22 +367,41 @@ fn lower_pair(mnem: &str, ops: &[&str], off: usize) -> Result<Vec<Inst>> {
             base_ptr
         } else {
             let p = temp_reg(off + 800 + slot);
-            insts.push(Inst::PtrOffset { dst: p, base: Operand::Reg(base_ptr), index: Operand::int(64, 8 * slot as u128), elem: Type::int(8) });
+            insts.push(Inst::PtrOffset {
+                dst: p,
+                base: Operand::Reg(base_ptr),
+                index: Operand::int(64, 8 * slot as u128),
+                elem: Type::int(8),
+            });
             p
         };
         if mnem == "stp" {
             let value = if rt.trim() == "xzr" || rt.trim() == "wzr" {
                 Operand::int(64, 0)
             } else {
-                Operand::Reg(reg(reg_number(rt).ok_or_else(|| Error::unsupported("arm64: stp value reg"))?))
+                Operand::Reg(reg(
+                    reg_number(rt).ok_or_else(|| Error::unsupported("arm64: stp value reg"))?
+                ))
             };
-            insts.push(Inst::Store { ty: Type::int(64), ptr: Operand::Reg(ptr), value, align: 1, volatile: false });
+            insts.push(Inst::Store {
+                ty: Type::int(64),
+                ptr: Operand::Reg(ptr),
+                value,
+                align: 1,
+                volatile: false,
+            });
         } else {
             let dst = match reg_number(rt) {
                 Some(n) => reg(n),
                 None => temp_reg(off + 700 + slot),
             };
-            insts.push(Inst::Load { dst, ty: Type::int(64), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+            insts.push(Inst::Load {
+                dst,
+                ty: Type::int(64),
+                ptr: Operand::Reg(ptr),
+                align: 1,
+                volatile: false,
+            });
         }
         Ok(())
     };
@@ -321,7 +436,8 @@ fn parse_mem(ops: &[&str], i: usize, off: usize) -> Result<(Vec<Inst>, RegId)> {
         .and_then(|s| s.trim_end_matches(['!']).trim().strip_suffix(']'))
         .ok_or_else(|| Error::unsupported(format!("arm64: memory operand `{joined}`")))?;
     let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-    let base = reg_number(parts.first().copied().unwrap_or("")).ok_or_else(|| Error::unsupported("arm64: mem base"))?;
+    let base = reg_number(parts.first().copied().unwrap_or(""))
+        .ok_or_else(|| Error::unsupported("arm64: mem base"))?;
     let mut insts = Vec::new();
     let mut ptr = reg(base);
     match parts.get(1) {
@@ -329,21 +445,37 @@ fn parse_mem(ops: &[&str], i: usize, off: usize) -> Result<(Vec<Inst>, RegId)> {
         Some(t) if t.starts_with('#') => {
             let disp = parse_imm(t).unwrap_or(0);
             let dst = temp_reg(off);
-            insts.push(Inst::PtrOffset { dst, base: Operand::Reg(ptr), index: Operand::int(64, disp as u128), elem: Type::int(8) });
+            insts.push(Inst::PtrOffset {
+                dst,
+                base: Operand::Reg(ptr),
+                index: Operand::int(64, disp as u128),
+                elem: Type::int(8),
+            });
             ptr = dst;
         }
         // `[base, Xindex {, lsl #s}]`
         Some(t) => {
-            let index = reg_number(t).ok_or_else(|| Error::unsupported(format!("arm64: mem index `{t}`")))?;
+            let index = reg_number(t)
+                .ok_or_else(|| Error::unsupported(format!("arm64: mem index `{t}`")))?;
             let scale = parts.get(2).and_then(parse_lsl_scale).unwrap_or(1);
             let dst = temp_reg(off);
-            insts.push(Inst::PtrOffset { dst, base: Operand::Reg(ptr), index: Operand::Reg(reg(index)), elem: Type::int(8 * scale) });
+            insts.push(Inst::PtrOffset {
+                dst,
+                base: Operand::Reg(ptr),
+                index: Operand::Reg(reg(index)),
+                elem: Type::int(8 * scale),
+            });
             ptr = dst;
         }
         // `[base]`
         None => {
             let dst = temp_reg(off);
-            insts.push(Inst::PtrOffset { dst, base: Operand::Reg(ptr), index: Operand::int(64, 0), elem: Type::int(8) });
+            insts.push(Inst::PtrOffset {
+                dst,
+                base: Operand::Reg(ptr),
+                index: Operand::int(64, 0),
+                elem: Type::int(8),
+            });
             ptr = dst;
         }
     }
@@ -366,29 +498,66 @@ fn lower_call(ops: &[&str]) -> Inst {
         None if !t.is_empty() => Callee::Symbol(t.to_string()),
         None => Callee::Symbol("<indirect>".to_string()),
     };
-    Inst::Call { dst: Some(reg(0)), callee, args: Vec::new(), ret_ty: Type::int(64), ret_ref: None }
-}
-
-fn branch(off: usize, next: usize, target: usize, cc: CmpOp, flags: Option<(Operand, Operand)>) -> Result<DecodedInsn> {
-    match flags {
-        Some((a, b)) => branch_cmp(off, next, target, cc, a, b),
-        None => branch_cmp(off, next, target, CmpOp::Ne, Operand::Reg(RegId(2000 + off as u32)), Operand::int(64, 0)),
+    Inst::Call {
+        dst: Some(reg(0)),
+        callee,
+        args: Vec::new(),
+        ret_ty: Type::int(64),
+        ret_ref: None,
     }
 }
 
-fn branch_cmp(off: usize, next: usize, target: usize, op: CmpOp, lhs: Operand, rhs: Operand) -> Result<DecodedInsn> {
+fn branch(
+    off: usize,
+    next: usize,
+    target: usize,
+    cc: CmpOp,
+    flags: Option<(Operand, Operand)>,
+) -> Result<DecodedInsn> {
+    match flags {
+        Some((a, b)) => branch_cmp(off, next, target, cc, a, b),
+        None => branch_cmp(
+            off,
+            next,
+            target,
+            CmpOp::Ne,
+            Operand::Reg(RegId(2000 + off as u32)),
+            Operand::int(64, 0),
+        ),
+    }
+}
+
+fn branch_cmp(
+    off: usize,
+    next: usize,
+    target: usize,
+    op: CmpOp,
+    lhs: Operand,
+    rhs: Operand,
+) -> Result<DecodedInsn> {
     let cond = temp_reg(off);
     Ok(DecodedInsn {
         offset: off,
         next,
-        insts: vec![Inst::Assign { dst: cond, ty: Type::Bool, value: RValue::Cmp { op, lhs, rhs } }],
+        insts: vec![Inst::Assign {
+            dst: cond,
+            ty: Type::Bool,
+            value: RValue::Cmp { op, lhs, rhs },
+        }],
         ctrl: Ctrl::Jcc(target, cond),
     })
 }
 
-fn label(ops: &[&str], i: usize, labels: &std::collections::HashMap<String, usize>) -> Result<usize> {
+fn label(
+    ops: &[&str],
+    i: usize,
+    labels: &std::collections::HashMap<String, usize>,
+) -> Result<usize> {
     let t = ops.get(i).copied().unwrap_or("").trim();
-    labels.get(t).copied().ok_or_else(|| Error::unsupported(format!("arm64: branch to unknown label `{t}`")))
+    labels
+        .get(t)
+        .copied()
+        .ok_or_else(|| Error::unsupported(format!("arm64: branch to unknown label `{t}`")))
 }
 
 /// `x0`/`w0`→0 … `x30`→30, `sp`/`xzr`/`wzr`→31, `fp`→29, `lr`→30. `None` if not
@@ -484,7 +653,9 @@ fn strip_comment(line: &str) -> &str {
 }
 
 fn is_symbol(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '@')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '@')
 }
 
 #[cfg(test)]

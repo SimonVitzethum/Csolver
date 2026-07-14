@@ -24,7 +24,9 @@ pub(super) fn parse(mnem: &str, rest: &str) -> Result<(String, u32, Vec<TextOp>)
         let op = if let Some((n, _)) = reg_token(t) {
             TextOp::Reg(n)
         } else if t.contains('[') {
-            parse_mem(t).map(TextOp::Mem).unwrap_or_else(|| TextOp::Label(t.to_string()))
+            parse_mem(t)
+                .map(TextOp::Mem)
+                .unwrap_or_else(|| TextOp::Label(t.to_string()))
         } else {
             TextOp::Label(t.to_string())
         };
@@ -97,7 +99,8 @@ fn parse_mem(tok: &str) -> Option<MemOperand> {
         return None;
     }
     let inner = &tok[open + 1..close];
-    let (mut base, mut index, mut disp, mut symbol) = (None::<u8>, None::<(u8, u8)>, 0i64, None::<String>);
+    let (mut base, mut index, mut disp, mut symbol) =
+        (None::<u8>, None::<(u8, u8)>, 0i64, None::<String>);
     let mut rip = false;
     for (sign, term) in signed_terms(inner) {
         let term = term.trim();
@@ -225,6 +228,9 @@ pub(super) fn parse_int(s: &str) -> Option<i64> {
 fn is_sym(s: &str) -> bool {
     let s = s.strip_prefix("offset ").unwrap_or(s).trim();
     !s.is_empty()
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '.')
-        && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$' | '@'))
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '.')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$' | '@'))
 }

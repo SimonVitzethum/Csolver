@@ -25,13 +25,37 @@ const CORPUS: &str = include_str!("data/x86_length_corpus.txt");
 fn csolver_mnemonic(dbg: &str) -> String {
     let name = dbg.split('(').next().unwrap_or("");
     if matches!(name, "Jcc" | "Setcc" | "Cmovcc") {
-        let cond = dbg.split('(').nth(1).unwrap_or("").split([',', ')']).next().unwrap_or("");
+        let cond = dbg
+            .split('(')
+            .nth(1)
+            .unwrap_or("")
+            .split([',', ')'])
+            .next()
+            .unwrap_or("");
         let cc = match cond {
-            "O" => "o", "NO" => "no", "B" => "b", "AE" => "ae", "E" => "e", "NE" => "ne",
-            "BE" => "be", "A" => "a", "S" => "s", "NS" => "ns", "P" => "p", "NP" => "np",
-            "L" => "l", "GE" => "ge", "LE" => "le", "G" => "g", _ => "?",
+            "O" => "o",
+            "NO" => "no",
+            "B" => "b",
+            "AE" => "ae",
+            "E" => "e",
+            "NE" => "ne",
+            "BE" => "be",
+            "A" => "a",
+            "S" => "s",
+            "NS" => "ns",
+            "P" => "p",
+            "NP" => "np",
+            "L" => "l",
+            "GE" => "ge",
+            "LE" => "le",
+            "G" => "g",
+            _ => "?",
         };
-        let base = match name { "Jcc" => "j", "Setcc" => "set", _ => "cmov" };
+        let base = match name {
+            "Jcc" => "j",
+            "Setcc" => "set",
+            _ => "cmov",
+        };
         return format!("{base}{cc}");
     }
     name.to_lowercase()
@@ -66,8 +90,9 @@ fn x86_decoder_operation_matches_llvm_ground_truth() {
         if !hex.len().is_multiple_of(2) {
             continue;
         }
-        let Some(bytes): Option<Vec<u8>> =
-            (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect()
+        let Some(bytes): Option<Vec<u8>> = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+            .collect()
         else {
             continue;
         };
@@ -79,8 +104,14 @@ fn x86_decoder_operation_matches_llvm_ground_truth() {
             }
         }
     }
-    eprintln!("x86 operation diff: {decoded} decoded, {} mismatch(es)", mismatches.len());
-    assert!(decoded > 500, "corpus should be substantial (got {decoded})");
+    eprintln!(
+        "x86 operation diff: {decoded} decoded, {} mismatch(es)",
+        mismatches.len()
+    );
+    assert!(
+        decoded > 500,
+        "corpus should be substantial (got {decoded})"
+    );
     assert!(
         mismatches.is_empty(),
         "decoded operation must match the real disassembly (a mis-decode models the wrong effect \

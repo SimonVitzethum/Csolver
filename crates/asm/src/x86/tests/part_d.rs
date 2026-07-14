@@ -164,7 +164,10 @@ fn typed_sse_movupd_reg_reg() {
 fn typed_sse_movupd_store() {
     // movupd [rdi], xmm2  = 66 0f 11 17
     let d = decode_instruction(&[0x66, 0x0f, 0x11, 0x17], 0).unwrap();
-    assert!(matches!(d.instruction, Instruction::Movupd(X86Operand::Mem(..), _)));
+    assert!(matches!(
+        d.instruction,
+        Instruction::Movupd(X86Operand::Mem(..), _)
+    ));
 }
 
 #[test]
@@ -251,7 +254,11 @@ fn typed_sse_psubq_reg_reg() {
 fn typed_sse_movaps_load_from_mem() {
     // movaps xmm0, [rax]  = 0f 28 00  (ModRM 00_000_000)
     let d = decode_instruction(&[0x0f, 0x28, 0x00], 0).unwrap();
-    let expected_mem = Mem { base: Some(Reg::RAX), index: None, disp: 0 };
+    let expected_mem = Mem {
+        base: Some(Reg::RAX),
+        index: None,
+        disp: 0,
+    };
     assert_eq!(
         d.instruction,
         Instruction::Movaps(
@@ -265,7 +272,11 @@ fn typed_sse_movaps_load_from_mem() {
 fn typed_sse_addps_load_from_mem() {
     // addps xmm0, [rax]  = 0f 58 00
     let d = decode_instruction(&[0x0f, 0x58, 0x00], 0).unwrap();
-    let expected_mem = Mem { base: Some(Reg::RAX), index: None, disp: 0 };
+    let expected_mem = Mem {
+        base: Some(Reg::RAX),
+        index: None,
+        disp: 0,
+    };
     assert_eq!(
         d.instruction,
         Instruction::Addps(

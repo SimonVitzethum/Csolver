@@ -45,7 +45,11 @@ sum:
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
     let f = &m.functions[0];
     assert!(f.blocks.len() >= 3, "loop CFG has multiple blocks");
-    assert!(f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Load { .. })));
+    assert!(f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::Load { .. })));
 }
 
 #[test]
@@ -87,9 +91,24 @@ f:
 ";
     let m = decode_att(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
-    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
-    assert!(insts.iter().any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. })), "sub rsp → stack frame");
-    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "helper")));
+    let insts: Vec<_> = m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .collect();
+    assert!(
+        insts.iter().any(|i| matches!(
+            i,
+            Inst::Alloc {
+                region: RegionKind::Stack,
+                ..
+            }
+        )),
+        "sub rsp → stack frame"
+    );
+    assert!(insts
+        .iter()
+        .any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "helper")));
 }
 
 #[test]
@@ -100,7 +119,11 @@ fn frame_pointer_idiom_builds_one_open_frame() {
     let src = "f:\n\tpushq\t%rbp\n\tmovq\t%rsp, %rbp\n\tsubq\t$16, %rsp\n\tretq\n";
     let m = decode_att(src);
     assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
-    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
+    let insts: Vec<_> = m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .collect();
     // The frame Alloc's count is a register (symbolic), not a constant — this is
     // what marks the region `assumed` (open above) in the executor.
     assert!(
@@ -124,7 +147,17 @@ fn frame_pointer_idiom_builds_one_open_frame() {
 fn att_indirect_call() {
     let m = decode_att("f:\n\tcall\t*%rax\n\tretq\n");
     assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
-    assert!(m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Call { callee: Callee::Indirect(_), .. })));
+    assert!(m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(
+            i,
+            Inst::Call {
+                callee: Callee::Indirect(_),
+                ..
+            }
+        )));
 }
 
 // ==========================================================================
@@ -162,9 +195,19 @@ f:
     let m = decode_intel(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
     assert!(has_stack_frame(&m));
-    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
-    assert!(insts.iter().any(|i| matches!(i, Inst::Store { .. })), "store to [rsp]");
-    assert!(insts.iter().any(|i| matches!(i, Inst::Load { .. })), "load from [rsp]");
+    let insts: Vec<_> = m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .collect();
+    assert!(
+        insts.iter().any(|i| matches!(i, Inst::Store { .. })),
+        "store to [rsp]"
+    );
+    assert!(
+        insts.iter().any(|i| matches!(i, Inst::Load { .. })),
+        "load from [rsp]"
+    );
 }
 
 #[test]
@@ -214,7 +257,11 @@ fn intel_negative_displacement() {
     let src = "f:\n\tmov\tdword ptr [rbp - 4], edi\n\tret\n";
     let m = decode_intel(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
-    assert!(m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Store { .. })));
+    assert!(m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::Store { .. })));
 }
 
 #[test]
@@ -232,9 +279,24 @@ f:
 ";
     let m = decode_intel(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
-    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
-    assert!(insts.iter().any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. })), "sub rsp → stack frame");
-    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "helper")));
+    let insts: Vec<_> = m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .collect();
+    assert!(
+        insts.iter().any(|i| matches!(
+            i,
+            Inst::Alloc {
+                region: RegionKind::Stack,
+                ..
+            }
+        )),
+        "sub rsp → stack frame"
+    );
+    assert!(insts
+        .iter()
+        .any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "helper")));
 }
 
 // ==========================================================================
@@ -243,13 +305,22 @@ f:
 
 #[test]
 fn detect_distinguishes_syntaxes_and_arch() {
-    assert_eq!(detect("f:\n\tmovq\t%rax, %rbx\n\tretq\n"), (Architecture::X86_64, Syntax::Att));
+    assert_eq!(
+        detect("f:\n\tmovq\t%rax, %rbx\n\tretq\n"),
+        (Architecture::X86_64, Syntax::Att)
+    );
     assert_eq!(
         detect(".intel_syntax noprefix\nf:\n\tmov\trax, rbx\n\tret\n"),
         (Architecture::X86_64, Syntax::Intel)
     );
-    assert_eq!(detect("f:\n\tmov\trax, qword ptr [rbx]\n\tret\n").1, Syntax::Intel);
-    assert_eq!(detect("f:\n\tldp\tx29, x30, [sp]\n\tret\n").0, Architecture::AArch64);
+    assert_eq!(
+        detect("f:\n\tmov\trax, qword ptr [rbx]\n\tret\n").1,
+        Syntax::Intel
+    );
+    assert_eq!(
+        detect("f:\n\tldp\tx29, x30, [sp]\n\tret\n").0,
+        Architecture::AArch64
+    );
 }
 
 // ==========================================================================
@@ -261,7 +332,15 @@ fn has_stack_frame(m: &Module) -> bool {
         .iter()
         .flat_map(|f| f.blocks.iter())
         .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. }))
+        .any(|i| {
+            matches!(
+                i,
+                Inst::Alloc {
+                    region: RegionKind::Stack,
+                    ..
+                }
+            )
+        })
 }
 
 #[test]

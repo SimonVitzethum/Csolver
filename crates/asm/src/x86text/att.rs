@@ -12,7 +12,11 @@ pub(super) fn parse(mnem: &str, rest: &str) -> Result<(String, u32, Vec<TextOp>)
     let (base, width) = strip_suffix(mnem);
     // Control-flow mnemonics take a bare label (not an `%reg`/`$imm`/mem operand).
     if base.starts_with('j') && base.len() >= 2 {
-        return Ok((base.to_string(), width, vec![TextOp::Label(rest.trim().to_string())]));
+        return Ok((
+            base.to_string(),
+            width,
+            vec![TextOp::Label(rest.trim().to_string())],
+        ));
     }
     // `call`: a direct symbol, or an indirect `*%reg` / `*(mem)` target.
     if base == "call" {
@@ -83,10 +87,20 @@ fn parse_mem(tok: &str) -> Option<MemOperand> {
     let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
     // A RIP-relative access `symbol(%rip)`: base is `%rip`, displacement is a symbol.
     if parts.first().copied() == Some("%rip") {
-        return Some(MemOperand { base: reg(0), index: None, disp: 0, next: 0, symbol: Some(disp_str.to_string()) });
+        return Some(MemOperand {
+            base: reg(0),
+            index: None,
+            disp: 0,
+            next: 0,
+            symbol: Some(disp_str.to_string()),
+        });
     }
     let disp: i64 = if open == 0 { 0 } else { parse_disp(disp_str)? };
-    let base = parts.first().copied()?.strip_prefix('%').and_then(reg_number)?;
+    let base = parts
+        .first()
+        .copied()?
+        .strip_prefix('%')
+        .and_then(reg_number)?;
     let index = match parts.get(1) {
         Some(r) if !r.is_empty() => {
             let ir = r.strip_prefix('%').and_then(reg_number)?;
@@ -95,7 +109,13 @@ fn parse_mem(tok: &str) -> Option<MemOperand> {
         }
         _ => None,
     };
-    Some(MemOperand { base: reg(base), index, disp, next: 0, symbol: None })
+    Some(MemOperand {
+        base: reg(base),
+        index,
+        disp,
+        next: 0,
+        symbol: None,
+    })
 }
 
 fn parse_disp(s: &str) -> Option<i64> {
@@ -113,8 +133,20 @@ fn strip_suffix(mnem: &str) -> (&str, u32) {
     let known_base = |m: &str| {
         matches!(
             m,
-            "mov" | "add" | "sub" | "and" | "or" | "xor" | "cmp" | "test" | "inc" | "dec" | "lea"
-                | "push" | "pop" | "call"
+            "mov"
+                | "add"
+                | "sub"
+                | "and"
+                | "or"
+                | "xor"
+                | "cmp"
+                | "test"
+                | "inc"
+                | "dec"
+                | "lea"
+                | "push"
+                | "pop"
+                | "call"
         ) || m.starts_with("cmov")
     };
     for (suf, w) in [('q', 64u32), ('l', 32), ('w', 16), ('b', 8)] {

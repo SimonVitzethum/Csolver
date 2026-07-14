@@ -51,7 +51,10 @@ fn x86_decoder_length_matches_llvm_ground_truth() {
         if let Ok(d) = decode_instruction(&bytes, 0) {
             decoded += 1;
             if d.length != want {
-                mismatches.push(format!("{hex} ({mn}): decoded length {} but true length is {want}", d.length));
+                mismatches.push(format!(
+                    "{hex} ({mn}): decoded length {} but true length is {want}",
+                    d.length
+                ));
             }
         }
     }

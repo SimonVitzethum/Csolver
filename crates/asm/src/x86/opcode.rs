@@ -79,7 +79,10 @@ pub(crate) fn decode_typed_opcode(
                 Ok((Instruction::Mov(reg_op(dst), reg_op(src)), p))
             } else {
                 let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                Ok((Instruction::Mov(X86Operand::Mem(mem, width), reg_op(src)), p))
+                Ok((
+                    Instruction::Mov(X86Operand::Mem(mem, width), reg_op(src)),
+                    p,
+                ))
             }
         }
 
@@ -95,7 +98,10 @@ pub(crate) fn decode_typed_opcode(
                 Ok((Instruction::Mov(reg_op(dst), reg_op(src)), p))
             } else {
                 let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                Ok((Instruction::Mov(reg_op(dst), X86Operand::Mem(mem, width)), p))
+                Ok((
+                    Instruction::Mov(reg_op(dst), X86Operand::Mem(mem, width)),
+                    p,
+                ))
             }
         }
 
@@ -124,7 +130,11 @@ pub(crate) fn decode_typed_opcode(
                 Group1Op::And => Instruction::And(operand, X86Operand::Imm(imm as u64)),
                 Group1Op::Or => Instruction::Or(operand, X86Operand::Imm(imm as u64)),
                 Group1Op::Xor => Instruction::Xor(operand, X86Operand::Imm(imm as u64)),
-                _ => return Err(CoreError::unsupported("x86: unsupported group-1 operation with imm8 (0x80)")),
+                _ => {
+                    return Err(CoreError::unsupported(
+                        "x86: unsupported group-1 operation with imm8 (0x80)",
+                    ))
+                }
             };
             Ok((inst, p))
         }
@@ -140,7 +150,11 @@ pub(crate) fn decode_typed_opcode(
                 Group1Op::And => Instruction::And(operand, X86Operand::Imm(imm)),
                 Group1Op::Or => Instruction::Or(operand, X86Operand::Imm(imm)),
                 Group1Op::Xor => Instruction::Xor(operand, X86Operand::Imm(imm)),
-                _ => return Err(CoreError::unsupported("x86: unsupported group-1 operation with imm32")),
+                _ => {
+                    return Err(CoreError::unsupported(
+                        "x86: unsupported group-1 operation with imm32",
+                    ))
+                }
             };
             Ok((inst, p))
         }
@@ -160,7 +174,11 @@ pub(crate) fn decode_typed_opcode(
                 Group1Op::And => Instruction::And(operand, X86Operand::Imm(imm)),
                 Group1Op::Or => Instruction::Or(operand, X86Operand::Imm(imm)),
                 Group1Op::Xor => Instruction::Xor(operand, X86Operand::Imm(imm as u64)),
-                _ => return Err(CoreError::unsupported("x86: unsupported group-1 operation with imm8")),
+                _ => {
+                    return Err(CoreError::unsupported(
+                        "x86: unsupported group-1 operation with imm8",
+                    ))
+                }
             };
             Ok((inst, p))
         }
@@ -296,10 +314,22 @@ pub(crate) fn decode_typed_opcode(
             if m.mode == 0b11 {
                 let src = Reg::from_idx(m.rm)
                     .ok_or_else(|| CoreError::parse("x86: invalid register in movsxd"))?;
-                Ok((Instruction::Movsxd(X86Operand::Reg(dst, Width::Q), X86Operand::Reg(src, Width::D)), p))
+                Ok((
+                    Instruction::Movsxd(
+                        X86Operand::Reg(dst, Width::Q),
+                        X86Operand::Reg(src, Width::D),
+                    ),
+                    p,
+                ))
             } else {
                 let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                Ok((Instruction::Movsxd(X86Operand::Reg(dst, Width::Q), X86Operand::Mem(mem, Width::D)), p))
+                Ok((
+                    Instruction::Movsxd(
+                        X86Operand::Reg(dst, Width::Q),
+                        X86Operand::Mem(mem, Width::D),
+                    ),
+                    p,
+                ))
             }
         }
 
@@ -357,7 +387,10 @@ pub(crate) fn decode_typed_opcode(
             match m.reg & 7 {
                 0 => Ok((Instruction::Inc(operand), p)),
                 1 => Ok((Instruction::Dec(operand), p)),
-                _ => Err(CoreError::unsupported(format!("x86: unsupported group-4 /digit {}", m.reg & 7))),
+                _ => Err(CoreError::unsupported(format!(
+                    "x86: unsupported group-4 /digit {}",
+                    m.reg & 7
+                ))),
             }
         }
 
@@ -376,7 +409,10 @@ pub(crate) fn decode_typed_opcode(
                 1 => Ok((Instruction::Dec(operand), p)),
                 2 => Ok((Instruction::Call(operand), p)),
                 4 => Ok((Instruction::Jmp(operand), p)),
-                _ => Err(CoreError::unsupported(format!("x86: unsupported group-5 /digit {}", m.reg & 7))),
+                _ => Err(CoreError::unsupported(format!(
+                    "x86: unsupported group-5 /digit {}",
+                    m.reg & 7
+                ))),
             }
         }
 
@@ -391,7 +427,11 @@ pub(crate) fn decode_typed_opcode(
             let operand = read_rm_operand(code, &mut p, rex_r, rex_x, rex_b, width)?;
             let (imm_raw, _) = read_imm64(code, p, 4)?;
             p += 4;
-            let imm = if width.bits() > 32 { imm_raw as u32 as i32 as i64 as u128 as u64 } else { imm_raw };
+            let imm = if width.bits() > 32 {
+                imm_raw as u32 as i32 as i64 as u128 as u64
+            } else {
+                imm_raw
+            };
             Ok((Instruction::Mov(operand, X86Operand::Imm(imm)), p))
         }
 
@@ -410,7 +450,10 @@ pub(crate) fn decode_typed_opcode(
                 4 => Ok((Instruction::Shl(operand, imm), p)),
                 5 => Ok((Instruction::Shr(operand, imm), p)),
                 7 => Ok((Instruction::Sar(operand, imm), p)),
-                _ => Err(CoreError::unsupported(format!("x86: unsupported group-2 /digit {}", m.reg & 7))),
+                _ => Err(CoreError::unsupported(format!(
+                    "x86: unsupported group-2 /digit {}",
+                    m.reg & 7
+                ))),
             }
         }
 
@@ -428,7 +471,10 @@ pub(crate) fn decode_typed_opcode(
                 4 => Ok((Instruction::Shl(operand, 1), p)),
                 5 => Ok((Instruction::Shr(operand, 1), p)),
                 7 => Ok((Instruction::Sar(operand, 1), p)),
-                _ => Err(CoreError::unsupported(format!("x86: unsupported group-2 shift-1 /digit {}", m.reg & 7))),
+                _ => Err(CoreError::unsupported(format!(
+                    "x86: unsupported group-2 shift-1 /digit {}",
+                    m.reg & 7
+                ))),
             }
         }
 
@@ -448,12 +494,22 @@ pub(crate) fn decode_typed_opcode(
             }
             let o1 = read_rm_operand(code, &mut p, rex_r, rex_x, rex_b, group_width)?;
             // Read the /digit field from the ModRM byte (at p-1 after read_rm_operand).
-            let modrm_byte = *code.get(p - 1).ok_or_else(|| CoreError::parse("x86: truncated ModR/M in group-3"))?;
+            let modrm_byte = *code
+                .get(p - 1)
+                .ok_or_else(|| CoreError::parse("x86: truncated ModR/M in group-3"))?;
             let reg_field = ((modrm_byte >> 3) & 7) | if rex_r { 8 } else { 0 };
             match reg_field & 7 {
                 0 => {
                     // test r/m, imm — not /0
-                    let imm_len = if is_byte { 1 } else { if rex_w { 8 } else { 4 } };
+                    let imm_len = if is_byte {
+                        1
+                    } else {
+                        if rex_w {
+                            8
+                        } else {
+                            4
+                        }
+                    };
                     let (imm, _) = read_imm64(code, p, imm_len)?;
                     p += imm_len;
                     Ok((Instruction::Test(o1, X86Operand::Imm(imm)), p))
@@ -464,13 +520,18 @@ pub(crate) fn decode_typed_opcode(
                 5 => Ok((Instruction::Imul(o1), p)),
                 6 => Ok((Instruction::Div(o1), p)),
                 7 => Ok((Instruction::Idiv(o1), p)),
-                _ => Err(CoreError::unsupported(format!("x86: unsupported group-3 /digit {}", reg_field & 7))),
+                _ => Err(CoreError::unsupported(format!(
+                    "x86: unsupported group-3 /digit {}",
+                    reg_field & 7
+                ))),
             }
         }
 
         // Two-byte opcode escape (0x0F).
         0x0f => {
-            let op2 = *code.get(p).ok_or_else(|| CoreError::parse(format!("x86: truncated 0F opcode at offset {p}")))?;
+            let op2 = *code.get(p).ok_or_else(|| {
+                CoreError::parse(format!("x86: truncated 0F opcode at offset {p}"))
+            })?;
             p += 1;
             match op2 {
                 // syscall (0F 05)
@@ -489,7 +550,10 @@ pub(crate) fn decode_typed_opcode(
                         Ok((Instruction::Cmovcc(cc, reg_op(dst), reg_op(src)), p))
                     } else {
                         let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                        Ok((Instruction::Cmovcc(cc, reg_op(dst), X86Operand::Mem(mem, width)), p))
+                        Ok((
+                            Instruction::Cmovcc(cc, reg_op(dst), X86Operand::Mem(mem, width)),
+                            p,
+                        ))
                     }
                 }
                 // jcc rel32 (0F 80..8F)
@@ -537,7 +601,10 @@ pub(crate) fn decode_typed_opcode(
                         Ok((Instruction::Bt(reg_op(base), reg_op(bit_index)), p))
                     } else {
                         let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                        Ok((Instruction::Bt(X86Operand::Mem(mem, width), reg_op(bit_index)), p))
+                        Ok((
+                            Instruction::Bt(X86Operand::Mem(mem, width), reg_op(bit_index)),
+                            p,
+                        ))
                     }
                 }
                 // bts r/m, r (0F AB) — bit test and set.
@@ -552,7 +619,10 @@ pub(crate) fn decode_typed_opcode(
                         Ok((Instruction::Bts(reg_op(base), reg_op(bit_index)), p))
                     } else {
                         let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                        Ok((Instruction::Bts(X86Operand::Mem(mem, width), reg_op(bit_index)), p))
+                        Ok((
+                            Instruction::Bts(X86Operand::Mem(mem, width), reg_op(bit_index)),
+                            p,
+                        ))
                     }
                 }
                 // btr r/m, r (0F B3) — bit test and reset.
@@ -567,7 +637,10 @@ pub(crate) fn decode_typed_opcode(
                         Ok((Instruction::Btr(reg_op(base), reg_op(bit_index)), p))
                     } else {
                         let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                        Ok((Instruction::Btr(X86Operand::Mem(mem, width), reg_op(bit_index)), p))
+                        Ok((
+                            Instruction::Btr(X86Operand::Mem(mem, width), reg_op(bit_index)),
+                            p,
+                        ))
                     }
                 }
                 // btc r/m, r (0F BB) — bit test and complement.
@@ -582,7 +655,10 @@ pub(crate) fn decode_typed_opcode(
                         Ok((Instruction::Btc(reg_op(base), reg_op(bit_index)), p))
                     } else {
                         let mem = read_mem(code, &mut p, &m, rex_x, rex_b)?;
-                        Ok((Instruction::Btc(X86Operand::Mem(mem, width), reg_op(bit_index)), p))
+                        Ok((
+                            Instruction::Btc(X86Operand::Mem(mem, width), reg_op(bit_index)),
+                            p,
+                        ))
                     }
                 }
                 // bsf (0F BC) — bit scan forward; bsr (0F BD) — bit scan reverse.
@@ -596,17 +672,20 @@ pub(crate) fn decode_typed_opcode(
                 0xbf => decode_movsx(code, &mut p, rex_r, rex_x, rex_b, width, true),
                 // 0F SSE opcodes (legacy prefix encoded in sse_pp).
                 // These are handled by the shared SSE decoder that both VEX and legacy paths use.
-                0x10 | 0x11 | 0x14 | 0x15 | 0x28 | 0x29 | 0x2e | 0x2f |
-                0x51 | 0x54 | 0x55 | 0x56 | 0x57 | 0x58 | 0x59 |
-                0x5b | 0x5c | 0x5d | 0x5e | 0x5f | 0xc2 | 0xc6 |
-                0xd4 | 0xdb | 0xeb | 0xef | 0xfb => {
+                0x10 | 0x11 | 0x14 | 0x15 | 0x28 | 0x29 | 0x2e | 0x2f | 0x51 | 0x54 | 0x55
+                | 0x56 | 0x57 | 0x58 | 0x59 | 0x5b | 0x5c | 0x5d | 0x5e | 0x5f | 0xc2 | 0xc6
+                | 0xd4 | 0xdb | 0xeb | 0xef | 0xfb => {
                     decode_sse_0f_op(op2, code, &mut p, sse_pp, rex_r, rex_x, rex_b)
                 }
-                _ => Err(CoreError::unsupported(format!("x86: unsupported two-byte opcode 0f {op2:#04x}"))),
+                _ => Err(CoreError::unsupported(format!(
+                    "x86: unsupported two-byte opcode 0f {op2:#04x}"
+                ))),
             }
         }
 
-        other => Err(CoreError::unsupported(format!("x86: unsupported opcode {other:#04x}"))),
+        other => Err(CoreError::unsupported(format!(
+            "x86: unsupported opcode {other:#04x}"
+        ))),
     }
 }
 

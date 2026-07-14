@@ -1,5 +1,5 @@
-use super::*;
 use super::part_f::TRUNCATED_OPS;
+use super::*;
 
 #[test]
 fn every_decode_point_rejects_truncated_input() {
@@ -105,7 +105,11 @@ fn rejects_unknown_single_byte_opcodes() {
             bad.push(format!("{op:#04x} gave unexpected error: {e}"));
         }
     }
-    assert!(bad.is_empty(), "unsupported opcode mismatches:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "unsupported opcode mismatches:\n{}",
+        bad.join("\n")
+    );
 }
 
 /// Return true if `op` is a single-byte x86-64 opcode handled by the
@@ -190,7 +194,11 @@ fn rejects_unknown_two_byte_opcodes() {
             bad.push(format!("0f {op2:#04x} gave unexpected error: {e}"));
         }
     }
-    assert!(bad.is_empty(), "unsupported two-byte opcode mismatches:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "unsupported two-byte opcode mismatches:\n{}",
+        bad.join("\n")
+    );
 }
 
 fn is_supported_two_byte_opcode(op2: u8) -> bool {
@@ -292,7 +300,11 @@ fn typed_sse_movapd_reg_reg() {
 fn typed_sse_movaps_store() {
     // movaps [rax], xmm0  = 0f 29 00  (ModRM 00_000_000)
     let d = decode_instruction(&[0x0f, 0x29, 0x00], 0).unwrap();
-    let expected_mem = Mem { base: Some(Reg::RAX), index: None, disp: 0 };
+    let expected_mem = Mem {
+        base: Some(Reg::RAX),
+        index: None,
+        disp: 0,
+    };
     assert_eq!(
         d.instruction,
         Instruction::Movaps(

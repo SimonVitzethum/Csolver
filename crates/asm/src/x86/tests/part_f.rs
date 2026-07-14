@@ -49,7 +49,10 @@ fn typed_lea_r8_indexed() {
         index: Some((Reg::RCX, 4)),
         disp: 0,
     };
-    assert_eq!(d.instruction, Instruction::Lea(Reg::R8, Width::D, expected_mem));
+    assert_eq!(
+        d.instruction,
+        Instruction::Lea(Reg::R8, Width::D, expected_mem)
+    );
 }
 
 #[test]
@@ -126,15 +129,27 @@ fn typed_error_unsupported_group1_op() {
 fn typed_conditional_count() {
     // Verify all 16 conditions decode
     for cc in 0..=15u8 {
-        let code = [0x70 | (cc & 0xf), 0x00];  // jo .. jg +0
+        let code = [0x70 | (cc & 0xf), 0x00]; // jo .. jg +0
         let d = decode_instruction(&code, 0).unwrap();
         if let Instruction::Jcc(c, 0) = d.instruction {
             assert!(matches!(
                 c,
-                Condition::O | Condition::NO | Condition::B | Condition::AE
-                    | Condition::E | Condition::NE | Condition::BE | Condition::A
-                    | Condition::S | Condition::NS | Condition::P | Condition::NP
-                    | Condition::L | Condition::GE | Condition::LE | Condition::G
+                Condition::O
+                    | Condition::NO
+                    | Condition::B
+                    | Condition::AE
+                    | Condition::E
+                    | Condition::NE
+                    | Condition::BE
+                    | Condition::A
+                    | Condition::S
+                    | Condition::NS
+                    | Condition::P
+                    | Condition::NP
+                    | Condition::L
+                    | Condition::GE
+                    | Condition::LE
+                    | Condition::G
             ));
         } else {
             panic!("unexpected instruction for cc={cc}");
@@ -244,5 +259,8 @@ pub(super) const TRUNCATED_OPS: &[(&[u8], &str)] = &[
     // disp32 with SIB and no base
     (&[0x8b, 0x04, 0x25], "SIB mod=00 base=5 disp32 truncated"),
     // Prefix chain truncated
-    (&[0x66, 0x90], "0x66 prefix nop works (positive) not truncated"),
+    (
+        &[0x66, 0x90],
+        "0x66 prefix nop works (positive) not truncated",
+    ),
 ];

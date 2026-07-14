@@ -1,22 +1,35 @@
 use super::*;
 
 /// VEX.128 wrapper: reads the opcode byte and dispatches to `decode_sse_0f_op`.
-pub(crate) fn decode_vex_0f(code: &[u8], p: &mut usize, vex: VexInfo) -> csolver_core::Result<(Instruction, usize)> {
-    let op = *code.get(*p).ok_or_else(|| CoreError::parse(format!("x86: truncated VEX opcode at offset {}", *p)))?;
+pub(crate) fn decode_vex_0f(
+    code: &[u8],
+    p: &mut usize,
+    vex: VexInfo,
+) -> csolver_core::Result<(Instruction, usize)> {
+    let op = *code
+        .get(*p)
+        .ok_or_else(|| CoreError::parse(format!("x86: truncated VEX opcode at offset {}", *p)))?;
     *p += 1;
     decode_sse_0f_op(op, code, p, vex.pp, vex.rex_r, vex.rex_x, vex.rex_b)
 }
 
 /// Decode VEX.128-encoded instructions from the 0F38 opcode map (VEX.mmmmm=2).
 /// Most instructions require pp=1 (66 prefix). SSSE3 and SSE4.1 instructions.
-pub(crate) fn decode_vex_0f38(code: &[u8], p: &mut usize, vex: VexInfo) -> csolver_core::Result<(Instruction, usize)> {
-    let op = *code.get(*p).ok_or_else(|| CoreError::parse(format!("x86: truncated VEX 0F38 opcode at offset {}", *p)))?;
+pub(crate) fn decode_vex_0f38(
+    code: &[u8],
+    p: &mut usize,
+    vex: VexInfo,
+) -> csolver_core::Result<(Instruction, usize)> {
+    let op = *code.get(*p).ok_or_else(|| {
+        CoreError::parse(format!("x86: truncated VEX 0F38 opcode at offset {}", *p))
+    })?;
     *p += 1;
     let pp = vex.pp;
     let (rex_r, rex_x, rex_b) = (vex.rex_r, vex.rex_x, vex.rex_b);
-    let decode_reg_mem = |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
-        read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
-    };
+    let decode_reg_mem =
+        |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
+            read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
+        };
     // Most 0F38 instructions require 66 prefix (pp=1).
     match op {
         // 0F38 00: PSHUFB dst, src (SSSE3)
@@ -243,23 +256,35 @@ pub(crate) fn decode_vex_0f38(code: &[u8], p: &mut usize, vex: VexInfo) -> csolv
                 .ok_or_else(|| CoreError::parse("x86: invalid XMM register in PHMINPOSUW"))?;
             Ok((Instruction::Phminposuw(xmm_op(dst, Width::DQ), src), *p))
         }
-        _ => Err(CoreError::unsupported(format!("x86: unsupported VEX.128 0F38 opcode {:02x} pp={}", op, pp))),
+        _ => Err(CoreError::unsupported(format!(
+            "x86: unsupported VEX.128 0F38 opcode {:02x} pp={}",
+            op, pp
+        ))),
     }
 }
 
 /// Decode VEX.128-encoded instructions from the 0F3A opcode map (VEX.mmmmm=3).
 /// All require pp=1 (66 prefix). SSE4.1 and SSSE3 instructions with an imm8.
-pub(crate) fn decode_vex_0f3a(code: &[u8], p: &mut usize, vex: VexInfo) -> csolver_core::Result<(Instruction, usize)> {
-    let op = *code.get(*p).ok_or_else(|| CoreError::parse(format!("x86: truncated VEX 0F3A opcode at offset {}", *p)))?;
+pub(crate) fn decode_vex_0f3a(
+    code: &[u8],
+    p: &mut usize,
+    vex: VexInfo,
+) -> csolver_core::Result<(Instruction, usize)> {
+    let op = *code.get(*p).ok_or_else(|| {
+        CoreError::parse(format!("x86: truncated VEX 0F3A opcode at offset {}", *p))
+    })?;
     *p += 1;
     let pp = vex.pp;
     let rex_w = vex.w;
     let (rex_r, rex_x, rex_b) = (vex.rex_r, vex.rex_x, vex.rex_b);
-    let decode_reg_mem = |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
-        read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
-    };
+    let decode_reg_mem =
+        |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
+            read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
+        };
     let read_imm8 = |code: &[u8], p: &mut usize| -> csolver_core::Result<u8> {
-        let imm = code.get(*p).copied()
+        let imm = code
+            .get(*p)
+            .copied()
             .ok_or_else(|| CoreError::parse("x86: truncated 0F3A immediate"))?;
         *p += 1;
         Ok(imm)
@@ -386,7 +411,10 @@ pub(crate) fn decode_vex_0f3a(code: &[u8], p: &mut usize, vex: VexInfo) -> csolv
                 Ok((Instruction::Pinsrd(xmm_op(dst, Width::DQ), src, imm), *p))
             }
         }
-        _ => Err(CoreError::unsupported(format!("x86: unsupported VEX.128 0F3A opcode {:02x} pp={}", op, pp))),
+        _ => Err(CoreError::unsupported(format!(
+            "x86: unsupported VEX.128 0F3A opcode {:02x} pp={}",
+            op, pp
+        ))),
     }
 }
 

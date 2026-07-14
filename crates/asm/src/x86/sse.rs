@@ -12,12 +12,18 @@ use super::*;
 /// extended, i.e. r8/xmm8+), and `~vvvv` is the 1's-complement of the third
 /// operand's register number. Test vectors are taken from a real assembler
 /// (`llvm-mc -triple=x86_64 --show-encoding`).
-pub(crate) fn parse_vex(code: &[u8], p: &mut usize, is_two_byte: bool) -> csolver_core::Result<VexInfo> {
+pub(crate) fn parse_vex(
+    code: &[u8],
+    p: &mut usize,
+    is_two_byte: bool,
+) -> csolver_core::Result<VexInfo> {
     // Advance past the C4/C5 lead byte.
     *p += 1;
     if is_two_byte {
         // C5: single payload byte [~R vvvv L pp]. Map is implicitly 0F; W=0.
-        let b = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated 2-byte VEX prefix (C5)"))?;
+        let b = *code
+            .get(*p)
+            .ok_or_else(|| CoreError::parse("x86: truncated 2-byte VEX prefix (C5)"))?;
         *p += 1;
         Ok(VexInfo {
             vvvv: (!(b >> 3)) & 0xf,
@@ -31,13 +37,19 @@ pub(crate) fn parse_vex(code: &[u8], p: &mut usize, is_two_byte: bool) -> csolve
         })
     } else {
         // C4: b1 = [~R ~X ~B mmmmm(5)], b2 = [W ~vvvv L pp].
-        let b1 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated 3-byte VEX prefix (C4 byte 1)"))?;
+        let b1 = *code
+            .get(*p)
+            .ok_or_else(|| CoreError::parse("x86: truncated 3-byte VEX prefix (C4 byte 1)"))?;
         *p += 1;
-        let b2 = *code.get(*p).ok_or_else(|| CoreError::parse("x86: truncated 3-byte VEX prefix (C4 byte 2)"))?;
+        let b2 = *code
+            .get(*p)
+            .ok_or_else(|| CoreError::parse("x86: truncated 3-byte VEX prefix (C4 byte 2)"))?;
         *p += 1;
         let mmmmm = b1 & 0x1f;
         if mmmmm == 0 || mmmmm > 3 {
-            return Err(CoreError::unsupported(format!("x86: unsupported VEX.mmmmm {mmmmm}")));
+            return Err(CoreError::unsupported(format!(
+                "x86: unsupported VEX.mmmmm {mmmmm}"
+            )));
         }
         Ok(VexInfo {
             vvvv: (!(b2 >> 3)) & 0xf,
@@ -70,8 +82,9 @@ pub(crate) fn read_xmm_rm_operand(
     let m = read_modrm(code, *p, rex_r, rex_b)?;
     *p += 1;
     if m.mode == 0b11 {
-        let r = XmmReg::from_idx(m.rm)
-            .ok_or_else(|| CoreError::parse(format!("x86: invalid XMM register {} in SSE operand", m.rm)))?;
+        let r = XmmReg::from_idx(m.rm).ok_or_else(|| {
+            CoreError::parse(format!("x86: invalid XMM register {} in SSE operand", m.rm))
+        })?;
         Ok((X86Operand::Xmm(r, width), m))
     } else {
         let mem = read_mem(code, p, &m, rex_x, rex_b)?;
@@ -92,9 +105,10 @@ pub(crate) fn decode_sse_0f_op(
     rex_x: bool,
     rex_b: bool,
 ) -> csolver_core::Result<(Instruction, usize)> {
-    let decode_reg_mem = |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
-        read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
-    };
+    let decode_reg_mem =
+        |code: &[u8], p: &mut usize| -> csolver_core::Result<(X86Operand, TypedModRm)> {
+            read_xmm_rm_operand(code, p, rex_r, rex_x, rex_b, Width::DQ)
+        };
     match op {
         // 0F 10: MOVUPS (pp=0), MOVSS (pp=2), MOVSD (pp=3), MOVUPD (pp=1)
         0x10 => {
@@ -349,7 +363,9 @@ pub(crate) fn decode_sse_0f_op(
             let (src, m) = decode_reg_mem(code, p)?;
             let dst = XmmReg::from_idx(m.reg)
                 .ok_or_else(|| CoreError::parse("x86: invalid XMM register in CMP*"))?;
-            let imm = code.get(*p).copied()
+            let imm = code
+                .get(*p)
+                .copied()
                 .ok_or_else(|| CoreError::parse("x86: truncated CMP immediate"))?;
             *p += 1;
             let inst = match pp {
@@ -366,7 +382,9 @@ pub(crate) fn decode_sse_0f_op(
             let (src, m) = decode_reg_mem(code, p)?;
             let dst = XmmReg::from_idx(m.reg)
                 .ok_or_else(|| CoreError::parse("x86: invalid XMM register in SHUF*"))?;
-            let imm = code.get(*p).copied()
+            let imm = code
+                .get(*p)
+                .copied()
                 .ok_or_else(|| CoreError::parse("x86: truncated SHUF immediate"))?;
             *p += 1;
             match pp {
@@ -410,6 +428,9 @@ pub(crate) fn decode_sse_0f_op(
                 .ok_or_else(|| CoreError::parse("x86: invalid XMM register in PSUBQ"))?;
             Ok((Instruction::Psubq(xmm_op(dst, Width::DQ), src), *p))
         }
-        _ => Err(CoreError::unsupported(format!("x86: unsupported VEX.128 opcode 0f {:02x}", op))),
+        _ => Err(CoreError::unsupported(format!(
+            "x86: unsupported VEX.128 opcode 0f {:02x}",
+            op
+        ))),
     }
 }

@@ -142,12 +142,23 @@ impl fmt::Display for X86Operand {
 }
 
 /// Helper: format a two-operand instruction `mnemonic dst, src`.
-pub(crate) fn fmt_binary(f: &mut fmt::Formatter<'_>, mnemonic: &str, dst: &X86Operand, src: &X86Operand) -> fmt::Result {
+pub(crate) fn fmt_binary(
+    f: &mut fmt::Formatter<'_>,
+    mnemonic: &str,
+    dst: &X86Operand,
+    src: &X86Operand,
+) -> fmt::Result {
     write!(f, "{mnemonic} {dst}, {src}")
 }
 
 /// Helper: format a two-operand-with-immediate instruction `mnemonic dst, src, imm`.
-pub(crate) fn fmt_ternary(f: &mut fmt::Formatter<'_>, mnemonic: &str, a: &X86Operand, b: &X86Operand, imm: u8) -> fmt::Result {
+pub(crate) fn fmt_ternary(
+    f: &mut fmt::Formatter<'_>,
+    mnemonic: &str,
+    a: &X86Operand,
+    b: &X86Operand,
+    imm: u8,
+) -> fmt::Result {
     write!(f, "{mnemonic} {a}, {b}, {imm}")
 }
 

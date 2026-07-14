@@ -3,14 +3,22 @@ use super::*;
 impl Condition {
     pub(crate) fn from_cc(cc: u8) -> Option<Condition> {
         match cc {
-            0x0 => Some(Condition::O),  0x1 => Some(Condition::NO),
-            0x2 => Some(Condition::B),  0x3 => Some(Condition::AE),
-            0x4 => Some(Condition::E),  0x5 => Some(Condition::NE),
-            0x6 => Some(Condition::BE), 0x7 => Some(Condition::A),
-            0x8 => Some(Condition::S),  0x9 => Some(Condition::NS),
-            0xa => Some(Condition::P),  0xb => Some(Condition::NP),
-            0xc => Some(Condition::L),  0xd => Some(Condition::GE),
-            0xe => Some(Condition::LE), 0xf => Some(Condition::G),
+            0x0 => Some(Condition::O),
+            0x1 => Some(Condition::NO),
+            0x2 => Some(Condition::B),
+            0x3 => Some(Condition::AE),
+            0x4 => Some(Condition::E),
+            0x5 => Some(Condition::NE),
+            0x6 => Some(Condition::BE),
+            0x7 => Some(Condition::A),
+            0x8 => Some(Condition::S),
+            0x9 => Some(Condition::NS),
+            0xa => Some(Condition::P),
+            0xb => Some(Condition::NP),
+            0xc => Some(Condition::L),
+            0xd => Some(Condition::GE),
+            0xe => Some(Condition::LE),
+            0xf => Some(Condition::G),
             _ => None,
         }
     }

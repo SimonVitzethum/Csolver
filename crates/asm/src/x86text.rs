@@ -23,7 +23,9 @@
 use crate::blocks::{build_blocks, Ctrl, DecodedInsn};
 use crate::x86::{cc_cmpop, reg, temp_reg, MemOperand};
 use csolver_core::{Error, RegionKind, Result};
-use csolver_ir::{BinOp, Callee, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type};
+use csolver_ir::{
+    BinOp, Callee, Const, FuncId, Function, Inst, Module, Operand, RValue, RegId, Type,
+};
 
 /// One parsed textual operand, in a syntax-independent form. Widths are in bits.
 pub(crate) enum TextOp {
@@ -44,7 +46,11 @@ pub(crate) fn decode(source: &str, intel: bool) -> Module {
     let mut m = Module::new("asm");
     for (name, body) in split_functions(source) {
         match decode_function_lines(&body, intel) {
-            Ok(f) => m.functions.push(Function { id: FuncId(m.functions.len() as u32), name, ..f }),
+            Ok(f) => m.functions.push(Function {
+                id: FuncId(m.functions.len() as u32),
+                name,
+                ..f
+            }),
             Err(e) => m.unanalyzed.push((name, e.to_string())),
         }
     }
@@ -149,34 +155,61 @@ fn lower_insn(
     intel: bool,
 ) -> Result<DecodedInsn> {
     let next = off + 1;
-    let fall = |insts: Vec<Inst>| DecodedInsn { offset: off, next, insts, ctrl: Ctrl::Fall };
+    let fall = |insts: Vec<Inst>| DecodedInsn {
+        offset: off,
+        next,
+        insts,
+        ctrl: Ctrl::Fall,
+    };
     let (mnem, rest) = match ins.split_once(char::is_whitespace) {
         Some((m, r)) => (m, r.trim()),
         None => (ins, ""),
     };
     // Parse the operands (in AT&T order: source first, destination last) and the
     // instruction's base mnemonic + access width.
-    let (base, width, ops) =
-        if intel { intel::parse(mnem, rest)? } else { att::parse(mnem, rest)? };
+    let (base, width, ops) = if intel {
+        intel::parse(mnem, rest)?
+    } else {
+        att::parse(mnem, rest)?
+    };
 
     match base.as_str() {
-        "ret" | "retq" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Ret }),
+        "ret" | "retq" => Ok(DecodedInsn {
+            offset: off,
+            next,
+            insts: vec![],
+            ctrl: Ctrl::Ret,
+        }),
         "endbr64" | "endbr32" | "hlt" | "ud2" => Ok(fall(vec![])),
         _ if base.starts_with("nop") => Ok(fall(vec![])),
-        "jmp" => Ok(DecodedInsn { offset: off, next, insts: vec![], ctrl: Ctrl::Jmp(label(&ops, 0, labels)?) }),
+        "jmp" => Ok(DecodedInsn {
+            offset: off,
+            next,
+            insts: vec![],
+            ctrl: Ctrl::Jmp(label(&ops, 0, labels)?),
+        }),
         // jcc: `j<cc>` — the condition is the cc suffix.
         _ if base.starts_with('j') && base.len() >= 2 => {
-            let cc = jcc_code(&base[1..]).ok_or_else(|| Error::unsupported(format!("asm: jcc `{base}`")))?;
+            let cc = jcc_code(&base[1..])
+                .ok_or_else(|| Error::unsupported(format!("asm: jcc `{base}`")))?;
             let t = label(&ops, 0, labels)?;
             let cond = temp_reg(off);
             let (op, lhs, rhs) = match (cc_cmpop(cc), flags.clone()) {
                 (Some(op), Some((a, b))) => (op, a, b),
-                _ => (csolver_ir::CmpOp::Ne, Operand::Reg(RegId(2000 + off as u32)), Operand::int(64, 0)),
+                _ => (
+                    csolver_ir::CmpOp::Ne,
+                    Operand::Reg(RegId(2000 + off as u32)),
+                    Operand::int(64, 0),
+                ),
             };
             Ok(DecodedInsn {
                 offset: off,
                 next,
-                insts: vec![Inst::Assign { dst: cond, ty: Type::Bool, value: RValue::Cmp { op, lhs, rhs } }],
+                insts: vec![Inst::Assign {
+                    dst: cond,
+                    ty: Type::Bool,
+                    value: RValue::Cmp { op, lhs, rhs },
+                }],
                 ctrl: Ctrl::Jcc(t, cond),
             })
         }
@@ -194,7 +227,10 @@ fn lower_insn(
             // Frame-pointer establishment `mov rbp, rsp` (AT&T-internal order
             // src=rsp(4), dst=rbp(5)): mark the frame pending so the next
             // `sub rsp, N` builds the precise frame region binding both rsp and rbp.
-            if matches!((op_at(&ops, 0), op_at(&ops, 1)), (Ok(TextOp::Reg(4)), Ok(TextOp::Reg(5)))) {
+            if matches!(
+                (op_at(&ops, 0), op_at(&ops, 1)),
+                (Ok(TextOp::Reg(4)), Ok(TextOp::Reg(5)))
+            ) {
                 *fp = true;
             }
             lower_mov(&ops, off, width).map(&fall)
@@ -203,20 +239,35 @@ fn lower_insn(
         "movslq" | "movsbl" | "movzbl" | "movzwl" | "movswl" | "movsbq" | "movzbq" | "movsxd"
         | "movsx" | "movzx" => lower_mov(&ops, off, width).map(&fall),
         "lea" => lower_lea(&ops, off).map(&fall),
-        "add" | "sub" | "and" | "or" | "xor" => lower_alu_or_frame(&base, &ops, off, width, fp).map(&fall),
+        "add" | "sub" | "and" | "or" | "xor" => {
+            lower_alu_or_frame(&base, &ops, off, width, fp).map(&fall)
+        }
         "inc" | "dec" => {
             let d = reg_of(op_at(&ops, 0)?)?;
-            let bin = if base == "inc" { BinOp::Add } else { BinOp::Sub };
+            let bin = if base == "inc" {
+                BinOp::Add
+            } else {
+                BinOp::Sub
+            };
             Ok(fall(vec![Inst::Assign {
                 dst: d,
                 ty: Type::int(width),
-                value: RValue::Bin { op: bin, lhs: Operand::Reg(d), rhs: Operand::int(width, 1), flags: Default::default() },
+                value: RValue::Bin {
+                    op: bin,
+                    lhs: Operand::Reg(d),
+                    rhs: Operand::int(width, 1),
+                    flags: Default::default(),
+                },
             }]))
         }
         _ if base.starts_with("cmov") => {
             // Conditional move: destination becomes unknown (flags not modelled precisely).
             let d = reg_of(op_at(&ops, 1)?)?;
-            Ok(fall(vec![Inst::Assign { dst: d, ty: Type::int(width), value: RValue::Use(Operand::Const(Const::Undef)) }]))
+            Ok(fall(vec![Inst::Assign {
+                dst: d,
+                ty: Type::int(width),
+                value: RValue::Use(Operand::Const(Const::Undef)),
+            }]))
         }
         // push/pop: a callee-saved register spill/restore. The saved value always
         // lands on valid stack, so **not** modelling the store/load is sound (we
@@ -229,11 +280,19 @@ fn lower_insn(
         "push" => Ok(fall(vec![])),
         "pop" => {
             let d = reg_of(op_at(&ops, 0)?)?;
-            Ok(fall(vec![Inst::Assign { dst: d, ty: Type::int(64), value: RValue::Use(Operand::Const(Const::Undef)) }]))
+            Ok(fall(vec![Inst::Assign {
+                dst: d,
+                ty: Type::int(64),
+                value: RValue::Use(Operand::Const(Const::Undef)),
+            }]))
         }
         // `leave` = `mov rsp, rbp; pop rbp` — havoc rbp; rsp is re-established by the
         // caller's frame (or the next prologue). Sound (the restore is always valid).
-        "leave" => Ok(fall(vec![Inst::Assign { dst: reg(5), ty: Type::int(64), value: RValue::Use(Operand::Const(Const::Undef)) }])),
+        "leave" => Ok(fall(vec![Inst::Assign {
+            dst: reg(5),
+            ty: Type::int(64),
+            value: RValue::Use(Operand::Const(Const::Undef)),
+        }])),
         // call: an opaque call that returns and falls through (havocs caller-saved
         // state and rax), so analysis continues past it — strictly more than the
         // byte decoder's conservative stop. A direct `call sym` names the symbol; a
@@ -251,7 +310,13 @@ fn lower_call(op: &TextOp) -> Inst {
         TextOp::Reg(n) => Callee::Indirect(Operand::Reg(reg(*n))),
         _ => Callee::Symbol("<indirect>".to_string()),
     };
-    Inst::Call { dst: Some(reg(0)), callee, args: Vec::new(), ret_ty: Type::int(64), ret_ref: None }
+    Inst::Call {
+        dst: Some(reg(0)),
+        callee,
+        args: Vec::new(),
+        ret_ty: Type::int(64),
+        ret_ref: None,
+    }
 }
 
 /// A parsed operand's MSIR value plus any address-computing insts.
@@ -261,7 +326,8 @@ struct OpVal {
 }
 
 fn op_at(ops: &[TextOp], i: usize) -> Result<&TextOp> {
-    ops.get(i).ok_or_else(|| Error::unsupported(format!("asm: missing operand {i}")))
+    ops.get(i)
+        .ok_or_else(|| Error::unsupported(format!("asm: missing operand {i}")))
 }
 
 fn reg_of(op: &TextOp) -> Result<RegId> {
@@ -275,15 +341,32 @@ fn reg_of(op: &TextOp) -> Result<RegId> {
 /// (emitting the address computation + load into temporaries).
 fn operand_value(op: &TextOp, off: usize, width: u32) -> Result<OpVal> {
     match op {
-        TextOp::Reg(n) => Ok(OpVal { value: Operand::Reg(reg(*n)), pre: vec![] }),
-        TextOp::Imm(v) => Ok(OpVal { value: Operand::int(width, *v as u128), pre: vec![] }),
+        TextOp::Reg(n) => Ok(OpVal {
+            value: Operand::Reg(reg(*n)),
+            pre: vec![],
+        }),
+        TextOp::Imm(v) => Ok(OpVal {
+            value: Operand::int(width, *v as u128),
+            pre: vec![],
+        }),
         TextOp::Mem(mem) => {
             let (mut pre, ptr) = mem.lower(off);
             let loaded = RegId(3000 + off as u32);
-            pre.push(Inst::Load { dst: loaded, ty: Type::int(width), ptr: Operand::Reg(ptr), align: 1, volatile: false });
-            Ok(OpVal { value: Operand::Reg(loaded), pre })
+            pre.push(Inst::Load {
+                dst: loaded,
+                ty: Type::int(width),
+                ptr: Operand::Reg(ptr),
+                align: 1,
+                volatile: false,
+            });
+            Ok(OpVal {
+                value: Operand::Reg(loaded),
+                pre,
+            })
         }
-        TextOp::Label(l) => Err(Error::unsupported(format!("asm: unexpected label operand `{l}`"))),
+        TextOp::Label(l) => Err(Error::unsupported(format!(
+            "asm: unexpected label operand `{l}`"
+        ))),
     }
 }
 
@@ -293,16 +376,28 @@ fn lower_mov(ops: &[TextOp], off: usize, width: u32) -> Result<Vec<Inst>> {
     match op_at(ops, 1)? {
         TextOp::Reg(d) => {
             let mut insts = src.pre;
-            insts.push(Inst::Assign { dst: reg(*d), ty, value: RValue::Use(src.value) });
+            insts.push(Inst::Assign {
+                dst: reg(*d),
+                ty,
+                value: RValue::Use(src.value),
+            });
             Ok(insts)
         }
         TextOp::Mem(mem) => {
             let (mut insts, ptr) = mem.lower(off);
             insts.extend(src.pre);
-            insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: src.value, align: 1, volatile: false });
+            insts.push(Inst::Store {
+                ty,
+                ptr: Operand::Reg(ptr),
+                value: src.value,
+                align: 1,
+                volatile: false,
+            });
             Ok(insts)
         }
-        _ => Err(Error::unsupported("asm: mov destination must be a register or memory")),
+        _ => Err(Error::unsupported(
+            "asm: mov destination must be a register or memory",
+        )),
     }
 }
 
@@ -312,14 +407,24 @@ fn lower_lea(ops: &[TextOp], off: usize) -> Result<Vec<Inst>> {
         return Err(Error::unsupported("asm: lea needs a memory operand"));
     };
     let (mut insts, ptr) = mem.lower(off);
-    insts.push(Inst::Assign { dst: d, ty: Type::int(64), value: RValue::Use(Operand::Reg(ptr)) });
+    insts.push(Inst::Assign {
+        dst: d,
+        ty: Type::int(64),
+        value: RValue::Use(Operand::Reg(ptr)),
+    });
     Ok(insts)
 }
 
 /// `add/sub/and/or/xor`, with the stack-frame prologue special case: `sub $N,
 /// %rsp` (rsp = register 4) allocates the frame region so `[rsp+disp]` is
 /// checked against it; `add $N, %rsp` tears it down (a no-op).
-fn lower_alu_or_frame(base: &str, ops: &[TextOp], off: usize, width: u32, fp: &mut bool) -> Result<Vec<Inst>> {
+fn lower_alu_or_frame(
+    base: &str,
+    ops: &[TextOp],
+    off: usize,
+    width: u32,
+    fp: &mut bool,
+) -> Result<Vec<Inst>> {
     if matches!(base, "add" | "sub") {
         if let (TextOp::Imm(n), TextOp::Reg(4)) = (op_at(ops, 0)?, op_at(ops, 1)?) {
             if base == "sub" {
@@ -328,7 +433,13 @@ fn lower_alu_or_frame(base: &str, ops: &[TextOp], off: usize, width: u32, fp: &m
                 if std::mem::take(fp) {
                     return Ok(frame_insts(*n as u128, off));
                 }
-                return Ok(vec![Inst::Alloc { dst: reg(4), region: RegionKind::Stack, elem: Type::int(8), count: Operand::int(64, *n as u128), align: 16 }]);
+                return Ok(vec![Inst::Alloc {
+                    dst: reg(4),
+                    region: RegionKind::Stack,
+                    elem: Type::int(8),
+                    count: Operand::int(64, *n as u128),
+                    align: 16,
+                }]);
             }
             return Ok(vec![]); // `add $N, %rsp` — frame teardown, a no-op.
         }
@@ -347,13 +458,26 @@ fn lower_alu_or_frame(base: &str, ops: &[TextOp], off: usize, width: u32, fp: &m
     if matches!(bin, BinOp::Xor) {
         if let (TextOp::Reg(a), TextOp::Reg(b)) = (op_at(ops, 0)?, op_at(ops, 1)?) {
             if a == b {
-                return Ok(vec![Inst::Assign { dst: d, ty, value: RValue::Use(Operand::int(width, 0)) }]);
+                return Ok(vec![Inst::Assign {
+                    dst: d,
+                    ty,
+                    value: RValue::Use(Operand::int(width, 0)),
+                }]);
             }
         }
     }
     let src = operand_value(op_at(ops, 0)?, off, width)?;
     let mut insts = src.pre;
-    insts.push(Inst::Assign { dst: d, ty, value: RValue::Bin { op: bin, lhs: Operand::Reg(d), rhs: src.value, flags: Default::default() } });
+    insts.push(Inst::Assign {
+        dst: d,
+        ty,
+        value: RValue::Bin {
+            op: bin,
+            lhs: Operand::Reg(d),
+            rhs: src.value,
+            flags: Default::default(),
+        },
+    });
     Ok(insts)
 }
 
@@ -387,22 +511,47 @@ fn frame_insts(n: u128, off: usize) -> Vec<Inst> {
         Inst::Assign {
             dst: headroom,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::And, lhs: Operand::Reg(fresh), rhs: Operand::int(64, 0xFFFF_FFFF), flags: Default::default() },
+            value: RValue::Bin {
+                op: BinOp::And,
+                lhs: Operand::Reg(fresh),
+                rhs: Operand::int(64, 0xFFFF_FFFF),
+                flags: Default::default(),
+            },
         },
         // size = (N + 16) + headroom   ∈ [N+16, N+16+2^32)
         Inst::Assign {
             dst: size,
             ty: Type::int(64),
-            value: RValue::Bin { op: BinOp::Add, lhs: Operand::int(64, n + 16), rhs: Operand::Reg(headroom), flags: Default::default() },
+            value: RValue::Bin {
+                op: BinOp::Add,
+                lhs: Operand::int(64, n + 16),
+                rhs: Operand::Reg(headroom),
+                flags: Default::default(),
+            },
         },
         // rsp = base of the frame region (offset 0).
-        Inst::Alloc { dst: reg(4), region: RegionKind::Stack, elem: Type::int(8), count: Operand::Reg(size), align: 16 },
+        Inst::Alloc {
+            dst: reg(4),
+            region: RegionKind::Stack,
+            elem: Type::int(8),
+            count: Operand::Reg(size),
+            align: 16,
+        },
         // rbp = base + N (the top of the local area; locals are at negative offsets).
-        Inst::PtrOffset { dst: reg(5), base: Operand::Reg(reg(4)), index: Operand::int(64, n), elem: Type::int(8) },
+        Inst::PtrOffset {
+            dst: reg(5),
+            base: Operand::Reg(reg(4)),
+            index: Operand::int(64, n),
+            elem: Type::int(8),
+        },
     ]
 }
 
-fn label(ops: &[TextOp], i: usize, labels: &std::collections::HashMap<String, usize>) -> Result<usize> {
+fn label(
+    ops: &[TextOp],
+    i: usize,
+    labels: &std::collections::HashMap<String, usize>,
+) -> Result<usize> {
     match ops.get(i) {
         Some(TextOp::Label(t)) => labels
             .get(t)
@@ -439,7 +588,9 @@ pub(crate) fn strip_comment(line: &str) -> &str {
 }
 
 fn is_symbol(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '@')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '@')
 }
 
 /// AT&T register name → x86 register number (sub-registers alias their 64-bit

@@ -28,11 +28,15 @@ fn decodes_endbr_nop_cmov_and_alu_mem() {
     // 03 c1        add eax, ecx           (alu r, r/m reg)
     // c3           ret
     let code = [
-        0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x1f, 0x00, 0x0f, 0x4f, 0xc7, 0x48, 0x03, 0x07, 0x03,
-        0xc1, 0xc3,
+        0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x1f, 0x00, 0x0f, 0x4f, 0xc7, 0x48, 0x03, 0x07, 0x03, 0xc1,
+        0xc3,
     ];
     let m = decode_function("f", &code);
-    assert!(m.unanalyzed.is_empty(), "must fully decode: {:?}", m.unanalyzed);
+    assert!(
+        m.unanalyzed.is_empty(),
+        "must fully decode: {:?}",
+        m.unanalyzed
+    );
     assert_eq!(m.functions.len(), 1);
     // The `add rax, [rdi]` emits a Load (a memory obligation the analysis sees).
     let has_load = m.functions[0]
@@ -53,7 +57,10 @@ fn rip_relative_resolves_to_a_global_symbol() {
     let has_sym = m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(i, Inst::Assign { value: RValue::Use(Operand::Const(csolver_ir::Const::Symbol(s))), .. } if s == "g")
     });
-    assert!(has_sym, "a resolved RIP-relative access must materialize the global symbol");
+    assert!(
+        has_sym,
+        "a resolved RIP-relative access must materialize the global symbol"
+    );
 }
 
 #[test]
@@ -62,7 +69,11 @@ fn rip_relative_unresolved_still_decodes() {
     // function must still decode (previously it dropped whole).
     let code = [0x8b, 0x05, 0x00, 0x00, 0x00, 0x00, 0xc3];
     let m = decode_function("f", &code);
-    assert!(m.unanalyzed.is_empty(), "unresolved RIP-relative must decode, not drop: {:?}", m.unanalyzed);
+    assert!(
+        m.unanalyzed.is_empty(),
+        "unresolved RIP-relative must decode, not drop: {:?}",
+        m.unanalyzed
+    );
 }
 
 /// endbr64 opens almost every CET-built kernel function; without it the whole
@@ -70,7 +81,11 @@ fn rip_relative_unresolved_still_decodes() {
 #[test]
 fn endbr_at_entry_does_not_drop_the_function() {
     let m = decode_function("f", &[0xf3, 0x0f, 0x1e, 0xfa, 0x31, 0xc0, 0xc3]);
-    assert!(m.unanalyzed.is_empty(), "endbr64 entry must not drop: {:?}", m.unanalyzed);
+    assert!(
+        m.unanalyzed.is_empty(),
+        "endbr64 entry must not drop: {:?}",
+        m.unanalyzed
+    );
 }
 
 #[test]
@@ -90,12 +105,20 @@ fn decodes_a_stack_frame_and_its_access() {
     // 89 44 24 08        mov [rsp+8], eax   (store within the frame)
     // 48 83 c4 10        add rsp, 16
     // c3                 ret
-    let code = [0x48, 0x83, 0xec, 0x10, 0x89, 0x44, 0x24, 0x08, 0x48, 0x83, 0xc4, 0x10, 0xc3];
+    let code = [
+        0x48, 0x83, 0xec, 0x10, 0x89, 0x44, 0x24, 0x08, 0x48, 0x83, 0xc4, 0x10, 0xc3,
+    ];
     let m = decode_function("f", &code);
     assert!(m.unanalyzed.is_empty(), "fully decoded: {:?}", m.unanalyzed);
     let insts = &m.functions[0].blocks[0].insts;
     // sub rsp,16 -> Alloc Stack; [rsp+8] -> PtrOffset + Store; add rsp -> noop.
-    assert!(matches!(insts[0], Inst::Alloc { region: RegionKind::Stack, .. }));
+    assert!(matches!(
+        insts[0],
+        Inst::Alloc {
+            region: RegionKind::Stack,
+            ..
+        }
+    ));
     assert!(matches!(insts[1], Inst::PtrOffset { .. }));
     assert!(matches!(insts[2], Inst::Store { .. }));
 }
@@ -104,14 +127,17 @@ fn decodes_a_stack_frame_and_its_access() {
 fn reconstructs_a_conditional_branch() {
     // sub rsp,16 ; cmp edi,0 ; jne +4 ; mov [rsp+8],eax ; add rsp,16 ; ret
     let code = [
-        0x48, 0x83, 0xec, 0x10, 0x83, 0xff, 0x00, 0x75, 0x04, 0x89, 0x44, 0x24, 0x08, 0x48,
-        0x83, 0xc4, 0x10, 0xc3,
+        0x48, 0x83, 0xec, 0x10, 0x83, 0xff, 0x00, 0x75, 0x04, 0x89, 0x44, 0x24, 0x08, 0x48, 0x83,
+        0xc4, 0x10, 0xc3,
     ];
     let m = decode_function("f", &code);
     assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
     let f = &m.functions[0];
     assert_eq!(f.blocks.len(), 3, "entry + store + join");
-    assert!(matches!(f.blocks[0].term, Terminator::CondBr { .. }), "entry branches");
+    assert!(
+        matches!(f.blocks[0].term, Terminator::CondBr { .. }),
+        "entry branches"
+    );
 }
 
 #[test]
@@ -141,14 +167,20 @@ fn decodes_indexed_addressing_and_lea() {
     let m = decode_function("f", &[0x89, 0x04, 0x8c, 0xc3]);
     assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
     let insts = &m.functions[0].blocks[0].insts;
-    assert!(matches!(insts[0], Inst::PtrOffset { .. }), "index*scale offset");
+    assert!(
+        matches!(insts[0], Inst::PtrOffset { .. }),
+        "index*scale offset"
+    );
     assert!(matches!(insts[1], Inst::Store { .. }));
 
     // lea rax, [rsp + rcx*4]  = 48 8d 04 8c   (compute address, no access)
     let m2 = decode_function("g", &[0x48, 0x8d, 0x04, 0x8c, 0xc3]);
     assert!(m2.unanalyzed.is_empty(), "{:?}", m2.unanalyzed);
     let insts = &m2.functions[0].blocks[0].insts;
-    assert!(matches!(insts.last(), Some(Inst::Assign { .. })), "lea assigns the address");
+    assert!(
+        matches!(insts.last(), Some(Inst::Assign { .. })),
+        "lea assigns the address"
+    );
 }
 
 #[test]
@@ -304,7 +336,10 @@ fn typed_mov_eax_imm() {
     let d = decode_instruction(&[0xb8, 0x78, 0x56, 0x34, 0x12], 0).unwrap();
     assert_eq!(
         d.instruction,
-        Instruction::Mov(X86Operand::Reg(Reg::RAX, Width::D), X86Operand::Imm(0x12345678))
+        Instruction::Mov(
+            X86Operand::Reg(Reg::RAX, Width::D),
+            X86Operand::Imm(0x12345678)
+        )
     );
     assert!(!d.prefixes.rex);
     assert_eq!(d.length, 5);
@@ -313,7 +348,11 @@ fn typed_mov_eax_imm() {
 #[test]
 fn typed_mov_rax_imm64() {
     // mov rax, 0x123456789abcdef0  (REX.W)
-    let d = decode_instruction(&[0x48, 0xb8, 0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12], 0).unwrap();
+    let d = decode_instruction(
+        &[0x48, 0xb8, 0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12],
+        0,
+    )
+    .unwrap();
     assert_eq!(
         d.instruction,
         Instruction::Mov(
@@ -483,7 +522,10 @@ fn typed_lea() {
         index: None,
         disp: 0,
     };
-    assert_eq!(d.instruction, Instruction::Lea(Reg::RAX, Width::D, expected_mem));
+    assert_eq!(
+        d.instruction,
+        Instruction::Lea(Reg::RAX, Width::D, expected_mem)
+    );
 }
 
 #[test]
@@ -495,7 +537,10 @@ fn typed_lea_indexed() {
         index: Some((Reg::RCX, 4)),
         disp: 0,
     };
-    assert_eq!(d.instruction, Instruction::Lea(Reg::RAX, Width::Q, expected_mem));
+    assert_eq!(
+        d.instruction,
+        Instruction::Lea(Reg::RAX, Width::Q, expected_mem)
+    );
 }
 
 #[test]
@@ -505,13 +550,18 @@ fn unmodeled_opcode_bridges_instead_of_dropping() {
     // the byte→MSIR decoder. Sandwiched before `ret`, the function used to drop whole;
     // now it decodes: the unmodeled instruction becomes an opaque call + register havoc.
     let m = decode_function("f", &[0x0f, 0x58, 0xc1, 0xc3]);
-    assert!(m.unanalyzed.is_empty(), "bridged, not dropped: {:?}", m.unanalyzed);
-    let has_havoc_call = m.functions[0]
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "<x86 unmodeled>"));
-    assert!(has_havoc_call, "the unmodeled instruction is an opaque havoc call");
+    assert!(
+        m.unanalyzed.is_empty(),
+        "bridged, not dropped: {:?}",
+        m.unanalyzed
+    );
+    let has_havoc_call = m.functions[0].blocks.iter().flat_map(|b| &b.insts).any(
+        |i| matches!(i, Inst::Call { callee: Callee::Symbol(s), .. } if s == "<x86 unmodeled>"),
+    );
+    assert!(
+        has_havoc_call,
+        "the unmodeled instruction is an opaque havoc call"
+    );
 }
 
 #[test]
@@ -535,7 +585,11 @@ fn recursive_descent_skips_unreachable_trailing_bytes() {
     // sweep would decode the garbage after the ret and drop the whole function; the
     // recursive-descent decode stops at the ret and never touches it — so it decodes.
     let m = decode_function("f", &[0x31, 0xc0, 0xc3, 0xff, 0xff, 0xff]);
-    assert!(m.unanalyzed.is_empty(), "unreachable trailing bytes must not drop the function: {:?}", m.unanalyzed);
+    assert!(
+        m.unanalyzed.is_empty(),
+        "unreachable trailing bytes must not drop the function: {:?}",
+        m.unanalyzed
+    );
     assert_eq!(m.functions.len(), 1);
 }
 
@@ -545,9 +599,29 @@ fn direct_call_decodes_as_opaque_and_continues() {
     // `call rel32 (e8 ..); xor eax,eax (31 c0); ret (c3)` — a function with a call must
     // DECODE (opaque call + fall-through), not drop or stop at the call.
     let m = decode_function("f", &[0xe8, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3]);
-    assert!(m.unanalyzed.is_empty(), "a call must not drop the function: {:?}", m.unanalyzed);
-    let insts: Vec<_> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
-    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: Callee::Symbol(_), .. })), "call → opaque Inst::Call");
+    assert!(
+        m.unanalyzed.is_empty(),
+        "a call must not drop the function: {:?}",
+        m.unanalyzed
+    );
+    let insts: Vec<_> = m.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .collect();
+    assert!(
+        insts.iter().any(|i| matches!(
+            i,
+            Inst::Call {
+                callee: Callee::Symbol(_),
+                ..
+            }
+        )),
+        "call → opaque Inst::Call"
+    );
     // The post-call `xor eax,eax` is still analysed (fall-through past the call).
-    assert!(insts.iter().any(|i| matches!(i, Inst::Assign { .. })), "instructions after the call are decoded");
+    assert!(
+        insts.iter().any(|i| matches!(i, Inst::Assign { .. })),
+        "instructions after the call are decoded"
+    );
 }

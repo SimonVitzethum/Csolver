@@ -701,199 +701,216 @@ pub(crate) fn decode_one(
             }
         }
         // Two-byte opcodes.
-        0x0f => {
-            let op2 = *code.get(p).ok_or_else(|| CoreError::parse(format!("x86: truncated 0F opcode at offset {p}")))?;
+        0x0f => decode_two_byte(code, p, pos, rex_r, rex_x, rex_b, ty, flags, resolve),
+        other => Err(CoreError::unsupported(format!("x86: unsupported opcode {other:#04x}"))),
+    }
+}
+
+/// The **two-byte (`0F`-prefixed) opcode** arm of [`decode_one`], split out to keep that
+/// function tractable. `p` points at the byte *after* `0F`; the other parameters are the
+/// prefix/type context [`decode_one`] already computed. Behaviour-identical to the inline arm.
+#[allow(clippy::too_many_arguments)]
+fn decode_two_byte(
+    code: &[u8],
+    mut p: usize,
+    pos: usize,
+    rex_r: bool,
+    rex_x: bool,
+    rex_b: bool,
+    ty: Type,
+    flags: &mut Option<(Operand, Operand)>,
+    resolve: RelocResolver,
+) -> csolver_core::Result<Decoded> {
+    let done = |insts: Vec<Inst>, next: usize| Ok(Decoded { insts, next, ctrl: Ctrl::Fall });
+    let op2 = *code.get(p).ok_or_else(|| CoreError::parse(format!("x86: truncated 0F opcode at offset {p}")))?;
+    p += 1;
+    match op2 {
+        // multi-byte nop (`0f 1f /M`) — consume the ModR/M operand, emit nothing.
+        0x1f => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            let next = if m.mode == 0b11 {
+                p + 1
+            } else {
+                mem_operand(code, p + 1, &m, rex_x, rex_b, resolve)?.next
+            };
+            Ok(Decoded { insts: vec![], next, ctrl: Ctrl::Fall })
+        }
+        // cmovcc r, r/m (`0f 40..4f`) — conditional move. Reg-reg only; the moved
+        // value depends on flags we do not model precisely, so the destination
+        // becomes an unknown (sound over-approximation) rather than dropping the
+        // whole function. A memory-operand form is rejected (its load would need
+        // its own obligations).
+        0x40..=0x4f => {
+            let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            match op2 {
-                // multi-byte nop (`0f 1f /M`) — consume the ModR/M operand, emit nothing.
-                0x1f => {
-                    let m = modrm(code, p, rex_r, rex_b)?;
-                    let next = if m.mode == 0b11 {
-                        p + 1
-                    } else {
-                        mem_operand(code, p + 1, &m, rex_x, rex_b, resolve)?.next
-                    };
-                    Ok(Decoded { insts: vec![], next, ctrl: Ctrl::Fall })
-                }
-                // cmovcc r, r/m (`0f 40..4f`) — conditional move. Reg-reg only; the moved
-                // value depends on flags we do not model precisely, so the destination
-                // becomes an unknown (sound over-approximation) rather than dropping the
-                // whole function. A memory-operand form is rejected (its load would need
-                // its own obligations).
-                0x40..=0x4f => {
-                    let m = modrm(code, p, rex_r, rex_b)?;
-                    p += 1;
-                    if m.mode != 0b11 {
-                        return Err(CoreError::unsupported("x86: cmovcc with a memory operand"));
-                    }
-                    done(
-                        vec![Inst::Assign {
-                            dst: reg(m.reg),
-                            ty,
-                            value: RValue::Use(Operand::Const(csolver_ir::Const::Undef)),
-                        }],
-                        p,
-                    )
-                }
-                // jcc rel32.
-                0x80..=0x8f => {
-                    let rel = read_imm(code, p, 4)? as u32 as i32 as i64;
-                    let np = p + 4;
-                    jcc(pos, np, branch_target(np, rel)?, op2 - 0x80, flags)
-                }
-                // setcc r/m8 (reg-reg only).
-                0x90..=0x9f => {
-                    let m = modrm(code, p, rex_r, rex_b)?;
-                    p += 1;
-                    if m.mode != 0b11 {
-                        return Err(CoreError::unsupported("x86: setcc with a memory operand"));
-                    }
-                    let cond_creg = temp_reg(pos);
-                    let (cmp_op, lhs, rhs) = match (cc_cmpop(op2 - 0x90), flags) {
-                        (Some(op), Some((a, b))) => (op, a.clone(), b.clone()),
-                        _ => (CmpOp::Ne, Operand::Reg(RegId(2000 + pos as u32)), Operand::int(64, 0)),
-                    };
-                    let dst_target = reg(m.rm);
-                    done(
-                        vec![
-                            Inst::Assign { dst: cond_creg, ty: Type::Bool, value: RValue::Cmp { op: cmp_op, lhs, rhs } },
-                            Inst::Assign {
-                                dst: dst_target,
-                                ty: Type::int(8),
-                                value: RValue::Cast {
-                                    op: CastOp::ZExt,
-                                    operand: Operand::Reg(cond_creg),
-                                    to: Type::int(8),
-                                },
-                            },
-                        ],
-                        p,
-                    )
-                }
-                // movzx r, r/m8 (0f b6).
-                0xb6 => {
-                    let m = modrm(code, p, rex_r, rex_b)?;
-                    p += 1;
-                    if m.mode == 0b11 {
-                        done(
-                            vec![Inst::Assign {
-                                dst: reg(m.reg),
-                                ty: ty.clone(),
-                                value: RValue::Cast {
-                                    op: CastOp::ZExt,
-                                    operand: Operand::Reg(reg(m.rm)),
-                                    to: ty,
-                                },
-                            }],
-                            p,
-                        )
-                    } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
-                        let (mut insts, ptr) = mem.lower(pos);
-                        let tmp = temp_reg(pos);
-                        insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
-                        insts.push(Inst::Assign {
-                            dst: reg(m.reg),
-                            ty: ty.clone(),
-                            value: RValue::Cast { op: CastOp::ZExt, operand: Operand::Reg(tmp), to: ty },
-                        });
-                        done(insts, mem.next)
-                    }
-                }
-                // movzx r, r/m16 (0f b7).
-                0xb7 => {
-                    let m = modrm(code, p, rex_r, rex_b)?;
-                    p += 1;
-                    if m.mode == 0b11 {
-                        done(
-                            vec![Inst::Assign {
-                                dst: reg(m.reg),
-                                ty: ty.clone(),
-                                value: RValue::Cast {
-                                    op: CastOp::ZExt,
-                                    operand: Operand::Reg(reg(m.rm)),
-                                    to: ty,
-                                },
-                            }],
-                            p,
-                        )
-                    } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
-                        let (mut insts, ptr) = mem.lower(pos);
-                        let tmp = temp_reg(pos);
-                        insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
-                        insts.push(Inst::Assign {
-                            dst: reg(m.reg),
-                            ty: ty.clone(),
-                            value: RValue::Cast { op: CastOp::ZExt, operand: Operand::Reg(tmp), to: ty },
-                        });
-                        done(insts, mem.next)
-                    }
-                }
-                // movsx r, r/m8 (0f be).
-                0xbe => {
-                    let m = modrm(code, p, rex_r, rex_b)?;
-                    p += 1;
-                    if m.mode == 0b11 {
-                        done(
-                            vec![Inst::Assign {
-                                dst: reg(m.reg),
-                                ty: ty.clone(),
-                                value: RValue::Cast {
-                                    op: CastOp::SExt,
-                                    operand: Operand::Reg(reg(m.rm)),
-                                    to: ty,
-                                },
-                            }],
-                            p,
-                        )
-                    } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
-                        let (mut insts, ptr) = mem.lower(pos);
-                        let tmp = temp_reg(pos);
-                        insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
-                        insts.push(Inst::Assign {
-                            dst: reg(m.reg),
-                            ty: ty.clone(),
-                            value: RValue::Cast { op: CastOp::SExt, operand: Operand::Reg(tmp), to: ty },
-                        });
-                        done(insts, mem.next)
-                    }
-                }
-                // movsx r, r/m16 (0f bf).
-                0xbf => {
-                    let m = modrm(code, p, rex_r, rex_b)?;
-                    p += 1;
-                    if m.mode == 0b11 {
-                        done(
-                            vec![Inst::Assign {
-                                dst: reg(m.reg),
-                                ty: ty.clone(),
-                                value: RValue::Cast {
-                                    op: CastOp::SExt,
-                                    operand: Operand::Reg(reg(m.rm)),
-                                    to: ty,
-                                },
-                            }],
-                            p,
-                        )
-                    } else {
-                        let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
-                        let (mut insts, ptr) = mem.lower(pos);
-                        let tmp = temp_reg(pos);
-                        insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
-                        insts.push(Inst::Assign {
-                            dst: reg(m.reg),
-                            ty: ty.clone(),
-                            value: RValue::Cast { op: CastOp::SExt, operand: Operand::Reg(tmp), to: ty },
-                        });
-                        done(insts, mem.next)
-                    }
-                }
-                _ => Err(CoreError::unsupported(format!("x86: unsupported opcode 0f {op2:#04x}"))),
+            if m.mode != 0b11 {
+                return Err(CoreError::unsupported("x86: cmovcc with a memory operand"));
+            }
+            done(
+                vec![Inst::Assign {
+                    dst: reg(m.reg),
+                    ty,
+                    value: RValue::Use(Operand::Const(csolver_ir::Const::Undef)),
+                }],
+                p,
+            )
+        }
+        // jcc rel32.
+        0x80..=0x8f => {
+            let rel = read_imm(code, p, 4)? as u32 as i32 as i64;
+            let np = p + 4;
+            jcc(pos, np, branch_target(np, rel)?, op2 - 0x80, flags)
+        }
+        // setcc r/m8 (reg-reg only).
+        0x90..=0x9f => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode != 0b11 {
+                return Err(CoreError::unsupported("x86: setcc with a memory operand"));
+            }
+            let cond_creg = temp_reg(pos);
+            let (cmp_op, lhs, rhs) = match (cc_cmpop(op2 - 0x90), flags) {
+                (Some(op), Some((a, b))) => (op, a.clone(), b.clone()),
+                _ => (CmpOp::Ne, Operand::Reg(RegId(2000 + pos as u32)), Operand::int(64, 0)),
+            };
+            let dst_target = reg(m.rm);
+            done(
+                vec![
+                    Inst::Assign { dst: cond_creg, ty: Type::Bool, value: RValue::Cmp { op: cmp_op, lhs, rhs } },
+                    Inst::Assign {
+                        dst: dst_target,
+                        ty: Type::int(8),
+                        value: RValue::Cast {
+                            op: CastOp::ZExt,
+                            operand: Operand::Reg(cond_creg),
+                            to: Type::int(8),
+                        },
+                    },
+                ],
+                p,
+            )
+        }
+        // movzx r, r/m8 (0f b6).
+        0xb6 => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode == 0b11 {
+                done(
+                    vec![Inst::Assign {
+                        dst: reg(m.reg),
+                        ty: ty.clone(),
+                        value: RValue::Cast {
+                            op: CastOp::ZExt,
+                            operand: Operand::Reg(reg(m.rm)),
+                            to: ty,
+                        },
+                    }],
+                    p,
+                )
+            } else {
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let tmp = temp_reg(pos);
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Assign {
+                    dst: reg(m.reg),
+                    ty: ty.clone(),
+                    value: RValue::Cast { op: CastOp::ZExt, operand: Operand::Reg(tmp), to: ty },
+                });
+                done(insts, mem.next)
             }
         }
-        other => Err(CoreError::unsupported(format!("x86: unsupported opcode {other:#04x}"))),
+        // movzx r, r/m16 (0f b7).
+        0xb7 => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode == 0b11 {
+                done(
+                    vec![Inst::Assign {
+                        dst: reg(m.reg),
+                        ty: ty.clone(),
+                        value: RValue::Cast {
+                            op: CastOp::ZExt,
+                            operand: Operand::Reg(reg(m.rm)),
+                            to: ty,
+                        },
+                    }],
+                    p,
+                )
+            } else {
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let tmp = temp_reg(pos);
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Assign {
+                    dst: reg(m.reg),
+                    ty: ty.clone(),
+                    value: RValue::Cast { op: CastOp::ZExt, operand: Operand::Reg(tmp), to: ty },
+                });
+                done(insts, mem.next)
+            }
+        }
+        // movsx r, r/m8 (0f be).
+        0xbe => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode == 0b11 {
+                done(
+                    vec![Inst::Assign {
+                        dst: reg(m.reg),
+                        ty: ty.clone(),
+                        value: RValue::Cast {
+                            op: CastOp::SExt,
+                            operand: Operand::Reg(reg(m.rm)),
+                            to: ty,
+                        },
+                    }],
+                    p,
+                )
+            } else {
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let tmp = temp_reg(pos);
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Assign {
+                    dst: reg(m.reg),
+                    ty: ty.clone(),
+                    value: RValue::Cast { op: CastOp::SExt, operand: Operand::Reg(tmp), to: ty },
+                });
+                done(insts, mem.next)
+            }
+        }
+        // movsx r, r/m16 (0f bf).
+        0xbf => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            if m.mode == 0b11 {
+                done(
+                    vec![Inst::Assign {
+                        dst: reg(m.reg),
+                        ty: ty.clone(),
+                        value: RValue::Cast {
+                            op: CastOp::SExt,
+                            operand: Operand::Reg(reg(m.rm)),
+                            to: ty,
+                        },
+                    }],
+                    p,
+                )
+            } else {
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let tmp = temp_reg(pos);
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Assign {
+                    dst: reg(m.reg),
+                    ty: ty.clone(),
+                    value: RValue::Cast { op: CastOp::SExt, operand: Operand::Reg(tmp), to: ty },
+                });
+                done(insts, mem.next)
+            }
+        }
+        _ => Err(CoreError::unsupported(format!("x86: unsupported opcode 0f {op2:#04x}"))),
     }
 }
 

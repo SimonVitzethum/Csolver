@@ -12,7 +12,9 @@
 use csolver_asm::x86::decode_function;
 
 fn decoded_insts(m: &csolver_ir::Module) -> Option<usize> {
-    m.functions.first().map(|f| f.blocks.iter().map(|b| b.insts.len()).sum())
+    m.functions
+        .first()
+        .map(|f| f.blocks.iter().map(|b| b.insts.len()).sum())
 }
 
 #[test]

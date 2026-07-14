@@ -2,7 +2,11 @@ use super::*;
 use csolver_ir::Inst;
 
 fn insts_of(m: &Module) -> Vec<&Inst> {
-    m.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| &b.insts).collect()
+    m.functions
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| &b.insts)
+        .collect()
 }
 
 #[test]
@@ -20,7 +24,13 @@ f:
     let m = decode(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
     let insts = insts_of(&m);
-    assert!(insts.iter().any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, .. })));
+    assert!(insts.iter().any(|i| matches!(
+        i,
+        Inst::Alloc {
+            region: RegionKind::Stack,
+            ..
+        }
+    )));
     assert!(insts.iter().any(|i| matches!(i, Inst::Store { .. })));
     assert!(insts.iter().any(|i| matches!(i, Inst::Load { .. })));
 }
@@ -40,7 +50,10 @@ f:
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
     let f = &m.functions[0];
     assert!(f.blocks.len() >= 2);
-    assert!(matches!(f.blocks[0].term, csolver_ir::Terminator::CondBr { .. }));
+    assert!(matches!(
+        f.blocks[0].term,
+        csolver_ir::Terminator::CondBr { .. }
+    ));
 }
 
 #[test]
@@ -48,7 +61,10 @@ fn cbz_builds_a_conditional_branch() {
     let src = "f:\n\tcbz\tx0, .L\n\tmov\tx1, #7\n.L:\n\tret\n";
     let m = decode(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
-    assert!(matches!(m.functions[0].blocks[0].term, csolver_ir::Terminator::CondBr { .. }));
+    assert!(matches!(
+        m.functions[0].blocks[0].term,
+        csolver_ir::Terminator::CondBr { .. }
+    ));
 }
 
 #[test]
@@ -65,8 +81,22 @@ f:
     let m = decode(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
     let insts = insts_of(&m);
-    assert!(insts.iter().filter(|i| matches!(i, Inst::Store { .. })).count() >= 2, "stp = two stores");
-    assert!(insts.iter().filter(|i| matches!(i, Inst::Load { .. })).count() >= 2, "ldp = two loads");
+    assert!(
+        insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Store { .. }))
+            .count()
+            >= 2,
+        "stp = two stores"
+    );
+    assert!(
+        insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Load { .. }))
+            .count()
+            >= 2,
+        "ldp = two loads"
+    );
 }
 
 #[test]
@@ -93,7 +123,9 @@ fn indexed_load_with_lsl_scale() {
     let src = "f:\n\tldr\tx1, [x0, x2, lsl #3]\n\tret\n";
     let m = decode(src);
     assert!(m.unanalyzed.is_empty(), "must decode: {:?}", m.unanalyzed);
-    assert!(insts_of(&m).iter().any(|i| matches!(i, Inst::PtrOffset { .. })));
+    assert!(insts_of(&m)
+        .iter()
+        .any(|i| matches!(i, Inst::PtrOffset { .. })));
     assert!(insts_of(&m).iter().any(|i| matches!(i, Inst::Load { .. })));
 }
 
@@ -104,9 +136,17 @@ fn bl_is_an_opaque_call_and_analysis_continues() {
     let m = decode(src);
     assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
     let insts = insts_of(&m);
-    assert!(insts.iter().any(|i| matches!(i, Inst::Call { callee: csolver_ir::Callee::Symbol(s), .. } if s == "helper")));
+    assert!(insts.iter().any(
+        |i| matches!(i, Inst::Call { callee: csolver_ir::Callee::Symbol(s), .. } if s == "helper")
+    ));
     // The post-call `add` is still lowered (analysis did not stop at the call).
-    assert!(insts.iter().filter(|i| matches!(i, Inst::Assign { .. })).count() >= 2);
+    assert!(
+        insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Assign { .. }))
+            .count()
+            >= 2
+    );
 }
 
 #[test]

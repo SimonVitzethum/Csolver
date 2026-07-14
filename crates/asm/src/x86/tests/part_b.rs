@@ -27,10 +27,7 @@ fn typed_jmp_rel8() {
 fn typed_jmp_rel32() {
     // jmp +0x12345678 = e9 78 56 34 12
     let d = decode_instruction(&[0xe9, 0x78, 0x56, 0x34, 0x12], 0).unwrap();
-    assert_eq!(
-        d.instruction,
-        Instruction::Jmp(X86Operand::Rel(0x12345678))
-    );
+    assert_eq!(d.instruction, Instruction::Jmp(X86Operand::Rel(0x12345678)));
     assert_eq!(d.length, 5);
 }
 

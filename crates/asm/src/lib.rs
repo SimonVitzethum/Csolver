@@ -19,9 +19,9 @@
 //! architecture and (for x86) syntax are auto-detected from the source when not
 //! given explicitly (see [`detect`]).
 
-mod blocks;
 pub mod arm64;
 pub mod arm64_text;
+mod blocks;
 pub mod x86;
 pub mod x86text;
 
@@ -117,8 +117,10 @@ fn looks_like_arm(source: &str) -> bool {
             return false;
         }
         let (mnem, rest) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
-        matches!(mnem, "adrp" | "adr" | "ldp" | "stp" | "cbz" | "cbnz" | "ldrsw")
-            || mnem.starts_with("b.")
+        matches!(
+            mnem,
+            "adrp" | "adr" | "ldp" | "stp" | "cbz" | "cbnz" | "ldrsw"
+        ) || mnem.starts_with("b.")
             || rest.contains(", #")
             || rest.contains(", [")
             || rest.split([',', ' ', '[', ']', '\t']).any(is_arm_reg)

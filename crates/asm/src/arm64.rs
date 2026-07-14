@@ -58,7 +58,9 @@ fn arg_registers() -> Vec<(RegId, Type)> {
 /// Linearly decode the function body, threading the `cmp` flags for `b.cond`.
 fn decode_cfg(code: &[u8]) -> csolver_core::Result<Vec<DecodedInsn>> {
     if !code.len().is_multiple_of(4) {
-        return Err(CoreError::parse("arm64: code length is not a multiple of 4"));
+        return Err(CoreError::parse(
+            "arm64: code length is not a multiple of 4",
+        ));
     }
     let mut out = Vec::new();
     let mut pos = 0;
@@ -66,7 +68,12 @@ fn decode_cfg(code: &[u8]) -> csolver_core::Result<Vec<DecodedInsn>> {
     while pos + 4 <= code.len() {
         let word = u32::from_le_bytes([code[pos], code[pos + 1], code[pos + 2], code[pos + 3]]);
         let d = decode_one(word, pos, &mut flags)?;
-        out.push(DecodedInsn { offset: pos, next: pos + 4, insts: d.insts, ctrl: d.ctrl });
+        out.push(DecodedInsn {
+            offset: pos,
+            next: pos + 4,
+            insts: d.insts,
+            ctrl: d.ctrl,
+        });
         pos += 4;
     }
     Ok(out)
@@ -102,11 +109,19 @@ fn decode_one(
     pos: usize,
     flags: &mut Option<(Operand, Operand)>,
 ) -> csolver_core::Result<Decoded> {
-    let fall = |insts: Vec<Inst>| Ok(Decoded { insts, ctrl: Ctrl::Fall });
+    let fall = |insts: Vec<Inst>| {
+        Ok(Decoded {
+            insts,
+            ctrl: Ctrl::Fall,
+        })
+    };
 
     // RET {Xn} — `1101011 0010 11111 0000 00 Rn 00000`; the common `ret` (x30).
     if word & 0xffff_fc1f == 0xd65f_0000 {
-        return Ok(Decoded { insts: Vec::new(), ctrl: Ctrl::Ret });
+        return Ok(Decoded {
+            insts: Vec::new(),
+            ctrl: Ctrl::Ret,
+        });
     }
 
     // NOP — `1101 0101 0000 0011 0010 0000 0001 1111` = 0xd503201f
@@ -119,13 +134,19 @@ fn decode_one(
     if word >> 26 == 0b10_0011 {
         // Model as a Ret (conservative: analysis stops here); the target
         // offset is deliberately not resolved.
-        return Ok(Decoded { insts: Vec::new(), ctrl: Ctrl::Ret });
+        return Ok(Decoded {
+            insts: Vec::new(),
+            ctrl: Ctrl::Ret,
+        });
     }
 
     // B (unconditional): bits[31:26] == 000101.
     if word >> 26 == 0b00_0101 {
         let off = sign_extend(word & 0x03ff_ffff, 26) * 4;
-        return Ok(Decoded { insts: Vec::new(), ctrl: Ctrl::Jmp(branch_target(pos, off)?) });
+        return Ok(Decoded {
+            insts: Vec::new(),
+            ctrl: Ctrl::Jmp(branch_target(pos, off)?),
+        });
     }
 
     // B.cond: bits[31:24] == 01010100, bit[4] == 0.
@@ -165,7 +186,7 @@ fn decode_one(
                     op: BinOp::Or,
                     lhs: Operand::Reg(reg(rd)),
                     rhs: Operand::int(width, val),
-                flags: Default::default(),
+                    flags: Default::default(),
                 },
             }]);
         }
@@ -212,7 +233,12 @@ fn decode_one(
         return fall(vec![Inst::Assign {
             dst: reg(rd),
             ty,
-            value: RValue::Bin { op, lhs: Operand::Reg(reg(rn)), rhs: Operand::int(width, imm as u128) , flags: Default::default() },
+            value: RValue::Bin {
+                op,
+                lhs: Operand::Reg(reg(rn)),
+                rhs: Operand::int(width, imm as u128),
+                flags: Default::default(),
+            },
         }]);
     }
 
@@ -237,19 +263,45 @@ fn decode_one(
         return match opc {
             0 => {
                 // STR Rt, [Rn, #off]; register 31 here is the zero register.
-                let value = if rt == 31 { Operand::int(width, 0) } else { Operand::Reg(reg(rt)) };
-                fall(vec![off, Inst::Store { ty, ptr: Operand::Reg(ptr), value, align: 1 , volatile: false}])
+                let value = if rt == 31 {
+                    Operand::int(width, 0)
+                } else {
+                    Operand::Reg(reg(rt))
+                };
+                fall(vec![
+                    off,
+                    Inst::Store {
+                        ty,
+                        ptr: Operand::Reg(ptr),
+                        value,
+                        align: 1,
+                        volatile: false,
+                    },
+                ])
             }
             1 => {
                 // LDR Rt, [Rn, #off]; loading into the zero register is a discard.
                 let dst = if rt == 31 { temp_reg(pos + 1) } else { reg(rt) };
-                fall(vec![off, Inst::Load { dst, ty, ptr: Operand::Reg(ptr), align: 1 , volatile: false}])
+                fall(vec![
+                    off,
+                    Inst::Load {
+                        dst,
+                        ty,
+                        ptr: Operand::Reg(ptr),
+                        align: 1,
+                        volatile: false,
+                    },
+                ])
             }
-            _ => Err(CoreError::unsupported("arm64: unsupported load/store variant")),
+            _ => Err(CoreError::unsupported(
+                "arm64: unsupported load/store variant",
+            )),
         };
     }
 
-    Err(CoreError::unsupported(format!("arm64: unsupported instruction {word:#010x}")))
+    Err(CoreError::unsupported(format!(
+        "arm64: unsupported instruction {word:#010x}"
+    )))
 }
 
 /// Lower a `b.cond` to a condition assignment plus a `Jcc`. The condition comes
@@ -263,10 +315,18 @@ fn bcond(
     let creg = temp_reg(pos);
     let (op, lhs, rhs) = match (cc_cmpop(cond), flags) {
         (Some(op), Some((a, b))) => (op, a.clone(), b.clone()),
-        _ => (CmpOp::Ne, Operand::Reg(RegId(2000 + pos as u32)), Operand::int(64, 0)),
+        _ => (
+            CmpOp::Ne,
+            Operand::Reg(RegId(2000 + pos as u32)),
+            Operand::int(64, 0),
+        ),
     };
     Ok(Decoded {
-        insts: vec![Inst::Assign { dst: creg, ty: Type::Bool, value: RValue::Cmp { op, lhs, rhs } }],
+        insts: vec![Inst::Assign {
+            dst: creg,
+            ty: Type::Bool,
+            value: RValue::Cmp { op, lhs, rhs },
+        }],
         ctrl: Ctrl::Jcc(target, creg),
     })
 }
@@ -307,7 +367,13 @@ mod tests {
         let m = decode_function("f", &FRAME);
         assert!(m.unanalyzed.is_empty(), "fully decoded: {:?}", m.unanalyzed);
         let insts = &m.functions[0].blocks[0].insts;
-        assert!(matches!(insts[0], Inst::Alloc { region: RegionKind::Stack, .. }));
+        assert!(matches!(
+            insts[0],
+            Inst::Alloc {
+                region: RegionKind::Stack,
+                ..
+            }
+        ));
         assert!(matches!(insts[1], Inst::PtrOffset { .. }));
         assert!(matches!(insts[2], Inst::Store { .. }));
     }
@@ -337,7 +403,10 @@ mod tests {
         assert!(m.unanalyzed.is_empty(), "{:?}", m.unanalyzed);
         let f = &m.functions[0];
         assert_eq!(f.blocks.len(), 3, "entry + store + join");
-        assert!(matches!(f.blocks[0].term, Terminator::CondBr { .. }), "cmp/b.cond → CondBr");
+        assert!(
+            matches!(f.blocks[0].term, Terminator::CondBr { .. }),
+            "cmp/b.cond → CondBr"
+        );
     }
 
     #[test]

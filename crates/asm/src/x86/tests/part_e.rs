@@ -203,7 +203,10 @@ fn rejects_group3_memory_operand() {
     // 0xf7 /0 [rax] → test [rax], imm32 — memory form unsupported
     let r = decode_instruction(&[0xf7, 0x00, 0x01, 0x00, 0x00, 0x00], 0);
     assert!(r.is_err());
-    assert!(r.unwrap_err().to_string().contains("group-3 with a memory operand"));
+    assert!(r
+        .unwrap_err()
+        .to_string()
+        .contains("group-3 with a memory operand"));
 }
 
 #[test]
