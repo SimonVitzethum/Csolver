@@ -100,6 +100,13 @@ pub enum RetSummary {
         /// Byte offset added to that parameter's pointer.
         offset: Affine,
     },
+    /// The function returns a pointer into **its own stack frame** on every returning
+    /// path (a `return &local`). The frame is popped at the return, so the result is
+    /// dangling in the caller. Applied at a call site as a fresh **already-freed**
+    /// region, so a caller that dereferences the result is caught by the ordinary
+    /// use-after-free machinery — the interprocedural counterpart of `NoDanglingDeref`
+    /// (which flags the escape at the callee's own `return`).
+    DanglingStack,
 }
 
 /// A function's **provenance-transfer** summary: how a call moves provenance labels
@@ -157,6 +164,12 @@ impl Summary {
 pub(crate) enum AbsVal {
     PtrArg { arg: usize, off: Affine },
     Scalar(Affine),
+    /// A pointer into **this frame's own stack allocation** (an `alloca` result, closed
+    /// under offset/copy). Returning it escapes a pointer to a frame that is popped on
+    /// return — a dangling-stack return. `join` degrades it to `Opaque` the moment a
+    /// returning path yields anything else, so `DanglingStack` is claimed only when the
+    /// pointer is a local on *every* returning path (a definite escape, no false FAIL).
+    LocalStack,
     Opaque,
 }
 

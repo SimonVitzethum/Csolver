@@ -352,6 +352,19 @@ impl Explorer<'_> {
                 Some(RetSummary::Scalar(aff)) => {
                     SymValue::Scalar(self.instantiate_affine(aff, &argvals))
                 }
+                // The callee returns a pointer into its own stack frame on every path;
+                // that frame is popped at the return, so the result is dangling here.
+                // Materialise it as an already-freed region — a caller deref is then a
+                // definite use-after-free (the interprocedural face of NoDanglingDeref).
+                Some(RetSummary::DanglingStack) => {
+                    let rid = self.materialize_freed_region(state);
+                    SymValue::Ptr(SymPointer {
+                        prov: Prov::Region(rid),
+                        offset: self.ctx.int(PTR_WIDTH, 0),
+                        align: 1,
+                        borrow: None,
+                    })
+                }
                 // No precise summary, but the result type is a reference: it is
                 // valid by Rust's type invariant (a safe callee cannot return a
                 // dangling `&T`). Materialise a valid-reference region instead of
@@ -409,6 +422,32 @@ impl Explorer<'_> {
             sentinel: None,
             user_controlled: false,
             assumed,
+            prov_labels: FxHashSet::default(),
+        });
+        rid
+    }
+
+    /// Create a fresh region that is **already freed**, modelling a pointer a callee
+    /// returned into its own (now-popped) stack frame. Sized by a fresh non-negative
+    /// scalar (the size is irrelevant — any deref refutes on liveness first). A load or
+    /// store through the returned pointer is a definite use-after-free.
+    pub(crate) fn materialize_freed_region(&mut self, state: &mut PathState) -> usize {
+        let size_e = self.fresh_scalar(PTR_WIDTH);
+        let zero = self.ctx.int(PTR_WIDTH, 0);
+        let nonneg = self.ctx.cmp(SCmp::Sle, zero, size_e);
+        state.facts.push(nonneg);
+        let rid = state.regions.len();
+        state.regions.push(SymRegion {
+            kind: RegionKind::Stack,
+            size: size_e,
+            base_align: 1,
+            state: LifetimeState::Freed,
+            perms: Permissions { read: true, write: true, exec: false },
+            contract: None,
+            size_nowrap: None,
+            sentinel: None,
+            user_controlled: false,
+            assumed: false,
             prov_labels: FxHashSet::default(),
         });
         rid

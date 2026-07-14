@@ -241,10 +241,16 @@ pub(crate) fn ret_of_fn(f: &Function) -> RetSummary {
                                     None => AbsVal::Opaque,
                                 }
                             }
+                            // Offsetting into this frame's own allocation stays a
+                            // pointer into that (dangling-on-return) local.
+                            (AbsVal::LocalStack, _) => AbsVal::LocalStack,
                             _ => AbsVal::Opaque,
                         };
                         (*dst, v)
                     }
+                    // A stack allocation of this frame: its address is a local whose
+                    // lifetime ends at return. Returning it is a dangling-stack escape.
+                    Inst::Alloc { dst, .. } => (*dst, AbsVal::LocalStack),
                     other => match other.defined_reg() {
                         Some(dst) => (dst, AbsVal::Opaque),
                         None => continue,
@@ -296,6 +302,7 @@ pub(crate) fn ret_of_fn(f: &Function) -> RetSummary {
             return match ret {
                 Some(AbsVal::PtrArg { arg, off }) => RetSummary::PtrFromArg { arg, offset: off },
                 Some(AbsVal::Scalar(a)) => RetSummary::Scalar(a),
+                Some(AbsVal::LocalStack) => RetSummary::DanglingStack,
                 _ => RetSummary::Unknown,
             };
         }

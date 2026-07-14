@@ -356,6 +356,86 @@ fn guarded_pointer_wrapper_summary() {
     );
 }
 
+/// A function that returns the address of its own stack allocation (`return &local`,
+/// optionally offset into it) escapes a pointer to a frame popped at the return — the
+/// summary must report `DanglingStack` so a caller that derefs the result trips the
+/// use-after-free machinery. A returned *parameter* pointer stays `PtrFromArg` (the
+/// caller owns it), and a mixed path (local on one arm, parameter on the other) must
+/// degrade to `Unknown` — never a false dangling claim.
+#[test]
+fn returning_a_local_stack_pointer_is_dangling() {
+    let a = RegId(0);
+    let q = RegId(1);
+    let alloc = |dst| Inst::Alloc {
+        dst,
+        region: csolver_core::RegionKind::Stack,
+        elem: Type::int(32),
+        count: Operand::int(64, 1),
+        align: 4,
+    };
+    // fn leak() { let a; return &a }
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(Some(Operand::Reg(a))));
+    bb.insts.push(alloc(a));
+    let leak = Function {
+        id: FuncId(0),
+        name: "leak".into(),
+        params: vec![],
+        ret_ty: Type::ptr(Type::int(32)),
+        blocks: vec![bb],
+        entry: BlockId(0),
+    };
+    assert_eq!(summarize_fn(&leak).ret, RetSummary::DanglingStack);
+
+    // fn leak_off() { let a; return &a[1] } — an offset into the local is still the local.
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(Some(Operand::Reg(q))));
+    bb.insts.push(alloc(a));
+    bb.insts.push(Inst::PtrOffset {
+        dst: q,
+        base: Operand::Reg(a),
+        index: Operand::int(64, 1),
+        elem: Type::int(32),
+    });
+    let leak_off = Function {
+        id: FuncId(0),
+        name: "leak_off".into(),
+        params: vec![],
+        ret_ty: Type::ptr(Type::int(32)),
+        blocks: vec![bb],
+        entry: BlockId(0),
+    };
+    assert_eq!(summarize_fn(&leak_off).ret, RetSummary::DanglingStack);
+
+    // fn maybe(p, c) { if c { return p } else { let a; return &a } } — mixed → Unknown.
+    let p = RegId(2);
+    let c = RegId(3);
+    let entry = BasicBlock::new(
+        BlockId(0),
+        Terminator::CondBr {
+            cond: Operand::Reg(c),
+            then_blk: BlockId(1),
+            then_args: vec![],
+            else_blk: BlockId(2),
+            else_args: vec![],
+        },
+    );
+    let ret_param = BasicBlock::new(BlockId(1), Terminator::Return(Some(Operand::Reg(p))));
+    let mut ret_local = BasicBlock::new(BlockId(2), Terminator::Return(Some(Operand::Reg(a))));
+    ret_local.insts.push(alloc(a));
+    let maybe = Function {
+        id: FuncId(0),
+        name: "maybe".into(),
+        params: vec![(p, Type::ptr(Type::int(32))), (c, Type::Bool)],
+        ret_ty: Type::ptr(Type::int(32)),
+        blocks: vec![entry, ret_param, ret_local],
+        entry: BlockId(0),
+    };
+    assert_eq!(
+        summarize_fn(&maybe).ret,
+        RetSummary::Unknown,
+        "a local on only one path must not be claimed dangling"
+    );
+}
+
 /// Disagreeing return sites (`ret p` vs `ret p+4`) must yield `Unknown` —
 /// the caller trusts a summary to rebuild the result *exactly*, so a "may"
 /// summary would be unsound. Likewise a loop-varying pointer: the back-edge

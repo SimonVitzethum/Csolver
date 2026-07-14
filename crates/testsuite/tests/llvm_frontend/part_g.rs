@@ -257,6 +257,34 @@ fn dangling_stack_return_is_flagged() {
     assert_ne!(verify_module(&scalar, &cfg).verdict, Verdict::Fail, "returning a scalar is safe");
 }
 
+/// Interprocedural dangling-stack: a callee returns the address of its own local, and a
+/// *caller* dereferences the returned pointer. The callee's summary carries `DanglingStack`,
+/// which the call site materialises as an already-freed region, so the caller's `store`
+/// through it is a definite use-after-free — the interprocedural face of the intra-return
+/// `NoDanglingDeref` above. The negative control (a callee returning a *parameter* pointer,
+/// which the caller owns) must leave the caller safe: no false FAIL from the new freed region.
+#[test]
+fn caller_side_deref_of_returned_local_is_flagged() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let lower = |src: &str| LlvmFrontend.lower(LlvmInput { source: src.into(), name: "r".into() }).expect("lower");
+    let verdict_of = |m: &_, f: &str| {
+        verify_module(m, &cfg).functions.into_iter().find(|r| r.function == f).expect("fn report").verdict
+    };
+    // @leak returns &local; @caller derefs the result → caller-side use-after-free.
+    let bad = lower(concat!(
+        "define ptr @leak() {\nb:\n  %p = alloca i32, align 4\n  ret ptr %p\n}\n",
+        "define void @caller() {\nb:\n  %q = call ptr @leak()\n  store i32 7, ptr %q, align 4\n  ret void\n}\n",
+    ));
+    assert_eq!(verdict_of(&bad, "caller"), Verdict::Fail, "dereferencing a returned dangling-stack pointer is a use-after-free");
+    // Negative control: @id returns its parameter pointer; the caller owns that object, so a
+    // deref is fine — the interprocedural freed-region path must not fire here.
+    let ok = lower(concat!(
+        "define ptr @id(ptr %x) {\nb:\n  ret ptr %x\n}\n",
+        "define void @caller2(ptr %m) {\nb:\n  %q = call ptr @id(ptr %m)\n  store i32 7, ptr %q, align 4\n  ret void\n}\n",
+    ));
+    assert_ne!(verdict_of(&ok, "caller2"), Verdict::Fail, "dereferencing a returned parameter pointer is safe");
+}
+
 /// and `aead_request_set_crypt` into the request, and `crypto_aead_encrypt` requires the
 /// request's destination to grant `write` — which `foreign` does not → FAIL. This exercises
 /// `label`/`propagate`/`require` (data/provenance.contract) end to end through real API names.
