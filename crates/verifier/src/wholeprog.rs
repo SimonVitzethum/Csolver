@@ -22,6 +22,12 @@ pub struct WholeProgramFacts {
     contracts: ContractFacts,
     fields: FieldFacts,
     n_functions: usize,
+    /// MMIO dispatch handlers by name, unioned across every file. A handler may be defined in
+    /// one file and registered (its ops named) in another (`register_read_memory`), so its
+    /// dispatch bound must be recovered whole-program: `finalize` emits a `size ∈ [1, 8]` scalar
+    /// precondition for each, keyed by name, so the per-file overlay applies it wherever the
+    /// handler is actually defined.
+    mmio_handlers: HashMap<String, csolver_ir::MmioHandler>,
 }
 
 impl WholeProgramFacts {
@@ -38,6 +44,9 @@ impl WholeProgramFacts {
         self.scalars.push_module(m);
         self.contracts.push_module(m);
         self.fields.push_module(m);
+        for (name, h) in &m.mmio_handlers {
+            self.mmio_handlers.entry(name.clone()).or_insert(*h);
+        }
     }
 
     /// Absorb a fact set built in parallel over a *later* range of files, so shards
@@ -49,6 +58,9 @@ impl WholeProgramFacts {
         self.scalars.merge(other.scalars);
         self.contracts.merge(other.contracts);
         self.fields.merge(other.fields);
+        for (name, h) in other.mmio_handlers {
+            self.mmio_handlers.entry(name).or_insert(h);
+        }
     }
 
     /// Finalize all four passes. Pointer contracts feed member-provenance, exactly
@@ -78,10 +90,18 @@ impl WholeProgramFacts {
         // be matched across files (two files may define same-named statics). Only sound
         // to apply under closed-world — the extraction mode of these very facts.
         let by_name = |g: &FuncId| id_to_name.get(g).cloned();
-        let name_scalars = scalars
+        let mut name_scalars: HashMap<(String, u32), (i128, i128)> = scalars
             .iter()
             .filter_map(|(&(g, p), v)| by_name(&g).map(|n| ((n, p), *v)))
             .collect();
+        // Emit the MMIO dispatch bound `size ∈ [1, 8]` as a name-keyed scalar precondition for
+        // every handler (whole-program union), so a handler defined in one file but registered
+        // in another (`register_read_memory`) is bounded wherever it is verified. Sound: it is
+        // a real invariant of how the memory core dispatches. A genuine synthesized range (from
+        // direct callers) is narrower or equal, so it wins where present.
+        for (name, h) in &self.mmio_handlers {
+            name_scalars.entry((name.clone(), h.size_param)).or_insert((1, 8));
+        }
         let name_ptr_contracts = ptr_contracts
             .iter()
             .filter_map(|(&(g, p), v)| by_name(&g).map(|n| ((n, p), *v)))
