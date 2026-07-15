@@ -110,18 +110,30 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
 /// region byte size (recorded when constant). Precise by construction — only a global actually
 /// passed as the `ops` operand is treated as a `MemoryRegionOps`, so no unrelated function is
 /// ever constrained (which would be a false PASS).
-fn collect_mmio_handlers(m: &LModule, func_ids: &HashMap<String, FuncId>, module: &mut Module) {
+fn collect_mmio_handlers(m: &LModule, _func_ids: &HashMap<String, FuncId>, module: &mut Module) {
+    // The MMIO-registration functions and where each puts the `ops` global and the region size
+    // in its argument list. `memory_region_init_io(mr, owner, ops, opaque, name, size)` is the
+    // core one; `register_init_block{8,32,64}(owner, rae, num, ri, ops, name, size)` is QEMU's
+    // register-array wrapper (which forwards to `memory_region_init_io`) — recognising it too is
+    // what catches `register_read_memory`, whose ops global lives in the device file while the
+    // handler itself is defined in `hw/core/register.c`.
+    let reg_site = |callee: &str| -> Option<(usize, usize)> {
+        match callee {
+            "memory_region_init_io" => Some((2, 5)),
+            "register_init_block8" | "register_init_block32" | "register_init_block64" => {
+                Some((4, 6))
+            }
+            _ => None,
+        }
+    };
     // ops-global name → region size (`None` if the init call passed a non-constant size).
     let mut ops_size: HashMap<&str, Option<u64>> = HashMap::new();
     for f in &m.funcs {
         for inst in f.blocks.iter().flat_map(|b| &b.insts) {
             let LInst::Call { callee, args, .. } = inst else { continue };
-            if callee != "memory_region_init_io" {
-                continue;
-            }
-            // memory_region_init_io(mr, owner, ops, opaque, name, size)
-            let Some(LValue::Global(ops)) = args.get(2) else { continue };
-            let size = match args.get(5) {
+            let Some((ops_idx, size_idx)) = reg_site(callee) else { continue };
+            let Some(LValue::Global(ops)) = args.get(ops_idx) else { continue };
+            let size = match args.get(size_idx) {
                 Some(LValue::Int(n)) if *n >= 0 => Some(*n as u64),
                 _ => None,
             };
@@ -147,8 +159,12 @@ fn collect_mmio_handlers(m: &LModule, func_ids: &HashMap<String, FuncId>, module
     for g in &m.globals {
         let Some(&region_size) = ops_size.get(g.name.as_str()) else { continue };
         for (off, target) in &g.fn_ptrs {
-            if let (Some(size_param), Some(&fid)) = (size_param_of(*off), func_ids.get(target)) {
-                module.mmio_handlers.insert(fid, csolver_ir::MmioHandler { region_size, size_param });
+            // Record by handler *name* (not FuncId): the handler may be defined in another file
+            // (`register_read_memory`), so it is resolved against the analysed function by name.
+            if let Some(size_param) = size_param_of(*off) {
+                module
+                    .mmio_handlers
+                    .insert(target.clone(), csolver_ir::MmioHandler { region_size, size_param });
             }
         }
     }

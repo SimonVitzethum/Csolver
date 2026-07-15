@@ -84,7 +84,7 @@ pub(crate) fn synthesize_scalars(
                 // helpers — the bound flows from the handler to the helper's `size` parameter.
                 let caller_mmio_size_reg = module
                     .mmio_handlers
-                    .get(&caller.id)
+                    .get(&caller.name)
                     .and_then(|h| caller.params.get(h.size_param as usize))
                     .map(|(r, _)| *r);
                 for (i, arg) in args.iter().enumerate() {
@@ -189,7 +189,7 @@ impl ScalarFacts {
             // analogue of the same override in `synthesize_scalars`.
             let mmio_size_reg = m
                 .mmio_handlers
-                .get(&f.id)
+                .get(&f.name)
                 .and_then(|h| f.params.get(h.size_param as usize))
                 .map(|(r, _)| *r);
             let mut sites = Vec::new();

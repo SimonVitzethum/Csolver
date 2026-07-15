@@ -300,7 +300,13 @@ pub struct Module {
     /// them is precision. Without them, treating a handler as an entry point (via
     /// `--auto-entries`) with a free `addr`/`size` refutes on a register offset or access size
     /// the dispatch never produces (a false FAIL). Keyed by handler `FuncId`.
-    pub mmio_handlers: HashMap<FuncId, MmioHandler>,
+    ///
+    /// Keyed by handler **name** (not `FuncId`) so it survives cross-file linking: a device's
+    /// ops global may name a handler (`register_read_memory`) that is *defined in another file*
+    /// (`hw/core/register.c`), and registration wrappers like `register_init_block32` pass the
+    /// ops through. The name is recovered from the ops global's initialiser regardless of where
+    /// the handler is defined; the verifier resolves it against the function being analysed.
+    pub mmio_handlers: HashMap<String, MmioHandler>,
 }
 
 /// What the frontend recovered about a memory-mapped-I/O dispatch handler (see
@@ -498,8 +504,8 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         for ((fid, reg), hint) in m.reg_ptr_hints {
             merged.reg_ptr_hints.insert((remap[&fid], reg), hint);
         }
-        for (fid, size) in m.mmio_handlers {
-            merged.mmio_handlers.insert(remap[&fid], size);
+        for (name, h) in m.mmio_handlers {
+            merged.mmio_handlers.insert(name, h);
         }
         for (k, v) in m.globals {
             merged.globals.entry(k).or_insert(v);

@@ -232,7 +232,7 @@ pub(crate) fn verify_one_function(
             .filter(|((fid, _), _)| *fid == f.id)
             .map(|((_, r), s)| (*r, *s))
             .collect(),
-        module.mmio_handlers.get(&f.id).copied(),
+        module.mmio_handlers.get(&f.name).copied(),
         config,
         exported,
         &mut local_id,
