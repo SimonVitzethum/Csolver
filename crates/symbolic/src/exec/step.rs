@@ -94,11 +94,13 @@ impl Explorer<'_> {
                 let count_e = self.eval_scalar(count, state);
                 let stride_e = self.ctx.int(PTR_WIDTH, stride as u128);
                 let size = self.ctx.bin(BvOp::Mul, count_e, stride_e);
-                let perms = if *region == RegionKind::Global {
-                    Permissions::READ_ONLY
-                } else {
-                    Permissions::READ_WRITE
-                };
+                // A `Global`-kind allocation models an **externally-backed MMIO mapping**
+                // (`ioremap`): its bytes are read/write device registers, already initialized
+                // by hardware. `contract = Some(MMIO)` (set below) marks it non-fresh, so a
+                // register read is not an uninitialized-read bug — while `size_nowrap` is kept,
+                // so a *provable* out-of-bounds register access is still refuted.
+                let external = *region == RegionKind::Global;
+                let perms = Permissions::READ_WRITE;
                 // A successful allocation has size <= isize::MAX, so the element
                 // count times the stride does not wrap (`alloc-succeeds`). Kept
                 // off `facts` (it would slow every proof) and used only to make a
@@ -128,7 +130,7 @@ impl Explorer<'_> {
                     base_align: (*align as u64).max(1),
                     state: LifetimeState::Live,
                     perms,
-                    contract: None,
+                    contract: external.then_some(MMIO),
                     size_nowrap: refute_bounds.then_some(nowrap),
                     sentinel: None,
                     user_controlled: false,

@@ -467,3 +467,44 @@ entry:
     assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
         "the pointee size is inferred from the gep-base type when debug info is absent");
 }
+
+/// `ioremap(phys, size)` maps device registers: a live, `size`-byte, externally *initialized*
+/// region. Unlike a plain allocator (fresh, uninitialized), a register READ is valid — but a
+/// provably out-of-bounds register access is still refuted. No flag: like `malloc`, the mapping
+/// really is `size` bytes (NULL-on-failure rests on `alloc-succeeds`).
+#[test]
+fn ioremap_is_an_initialized_sized_mmio_region() {
+    let ok = r#"
+define i32 @rd(i64 %phys) {
+  %p = call ptr @ioremap(i64 %phys, i64 64)
+  %g = getelementptr i8, ptr %p, i64 60
+  %v = load i32, ptr %g, align 4
+  ret i32 %v
+}
+declare ptr @ioremap(i64, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ok.into(), name: "io".into() }).expect("lower");
+    // An in-bounds register read proves — the region is initialized (no false uninit-read FAIL).
+    assert_eq!(
+        verify_module(&m, &Config { bug_finding: true, ..Config::default() }).verdict,
+        Verdict::Pass,
+        "an in-bounds MMIO register read is valid (initialized, sized)",
+    );
+
+    let oob = r#"
+define i32 @rd(i64 %phys) {
+  %p = call ptr @ioremap(i64 %phys, i64 64)
+  %g = getelementptr i8, ptr %p, i64 128
+  %v = load i32, ptr %g, align 4
+  ret i32 %v
+}
+declare ptr @ioremap(i64, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: oob.into(), name: "io".into() }).expect("lower");
+    // A provably out-of-bounds register access (offset 128 into a 64-byte mapping) is a bug.
+    assert_eq!(
+        verify_module(&m, &Config { bug_finding: true, ..Config::default() }).verdict,
+        Verdict::Fail,
+        "an out-of-bounds MMIO access is still refuted (the region stays bounds-refutable)",
+    );
+}

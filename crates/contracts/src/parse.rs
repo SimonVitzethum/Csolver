@@ -8,7 +8,14 @@ pub(crate) fn parse_effect(line: &str) -> Result<Effect, String> {
         "alloc" => {
             let size = parse_kv_size(&rest, "size")?;
             let align = parse_kv_u32(&rest, "align")?;
-            Ok(Effect::Alloc { size, align })
+            Ok(Effect::Alloc { size, align, external: false })
+        }
+        // `ioremap`-style MMIO mapping: an allocation of known size whose bytes are already
+        // initialized by hardware (a register read is not an uninitialized-read bug).
+        "mmio" => {
+            let size = parse_kv_size(&rest, "size")?;
+            let align = parse_kv_u32(&rest, "align")?;
+            Ok(Effect::Alloc { size, align, external: true })
         }
         "free" => Ok(Effect::Free { ptr: parse_arg(rest.first().copied().unwrap_or(""))? }),
         "write" => {

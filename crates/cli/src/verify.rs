@@ -507,9 +507,10 @@ fn apply_binary_call_contracts(m: &mut csolver_ir::Module) {
                 let mut effects = Vec::new();
                 for effect in &contract.effects {
                     match effect {
-                        Effect::Alloc { size, align } => {
+                        Effect::Alloc { size, align, external } => {
                             if let (Some(d), Some(count)) = (*dst, size_op(size, args)) {
-                                effects.push(Inst::Alloc { dst: d, region: RegionKind::Heap, elem: Type::int(8), count, align: *align });
+                                let region = if *external { RegionKind::Global } else { RegionKind::Heap };
+                                effects.push(Inst::Alloc { dst: d, region, elem: Type::int(8), count, align: *align });
                             }
                         }
                         Effect::Free { ptr } => {

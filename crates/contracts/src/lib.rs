@@ -81,6 +81,11 @@ pub enum Effect {
         size: SizeExpr,
         /// The guaranteed alignment of the returned pointer, in bytes.
         align: u32,
+        /// `true` for an **externally-backed** mapping (`ioremap` MMIO): the region is
+        /// live and of known size like an allocation, but its bytes are *already
+        /// initialized* by the device/hardware, so a register read is not an
+        /// uninitialized-read bug. A plain allocator is `false` (its bytes are fresh).
+        external: bool,
     },
     /// Frees the region pointed to by argument `ptr`.
     Free {
@@ -369,7 +374,7 @@ impl ApiContract {
     /// call result to the fresh pointer).
     pub fn alloc(&self) -> Option<(&SizeExpr, u32)> {
         self.effects.iter().find_map(|e| match e {
-            Effect::Alloc { size, align } => Some((size, *align)),
+            Effect::Alloc { size, align, .. } => Some((size, *align)),
             _ => None,
         })
     }
@@ -527,6 +532,7 @@ pub(crate) use parse::*;
 /// The built-in contract files, embedded so the binary is self-contained.
 const DEFAULT_FILES: &[(&str, &str)] = &[
     ("alloc.contract", include_str!("../data/alloc.contract")),
+    ("mmio.contract", include_str!("../data/mmio.contract")),
     ("free.contract", include_str!("../data/free.contract")),
     ("user_copy.contract", include_str!("../data/user_copy.contract")),
     ("provenance.contract", include_str!("../data/provenance.contract")),

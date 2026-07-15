@@ -67,6 +67,10 @@ const PARAM_BUFFER_LEN: &str = "param-buffer-len";
 /// code reaches is assumed to be within it. Opt-in: a symbolic index could overrun into the
 /// assumed tail without being refuted.
 const STRUCT_TAIL: &str = "struct-tail";
+/// A region backing an `ioremap`-style MMIO mapping: live, of the mapped size, and
+/// **externally initialized** (device registers), so a read of it is not an
+/// uninitialized-read bug. Rests on `alloc-succeeds` (the mapping call succeeded).
+const MMIO: &str = "mmio-mapping";
 /// A `&T`/`&mut T` value is a valid reference to its pointee (Rust's reference
 /// invariant), even when the analysis cannot see where it came from.
 const VALID_REFERENCE: &str = "valid-reference";

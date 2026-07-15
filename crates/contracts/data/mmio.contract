@@ -1,0 +1,23 @@
+# Memory-mapped I/O mappings (`ioremap` family). A successful call returns a pointer to a
+# freshly-mapped region of a **known** byte size, exactly like an allocator — so the return is
+# modelled as a heap region of that size (register accesses through it are then bounds-checked).
+# NULL-on-failure is covered by the same `alloc-succeeds` assumption an allocator rests on;
+# the unmap (`iounmap`) is deliberately not modelled as a free (its absence can only miss a
+# use-after-unmap, never fabricate a false FAIL).
+#
+# Only the APIs whose size is a **call argument** appear here. The device-tree / BAR-sized
+# family (`of_iomap`, `devm_platform_ioremap_resource`, `pci_iomap` with a 0 "whole-BAR"
+# length, …) has no static size; those are handled by the `iomem` provenance label
+# (see provenance.contract) and `--assume-valid-mmio`, not by a size here.
+#
+# Alignment is stated at 16: an MMIO mapping is in fact page-aligned, but a sound *lower*
+# bound suffices (under-stating alignment can only leave a misalignment obligation UNKNOWN,
+# never fabricate a false FAIL) and 16 matches the allocator convention.
+
+# ioremap(phys_addr, size) and its cache-attribute variants — size is the 2nd argument.
+[ioremap ioremap_wc ioremap_cache ioremap_uc ioremap_np ioremap_encrypted ioremap_prot]
+mmio size=arg1 align=16
+
+# devm_ioremap(dev, offset, size) and variants — size is the 3rd argument.
+[devm_ioremap devm_ioremap_wc devm_ioremap_uc devm_ioremap_np]
+mmio size=arg2 align=16

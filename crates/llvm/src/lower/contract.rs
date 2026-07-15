@@ -107,12 +107,14 @@ pub(crate) fn emit_contract(
         match effect {
             // A fresh heap region (byte-granular, `elem = i8`) whose result pointer is
             // the call value — only meaningful when that result is actually used.
-            Effect::Alloc { size, align } => {
+            Effect::Alloc { size, align, external } => {
                 let Some(dst) = dst else { continue };
                 let Some(count) = size_operand(ctx, insts, size, args)? else { continue };
                 insts.push(Inst::Alloc {
                     dst: ctx.reg(dst)?,
-                    region: RegionKind::Heap,
+                    // An externally-backed MMIO mapping is a `Global` region (initialized
+                    // static-like storage); an ordinary allocator is `Heap` (fresh bytes).
+                    region: if *external { RegionKind::Global } else { RegionKind::Heap },
                     elem: Type::int(8),
                     count,
                     align: *align,
