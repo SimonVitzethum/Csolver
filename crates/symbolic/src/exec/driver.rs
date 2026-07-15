@@ -102,6 +102,7 @@ pub(crate) fn discharge_inner(
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     analysis_in: Option<&IntervalAnalysis>,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
+    mmio_region: Option<Option<u64>>,
 ) -> SymbolicReport {
     // Reuse the caller's interval analysis when supplied (the verifier already
     // computes it for interval-based discharge), so it is not recomputed here —
@@ -163,6 +164,7 @@ pub(crate) fn discharge_inner(
         exported: limits.exported,
         assume_valid_params: limits.assume_valid_params,
         reg_ptr_hints,
+        mmio_region,
         visits: 0,
         truncated: false,
         pruned_succs: FxHashSet::default(),
@@ -481,6 +483,38 @@ pub(crate) fn discharge_inner(
             ex.global_fnptrs.insert(rid, table.iter().copied().collect());
         }
         ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
+    }
+
+    // MMIO dispatch precondition (`Module::mmio_handlers`): a `MemoryRegionOps.read/.write`
+    // handler `(void *opaque, hwaddr addr, unsigned size)` is only ever called by the memory
+    // core, which guarantees `1 ≤ size ≤ 8` and (when the region size is known) `addr + size ≤
+    // region_size`. These are real invariants of how the handler is invoked, so seeding them is
+    // precision — it removes the false FAILs that arise from treating a handler as an entry with
+    // a free `addr`/`size` (`addr` a huge register offset the dispatch never forms, `size` 0 or
+    // enormous), while a genuine `region_size > backing array` overrun still refutes.
+    if let Some(region) = ex.mmio_region {
+        if let (Some(SymValue::Scalar(addr)), Some(SymValue::Scalar(size))) =
+            (f.params.get(1).and_then(|(r, _)| env.get(r)).cloned(),
+             f.params.get(2).and_then(|(r, _)| env.get(r)).cloned())
+        {
+            let sw = ex.ctx.width(size);
+            let one = ex.ctx.int(sw, 1);
+            let eight = ex.ctx.int(sw, 8);
+            facts.push(ex.ctx.cmp(SCmp::Ule, one, size));
+            facts.push(ex.ctx.cmp(SCmp::Ule, size, eight));
+            if let Some(bytes) = region {
+                let size64 = if sw < PTR_WIDTH { ex.ctx.zext(size, PTR_WIDTH) } else { size };
+                let end = ex.ctx.bin(BvOp::Add, addr, size64);
+                let cap = ex.ctx.int(PTR_WIDTH, bytes as u128);
+                // `addr ≤ region_size` bounds the offset AND (since region_size is a small
+                // constant) rules out a near-`u64::MAX` addr whose `addr + size` would *wrap*
+                // below the cap — without it the `end ≤ cap` fact alone would spuriously admit
+                // a huge offset. `end ≤ cap` then pins the exact tail. Both hold in QEMU (the
+                // dispatch forms `addr` as a valid in-region offset).
+                facts.push(ex.ctx.cmp(SCmp::Ule, addr, cap));
+                facts.push(ex.ctx.cmp(SCmp::Ule, end, cap));
+            }
+        }
     }
 
     let state = PathState {

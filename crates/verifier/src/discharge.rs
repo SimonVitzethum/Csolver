@@ -5,7 +5,7 @@ use super::*;
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
     verify_function_with(
         f, None, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(),
-        &HashMap::new(), &HashMap::new(), config, true, next_id,
+        &HashMap::new(), &HashMap::new(), None, config, true, next_id,
     )
 }
 
@@ -23,6 +23,7 @@ pub(crate) fn verify_function_with(
     prov_grants: &HashMap<u32, std::collections::HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     reg_ptr_hints: &HashMap<csolver_ir::RegId, csolver_ir::PtrHint>,
+    mmio_region: Option<Option<u64>>,
     config: &Config,
     exported: bool,
     next_id: &mut u32,
@@ -45,6 +46,7 @@ pub(crate) fn verify_function_with(
             config.assume_struct_tail,
             config.assume_valid_mmio,
             reg_ptr_hints,
+            mmio_region,
         ),
         None => discharge_function(f),
     });

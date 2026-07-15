@@ -99,7 +99,56 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
     // The provenance lattice (label id → granted capability ids) that the emitted
     // `ProvLabel`/`CapRequire` instructions reference; same for every module.
     module.prov_grants = prov_interner().grants().clone();
+    collect_mmio_handlers(m, &func_ids, &mut module);
     Ok(module)
+}
+
+/// Record every **MMIO dispatch handler** in the module (see `Module::mmio_handlers`): the
+/// `.read`/`.write` function of a `MemoryRegionOps` registered via
+/// `memory_region_init_io(mr, owner, ops, opaque, name, size)`. The 3rd argument names the ops
+/// global (whose field-0 / field-8 pointers are the read / write handlers) and the 6th is the
+/// region byte size (recorded when constant). Precise by construction — only a global actually
+/// passed as the `ops` operand is treated as a `MemoryRegionOps`, so no unrelated function is
+/// ever constrained (which would be a false PASS).
+fn collect_mmio_handlers(m: &LModule, func_ids: &HashMap<String, FuncId>, module: &mut Module) {
+    // ops-global name → region size (`None` if the init call passed a non-constant size).
+    let mut ops_size: HashMap<&str, Option<u64>> = HashMap::new();
+    for f in &m.funcs {
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            let LInst::Call { callee, args, .. } = inst else { continue };
+            if callee != "memory_region_init_io" {
+                continue;
+            }
+            // memory_region_init_io(mr, owner, ops, opaque, name, size)
+            let Some(LValue::Global(ops)) = args.get(2) else { continue };
+            let size = match args.get(5) {
+                Some(LValue::Int(n)) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            };
+            // A later call with a constant size wins over an earlier `None` for the same ops.
+            let e = ops_size.entry(ops.as_str()).or_insert(None);
+            if e.is_none() {
+                *e = size;
+            }
+        }
+    }
+    if ops_size.is_empty() {
+        return;
+    }
+    // Field byte offsets of `.read` / `.write` in `MemoryRegionOps` (both are the first two
+    // pointer fields on a 64-bit target).
+    const READ_OFF: u64 = 0;
+    const WRITE_OFF: u64 = 8;
+    for g in &m.globals {
+        let Some(&size) = ops_size.get(g.name.as_str()) else { continue };
+        for (off, target) in &g.fn_ptrs {
+            if *off == READ_OFF || *off == WRITE_OFF {
+                if let Some(&fid) = func_ids.get(target) {
+                    module.mmio_handlers.insert(fid, size);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct Ctx<'a> {

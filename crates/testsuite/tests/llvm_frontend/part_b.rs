@@ -448,7 +448,7 @@ entry:
         "a raw pointer parameter is not assumed valid by default");
     // Opt-in: the framework-valid-pointer assumption makes the field access prove.
     let cfg = Config { assume_valid_params: true, ..Config::default() };
-    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+    assert_eq!(csolver_verifier::verify_module_with_threads(&m, &cfg, 1).verdict, Verdict::Pass,
         "assume_valid_params contracts the raw pointer param to its pointee size");
 
     // Kernel IR is built without debug info, so the pointee size must also be
@@ -464,7 +464,7 @@ entry:
 "#;
     let m = LlvmFrontend.lower(LlvmInput { source: no_dwarf.into(), name: "n".into() }).expect("lower");
     assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Pass);
-    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+    assert_eq!(csolver_verifier::verify_module_with_threads(&m, &cfg, 1).verdict, Verdict::Pass,
         "the pointee size is inferred from the gep-base type when debug info is absent");
 }
 
@@ -532,8 +532,62 @@ declare ptr @of_iomap(ptr, i32)
     );
     let cfg = Config { bug_finding: true, assume_valid_mmio: true, ..Config::default() };
     assert_eq!(
-        verify_module(&m, &cfg).verdict,
+        csolver_verifier::verify_module_with_threads(&m, &cfg, 1).verdict,
         Verdict::Pass,
         "under --assume-valid-mmio the iomem-labelled register access is trusted",
+    );
+}
+
+/// A QEMU MMIO dispatch handler (`.read`/`.write` of a `MemoryRegionOps` passed to
+/// `memory_region_init_io(..., size)`) is only ever called by the memory core, which guarantees
+/// `1 <= size <= 8`. Modelling that (Module::mmio_handlers) is precision, not an assumption:
+/// without it, treating the handler as an entry with a free `size` refutes a division `x / size`
+/// (size 0 => division by zero) the dispatch never produces -- a false FAIL.
+#[test]
+fn mmio_dispatch_bound_removes_the_false_positive() {
+    let ir = r#"
+@dev_ops = internal constant { ptr, ptr } { ptr @dev_read, ptr @dev_write }
+
+define i64 @dev_read(ptr %opaque, i64 %addr, i32 %size) {
+  %s64 = zext i32 %size to i64
+  %q = udiv i64 %addr, %s64
+  ret i64 %q
+}
+define void @dev_write(ptr %opaque, i64 %addr, i32 %size) { ret void }
+
+define void @dev_init(ptr %mr, ptr %owner, ptr %opaque) {
+  call void @memory_region_init_io(ptr %mr, ptr %owner, ptr @dev_ops, ptr %opaque, ptr null, i64 32)
+  ret void
+}
+declare void @memory_region_init_io(ptr, ptr, ptr, ptr, ptr, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "q".into() }).expect("lower");
+
+    // Control: a NON-handler function with the same `x / size` shape and a free `size` is
+    // refuted (size can be 0) -- so the test proves the fix is specific to MMIO handlers.
+    let free = r#"
+define i64 @plain(i64 %addr, i32 %size) {
+  %s64 = zext i32 %size to i64
+  %q = udiv i64 %addr, %s64
+  ret i64 %q
+}
+"#;
+    let mf = LlvmFrontend.lower(LlvmInput { source: free.into(), name: "p".into() }).expect("lower");
+    let cfg_free = Config { bug_finding: true, entry_patterns: Some(vec!["plain".into()]), ..Config::default() };
+    let rf = verify_module(&mf, &cfg_free);
+    let plain = rf.functions.iter().find(|f| f.function == "plain").expect("plain");
+    assert_eq!(
+        plain.verdict, Verdict::Fail,
+        "a plain function with a free divisor is correctly refuted (division by zero)",
+    );
+
+    // The MMIO handler: the dispatch bound `size >= 1` proves the division safe instead of
+    // refuting it -- the false positive is gone, and it is a proof (not merely UNKNOWN).
+    let cfg = Config { bug_finding: true, entry_patterns: Some(vec!["dev_read".into()]), ..Config::default() };
+    let r = verify_module(&m, &cfg);
+    let dev_read = r.functions.iter().find(|f| f.function == "dev_read").expect("dev_read");
+    assert_eq!(
+        dev_read.verdict, Verdict::Pass,
+        "the MMIO dispatch bound proves `addr / size` cannot divide by zero (size >= 1)",
     );
 }

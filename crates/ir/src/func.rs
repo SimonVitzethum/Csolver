@@ -290,6 +290,17 @@ pub struct Module {
     /// how big that object is. Empty for frontends that carry no type information — the sound
     /// default (the region stays unsized).
     pub reg_ptr_hints: HashMap<(FuncId, RegId), PtrHint>,
+    /// Functions registered as a **memory-mapped-I/O dispatch handler** — the `.read`/`.write`
+    /// of a `MemoryRegionOps` passed to `memory_region_init_io(mr, owner, ops, opaque, name,
+    /// size)`. Such a handler is *only* ever called by the memory core's dispatch, which
+    /// guarantees `size ∈ {1,2,4,8}` and `addr + size ≤ region_size`. The value is the region
+    /// byte size when the init call passed a constant (`Some`), else `None` (size-arg only).
+    ///
+    /// These are genuine guarantees of how the handler is invoked, not assumptions — modelling
+    /// them is precision. Without them, treating a handler as an entry point (via
+    /// `--auto-entries`) with a free `addr`/`size` refutes on a register offset or access size
+    /// the dispatch never produces (a false FAIL). Keyed by handler `FuncId`.
+    pub mmio_handlers: HashMap<FuncId, Option<u64>>,
 }
 
 /// What a frontend recovered about the object a register points at: its byte size and,
@@ -375,6 +386,7 @@ impl Module {
             prov_grants: HashMap::new(),
             global_fn_ptrs: HashMap::new(),
             reg_ptr_hints: HashMap::new(),
+            mmio_handlers: HashMap::new(),
         }
     }
 
@@ -472,6 +484,9 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         }
         for ((fid, reg), hint) in m.reg_ptr_hints {
             merged.reg_ptr_hints.insert((remap[&fid], reg), hint);
+        }
+        for (fid, size) in m.mmio_handlers {
+            merged.mmio_handlers.insert(remap[&fid], size);
         }
         for (k, v) in m.globals {
             merged.globals.entry(k).or_insert(v);

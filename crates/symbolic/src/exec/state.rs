@@ -219,6 +219,11 @@ pub(crate) struct Explorer<'f> {
     /// header under `--assume-valid-loop-ptrs`, so accesses through a moving iterator get real
     /// bounds instead of an unsized (always-UNKNOWN) region. Empty for typeless frontends.
     pub(crate) reg_ptr_hints: &'f HashMap<RegId, PtrHint>,
+    /// Set when this function is a **MMIO dispatch handler** (`Module::mmio_handlers`): its
+    /// `(addr, size)` parameters are constrained by the memory core's dispatch guarantee
+    /// (`size ∈ {1,2,4,8}`, and `addr + size ≤ region_size` when the inner `Some` gives the
+    /// region byte size). `None` for an ordinary function. Genuine precision, not an assumption.
+    pub(crate) mmio_region: Option<Option<u64>>,
     pub(crate) visits: usize,
     pub(crate) truncated: bool,
     /// Successors whose incoming edge a **visited** predecessor pruned as bit-precisely
