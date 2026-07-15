@@ -206,6 +206,33 @@ pub(crate) fn checked_arith_map(f: &LFunc) -> HashMap<String, (BinOp, LValue, LV
 
 /// Map `llvm.{s,u}{add,sub,mul}.with.overflow.iN` to its arithmetic op (signed vs
 /// unsigned is the same bitvector operation for memory-safety reasoning).
+/// An integer min/max intrinsic (`llvm.umin`/`umax`/`smin`/`smax`) → the comparison whose
+/// `select(a <cmp> b, a, b)` computes it, and the operand bit width from the `.iN` suffix.
+/// `min = select(a < b, a, b)`, `max = select(a > b, a, b)`, unsigned or signed per the prefix.
+pub(crate) fn minmax_intrinsic(callee: &str) -> Option<CmpOp> {
+    let kind = callee.strip_prefix("llvm.")?;
+    let name = kind.split('.').next()?;
+    Some(match name {
+        "umin" => CmpOp::Ult,
+        "umax" => CmpOp::Ugt,
+        "smin" => CmpOp::Slt,
+        "smax" => CmpOp::Sgt,
+        _ => return None,
+    })
+}
+
+/// The operand bit width of an `.iN`-suffixed intrinsic (`llvm.umin.i32` → 32), defaulting to
+/// 64 when the suffix is absent or unparseable (harmless for register operands).
+pub(crate) fn intrinsic_width(callee: &str) -> u32 {
+    callee
+        .rsplit('.')
+        .next()
+        .and_then(|s| s.strip_prefix('i'))
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|w| (1..=128).contains(w))
+        .unwrap_or(64)
+}
+
 pub(crate) fn overflow_intrinsic_op(callee: &str) -> Option<BinOp> {
     let kind = callee.strip_prefix("llvm.")?;
     if !kind.contains(".with.overflow.") {

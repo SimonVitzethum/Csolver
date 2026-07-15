@@ -129,6 +129,33 @@ pub(crate) fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<Basi
         // instead of a hardcoded table: an `Alloc`/`Dealloc`/`MemIntrinsic` that models the
         // API's memory effect. This keeps the path *exact* (an `Inst::Call` would taint it,
         // disabling refutation) and lets a new API be covered by writing one contract block.
+        // Integer min/max intrinsics (`llvm.umin`/`umax`/`smin`/`smax`): model the *value*
+        // as `select(a <cmp> b, a, b)` instead of an opaque fresh scalar, so a shift/index
+        // amount computed from `umin(field, size)` stays a real expression over its inputs
+        // (and carries their bounds). Two MSIR instructions — the comparison then the select.
+        if let LInst::Call { dst: Some(dst), callee, args, .. } = inst {
+            if let (Some(cmp), [a, b]) = (minmax_intrinsic(callee), args.as_slice()) {
+                let w = intrinsic_width(callee);
+                let d = ctx.reg(dst)?;
+                let cmp_reg = ctx.fresh();
+                let (lhs, rhs) = (ctx.operand(a, w)?, ctx.operand(b, w)?);
+                insts.push(Inst::Assign {
+                    dst: cmp_reg,
+                    ty: Type::int(1),
+                    value: RValue::Cmp { op: cmp, lhs: lhs.clone(), rhs: rhs.clone() },
+                });
+                insts.push(Inst::Assign {
+                    dst: d,
+                    ty: Type::int(w),
+                    value: RValue::Select {
+                        cond: Operand::Reg(cmp_reg),
+                        then_val: lhs,
+                        else_val: rhs,
+                    },
+                });
+                continue;
+            }
+        }
         if let LInst::Call { dst, callee, args, ret } = inst {
             if let Some(contract) = contracts().lookup(callee) {
                 if emit_contract(ctx, &mut insts, contract, dst.as_deref(), args, ret)? {

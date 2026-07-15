@@ -629,3 +629,27 @@ declare void @memory_region_init_io(ptr, ptr, ptr, ptr, ptr, i64)
         "the dispatch bound must propagate to the helper's size, proving `addr / size` safe",
     );
 }
+
+/// Integer min/max intrinsics (`llvm.umin`/`umax`/`smin`/`smax`) are modelled as a real
+/// `select(a <cmp> b, a, b)` value, not an opaque fresh scalar — so a shift/index amount
+/// computed from `umin(x, k)` carries the bound `<= k`. Here `shl x, umin(y, 4)` is proven
+/// safe for *any* y because `umin(y, 4) <= 4 < 32`, which an opaque umin result could not show.
+#[test]
+fn min_max_intrinsics_are_modelled_as_select() {
+    let ir = r#"
+declare i32 @llvm.umin.i32(i32, i32)
+define i32 @f(i32 %x, i32 %y) {
+  %m = call i32 @llvm.umin.i32(i32 %y, i32 4)
+  %r = shl i32 %x, %m
+  ret i32 %r
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "mm".into() }).expect("lower");
+    let cfg = Config { bug_finding: true, entry_patterns: Some(vec!["f".into()]), ..Config::default() };
+    let r = verify_module(&m, &cfg);
+    let f = r.functions.iter().find(|f| f.function == "f").expect("f");
+    assert_eq!(
+        f.verdict, Verdict::Pass,
+        "umin(y,4) <= 4 < 32 must prove the shift safe (min/max modelled, not opaque)",
+    );
+}
