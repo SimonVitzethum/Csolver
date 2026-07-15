@@ -92,11 +92,20 @@ Entry mit *freien* `addr`/`size` — der Executor refutiert dann `x/size` (size 
 ### Verbleibende Div/Shift-FPs — ZWEI neue Klassen (nicht MMIO-Param)
 Der QEMU-FAIL-Count blieb bei 480, weil die restlichen ~100 Div/Shift-FPs **nicht** an einem
 Dispatch-Param hängen, sondern an:
-- [ ] **Unbeschränkte Struct-Feld-Invarianten.** `register_read_memory` failt weiter, aber NICHT am
-  `size`-Param (der ist jetzt [1,8]) — sondern an `register_enabled_mask(reg->data_size, size)`:
-  `MAKE_64BIT_MASK(0, size*8)` nach `size = reg->data_size`, wo `reg->data_size` ein *Struct-Feld*
-  ist (bei Registrierung ∈{1,2,4,8}, aber unbeschränkt gesehen). Braucht **Feld-Wert-Preconditions**
-  (die member-provenance-Synthese um Skalar-Feld-Ranges erweitern) — ein eigenes Stück.
+- [x] **Struct-Feld-Invarianten (2026-07-15) — Fundament + Flag gebaut.**
+  - **min/max-Modeling (sound, kein Flag, `556bd85`):** `llvm.umin/umax/smin/smax` werden als
+    echtes `select(a<cmp>b, a, b)` gelowered statt als opakes frisches Skalar. `umin(y,4) ≤ 4`
+    ist jetzt beweisbar; der Wert trägt seine Operanden-Symbole.
+  - **`--assume-field-invariants` (Flag, `8f9acca`):** ein aus dem Speicher geladener Skalar
+    (distinktes `fld…`-Symbol) gilt als gültig für seine Nutzung (Shift < Bitbreite, Divisor ≠ 0).
+    Erkannt per Expr-Walk am Check (robust, weil das Symbol durch umins `ite`/shl/sub/zext fließt).
+    Prove-only, als Annahme `field-invariants` ausgewiesen. Skalar-Analogon zu `--assume-valid-params`.
+  - **Wirkung (Voll-Scan): +240 Funktionen UNKNOWN→PASS** (26.109→26.349), Orakel SOUND, Default inert.
+- [ ] **OFFEN: register_read_memory failt WEITER (kein UNKNOWN→PASS-Fall).** Der +240-Gewinn sind
+  UNKNOWN→PASS-Fälle; register_read_memory ist aber **refutiert** (FAIL mit Zeuge `arg2=3`), und die
+  field-invariant-Annahme greift dort nicht — der refutierende Shift trägt offenbar kein `fld`-Symbol
+  (oder der Refutation-Pfad weicht vom erwarteten ab). Braucht eine gezielte Diagnose des konkreten
+  refutierenden POs in register_read_memory (welcher der ~3 Shifts, welche Symbole im Ziel).
 - [ ] **TCG-CPU-Emulations-Helfer.** `helper_palignr_{xmm,ymm,mmx}`, `softfloat_addMagsF32`,
   `helper_insertq_i` — Shift/Div über Gast-Instruktions-Operanden (SSE-Shuffle-Amount, Float-Exponent).
   Gast-kontrolliert via CPU-Emulation, QEMU maskiert sie; braucht ein TCG-Helfer-Operand-Modell,
