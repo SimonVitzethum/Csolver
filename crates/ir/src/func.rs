@@ -300,7 +300,20 @@ pub struct Module {
     /// them is precision. Without them, treating a handler as an entry point (via
     /// `--auto-entries`) with a free `addr`/`size` refutes on a register offset or access size
     /// the dispatch never produces (a false FAIL). Keyed by handler `FuncId`.
-    pub mmio_handlers: HashMap<FuncId, Option<u64>>,
+    pub mmio_handlers: HashMap<FuncId, MmioHandler>,
+}
+
+/// What the frontend recovered about a memory-mapped-I/O dispatch handler (see
+/// [`Module::mmio_handlers`]). The address is always parameter 1; the access size is at
+/// `size_param` (2 for a plain `.read`/`.write`, 3 for a `.read_with_attrs`/`.write_with_attrs`,
+/// which take a data pointer/value at parameter 2). `region_size` is the mapped byte size when
+/// the `memory_region_init_io` call passed a constant, else `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioHandler {
+    /// Mapped region byte size, when the init call passed a constant.
+    pub region_size: Option<u64>,
+    /// Parameter index of the `unsigned size` access-size argument.
+    pub size_param: u32,
 }
 
 /// What a frontend recovered about the object a register points at: its byte size and,

@@ -77,12 +77,25 @@ pub(crate) fn synthesize_scalars(
                     }
                     continue;
                 }
+                // The caller's own MMIO dispatch bound, if it is a handler: its `size` parameter
+                // is `[1, 8]` even though its body has no guard that the interval analysis could
+                // see. Propagating that to a helper it calls (`register_read_memory(regs, addr,
+                // size)`) is what removes the residual shift/div false positives in dispatch
+                // helpers — the bound flows from the handler to the helper's `size` parameter.
+                let caller_mmio_size_reg = module
+                    .mmio_handlers
+                    .get(&caller.id)
+                    .and_then(|h| caller.params.get(h.size_param as usize))
+                    .map(|(r, _)| *r);
                 for (i, arg) in args.iter().enumerate() {
                     let key = (*g, i as u32);
                     if !candidates.contains(&key) {
                         continue;
                     }
-                    let site = arg_interval(arg, &iv, block.id);
+                    let site = match arg {
+                        Operand::Reg(r) if Some(*r) == caller_mmio_size_reg => Some((1, 8)),
+                        _ => arg_interval(arg, &iv, block.id),
+                    };
                     let entry = folded.entry(key).or_insert(site);
                     *entry = match (*entry, site) {
                         (Some((la, ha)), Some((lb, hb))) => Some((la.min(lb), ha.max(hb))),
@@ -170,6 +183,15 @@ impl ScalarFacts {
             );
             self.param_count.push(f.params.len());
             let iv = analyze_intervals(f);
+            // If this caller is an MMIO dispatch handler, its `size` parameter is `[1, 8]` (the
+            // dispatch guarantee) though its body carries no guard the interval analysis sees.
+            // Passing that reg to a helper propagates the bound cross-function — the whole-program
+            // analogue of the same override in `synthesize_scalars`.
+            let mmio_size_reg = m
+                .mmio_handlers
+                .get(&f.id)
+                .and_then(|h| f.params.get(h.size_param as usize))
+                .map(|(r, _)| *r);
             let mut sites = Vec::new();
             for block in &f.blocks {
                 for inst in &block.insts {
@@ -182,8 +204,13 @@ impl ScalarFacts {
                         Callee::Symbol(nm) => ScalarCallee::Name(nm.clone()),
                         Callee::Indirect(_) => continue,
                     };
-                    let arg_intervals =
-                        args.iter().map(|a| arg_interval(a, &iv, block.id)).collect();
+                    let arg_intervals = args
+                        .iter()
+                        .map(|a| match a {
+                            Operand::Reg(r) if Some(*r) == mmio_size_reg => Some((1, 8)),
+                            _ => arg_interval(a, &iv, block.id),
+                        })
+                        .collect();
                     sites.push(ScalarCall { callee, arg_intervals });
                 }
             }

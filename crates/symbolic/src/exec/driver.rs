@@ -102,7 +102,7 @@ pub(crate) fn discharge_inner(
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
     analysis_in: Option<&IntervalAnalysis>,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
-    mmio_region: Option<Option<u64>>,
+    mmio_region: Option<csolver_ir::MmioHandler>,
 ) -> SymbolicReport {
     // Reuse the caller's interval analysis when supplied (the verifier already
     // computes it for interval-based discharge), so it is not recomputed here —
@@ -492,17 +492,17 @@ pub(crate) fn discharge_inner(
     // precision — it removes the false FAILs that arise from treating a handler as an entry with
     // a free `addr`/`size` (`addr` a huge register offset the dispatch never forms, `size` 0 or
     // enormous), while a genuine `region_size > backing array` overrun still refutes.
-    if let Some(region) = ex.mmio_region {
+    if let Some(handler) = ex.mmio_region {
         if let (Some(SymValue::Scalar(addr)), Some(SymValue::Scalar(size))) =
             (f.params.get(1).and_then(|(r, _)| env.get(r)).cloned(),
-             f.params.get(2).and_then(|(r, _)| env.get(r)).cloned())
+             f.params.get(handler.size_param as usize).and_then(|(r, _)| env.get(r)).cloned())
         {
             let sw = ex.ctx.width(size);
             let one = ex.ctx.int(sw, 1);
             let eight = ex.ctx.int(sw, 8);
             facts.push(ex.ctx.cmp(SCmp::Ule, one, size));
             facts.push(ex.ctx.cmp(SCmp::Ule, size, eight));
-            if let Some(bytes) = region {
+            if let Some(bytes) = handler.region_size {
                 let size64 = if sw < PTR_WIDTH { ex.ctx.zext(size, PTR_WIDTH) } else { size };
                 let end = ex.ctx.bin(BvOp::Add, addr, size64);
                 let cap = ex.ctx.int(PTR_WIDTH, bytes as u128);

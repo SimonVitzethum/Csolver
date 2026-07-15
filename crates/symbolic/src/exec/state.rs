@@ -223,7 +223,7 @@ pub(crate) struct Explorer<'f> {
     /// `(addr, size)` parameters are constrained by the memory core's dispatch guarantee
     /// (`size ∈ {1,2,4,8}`, and `addr + size ≤ region_size` when the inner `Some` gives the
     /// region byte size). `None` for an ordinary function. Genuine precision, not an assumption.
-    pub(crate) mmio_region: Option<Option<u64>>,
+    pub(crate) mmio_region: Option<csolver_ir::MmioHandler>,
     pub(crate) visits: usize,
     pub(crate) truncated: bool,
     /// Successors whose incoming edge a **visited** predecessor pruned as bit-precisely

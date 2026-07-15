@@ -591,3 +591,41 @@ define i64 @plain(i64 %addr, i32 %size) {
         "the MMIO dispatch bound proves `addr / size` cannot divide by zero (size >= 1)",
     );
 }
+
+/// The MMIO dispatch bound propagates interprocedurally: a handler `h_read` calls an internal
+/// helper `reg_read(regs, addr, size)` passing its own `size`. The scalar-precondition synthesis
+/// carries the handler's `1 <= size <= 8` to the helper's `size` parameter, so a `addr / size`
+/// in the helper is proven safe instead of refuted -- the remaining false positives from
+/// register.c-style dispatch helpers. The helper is internal (its callers are complete), which
+/// is exactly QEMU's `register_read_memory`.
+#[test]
+fn mmio_size_bound_propagates_to_dispatch_helper() {
+    let ir = r#"
+@dev_ops = internal constant { ptr, ptr } { ptr @h_read, ptr @h_write }
+define internal i64 @reg_read(ptr %regs, i64 %addr, i32 %size) {
+  %s64 = zext i32 %size to i64
+  %q = udiv i64 %addr, %s64
+  ret i64 %q
+}
+define i64 @h_read(ptr %opaque, i64 %addr, i32 %size) {
+  %r = call i64 @reg_read(ptr %opaque, i64 %addr, i32 %size)
+  ret i64 %r
+}
+define void @h_write(ptr %opaque, i64 %addr, i32 %size) { ret void }
+define void @dev_init(ptr %mr, ptr %owner, ptr %opaque) {
+  call void @memory_region_init_io(ptr %mr, ptr %owner, ptr @dev_ops, ptr %opaque, ptr null, i64 32)
+  ret void
+}
+declare void @memory_region_init_io(ptr, ptr, ptr, ptr, ptr, i64)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "q".into() }).expect("lower");
+    // Only the handler is an attacker entry; the helper is an internal callee whose only caller
+    // is the handler, so its `size` inherits the [1,8] dispatch bound.
+    let cfg = Config { bug_finding: true, entry_patterns: Some(vec!["h_read".into()]), ..Config::default() };
+    let r = verify_module(&m, &cfg);
+    let helper = r.functions.iter().find(|f| f.function == "reg_read").expect("reg_read");
+    assert_eq!(
+        helper.verdict, Verdict::Pass,
+        "the dispatch bound must propagate to the helper's size, proving `addr / size` safe",
+    );
+}

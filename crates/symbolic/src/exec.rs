@@ -263,7 +263,7 @@ pub fn discharge_with_scalars(
     assume_struct_tail: bool,
     assume_valid_mmio: bool,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
-    mmio_region: Option<Option<u64>>,
+    mmio_region: Option<csolver_ir::MmioHandler>,
 ) -> SymbolicReport {
     let limits = ExecLimits {
         bug_finding, exported, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs,

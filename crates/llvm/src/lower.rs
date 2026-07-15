@@ -135,17 +135,20 @@ fn collect_mmio_handlers(m: &LModule, func_ids: &HashMap<String, FuncId>, module
     if ops_size.is_empty() {
         return;
     }
-    // Field byte offsets of `.read` / `.write` in `MemoryRegionOps` (both are the first two
-    // pointer fields on a 64-bit target).
-    const READ_OFF: u64 = 0;
-    const WRITE_OFF: u64 = 8;
+    // `MemoryRegionOps` field byte offsets → the access-size parameter index of the handler
+    // stored there. `.read`/`.write` (offsets 0/8) are `(opaque, addr, size)` — size is
+    // parameter 2. `.read_with_attrs`/`.write_with_attrs` (offsets 16/24) insert a data
+    // pointer/value at parameter 2, so their `size` is parameter 3.
+    let size_param_of = |off: u64| match off {
+        0 | 8 => Some(2u32),
+        16 | 24 => Some(3u32),
+        _ => None,
+    };
     for g in &m.globals {
-        let Some(&size) = ops_size.get(g.name.as_str()) else { continue };
+        let Some(&region_size) = ops_size.get(g.name.as_str()) else { continue };
         for (off, target) in &g.fn_ptrs {
-            if *off == READ_OFF || *off == WRITE_OFF {
-                if let Some(&fid) = func_ids.get(target) {
-                    module.mmio_handlers.insert(fid, size);
-                }
+            if let (Some(size_param), Some(&fid)) = (size_param_of(*off), func_ids.get(target)) {
+                module.mmio_handlers.insert(fid, csolver_ir::MmioHandler { region_size, size_param });
             }
         }
     }
