@@ -1,5 +1,29 @@
 # Todo — Schwächen & Risiken aus dem Code-Review (2026-07-13)
 
+## QEMU: was ist noch UNKNOWN + wie fixen (2026-07-15)
+
+50-Datei-Sample (alle Flags): 278 PASS / 4 FAIL / 162 UNKNOWN. **75 % der UNKNOWN-Funktionen
+hängen an *mehreren* Ursachen** — es gibt kaum Solo-Hebel. Residual-Häufigkeit:
+`loaded value (untyped, no store-load prov)` 715, `offset not in-object` 550, `bounds` 518,
+`opaque call result` 255, `null/opaque prov` 211, `arith overflow` 140, `alignment` 130.
+
+- [x] **`fence`-Befehl (12 Solo-Funktionen) — GEFIXT (`791ed14`).** War ein „unsupported construct",
+  das die ganze Funktion droppte. Jetzt geparst (via `parse_atomic_ordering`) und zum passenden
+  `Barrier` gelowered. Drops 12→0. (Nur +1 volles PASS — die anderen 11 sind jetzt *analysierbar*
+  statt gedroppt, haben aber andere Rest-Ursachen.)
+- [ ] **arith-overflow (16 Solo).** `mul nuw nsw i128 zext(field), C` (QEMUs `muldiv64`): `zext(iN)`
+  ist auf `[0, 2^N)` beschränkt, aber der Executor-zext ist ein werterhaltender No-Op (behält
+  Quellbreite), also gilt der Faktor als voll-i128 → Spurious Overflow. **Die naive Lösung (zext
+  global weiten) ist NETTO NEGATIV** (−14 PASS am Sample): sie bricht mehr Beweise, die auf der
+  alten Breite beruhten, als sie fixt, und triggert Seiteneffekte (z. B. Double-Fetch). Beide
+  Orakel blieben zwar SOUND, aber der Recall-Verlust überwiegt. **Braucht einen LOKALEN Fix im
+  arith-overflow-Check** (den zext-Operanden dort auf seine Quellbreite binden), analog zum
+  Shift-Breiten-Fix (`62f3016`) — nicht die globale zext-Änderung.
+- [ ] **bounds/offset (dominant, aber multi-cause).** Device-State-Zeiger ohne rekonstruierten Typ
+  (`s->field`), Index unbeschränkt. Braucht die Zeiger-Provenance/Typing-Arbeit (loaded-value-Klasse).
+- [ ] **loaded value / opaque call result.** Geladene Zeiger nie getypt + Callees ohne Summary.
+
+
 ## MESSFEHLER korrigiert (2026-07-14) — Benchmark-Sample war unrepräsentativ
 
 Zwei Fehler in der eigenen Auswertung, beide korrigiert:
