@@ -77,11 +77,30 @@ Entry mit *freien* `addr`/`size` — der Executor refutiert dann `x/size` (size 
   keine Annahme** — nur eine Funktion, die real als `ops` übergeben wird, wird constrained (kein
   false PASS). Ein echter `region_size > Array`-Overrun (die VM-Escape-Signatur) refutiert weiter.
   **Wirkung: FAIL 581→480 (101 FPs sound entfernt), PASS +50.** Kein Fix 2 (kein UNKNOWN-Downgrade).
-- [ ] **Rest: Dispatch-Helper.** Verbleibende Div/Shift-FPs stehen in *Helfern* (`register_read_memory`),
-  die der Handler mit seinem (jetzt beschränkten) `size` aufruft — der Bound muss interprozedural
-  propagieren (Erweiterung von `synthesize_scalars`). Größter verbleibender FP-Hebel.
-- [ ] **`_with_attrs`-Handler.** `.read_with_attrs`/`.write_with_attrs` (Feld 16/24) haben `size`
-  an Param 3 (nach dem `data`-Pointer) — noch nicht erfasst; analoge Erkennung nötig.
+- [x] **Dispatch-Helper-Propagation (2026-07-15).** `synthesize_scalars` + `ScalarFacts::push_module`
+  überschreiben das Call-Site-Intervall des `size`-Arguments eines Handlers auf [1,8], sodass der
+  Bound an interne Helfer fließt (`reg_read(regs,addr,size)`). Sound (nur interne, callsite-komplette
+  Callees). Verifiziert per Test.
+- [x] **`_with_attrs`-Handler (2026-07-15).** `MmioHandler{region_size, size_param}`; Felder 16/24 →
+  size_param=3 (nach dem `data`-Pointer). Seeding nutzt `size_param`.
+- [x] **Cross-file + Whole-Program (2026-07-15).** `mmio_handlers` ist namensbasiert (überlebt Merge);
+  `register_init_block{8,32,64}` als Registrierungsfunktion erkannt (ops@5, size@7);
+  `WholeProgramFacts` unioniert Handler datei-übergreifend und emittiert `size∈[1,8]` als
+  name-basierte Scalar-Precondition. **Verifiziert:** `register_read_memory`s `size`-Param ist jetzt
+  cross-file auf [1,8] beschränkt (Zeuge wechselte von `size=0xE0000003` auf `size=3`).
+
+### Verbleibende Div/Shift-FPs — ZWEI neue Klassen (nicht MMIO-Param)
+Der QEMU-FAIL-Count blieb bei 480, weil die restlichen ~100 Div/Shift-FPs **nicht** an einem
+Dispatch-Param hängen, sondern an:
+- [ ] **Unbeschränkte Struct-Feld-Invarianten.** `register_read_memory` failt weiter, aber NICHT am
+  `size`-Param (der ist jetzt [1,8]) — sondern an `register_enabled_mask(reg->data_size, size)`:
+  `MAKE_64BIT_MASK(0, size*8)` nach `size = reg->data_size`, wo `reg->data_size` ein *Struct-Feld*
+  ist (bei Registrierung ∈{1,2,4,8}, aber unbeschränkt gesehen). Braucht **Feld-Wert-Preconditions**
+  (die member-provenance-Synthese um Skalar-Feld-Ranges erweitern) — ein eigenes Stück.
+- [ ] **TCG-CPU-Emulations-Helfer.** `helper_palignr_{xmm,ymm,mmx}`, `softfloat_addMagsF32`,
+  `helper_insertq_i` — Shift/Div über Gast-Instruktions-Operanden (SSE-Shuffle-Amount, Float-Exponent).
+  Gast-kontrolliert via CPU-Emulation, QEMU maskiert sie; braucht ein TCG-Helfer-Operand-Modell,
+  komplett getrennt von MMIO.
 
 ### Triage-Ergebnis (kein reportbarer VM-Escape)
 274 Funde in `hw/` (Device-Emulation), Rest in `block/`/`util/`/`ui/`/Tests. Stichproben (lsi_ram,
