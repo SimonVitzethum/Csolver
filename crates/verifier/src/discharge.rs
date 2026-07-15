@@ -45,6 +45,7 @@ pub(crate) fn verify_function_with(
             config.assume_param_buffer_len,
             config.assume_struct_tail,
             config.assume_valid_mmio,
+            config.assume_field_invariants,
             reg_ptr_hints,
             mmio_region,
         ),

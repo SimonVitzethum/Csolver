@@ -53,7 +53,11 @@ impl Explorer<'_> {
                         let d = self.eval_scalar(rhs, state);
                         let zero = self.ctx.int(self.ctx.width(d), 0);
                         let nonzero = self.ctx.cmp(SCmp::Ne, d, zero);
-                        let decision = self.decide(&[nonzero], state, RefuteMode::Possible, &[]);
+                        let decision = if self.assume_field_scalar(rhs, state) {
+                            Decision::Proven
+                        } else {
+                            self.decide(&[nonzero], state, RefuteMode::Possible, &[])
+                        };
                         self.record_mem(
                             block,
                             idx,
@@ -70,7 +74,11 @@ impl Explorer<'_> {
                         let w = self.ctx.width(amt);
                         let width_c = self.ctx.int(w, w as u128);
                         let in_range = self.ctx.cmp(SCmp::Ult, amt, width_c);
-                        let decision = self.decide(&[in_range], state, RefuteMode::Possible, &[]);
+                        let decision = if self.assume_field_scalar(rhs, state) {
+                            Decision::Proven
+                        } else {
+                            self.decide(&[in_range], state, RefuteMode::Possible, &[])
+                        };
                         self.record_mem(
                             block,
                             idx,

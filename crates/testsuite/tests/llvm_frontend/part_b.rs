@@ -653,3 +653,44 @@ define i32 @f(i32 %x, i32 %y) {
         "umin(y,4) <= 4 < 32 must prove the shift safe (min/max modelled, not opaque)",
     );
 }
+
+/// `--assume-field-invariants`: a scalar loaded from memory (a struct field) is assumed valid
+/// for its use. Here the shift amount is loaded from a field (unbounded, so the shift is
+/// otherwise UNKNOWN); under the flag the `NoShiftOverflow` obligation is proven. The mark is
+/// recognised by walking the shift amount's value expression for a `fld…` symbol, so it is
+/// robust to the ops the value flows through.
+#[test]
+fn field_invariant_scalar_proves_shift_by_loaded_field() {
+    use csolver_core::SafetyProperty;
+    let ir = r#"
+define i64 @f(ptr %p, i64 %x) {
+  %fp = getelementptr i8, ptr %p, i64 8
+  %amt = load i32, ptr %fp, align 4
+  %a64 = zext i32 %amt to i64
+  %r = shl i64 %x, %a64
+  ret i64 %r
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "fi".into() }).expect("lower");
+    let shift_verdict = |cfg: &Config| {
+        let r = verify_module(&m, cfg);
+        let f = r.functions.iter().find(|f| f.function == "f").expect("f");
+        f.outcomes
+            .iter()
+            .find(|o| o.obligation.property == SafetyProperty::NoShiftOverflow)
+            .expect("shift obligation")
+            .verdict()
+    };
+    let base = Config { bug_finding: true, entry_patterns: Some(vec!["f".into()]), ..Config::default() };
+    assert_ne!(
+        shift_verdict(&base),
+        Verdict::Pass,
+        "without the flag a shift by an unbounded loaded field is not proven",
+    );
+    let cfg = Config { assume_field_invariants: true, ..base };
+    assert_eq!(
+        shift_verdict(&cfg),
+        Verdict::Pass,
+        "under --assume-field-invariants the shift by the loaded field is assumed valid",
+    );
+}

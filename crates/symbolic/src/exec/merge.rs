@@ -35,9 +35,24 @@ impl Explorer<'_> {
                 align: 1,
                 borrow: None,
             })
+        } else if origin == POrigin::Load {
+            // A scalar read from memory (a struct field / heap slot) gets a distinct `fld…`
+            // name, so `--assume-field-invariants` can recognise a shift/divide whose amount is
+            // *derived from a field* by walking the operand expression for such a symbol —
+            // robust to any value-producing op the value flows through. `fld…` is not a genuine
+            // input (like `?…`), so refutation gating is unchanged.
+            SymValue::Scalar(self.fresh_scalar_named("fld", type_width(ty)))
         } else {
             SymValue::Scalar(self.fresh_scalar(type_width(ty)))
         }
+    }
+
+    /// A fresh scalar symbol with a chosen name prefix (see [`Self::fresh_scalar`], which uses
+    /// `?`). The prefix records the value's origin for later recognition.
+    pub(crate) fn fresh_scalar_named(&mut self, prefix: &str, width: u32) -> ExprId {
+        let name = format!("{prefix}{}", self.fresh);
+        self.fresh += 1;
+        self.ctx.symbol(name, width)
     }
 
     /// Drive the analysis over the (back-edge-cut) CFG in **reverse postorder**,

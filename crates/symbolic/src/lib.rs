@@ -97,6 +97,9 @@ pub struct ExecLimits {
     /// Trust that an access through an `iomem`-labelled (`ioremap`) pointer stays within the
     /// device mapping. Prove-only, unsound in general (a symbolic register offset may overrun).
     pub assume_valid_mmio: bool,
+    /// Assume a scalar loaded from memory (a struct field) is valid for its use (shift/divide).
+    /// Unsound in general (an opaque write could store an out-of-range value).
+    pub assume_field_invariants: bool,
     /// **Rust aliasing (borrow-stack) model.** When on, track each pointer's originating
     /// borrow (from `RefWitness`) and flag a `NoAliasingViolation` — currently a write
     /// through a shared `&T` reference. Off by default (the reference model is only
@@ -126,6 +129,7 @@ impl Default for ExecLimits {
             assume_param_buffer_len: false,
             assume_struct_tail: false,
             assume_valid_mmio: false,
+            assume_field_invariants: false,
             aliasing_model: false,
             flat_memory: false,
         }

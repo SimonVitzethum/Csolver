@@ -7,6 +7,56 @@ impl Explorer<'_> {
     /// it per `mode` and return a concrete counterexample. `extra` adds premises
     /// used *only* for the refutation query (e.g. a region's no-wrap bound) — not
     /// for proving, which stays cheap.
+    /// Under `--assume-field-invariants`, a scalar operand that came from an *unknown* memory
+    /// read (a `fld…` symbol in its value expression) is assumed valid for its use — a shift amount below the bit
+    /// width, a non-zero divisor. Records the `field-invariants` assumption and returns `true` so
+    /// the caller treats the obligation as proven (prove-only — never refutes). Off by default,
+    /// and inert for a value the analysis actually tracks.
+    pub(crate) fn assume_field_scalar(&mut self, op: &Operand, state: &PathState) -> bool {
+        if !self.limits.assume_field_invariants {
+            return false;
+        }
+        // The operand's value **expression** carries a `fld…` symbol iff it is (transitively)
+        // derived from a memory-loaded scalar — the expression flows through every real op
+        // (`umin`'s `ite`, `shl`, `sub`, `zext`, …), so this is robust where a forward-propagated
+        // flag would break at an unmodelled op. Prove-only.
+        let e = self.eval_scalar(op, state);
+        if self.expr_has_field_load(e) {
+            self.assumptions.insert(FIELD_INVARIANTS);
+            return true;
+        }
+        false
+    }
+
+    /// Whether `expr` contains at least one `fld…` leaf — a symbol minted for a scalar read of
+    /// unknown memory (see `fresh_value`). Mirrors the [`Explorer::goal_is_genuine`] walk.
+    fn expr_has_field_load(&self, expr: ExprId) -> bool {
+        let mut stack = vec![expr];
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        while let Some(e) = stack.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            match self.ctx.node(e) {
+                Node::Sym { name, .. } if name.starts_with("fld") => return true,
+                Node::Sym { .. } | Node::Const(_) | Node::Bool(_) => {}
+                Node::Not(a) => stack.push(*a),
+                Node::Bin { a, b, .. } | Node::Cmp { a, b, .. } => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Node::And(xs) | Node::Or(xs) => stack.extend(xs.iter().copied()),
+                Node::Ite { c, t, e } => {
+                    stack.push(*c);
+                    stack.push(*t);
+                    stack.push(*e);
+                }
+                Node::Zext(v) | Node::Sext(v) => stack.push(*v),
+            }
+        }
+        false
+    }
+
     pub(crate) fn decide(
         &mut self,
         conjuncts: &[ExprId],

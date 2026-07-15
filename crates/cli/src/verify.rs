@@ -13,6 +13,7 @@ pub(crate) fn verify_path(
     assume_param_buffer_len: bool,
     assume_struct_tail: bool,
     assume_valid_mmio: bool,
+    assume_field_invariants: bool,
     aliasing_model: bool,
     pre_file: Option<&Path>,
     entry_patterns: Option<Vec<String>>,
@@ -94,6 +95,7 @@ pub(crate) fn verify_path(
                 assume_param_buffer_len,
                 assume_struct_tail,
                 assume_valid_mmio,
+                assume_field_invariants,
                 aliasing_model,
                 entry_patterns,
                 ..Config::default()
