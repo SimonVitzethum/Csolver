@@ -120,6 +120,9 @@ pub struct Config {
     /// reach (the C trailing-context idiom). Unsound in general: the tail's real size is
     /// known only at the allocation site.
     pub assume_struct_tail: bool,
+    /// Trust that an access through an `iomem`-labelled (`ioremap`) pointer stays within the
+    /// device mapping. Prove-only, unsound in general (a symbolic register offset may overrun).
+    pub assume_valid_mmio: bool,
     /// **Rust aliasing (borrow-stack) model.** Opt-in Stacked/Tree-Borrows checking: flag a
     /// `NoAliasingViolation` (currently a write through a shared `&T` reference). Off by
     /// default — the reference model is only partially reconstructed from the frontends, so
@@ -177,6 +180,7 @@ impl Default for Config {
             assume_valid_loop_ptrs: false,
             assume_param_buffer_len: false,
             assume_struct_tail: false,
+            assume_valid_mmio: false,
             aliasing_model: false,
             entry_patterns: None,
             time_budget: Some(std::time::Duration::from_secs(30)),

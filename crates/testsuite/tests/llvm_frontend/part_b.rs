@@ -508,3 +508,32 @@ declare ptr @ioremap(i64, i64)
         "an out-of-bounds MMIO access is still refuted (the region stays bounds-refutable)",
     );
 }
+
+/// A device-tree-sized mapping (`of_iomap`) has no static size, so a register access through
+/// it can only rest on trust. The return is labelled `iomem`; the label survives the gep, and
+/// under `--assume-valid-mmio` a register access through it is prove-only valid. Off by default
+/// (a symbolic register offset could genuinely overrun), so it stays soundly UNKNOWN.
+#[test]
+fn iomem_register_access_is_trusted_only_under_the_flag() {
+    let ir = r#"
+define i32 @rd(ptr %node) {
+  %io = call ptr @of_iomap(ptr %node, i32 0)
+  %g = getelementptr i8, ptr %io, i64 16
+  %v = load i32, ptr %g, align 4
+  ret i32 %v
+}
+declare ptr @of_iomap(ptr, i32)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "io".into() }).expect("lower");
+    assert_ne!(
+        verify_module(&m, &Config { bug_finding: true, ..Config::default() }).verdict,
+        Verdict::Pass,
+        "a register access through an unsized MMIO mapping is not proved by default",
+    );
+    let cfg = Config { bug_finding: true, assume_valid_mmio: true, ..Config::default() };
+    assert_eq!(
+        verify_module(&m, &cfg).verdict,
+        Verdict::Pass,
+        "under --assume-valid-mmio the iomem-labelled register access is trusted",
+    );
+}

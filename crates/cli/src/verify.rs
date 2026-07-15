@@ -12,6 +12,7 @@ pub(crate) fn verify_path(
     assume_valid_loop_ptrs: bool,
     assume_param_buffer_len: bool,
     assume_struct_tail: bool,
+    assume_valid_mmio: bool,
     aliasing_model: bool,
     pre_file: Option<&Path>,
     entry_patterns: Option<Vec<String>>,
@@ -92,6 +93,7 @@ pub(crate) fn verify_path(
                 assume_valid_loop_ptrs,
                 assume_param_buffer_len,
                 assume_struct_tail,
+                assume_valid_mmio,
                 aliasing_model,
                 entry_patterns,
                 ..Config::default()

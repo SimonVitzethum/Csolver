@@ -529,6 +529,89 @@ mod parse;
 pub use parse::RET_ARG;
 pub(crate) use parse::*;
 
+/// The compiled-in default contracts, as a process-global (built once). The single source of
+/// truth for the frontend, the executor, and the interner — so provenance label ids agree.
+pub fn contracts() -> &'static Contracts {
+    static CONTRACTS: std::sync::OnceLock<Contracts> = std::sync::OnceLock::new();
+    CONTRACTS.get_or_init(Contracts::defaults)
+}
+
+/// Interns provenance label and capability names (a shared namespace) to stable `u32` ids, and
+/// precomputes the id-keyed grant relation. `ProvLabel`/`CapRequire` instructions and
+/// `Module::prov_grants` speak in these ids; a consumer (the executor) resolves a label name to
+/// its id here so both sides agree. Built once from [`contracts`] (deterministic: names sorted
+/// before assigning ids).
+pub struct ProvInterner {
+    ids: HashMap<String, u32>,
+    grants: HashMap<u32, HashSet<u32>>,
+}
+
+impl ProvInterner {
+    /// The id of a provenance label/capability name, or `None` if no contract mentions it.
+    pub fn id(&self, name: &str) -> Option<u32> {
+        self.ids.get(name).copied()
+    }
+
+    /// The id-keyed grant relation (label id → capability ids it confers).
+    pub fn grants(&self) -> &HashMap<u32, HashSet<u32>> {
+        &self.grants
+    }
+}
+
+/// The process-global provenance interner (see [`ProvInterner`]).
+pub fn prov_interner() -> &'static ProvInterner {
+    static INTERNER: std::sync::OnceLock<ProvInterner> = std::sync::OnceLock::new();
+    INTERNER.get_or_init(|| {
+        let c = contracts();
+        // Every label/capability name: the lattice keys (labels) and values (capabilities),
+        // plus any name a `label`/`require`/taint/typestate/refcount effect mentions.
+        let mut names: Vec<&str> = Vec::new();
+        for (label, caps) in c.lattice() {
+            names.push(label);
+            names.extend(caps.iter().map(String::as_str));
+        }
+        for contract in c.iter() {
+            for effect in &contract.effects {
+                match effect {
+                    Effect::Label { label, .. } => names.push(label),
+                    Effect::Require { cap, .. } => names.push(cap),
+                    Effect::TaintSource { label, .. }
+                    | Effect::TaintSink { label, .. }
+                    | Effect::TaintSanitize { label, .. } => names.push(label),
+                    Effect::TypestateSet { protocol, state, .. }
+                    | Effect::TypestateRequire { protocol, state, .. }
+                    | Effect::TypestateLeak { protocol, state } => {
+                        names.push(protocol);
+                        names.push(state);
+                    }
+                    Effect::TypestateYield { protocol, from, to } => {
+                        names.push(protocol);
+                        names.push(from);
+                        names.push(to);
+                    }
+                    Effect::Refcount { protocol, .. } => names.push(protocol),
+                    Effect::Seed { label, .. } => names.push(label),
+                    _ => {}
+                }
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        let ids: HashMap<String, u32> =
+            names.iter().enumerate().map(|(i, n)| (n.to_string(), i as u32)).collect();
+        let grants = c
+            .lattice()
+            .iter()
+            .filter_map(|(label, caps)| {
+                let lid = *ids.get(label)?;
+                let cset = caps.iter().filter_map(|c| ids.get(c).copied()).collect();
+                Some((lid, cset))
+            })
+            .collect();
+        ProvInterner { ids, grants }
+    })
+}
+
 /// The built-in contract files, embedded so the binary is self-contained.
 const DEFAULT_FILES: &[(&str, &str)] = &[
     ("alloc.contract", include_str!("../data/alloc.contract")),

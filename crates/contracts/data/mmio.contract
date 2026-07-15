@@ -14,10 +14,23 @@
 # bound suffices (under-stating alignment can only leave a misalignment obligation UNKNOWN,
 # never fabricate a false FAIL) and 16 matches the allocator convention.
 
+# The return of every mapping call is labelled `iomem` (provenance.contract): the label is
+# the handle that flows through a struct field into another function (`pll->reg`), where
+# `--assume-valid-mmio` trusts a register access through it. Independent of whether a static
+# size is known, so it is on every family member, size-bearing or not.
+
 # ioremap(phys_addr, size) and its cache-attribute variants — size is the 2nd argument.
 [ioremap ioremap_wc ioremap_cache ioremap_uc ioremap_np ioremap_encrypted ioremap_prot]
 mmio size=arg1 align=16
+label ret iomem
 
 # devm_ioremap(dev, offset, size) and variants — size is the 3rd argument.
 [devm_ioremap devm_ioremap_wc devm_ioremap_uc devm_ioremap_np]
 mmio size=arg2 align=16
+label ret iomem
+
+# Device-tree / BAR / resource-sized mappings — NO static size (it comes from the device
+# tree, the PCI BAR, or a struct resource resolved at runtime). Only the `iomem` label; the
+# region stays unsized, so bounds through it rest entirely on `--assume-valid-mmio`.
+[of_iomap devm_platform_ioremap_resource devm_platform_ioremap_resource_byname devm_ioremap_resource pci_iomap pci_iomap_range devm_platform_get_and_ioremap_resource]
+label ret iomem

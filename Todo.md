@@ -40,11 +40,27 @@ Index ist nicht beweisbar. Der Engpass ist also **Bounds-Präzision**, nicht Typ
   **Wirkung (repräsentatives Sample, zusammen mit `--assume-param-buffer-len`):
   307 → 314 PASS, FAIL unverändert 16, Default bit-identisch.**
 
-- [ ] **Rest von `bounds`/`offset`.** Nach struct-tail bleiben die Fälle mit *echt*
-  unbeschränktem Index: MMIO-Basis + Offset aus einem Struct-Feld
-  (`xgene_clk_pll_is_enabled`: `reg + zext(pll_offset)`, u32 aus einem Feld, nirgends
-  beschränkt). Ohne Wissen über die Größe des Registerfensters prinzipiell unbeweisbar —
-  braucht Contracts für `ioremap`-artige APIs (Größe der Mapping-Region), keine Solver-Präzision.
+- [x] **ioremap-API-Erkennung (Phase 1–3, 2026-07-15).**
+  - **Phase 1 (sound, ohne Flagge):** `crates/contracts/data/mmio.contract` — die size-tragenden
+    APIs (`ioremap(phys,size)`, `devm_ioremap(dev,off,size)`) via neuem `mmio`-Effekt als
+    **initialisierte** `RegionKind::Global`-Region (extern vom Gerät initialisiert → ein
+    Register-Read ist kein uninit-Read-FAIL; Bounds bleiben widerlegbar). Behob nebenbei den
+    zeroing-Allocator-TODO-Mechanismus.
+  - **Phase 2 (sound, Default):** `iomem`-Label auf *jeder* ioremap-Rückgabe (auch der
+    größenlosen: `of_iomap`, `devm_platform_ioremap_resource`, `pci_iomap`). Nötig dafür:
+    `label ret` (Label auf Rückgabe, deferred nach der Ergebnis-Bindung); und der
+    Prov-Interner ist jetzt in der contracts-Crate (eine Quelle, damit Label-IDs zwischen
+    Frontend und Executor übereinstimmen).
+  - **Phase 3 (Flagge `--assume-valid-mmio`):** ein Zugriff/Offset durch einen
+    `iomem`-gelabelten Zeiger gilt als innerhalb des Mappings — prove-only, widerlegt nie.
+    **Wirkung (repräsentatives Sample): +1 Funktion (314→315), Default unverändert.**
+- [ ] **LIMITIERUNG von Phase 2/3: cross-function Feld-Provenance.** Der *dominante* Treiber-Fall
+  (`xgene_clk_pll_is_enabled`) bleibt UNKNOWN: `of_iomap`-Rückgabe wird in `probe` in ein
+  Struct-Feld gestoret und in `is_enabled` geladen — das `iomem`-Label fließt aber **nicht**
+  cross-function durch ein Feld (Labels reisen nur über `ProvTransfer`-Summaries für
+  *Argumente*, nicht für Feldwerte). Der intra-funktionale und der Direkt-Rückgabe-Fall sind
+  abgedeckt. Zum Schließen des Feld-Falls: whole-program Feld-Provenance, die Labels trägt
+  (Erweiterung der closed-world member-provenance) — ein eigenes, größeres Stück.
 
 ## Einheitliches Typ-Sizing für JEDEN opaken Zeiger (2026-07-14) — Abschluss
 

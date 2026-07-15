@@ -1,27 +1,9 @@
 use super::*;
 
-/// The API effect contracts, parsed once from the embedded default files (allocators,
-/// deallocators, user-copies). Recognized calls are lowered from these instead of a
-/// hardcoded table; see [`csolver_contracts`] and `crates/contracts/data/*.contract`.
-pub(crate) fn contracts() -> &'static Contracts {
-    static CONTRACTS: OnceLock<Contracts> = OnceLock::new();
-    CONTRACTS.get_or_init(Contracts::defaults)
-}
-
-/// Interns provenance label and capability names (a shared namespace) to stable `u32`
-/// ids, and precomputes the id-keyed grant relation, so the emitted `ProvLabel`/
-/// `CapRequire` instructions and `Module::prov_grants` speak in ids. Built once from the
-/// global contracts (deterministic: names sorted before assigning ids).
-pub(crate) struct ProvInterner {
-    pub(crate) ids: HashMap<String, u32>,
-    pub(crate) grants: HashMap<u32, std::collections::HashSet<u32>>,
-}
-
-impl ProvInterner {
-    pub(crate) fn id(&self, name: &str) -> Option<u32> {
-        self.ids.get(name).copied()
-    }
-}
+/// The default API effect contracts and the provenance-label interner live in the contracts
+/// crate (the single source of truth so label ids agree with the executor); re-exported here
+/// so the many in-crate call sites keep using the short names.
+pub(crate) use csolver_contracts::{contracts, prov_interner};
 
 /// The entry-seed `ProvLabel`s for a function definition: from any `seed arg_k <label>`
 /// effects in this function's own contract (`Effect::Seed`), a `ProvLabel` on the named
@@ -37,58 +19,6 @@ pub(crate) fn entry_seed_insts(name: &str, params: &[(RegId, Type)]) -> Vec<Inst
         }
     }
     seeds
-}
-
-pub(crate) fn prov_interner() -> &'static ProvInterner {
-    static INTERNER: OnceLock<ProvInterner> = OnceLock::new();
-    INTERNER.get_or_init(|| {
-        let c = contracts();
-        // Collect every label/capability name: the lattice keys (labels) and values
-        // (capabilities), plus any name mentioned by a `label`/`require` effect.
-        let mut names: Vec<&str> = Vec::new();
-        for (label, caps) in c.lattice() {
-            names.push(label);
-            names.extend(caps.iter().map(String::as_str));
-        }
-        for contract in c.iter() {
-            for effect in &contract.effects {
-                match effect {
-                    Effect::Label { label, .. } => names.push(label),
-                    Effect::Require { cap, .. } => names.push(cap),
-                    Effect::TaintSource { label, .. }
-                    | Effect::TaintSink { label, .. }
-                    | Effect::TaintSanitize { label, .. } => names.push(label),
-                    Effect::TypestateSet { protocol, state, .. }
-                    | Effect::TypestateRequire { protocol, state, .. }
-                    | Effect::TypestateLeak { protocol, state } => {
-                        names.push(protocol);
-                        names.push(state);
-                    }
-                    Effect::TypestateYield { protocol, from, to } => {
-                        names.push(protocol);
-                        names.push(from);
-                        names.push(to);
-                    }
-                    Effect::Refcount { protocol, .. } => names.push(protocol),
-                    _ => {}
-                }
-            }
-        }
-        names.sort_unstable();
-        names.dedup();
-        let ids: HashMap<String, u32> =
-            names.iter().enumerate().map(|(i, n)| (n.to_string(), i as u32)).collect();
-        let grants = c
-            .lattice()
-            .iter()
-            .filter_map(|(label, caps)| {
-                let lid = *ids.get(label)?;
-                let cset = caps.iter().filter_map(|c| ids.get(c).copied()).collect();
-                Some((lid, cset))
-            })
-            .collect();
-        ProvInterner { ids, grants }
-    })
 }
 
 /// Lower a recognized API call from its `contract` into the modelling MSIR instructions.
@@ -169,8 +99,21 @@ pub(crate) fn emit_contract(
             // an otherwise-unmodelled call still falls through to a generic (opaque) call,
             // it just also carries the provenance effect.
             Effect::Label { ptr, label } => {
-                if let (Some(a), Some(id)) = (args.get(*ptr), prov_interner().id(label)) {
-                    insts.push(Inst::ProvLabel { ptr: ctx.operand(a, 64)?, label: id });
+                // `ptr == RET_ARG` labels the call's **return** value. When a preceding effect
+                // already bound the result (an `ioremap` alloc), label it here. Otherwise (a
+                // label-only contract like `of_iomap`) the result is bound by the *real* call
+                // that follows this pass, so the label is deferred to `emit_ret_effects` — else
+                // it would attach to the pre-call undef value and be lost.
+                let target = if *ptr == RET_ARG {
+                    if !result_bound {
+                        continue;
+                    }
+                    dst.map(|d| ctx.reg(d)).transpose()?.map(Operand::Reg)
+                } else {
+                    args.get(*ptr).map(|a| ctx.operand(a, 64)).transpose()?
+                };
+                if let (Some(op), Some(id)) = (target, prov_interner().id(label)) {
+                    insts.push(Inst::ProvLabel { ptr: op, label: id });
                 }
             }
             Effect::Require { ptr, cap } => {
@@ -357,6 +300,13 @@ pub(crate) fn emit_ret_effects(
     let Some(dst) = dst else { return Ok(()) };
     for effect in &contract.effects {
         match effect {
+            // A `label ret <l>` on a label-only contract (`of_iomap` → `iomem`): applied here,
+            // after the real call bound the result, so it attaches to the returned pointer.
+            Effect::Label { ptr, label } if *ptr == RET_ARG => {
+                if let Some(id) = prov_interner().id(label) {
+                    insts.push(Inst::ProvLabel { ptr: Operand::Reg(ctx.reg(dst)?), label: id });
+                }
+            }
             Effect::TaintSource { arg, label } if *arg == RET_ARG => {
                 if let Some(id) = prov_interner().id(label) {
                     insts.push(Inst::TaintSource { val: Operand::Reg(ctx.reg(dst)?), taint: id });

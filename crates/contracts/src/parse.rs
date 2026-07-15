@@ -44,7 +44,7 @@ pub(crate) fn parse_effect(line: &str) -> Result<Effect, String> {
         }
         // `label arg<k> <labelname>` and `require arg<k> <capname>` (positional).
         "label" => {
-            let ptr = parse_arg(rest.first().copied().unwrap_or(""))?;
+            let ptr = parse_arg_or_ret(rest.first().copied().unwrap_or(""))?;
             let label = rest.get(1).copied().ok_or("`label` needs a label name")?.to_string();
             Ok(Effect::Label { ptr, label })
         }

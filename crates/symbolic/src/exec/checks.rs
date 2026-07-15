@@ -52,6 +52,21 @@ impl Explorer<'_> {
                 let goal = self.ctx.cmp(SCmp::Ne, addr, zero);
                 self.prove(goal, state)
             });
+        // MMIO trust (`--assume-valid-mmio`): an access through an `iomem`-labelled pointer — a
+        // device-register mapping whose extent is the device's, known only at the mapping site —
+        // is *assumed* within the mapping. Prove-only: every memory obligation is discharged, but
+        // nothing is refuted (a symbolic register offset could genuinely be out of range — a real
+        // driver bug — so with the flag off it stays UNKNOWN, and with it on we never fabricate a
+        // FAIL either). Placed before the opaque-provenance bailout, which is exactly the residual
+        // it closes: a loaded `void __iomem *` field carries the label but no region.
+        if self.limits.assume_valid_mmio && self.pointer_is_iomem(p, state) {
+            self.assumptions.insert(VALID_MMIO);
+            for prop in [NoNullDeref, NoUseAfterFree, InBounds, Alignment, perm_prop] {
+                self.record(block, idx, prop, true, "MMIO mapping access is assumed valid", "");
+            }
+            return;
+        }
+
         self.record(block, idx, NoNullDeref, non_null, "pointer is non-null", "pointer may be null or have opaque provenance");
 
         let Prov::Region(rid) = p.prov else {
@@ -178,6 +193,13 @@ impl Explorer<'_> {
             sb.pathcond.push(ncond);
             self.check_ptr_arith(block, idx, &pa, &sa);
             self.check_ptr_arith(block, idx, &pb, &sb);
+            return;
+        }
+        // MMIO trust: forming a register offset off an `iomem` mapping is assumed in-object
+        // (`--assume-valid-mmio`), matching the access bypass in `check_access`. Prove-only.
+        if self.limits.assume_valid_mmio && self.pointer_is_iomem(p, state) {
+            self.assumptions.insert(VALID_MMIO);
+            self.record(block, idx, ValidPointerArith, true, "MMIO register offset is assumed in-object", "");
             return;
         }
         let Prov::Region(rid) = p.prov else {

@@ -9,6 +9,10 @@
 #   kernel   — an ordinary kernel-owned buffer: read + write.
 prov foreign grants=read
 prov kernel  grants=read,write
+#   iomem    — a device-register mapping from the `ioremap` family. Read + write; its extent
+#              is the device's, known only at the mapping site, so bounds through it are a
+#              trust assumption (`--assume-valid-mmio`), not a proof.
+prov iomem   grants=read,write
 
 # CVE-2026-31431 "Copy Fail" source: splice()/sendpage inserts a caller-supplied page
 # (arg1) into the socket's scatterlist with no write-permission check. Label it `foreign`.

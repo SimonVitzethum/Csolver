@@ -166,6 +166,21 @@ impl Explorer<'_> {
     /// The provenance labels attached to a pointer operand: a materialised region's own
     /// labels, or — for an **opaque pointer** — the labels on its provenance identity
     /// (`Prov::Unknown`'s id, which flows through `gep`/copy). Unifies both channels.
+    /// Does `p` carry the `iomem` provenance label — i.e. is it a device-register mapping from
+    /// the `ioremap` family (directly, or loaded from a field an `iomem` pointer was stored to)?
+    /// The label id is resolved once from the shared contract interner. Reads the labels on the
+    /// pointer's region or opaque provenance id (see [`Self::ptr_labels`], but taking a
+    /// `SymPointer` directly since the caller already has it evaluated).
+    pub(crate) fn pointer_is_iomem(&self, p: &SymPointer, state: &PathState) -> bool {
+        let Some(iomem) = csolver_contracts::prov_interner().id("iomem") else { return false };
+        let labels = match &p.prov {
+            Prov::Region(rid) => state.regions.get(*rid).map(|r| &r.prov_labels),
+            Prov::Unknown(_, Some(id)) => state.opaque_labels.get(id),
+            _ => None,
+        };
+        labels.is_some_and(|l| l.contains(&iomem))
+    }
+
     pub(crate) fn ptr_labels(&mut self, ptr: &Operand, state: &PathState) -> FxHashSet<u32> {
         match self.eval_pointer(ptr, state).prov {
             Prov::Region(rid) => state.regions.get(rid).map(|r| r.prov_labels.clone()).unwrap_or_default(),

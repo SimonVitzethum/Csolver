@@ -8,7 +8,7 @@
 use crate::parser::{
     LBin, LBlock, LCast, LFunc, LInst, LModule, LOrdering, LPred, LTerm, LType, LValue,
 };
-use csolver_contracts::{ApiContract, Contracts, Effect, Fill, ReadSink, SizeExpr, RET_ARG};
+use csolver_contracts::{ApiContract, Effect, Fill, ReadSink, SizeExpr, RET_ARG};
 use csolver_core::{BitVector, Error, RegionKind, Result};
 use csolver_ir::{
     BasicBlock, BinOp, BlockId, Callee, CastOp, CmpOp, Const, DataLayout, FuncId, Function, Inst,
@@ -98,7 +98,7 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
     }
     // The provenance lattice (label id → granted capability ids) that the emitted
     // `ProvLabel`/`CapRequire` instructions reference; same for every module.
-    module.prov_grants = prov_interner().grants.clone();
+    module.prov_grants = prov_interner().grants().clone();
     Ok(module)
 }
 

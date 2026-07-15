@@ -71,6 +71,10 @@ const STRUCT_TAIL: &str = "struct-tail";
 /// **externally initialized** (device registers), so a read of it is not an
 /// uninitialized-read bug. Rests on `alloc-succeeds` (the mapping call succeeded).
 const MMIO: &str = "mmio-mapping";
+/// The trust that an access through an `iomem`-labelled pointer (an `ioremap` mapping reached,
+/// possibly, through a struct field) stays within the device's mapping. Prove-only, opt-in
+/// (`--assume-valid-mmio`): a symbolic register offset could genuinely overrun.
+const VALID_MMIO: &str = "valid-mmio";
 /// A `&T`/`&mut T` value is a valid reference to its pointee (Rust's reference
 /// invariant), even when the analysis cannot see where it came from.
 const VALID_REFERENCE: &str = "valid-reference";
@@ -226,7 +230,7 @@ pub fn discharge_with_fields(
     discharge_with_scalars(
         f, summaries, &HashMap::new(), contracts, field_contracts, &[], globals, prov_grants,
         &HashMap::new(), None, ExecLimits::default().time_budget, bug_finding, exported,
-        assume_valid_params, false, false, false, false, false, false, &HashMap::new(),
+        assume_valid_params, false, false, false, false, false, false, false, &HashMap::new(),
     )
 }
 
@@ -257,11 +261,12 @@ pub fn discharge_with_scalars(
     assume_valid_loop_ptrs: bool,
     assume_param_buffer_len: bool,
     assume_struct_tail: bool,
+    assume_valid_mmio: bool,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
 ) -> SymbolicReport {
     let limits = ExecLimits {
         bug_finding, exported, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs,
-        assume_param_buffer_len, assume_struct_tail, aliasing_model, flat_memory, time_budget,
+        assume_param_buffer_len, assume_struct_tail, assume_valid_mmio, aliasing_model, flat_memory, time_budget,
         ..ExecLimits::default()
     };
     discharge_inner(
