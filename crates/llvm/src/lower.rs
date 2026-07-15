@@ -120,8 +120,10 @@ fn collect_mmio_handlers(m: &LModule, _func_ids: &HashMap<String, FuncId>, modul
     let reg_site = |callee: &str| -> Option<(usize, usize)> {
         match callee {
             "memory_region_init_io" => Some((2, 5)),
+            // register_init_block{8,32,64}(owner, rae, num, regs_info, regs, ops, debug, size):
+            // the ops global is argument 5 and the region byte size argument 7.
             "register_init_block8" | "register_init_block32" | "register_init_block64" => {
-                Some((4, 6))
+                Some((5, 7))
             }
             _ => None,
         }
