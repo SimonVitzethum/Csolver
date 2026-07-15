@@ -694,3 +694,35 @@ define i64 @f(ptr %p, i64 %x) {
         "under --assume-field-invariants the shift by the loaded field is assumed valid",
     );
 }
+
+/// A 64-bit shift by a `zext`ed i32 amount (`lshr i64 x, zext(i32 (64 - k*8))`) must be checked
+/// against the *shifted value's* width (64), not the amount's source width (32). The amount
+/// `64 - k*8` for k∈[1,8] is in [0,56] — valid for an i64 shift, but a width-32 check would flag
+/// the [32,64) range as UB (QEMU's `MAKE_64BIT_MASK` shape, register_read_memory). No flag.
+#[test]
+fn shift_overflow_uses_the_shifted_value_width_not_the_amount_width() {
+    let ir = r#"
+define i64 @f(i32 %x) {
+  %g = icmp ugt i32 %x, 8
+  br i1 %g, label %bad, label %ok
+ok:
+  %g2 = icmp eq i32 %x, 0
+  br i1 %g2, label %bad, label %do
+do:
+  %m = shl i32 %x, 3
+  %s = sub i32 64, %m
+  %s64 = zext i32 %s to i64
+  %r = lshr i64 -1, %s64
+  ret i64 %r
+bad:
+  ret i64 0
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "sw".into() }).expect("lower");
+    let cfg = Config { bug_finding: true, entry_patterns: Some(vec!["f".into()]), ..Config::default() };
+    let f = verify_module(&m, &cfg).functions.into_iter().find(|f| f.function == "f").expect("f");
+    assert_eq!(
+        f.verdict, Verdict::Pass,
+        "an i64 shift by a zext'd i32 amount in [0,56] is in range — the 64-bit width bounds it",
+    );
+}

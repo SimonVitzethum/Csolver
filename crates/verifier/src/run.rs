@@ -232,7 +232,17 @@ pub(crate) fn verify_one_function(
             .filter(|((fid, _), _)| *fid == f.id)
             .map(|((_, r), s)| (*r, *s))
             .collect(),
-        module.mmio_handlers.get(&f.name).copied(),
+        // The MMIO dispatch bound applies wherever the handler is defined — including a handler
+        // registered in another file (`register_read_memory`) and *including when it is an
+        // auto-entry* (exported): it is a real dispatch invariant, not a caller convention, so it
+        // is seeded unconditionally (unlike `scalar_pre`, which is caller-established and gated on
+        // non-exported linkage). Resolve it from this file's own handlers, else the whole-program
+        // context's name-keyed union.
+        module
+            .mmio_handlers
+            .get(&f.name)
+            .copied()
+            .or_else(|| ctx.and_then(|c| c.name_mmio.get(&f.name).copied())),
         config,
         exported,
         &mut local_id,

@@ -120,6 +120,7 @@ impl WholeProgramFacts {
             name_scalars,
             name_ptr_contracts,
             name_field_contracts,
+            name_mmio: self.mmio_handlers,
         }
     }
 }
@@ -147,6 +148,12 @@ pub struct ProgramFacts {
     pub name_ptr_contracts: HashMap<(String, u32), PtrContract>,
     /// [`field_contracts`](Self::field_contracts) re-keyed by external function name.
     pub name_field_contracts: HashMap<(String, u32), Vec<FieldContract>>,
+    /// MMIO dispatch handlers by name (whole-program union). Applied to the handler wherever it
+    /// is defined — **even when it is an `--auto-entries` entry** (exported): the memory-core
+    /// dispatch bound (`size ∈ {1,2,4,8}`, `addr + size ≤ region_size`) is a real invariant of
+    /// how the handler is invoked, not a caller convention, so unlike `name_scalars` it is not
+    /// gated on non-exported linkage.
+    pub name_mmio: HashMap<String, csolver_ir::MmioHandler>,
 }
 
 impl ProgramFacts {
@@ -160,6 +167,7 @@ impl ProgramFacts {
             name_scalars: &self.name_scalars,
             name_ptr_contracts: &self.name_ptr_contracts,
             name_field_contracts: &self.name_field_contracts,
+            name_mmio: &self.name_mmio,
         }
     }
 }
@@ -182,4 +190,6 @@ pub struct WholeProgramContext<'a> {
     pub name_ptr_contracts: &'a HashMap<(String, u32), PtrContract>,
     /// Whole-program member-provenance field contracts, keyed by function name.
     pub name_field_contracts: &'a HashMap<(String, u32), Vec<FieldContract>>,
+    /// Whole-program MMIO dispatch handlers, keyed by function name (applied even when exported).
+    pub name_mmio: &'a HashMap<String, csolver_ir::MmioHandler>,
 }

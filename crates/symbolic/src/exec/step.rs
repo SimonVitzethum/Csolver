@@ -68,11 +68,20 @@ impl Explorer<'_> {
                         );
                     }
                     // Shift past the bit width is UB (a poison value): the shift amount must be
-                    // strictly less than the operand width. Refuted when it can reach the width.
+                    // strictly less than the **shifted value's** bit width — the result type `ty`,
+                    // NOT the amount's own evaluated width. A well-formed `lshr i64 x, y` has `y`
+                    // of type i64, but a `zext i32 … to i64` amount is evaluated at its source
+                    // width (32); using that width would check `amt < 32` on an i64 shift and
+                    // flag a legitimate `64 - k` amount (∈ [32, 64)) as UB — a false positive.
                     if matches!(op, BinOp::Shl | BinOp::LShr | BinOp::AShr) {
-                        let amt = self.eval_scalar(rhs, state);
-                        let w = self.ctx.width(amt);
-                        let width_c = self.ctx.int(w, w as u128);
+                        let amt0 = self.eval_scalar(rhs, state);
+                        let rw = type_width(ty);
+                        // Widen an under-width amount (a `zext`ed narrower value evaluated at its
+                        // source width) to the result width, then compare against `rw` built at
+                        // the amount's actual width — so the `< bit width` bound is checked at the
+                        // right width without a mismatched comparison.
+                        let amt = if self.ctx.width(amt0) < rw { self.ctx.zext(amt0, rw) } else { amt0 };
+                        let width_c = self.ctx.int(self.ctx.width(amt), rw as u128);
                         let in_range = self.ctx.cmp(SCmp::Ult, amt, width_c);
                         let decision = if self.assume_field_scalar(rhs, state) {
                             Decision::Proven
