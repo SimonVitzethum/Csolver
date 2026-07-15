@@ -96,6 +96,22 @@ pub(crate) fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<Basi
                 insts.push(Inst::Barrier { kind: if *ord == LOrdering::SeqCst { 0 } else { 2 }, access: None });
                 continue;
             }
+            // A standalone `fence <ordering>`: the matching weak-memory barrier (full for
+            // seq_cst/acq_rel, write for release, read for acquire), no access of its own. A
+            // fence has no memory-safety obligation, so this un-drops the whole function (it was
+            // previously an unsupported construct that failed lowering).
+            LInst::Fence { ordering } => {
+                let kind = match ordering {
+                    LOrdering::SeqCst | LOrdering::AcqRel => 0,
+                    LOrdering::Release => 1,
+                    LOrdering::Acquire => 2,
+                    LOrdering::None => {
+                        continue;
+                    }
+                };
+                insts.push(Inst::Barrier { kind, access: None });
+                continue;
+            }
             _ => {}
         }
                 // A `load ptr` that reads a *reference field* of a DWARF-typed struct
@@ -281,6 +297,7 @@ pub(crate) fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
             align: align_or(*align, ty),
             volatile: *atomic,
         },
+        LInst::Fence { .. } => Inst::Barrier { kind: 0, access: None },
         LInst::Store { ty, val, ptr, align, atomic, .. } => Inst::Store {
             ty: lower_type(ty),
             ptr: ctx.operand(ptr, 64)?,

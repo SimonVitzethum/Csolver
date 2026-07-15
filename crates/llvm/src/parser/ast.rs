@@ -354,6 +354,9 @@ pub enum LInst {
     /// object, which carries no memory-safety content. Lowered to `undef` (sound;
     /// unconstrained), so a function that merely has an unwind-cleanup path is
     /// analysed rather than dropped whole.
+    /// `fence [syncscope(…)] <ordering>` — an atomic memory fence. It carries no
+    /// memory-safety obligation of its own; lowered to the matching weak-memory `Barrier`.
+    Fence { ordering: LOrdering },
     Opaque { dst: String },
     /// `dst = select i1 cond, T a, T b` — an operand-level select. Kept (not opaque)
     /// so a pointer select becomes a provenance join and a scalar select an `ite`.

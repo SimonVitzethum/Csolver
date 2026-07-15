@@ -153,7 +153,7 @@ pub(crate) fn inst_dst(inst: &LInst) -> Option<&str> {
         | LInst::Select { dst, .. }
         | LInst::Cast { dst, .. } => Some(dst),
         LInst::Call { dst, .. } => dst.as_deref(),
-        LInst::Store { .. } => None,
+        LInst::Store { .. } | LInst::Fence { .. } => None,
     }
 }
 

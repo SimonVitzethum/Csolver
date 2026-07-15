@@ -726,3 +726,25 @@ bad:
         "an i64 shift by a zext'd i32 amount in [0,56] is in range — the 64-bit width bounds it",
     );
 }
+
+/// A standalone `fence <ordering>` must not drop the whole function (it was an unsupported
+/// construct). It carries no memory-safety obligation — lowered to the matching weak-memory
+/// barrier — so the surrounding code is analysed normally.
+#[test]
+fn fence_does_not_drop_the_function() {
+    let ir = r#"
+define i32 @f() {
+  %p = alloca i32, align 4
+  store i32 7, ptr %p, align 4
+  fence seq_cst
+  fence syncscope("singlethread") release
+  %v = load i32, ptr %p, align 4
+  ret i32 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "fn".into() }).expect("lower");
+    assert!(m.unanalyzed.is_empty(), "a fence must not make the function unanalyzable: {:?}", m.unanalyzed);
+    let cfg = Config { bug_finding: true, entry_patterns: Some(vec!["f".into()]), ..Config::default() };
+    let f = verify_module(&m, &cfg).functions.into_iter().find(|f| f.function == "f").expect("f");
+    assert_eq!(f.verdict, Verdict::Pass, "the fenced function's stack access proves");
+}

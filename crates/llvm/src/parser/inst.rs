@@ -194,6 +194,7 @@ impl Parser {
                     tuple: true,
                 }
             }
+            "fence" => LInst::Fence { ordering: self.parse_atomic_ordering() },
             "insertelement" | "extractelement" | "shufflevector" | "freeze" => {
                 // Vector shuffling and `freeze` produce values with no
                 // memory-safety content of their own — opaque; the operands are
