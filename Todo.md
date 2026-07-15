@@ -101,11 +101,19 @@ Dispatch-Param hängen, sondern an:
     Erkannt per Expr-Walk am Check (robust, weil das Symbol durch umins `ite`/shl/sub/zext fließt).
     Prove-only, als Annahme `field-invariants` ausgewiesen. Skalar-Analogon zu `--assume-valid-params`.
   - **Wirkung (Voll-Scan): +240 Funktionen UNKNOWN→PASS** (26.109→26.349), Orakel SOUND, Default inert.
-- [ ] **OFFEN: register_read_memory failt WEITER (kein UNKNOWN→PASS-Fall).** Der +240-Gewinn sind
-  UNKNOWN→PASS-Fälle; register_read_memory ist aber **refutiert** (FAIL mit Zeuge `arg2=3`), und die
-  field-invariant-Annahme greift dort nicht — der refutierende Shift trägt offenbar kein `fld`-Symbol
-  (oder der Refutation-Pfad weicht vom erwarteten ab). Braucht eine gezielte Diagnose des konkreten
-  refutierenden POs in register_read_memory (welcher der ~3 Shifts, welche Symbole im Ziel).
+- [x] **GELÖST (2026-07-15): war ein Shift-Breiten-BUG, keine Feld-Invariante (`62f3016`).** Die
+  gezielte Diagnose ergab: der refutierende Shift ist `lshr i64 -1, zext(i32 (64 - size*8))`, und der
+  `NoShiftOverflow`-Check nutzte `ctx.width(amt)` = die **Quell**-Breite des zext-Operanden (32,
+  weil der Executor-zext ein werterhaltender No-Op ist) statt der **Ergebnis**-Breite (64). So wurde
+  `64 - size*8 ∈ [32,56]` als „Shift ≥ Bitbreite (32)" geflaggt — Zeuge `size=3` → amt=40 ≥ 32 (falsch)
+  aber < 64 (korrekt). Ein sauberer False Positive auf JEDEM register-array-Handler + ähnlichem
+  `i64`-Shift-durch-`zext(i32)`-Code. Fix: Check nutzt jetzt die Ergebnis-Typ-Breite (`ty`) und weitet
+  den Betrag darauf. **Sound, kein Flag.**
+  - Nebenbei: `name_mmio` im Whole-Program-Kontext, damit der MMIO-Dispatch-Bound einen *exportierten*
+    (Auto-Entry) cross-file-Handler erreicht (unbedingt geseedet, echter Invariant — nicht die
+    non-exported-gated `scalar_pre`).
+  - **Wirkung (Voll-Scan scan9→scan10): FAIL 480→468 (−12 FPs), Shift/Div-Funde 103→83 (−20),
+    register_read_memory nicht mehr FOUND.** Orakel SOUND.
 - [ ] **TCG-CPU-Emulations-Helfer.** `helper_palignr_{xmm,ymm,mmx}`, `softfloat_addMagsF32`,
   `helper_insertq_i` — Shift/Div über Gast-Instruktions-Operanden (SSE-Shuffle-Amount, Float-Exponent).
   Gast-kontrolliert via CPU-Emulation, QEMU maskiert sie; braucht ein TCG-Helfer-Operand-Modell,
