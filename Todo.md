@@ -62,6 +62,34 @@ Index ist nicht beweisbar. Der Engpass ist also **Bounds-Präzision**, nicht Typ
   abgedeckt. Zum Schließen des Feld-Falls: whole-program Feld-Provenance, die Labels trägt
   (Erweiterung der closed-world member-provenance) — ein eigenes, größeres Stück.
 
+## QEMU-Scan: MMIO-Dispatch-Vertrag gegen False Positives (2026-07-15)
+
+Ein `--bugs`-Scan von QEMU (3120 `.ll`, aus C gebaut) meldete ~600 Funde, fast alle **False
+Positives**. Beweis der Ursache: `sunhme_mif_read` isoliert = UNKNOWN (sound), als
+`--auto-entries`-Entry = FAIL. `--auto-entries` behandelt jeden der ~12800 Ops-Handler als
+Entry mit *freien* `addr`/`size` — der Executor refutiert dann `x/size` (size 0), `x<<size*8`
+(size riesig), `regs[addr>>2]` (addr riesig), die QEMUs Dispatch nie erzeugt.
+
+- [x] **Fix 1 (sound, kein Flag): MMIO-Dispatch-Vertrag modellieren.** Frontend erkennt
+  `.read`/`.write` (Feld 0/8 eines `MemoryRegionOps`, das an `memory_region_init_io(…, size)`
+  übergeben wird → `Module::mmio_handlers` mit Region-Größe). Executor seedet `1 ≤ size ≤ 8` und
+  (bei bekannter Größe) `addr ≤ region_size ∧ addr+size ≤ region_size` auf den Params. **Präzision,
+  keine Annahme** — nur eine Funktion, die real als `ops` übergeben wird, wird constrained (kein
+  false PASS). Ein echter `region_size > Array`-Overrun (die VM-Escape-Signatur) refutiert weiter.
+  **Wirkung: FAIL 581→480 (101 FPs sound entfernt), PASS +50.** Kein Fix 2 (kein UNKNOWN-Downgrade).
+- [ ] **Rest: Dispatch-Helper.** Verbleibende Div/Shift-FPs stehen in *Helfern* (`register_read_memory`),
+  die der Handler mit seinem (jetzt beschränkten) `size` aufruft — der Bound muss interprozedural
+  propagieren (Erweiterung von `synthesize_scalars`). Größter verbleibender FP-Hebel.
+- [ ] **`_with_attrs`-Handler.** `.read_with_attrs`/`.write_with_attrs` (Feld 16/24) haben `size`
+  an Param 3 (nach dem `data`-Pointer) — noch nicht erfasst; analoge Erkennung nötig.
+
+### Triage-Ergebnis (kein reportbarer VM-Escape)
+274 Funde in `hw/` (Device-Emulation), Rest in `block/`/`util/`/`ui/`/Tests. Stichproben (lsi_ram,
+sunhme, xlnx_dp, register_read_memory, cd_read_sector_cb): **alle FP** — Region-Größe = Array (Dispatch
+beschränkt addr) bzw. unmodellierte Struct-Feld-Invarianten. 16 Atomicity-Funde: alle in Test-Code
+(handgeschriebene Test-Mutexe). Free-Funde (`OPLCreate`, `vduse_dev_init`): nicht gast-erreichbar.
+**Bewusst nichts an QEMU gemeldet** (spekulative CVE-Meldungen = Mass-Reporting-Antipattern).
+
 ## Einheitliches Typ-Sizing für JEDEN opaken Zeiger (2026-07-14) — Abschluss
 
 Ein Prinzip, überall angewandt (`Explorer::size_hinted_pointer`, unter `--assume-valid-params`):
