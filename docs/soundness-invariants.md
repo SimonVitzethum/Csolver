@@ -23,6 +23,21 @@ Each entry: **invariant — the check — where.**
   instances, including ones that force restarts + clause deletion on hard 3-SAT. —
   `sat_tests.rs`.
 
+## Frontend lowering fidelity (`crates/llvm`, `crates/symbolic`)
+
+- **A shift's overflow is judged at the shifted value's width.** The `NoShiftOverflow`
+  obligation bounds the amount by the width of the value being shifted, not the width at
+  which the amount happens to be evaluated — a `lshr i64 x, zext(i32 k)` is safe iff
+  `k < 64`, not `k < 32`. Guards against a false FAIL on any amount in `[32, 64)`
+  (`AUDIT.md` P1). — `part_b.rs::shift_overflow_uses_the_shifted_value_width_not_the_amount_width`.
+- **Integer min/max intrinsics lower to a real `select`, not an opaque scalar.**
+  `llvm.{u,s}{min,max}` becomes `select(a <cmp> b, a, b)` with the comparison per the
+  prefix, so a `MAKE_64BIT_MASK`-style clamp is reasoned about rather than havoc'd. —
+  `part_b.rs::min_max_intrinsics_are_modelled_as_select`.
+- **`fence` is a supported construct, not a dropped function.** An atomic `fence` lowers
+  to a memory `Barrier` (no memory-safety obligation) instead of aborting the whole
+  function as an unsupported instruction. — `part_b.rs::fence_does_not_drop_the_function`.
+
 ## Whole-program summaries (`crates/symbolic/src/summary`)
 
 - **Link-free summaries equal the linked result.** `summarize_program(&[mods])` must equal

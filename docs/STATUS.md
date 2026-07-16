@@ -108,6 +108,22 @@ Highlights beyond the historical log below:
   UNKNOWN — it may dangle). Verified against real **Zig** 0.16 and **Julia** 1.12 output;
   the same path covers **Swift**'s ABI. CI pinned to Rust 1.96.
 
+- **QEMU device-model triage batch (2026-07).** Scanning QEMU under `--bugs
+  --auto-entries` surfaced that a device's **MMIO register callbacks** were treated
+  as free-parameter entries and false-flagged. A registered `MemoryRegionOps`
+  `.read`/`.write` handler (registered via `memory_region_init_io` /
+  `register_init_block{8,32,64}`, name-keyed and carried across the whole-program
+  merge) is now analysed under the memory core's **real dispatch contract** — access
+  size `∈ {1,2,4,8}`, `addr + size ≤ region_size` — precision, no flag; removed ~101
+  false-positive functions (`581 → 480`). Three frontend/analyzer fixes landed with
+  it: a **shift-overflow false FAIL** (the amount was bounded by *its own* evaluated
+  width, not the shifted value's — `AUDIT.md` P1; `−20` findings, `480 → 468`),
+  **`fence`** lowered to a memory barrier instead of dropping the whole function
+  (un-drops 12 QEMU functions), and integer **min/max intrinsics** modelled as a real
+  `select`. New opt-in `--assume-field-invariants` closes the loaded-scalar residual
+  (a shift amount / divisor read from a struct field is assumed in range) — prove-only,
+  the scalar analogue of `--assume-valid-params`; `+240` UNKNOWN→PASS on a full scan.
+
 Known open frontend gap on real kernel IR: complex `getelementptr` shapes
 (multi-index / vector) still drop the enclosing function to `unanalyzed`.
 

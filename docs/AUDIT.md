@@ -37,6 +37,18 @@ fixpoint engine's post-fixpoint convergence, dominator/loop-header detection,
 alias `Must` only on provable offset equality, provenance never fabricated from
 integers, and per-path obligation aggregation (truncation wipes all decisions).
 
+## Resolved precision defects (false FAIL, now fixed)
+
+A false FAIL is not a soundness bug, but it erodes trust and buries real findings.
+These were found while triaging a QEMU `--bugs` scan and fixed with a regression test.
+
+| # | Where | Defect | Fix | Test |
+|---|-------|--------|-----|------|
+| P1 | `symbolic/exec/step.rs` shift check | the `NoShiftOverflow` obligation compared the shift **amount** against the width at which the *amount* was evaluated, not the width of the value being shifted. A `zext i32 (…) to i64` is a value-preserving no-op in the executor (still width 32), so `lshr i64 x, zext(i32 k)` was checked as `k < 32` and any `k ∈ [32, 64)` was falsely flagged as UB | evaluate the amount at the **result** type's width (`zext` it up first), then bound it by that width — a `lshr i64` amount is in range iff `< 64` | `shift_overflow_uses_the_shifted_value_width_not_the_amount_width` |
+
+Corpus effect: `−20` spurious shift/div findings on the QEMU sample (`FAIL 480 → 468`),
+no `PASS` lost, both differential oracles still `SOUND`.
+
 ## Known non-soundness limitations (precision, not false PASS)
 
 * **False FAIL on dead branches.** The interval analysis does not yet refine

@@ -20,7 +20,12 @@ CSolver has two modes:
   (re-acquiring a held lock) — each reported with a concrete triggering input.
   Indirect calls through constant ops-struct / vtable globals are
   **devirtualized** so dispatch is analysed with the callee's summary instead of
-  an opaque havoc.
+  an opaque havoc. A registered **MMIO dispatch handler** (a `MemoryRegionOps`
+  `.read`/`.write` registered via `memory_region_init_io` / `register_init_block*`)
+  is analysed under the memory core's real calling contract — access size
+  `∈ {1,2,4,8}` and `addr + size ≤ region_size` — so a device model's register
+  callbacks are not falsely flagged as unbounded entries. This is a genuine
+  dispatch invariant (precision, no flag), distinct from the opt-in `--assume-valid-mmio`.
 
 ## Status
 
@@ -28,8 +33,9 @@ The common IR (MSIR) and the full pipeline — symbolic execution, memory model,
 loops, alias-aware heap, interprocedural summaries, and the internal bit-precise
 solver — are implemented and audited for soundness. The **Rust (MIR)** and
 **LLVM/C** frontends are mature: the LLVM path handles optimized IR, DWARF field
-recovery, C/kernel allocators, `copy_from_user`, and inline assembly, and runs on
-real Linux-kernel IR. **C++** goes through the same LLVM path.
+recovery, C/kernel allocators, `copy_from_user`, inline assembly, atomic `fence`s,
+and integer min/max intrinsics, and runs on real Linux-kernel IR. **C++** goes
+through the same LLVM path.
 
 The internal SAT core is a full **CDCL** solver (1-UIP clause learning,
 non-chronological backjumping, VSIDS, Luby restarts, two-watched literals, LBD
