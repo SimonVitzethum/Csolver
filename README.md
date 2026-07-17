@@ -230,6 +230,13 @@ concurrent modules ⇒ lower peak RSS), `CSOLVER_MEM_RESERVE_MB=<n>` raises the
 per-in-flight memory reserve so fewer large modules start together. Use them to fit
 a whole-kernel `--cross-file` scan under a memory ceiling.
 
+**Pause / resume a long scan** (`CSOLVER_PAUSE_FILE=<path>`): launch a `scan` with this
+set, then `touch <path>` to pause and `rm <path>` to resume. The scan checks the file at
+**unit boundaries** (never mid-analysis), so a pause withholds *starting the next unit*
+rather than interrupting one in flight — result- and soundness-neutral (it changes only
+*when* work runs, not *what* is analysed, and the final report is identical). Useful for
+freeing the machine mid-run on a long/detached kernel scan. Unset ⇒ zero overhead.
+
 Exit codes: `verify` — `0` PASS · `1` FAIL · `2` UNKNOWN · `3` tool error.
 `scan` exits `1` iff any bug was found (it is an inventory, not one verdict).
 

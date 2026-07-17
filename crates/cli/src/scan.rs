@@ -253,6 +253,39 @@ pub(crate) fn worker_count() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
+/// **Cooperative pause.** If `CSOLVER_PAUSE_FILE` names a path that currently exists,
+/// block here — polling every 500 ms — until that file is removed, then continue. This
+/// is checked only at **unit/file boundaries** (never mid-analysis), so pausing withholds
+/// *starting the next unit* rather than interrupting one in flight. It is
+/// result- and soundness-neutral: it changes only *when* work runs, never *what* is
+/// analysed or the verdict, and the deterministic post-scan aggregation is unaffected.
+///
+/// Usage on a long/detached run: launch with `CSOLVER_PAUSE_FILE=/path/to/pause`, then
+/// `touch /path/to/pause` to pause and `rm /path/to/pause` to resume. When the env var is
+/// unset (the default) this is a single cheap `getenv` and returns immediately — zero
+/// overhead. One `paused`/`resumed` line is logged per transition (not per worker).
+pub(crate) fn await_unpause() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Announce the pause/resume exactly once across all workers (not once per worker).
+    static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+    let Some(path) = std::env::var_os("CSOLVER_PAUSE_FILE") else {
+        return;
+    };
+    let path = std::path::Path::new(&path);
+    if !path.exists() {
+        return;
+    }
+    if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+        eprintln!("  ⏸ paused — remove {} to resume …", path.display());
+    }
+    while path.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if ANNOUNCED.swap(false, Ordering::Relaxed) {
+        eprintln!("  ▶ resumed");
+    }
+}
+
 /// Memory a single in-flight analysis is assumed to need, reserved by the
 /// backpressure (`await_memory`). Overridable via `CSOLVER_MEM_RESERVE_MB`: raise
 /// it for cross-file / whole-program runs whose linked modules dwarf a single

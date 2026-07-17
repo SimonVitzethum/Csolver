@@ -138,6 +138,10 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {
+                // Cooperative pause at the unit boundary (before claiming the next unit),
+                // so a pause never interrupts an in-flight analysis. No-op unless
+                // `CSOLVER_PAUSE_FILE` is set and present.
+                await_unpause();
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total_units {
                     break;
@@ -177,6 +181,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         unbounded.time_budget = None;
         let all_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         for i in deferred {
+            await_unpause();
             let (label, unit) = &units[i];
             let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen, wp_ctx);
             stream_findings(&fs, &found, &seen_find);

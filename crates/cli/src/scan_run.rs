@@ -436,6 +436,9 @@ pub(crate) fn stream_program_facts(
             s.spawn(move || {
                 let mut wpf = csolver_verifier::WholeProgramFacts::new();
                 for path in shard {
+                    // Cooperative pause at the file boundary (see `await_unpause`): no-op
+                    // unless `CSOLVER_PAUSE_FILE` is set and present.
+                    await_unpause();
                     let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
                     if let Ok(src) = std::fs::read_to_string(path) {
                         if let Ok(m) = (csolver_llvm::LlvmFrontend)
