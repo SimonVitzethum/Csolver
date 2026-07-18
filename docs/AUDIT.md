@@ -49,6 +49,12 @@ These were found while triaging a QEMU `--bugs` scan and fixed with a regression
 Corpus effect: `−20` spurious shift/div findings on the QEMU sample (`FAIL 480 → 468`),
 no `PASS` lost, both differential oracles still `SOUND`.
 
+| # | Where | Defect | Fix | Test |
+|---|-------|--------|-----|------|
+| P2 | `symbolic/exec/step.rs` Bin UB checks | an integer operation **wider than the bit-precise domain** (`MAX_WIDTH` = 128 — kernel crypto / SIMD `i256`/`i512`) made the scalar UB checks build a width-derived bound constant, and `BitVector::new` panicked (`"bit-vector width out of range"`). In a parallel scan the worker panic propagated through the scope join and **crashed the whole run** before the coverage report | skip the overflow / div-by-zero / shift obligations when `type_width(ty) > MAX_WIDTH`; the op is undecidable bit-precisely anyway, so it stays UNKNOWN. Sound (nothing proven ⇒ no false PASS) | `wide_integer_arithmetic_does_not_panic` |
+
+A panic is treated as a bug to fix, never a file to silently drop: P2 turned a scan-killing crash into a graceful per-obligation UNKNOWN on exotic widths.
+
 ## Known non-soundness limitations (precision, not false PASS)
 
 * **False FAIL on dead branches.** The interval analysis does not yet refine

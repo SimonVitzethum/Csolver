@@ -25,13 +25,23 @@ impl Explorer<'_> {
                 // can be zero on the path (the `decide` gate keeps it sound: a genuine-input divisor
                 // in bug-finding mode, or a definite zero on an exact path in strict mode).
                 if let RValue::Bin { op, lhs, rhs, flags } = value {
+                    // A value wider than the bit-precise domain (`MAX_WIDTH` = 128 bits) —
+                    // kernel crypto / SIMD big-integers such as `i256`/`i512` — cannot be
+                    // represented as a concrete `BitVector`, so the width-derived bound
+                    // constants the UB checks below build (`ctx.int(width, …)`,
+                    // `arith_no_overflow`'s `ctx.int(w, 0)`) would panic. Such an operation is
+                    // undecidable bit-precisely regardless, so skip its scalar UB obligations —
+                    // they stay UNKNOWN rather than crashing the whole scan. Sound: nothing is
+                    // proven, so never a false PASS (only a precision loss on exotic widths).
+                    let op_wide = type_width(ty) > csolver_solver::bitblast::MAX_WIDTH;
                     // `nsw`/`nuw`-flagged add/sub/mul must not wrap (UB in C / poison in
                     // LLVM). Only the flagged form carries an obligation — plain wrapping
                     // arithmetic raises nothing. The no-overflow goal is built with
                     // same-width sign predicates (signed add/sub) and a double-width
                     // product for BOTH mul forms — signed via `sext`, unsigned via `zext`
                     // (see `arith_no_overflow`), so signed *and* unsigned mul are checked.
-                    if (flags.nsw || flags.nuw)
+                    if !op_wide
+                        && (flags.nsw || flags.nuw)
                         && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                     {
                         let a = self.eval_scalar(lhs, state);
@@ -49,7 +59,7 @@ impl Explorer<'_> {
                             );
                         }
                     }
-                    if matches!(op, BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem) {
+                    if !op_wide && matches!(op, BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem) {
                         let d = self.eval_scalar(rhs, state);
                         let zero = self.ctx.int(self.ctx.width(d), 0);
                         let nonzero = self.ctx.cmp(SCmp::Ne, d, zero);
@@ -73,7 +83,7 @@ impl Explorer<'_> {
                     // of type i64, but a `zext i32 … to i64` amount is evaluated at its source
                     // width (32); using that width would check `amt < 32` on an i64 shift and
                     // flag a legitimate `64 - k` amount (∈ [32, 64)) as UB — a false positive.
-                    if matches!(op, BinOp::Shl | BinOp::LShr | BinOp::AShr) {
+                    if !op_wide && matches!(op, BinOp::Shl | BinOp::LShr | BinOp::AShr) {
                         let amt0 = self.eval_scalar(rhs, state);
                         let rw = type_width(ty);
                         // Widen an under-width amount (a `zext`ed narrower value evaluated at its

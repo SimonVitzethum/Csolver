@@ -748,3 +748,30 @@ define i32 @f() {
     let f = verify_module(&m, &cfg).functions.into_iter().find(|f| f.function == "f").expect("f");
     assert_eq!(f.verdict, Verdict::Pass, "the fenced function's stack access proves");
 }
+
+#[test]
+fn wide_integer_arithmetic_does_not_panic() {
+    // Kernel crypto / SIMD big-integers (`i256`/`i512`) exceed the 128-bit bit-precise
+    // domain (`MAX_WIDTH`), so the scalar UB checks (overflow / div / shift) cannot build
+    // their width-derived bound constants — `BitVector::new` would panic ("bit-vector width
+    // out of range"), which previously killed a whole kernel scan. The checks must instead
+    // be skipped (the obligation stays UNKNOWN), never crash. Regression for that panic.
+    let ir = r#"
+define i256 @wide_arith(i256 %a, i256 %b) {
+entry:
+  %m = mul nsw i256 %a, %b
+  %d = udiv i256 %m, %b
+  %s = shl i256 %d, %a
+  ret i256 %s
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: ir.into(), name: "fn".into() }).expect("lower");
+    let cfg = Config { bug_finding: true, entry_patterns: Some(vec!["wide_arith".into()]), ..Config::default() };
+    // The assertion is simply that verification RETURNS: before the fix it panicked inside
+    // `arith_no_overflow` while forming a 256-bit constant. A verdict (any) means no panic.
+    let r = verify_module(&m, &cfg);
+    assert!(
+        r.functions.iter().any(|f| f.function == "wide_arith"),
+        "the i256 function must be analysed to a verdict, not crash the run"
+    );
+}
