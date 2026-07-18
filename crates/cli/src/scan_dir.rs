@@ -221,6 +221,23 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     let mut seen: std::collections::HashSet<FindingKey> = std::collections::HashSet::new();
     findings.retain(|f| seen.insert(finding_key(f)));
 
+    // Attack-surface reporting lens (opt-in `--attack-surface`): keep only findings in
+    // functions directly reachable from a syscall / `*ioctl*` entry, dropping the internal
+    // driver-callback mass that `--auto-entries` promotes to free-parameter entries and that
+    // is reachable only through *indirect* ops dispatch. A pure reporting filter — verdicts
+    // and the coverage counts below are unchanged, so it can never mask a false PASS; it only
+    // narrows the printed violation inventory (trading recall for attack-surface precision).
+    if config.attack_surface_only {
+        let reach = attack_surface_reachable(&call_edges, &defined_fns);
+        let before = findings.len();
+        findings.retain(|f| reach.contains(&f.function));
+        eprintln!(
+            "  --attack-surface: {} of {before} findings kept (syscall/ioctl-reachable); {} internal-callback findings suppressed",
+            findings.len(),
+            before - findings.len(),
+        );
+    }
+
     let entry_patterns = config.entry_patterns.as_deref().unwrap_or(&[]);
     // Concurrency oracle for the whole-program scan: over the aggregated call graph, the set of
     // functions reachable from a concurrent seed — an attacker entry (`--entries`) or a spawned
@@ -307,6 +324,46 @@ pub(crate) fn whole_program_concurrent(
         }
     }
     Some(reach)
+}
+
+/// The **genuine attacker surface**: functions directly reachable (whole-program direct-call
+/// graph) from a syscall wrapper or an `*ioctl*` handler. `--attack-surface` reports only
+/// findings in this set. Seeds on the syscall entry prefixes and any defined function whose
+/// name contains `ioctl`, then closes over **direct** call edges only — so an internal driver
+/// callback reached solely through *indirect* ops dispatch (a register accessor, a clk/drm op),
+/// which has no direct edge from the entry, is excluded. That is exactly the false-positive mass
+/// `--auto-entries` creates by treating every ops-struct handler as a free-parameter entry.
+pub(crate) fn attack_surface_reachable(
+    call_edges: &[(String, Vec<String>)],
+    defined_fns: &[String],
+) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut seed_pats: Vec<String> = SYSCALL_ENTRY_PREFIXES.iter().map(|s| s.to_string()).collect();
+    seed_pats.push("*ioctl*".to_string());
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (caller, callees) in call_edges {
+        edges.entry(caller).or_default().extend(callees.iter().map(String::as_str));
+    }
+    let mut reach: HashSet<String> = HashSet::new();
+    let mut work: Vec<String> = Vec::new();
+    // Seed: every genuine-entry function (defined in the tree, or a caller in the graph).
+    let names = defined_fns.iter().chain(call_edges.iter().map(|(c, _)| c));
+    for name in names {
+        if csolver_verifier::matches_entry(name, &seed_pats) && reach.insert(name.clone()) {
+            work.push(name.clone());
+        }
+    }
+    // Close over direct callees.
+    while let Some(f) = work.pop() {
+        if let Some(callees) = edges.get(f.as_str()) {
+            for &c in callees {
+                if reach.insert(c.to_string()) {
+                    work.push(c.to_string());
+                }
+            }
+        }
+    }
+    reach
 }
 
 /// A finding's identity for de-duplication: the same `(function, property, witness)`

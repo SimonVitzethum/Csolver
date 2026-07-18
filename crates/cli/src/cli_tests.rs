@@ -78,6 +78,34 @@ fn whole_program_oracle_admits_indirect_targets() {
 /// guard. A `PASS` set means nothing if a function silently never reached the
 /// analyzer.
 #[test]
+fn attack_surface_keeps_syscall_ioctl_reachable_only() {
+    // foo_ioctl (matches *ioctl*) → helper ; __x64_sys_read (syscall) → vfs_read ;
+    // drm_reg_write → reg_poke is an internal driver callback: in the real kernel it is
+    // reached only through *indirect* ops dispatch, which has no direct edge here, so the
+    // attack-surface closure must exclude it (that is the false-positive mass we suppress).
+    let edges = vec![
+        ("foo_ioctl".to_string(), vec!["helper".to_string()]),
+        ("__x64_sys_read".to_string(), vec!["vfs_read".to_string()]),
+        ("drm_reg_write".to_string(), vec!["reg_poke".to_string()]),
+    ];
+    let defined = vec![
+        "foo_ioctl".to_string(),
+        "helper".to_string(),
+        "__x64_sys_read".to_string(),
+        "vfs_read".to_string(),
+        "drm_reg_write".to_string(),
+        "reg_poke".to_string(),
+    ];
+    let set = attack_surface_reachable(&edges, &defined);
+    assert!(set.contains("foo_ioctl") && set.contains("helper"), "ioctl entry + callee kept: {set:?}");
+    assert!(set.contains("__x64_sys_read") && set.contains("vfs_read"), "syscall entry + callee kept: {set:?}");
+    assert!(
+        !set.contains("drm_reg_write") && !set.contains("reg_poke"),
+        "internal callback reachable only via indirect dispatch is excluded: {set:?}"
+    );
+}
+
+#[test]
 fn coverage_names_not_analyzed_functions() {
     let mut module = csolver_ir::Module::new("m");
     module.unanalyzed.push(("uses_asm".into(), "inline asm unsupported".into()));

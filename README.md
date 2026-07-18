@@ -217,6 +217,8 @@ solver scan <dir> [--bugs] [--assume-valid-params]   # sweep EVERY .ll under a t
                                             # (PASS/FAIL/UNKNOWN %, decided, dropped)
 solver scan <dir> --cross-file --auto-entries --bugs # cross-module (link each dir),
                                             # attacker entries derived automatically
+solver scan <dir> --bugs --attack-surface   # triage lens: report only findings in
+                                            # syscall/ioctl-reachable functions
 solver scan <dir> --reachable --entries <f> --bugs   # per-entry whole-program slice
 solver facts <dir> [--closed-world]         # streaming whole-program facts (no linking):
                                             # extract summaries + pointer/scalar/field
@@ -236,6 +238,16 @@ set, then `touch <path>` to pause and `rm <path>` to resume. The scan checks the
 rather than interrupting one in flight — result- and soundness-neutral (it changes only
 *when* work runs, not *what* is analysed, and the final report is identical). Useful for
 freeing the machine mid-run on a long/detached kernel scan. Unset ⇒ zero overhead.
+
+**Attack-surface triage lens** (`--attack-surface`, scan only, opt-in): report only findings
+in functions **directly** reachable from a syscall wrapper or an `*ioctl*` handler in the
+whole-program direct-call graph. `--auto-entries` promotes every ops-struct handler and
+exported function to a free-parameter entry, which over-reports on internal driver callbacks
+(register accessors, clk/drm ops) that are reached only through *indirect* ops dispatch and
+whose parameters are in fact caller-bounded. This lens suppresses that mass and surfaces the
+genuine syscall/ioctl attack surface. It is purely a **reporting filter** — verdicts and the
+coverage counts are unchanged, so it never introduces a false `PASS`; it trades recall (a real
+bug reached only via an indirect callback is hidden) for precision. Default off ⇒ full recall.
 
 Exit codes: `verify` — `0` PASS · `1` FAIL · `2` UNKNOWN · `3` tool error.
 `scan` exits `1` iff any bug was found (it is an inventory, not one verdict).

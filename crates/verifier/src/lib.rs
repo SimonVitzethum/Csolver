@@ -148,6 +148,17 @@ pub struct Config {
     /// budget-limited unit a full-effort re-run). Defaults to the executor's
     /// generous 30 s termination guarantee.
     pub time_budget: Option<std::time::Duration>,
+    /// **Attack-surface reporting filter** (opt-in, scan only). When set, the scan
+    /// reports only findings in functions **directly** reachable (whole-program
+    /// direct-call graph) from a genuine attacker entry — a syscall wrapper or an
+    /// `*ioctl*` handler — suppressing the large mass of internal driver callbacks
+    /// (register accessors, clk/drm ops) that `--auto-entries` promotes to
+    /// free-parameter entries and that are reachable only through *indirect* ops
+    /// dispatch. Purely a **reporting lens**: verdicts and the coverage counts are
+    /// unchanged, so it can never introduce a false PASS — it trades recall (a real
+    /// bug reached only via an indirect callback is hidden) for precision on the
+    /// syscall/ioctl attack surface. `false` ⇒ every finding is reported (default).
+    pub attack_surface_only: bool,
 }
 
 /// Whether `name` matches an entry pattern. A single `*` is a wildcard at the
@@ -188,6 +199,7 @@ impl Default for Config {
             aliasing_model: false,
             entry_patterns: None,
             time_budget: Some(std::time::Duration::from_secs(30)),
+            attack_surface_only: false,
         }
     }
 }

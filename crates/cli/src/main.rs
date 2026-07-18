@@ -58,7 +58,7 @@ USAGE:
                                     (no_aliasing_violation);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
-    solver scan <dir> [--no-bugs] [--no-assume-valid-params] [--no-closed-world] [--no-cross-file] [--no-whole-program] [--no-auto-entries] [--no-aliasing-model] [--entries <file>] [--reachable]
+    solver scan <dir> [--no-bugs] [--no-assume-valid-params] [--no-closed-world] [--no-cross-file] [--no-whole-program] [--no-auto-entries] [--no-aliasing-model] [--attack-surface] [--entries <file>] [--reachable]
                                     verify EVERY .ll under <dir> without stopping, then
                                     report coverage (% of functions decided) and list
                                     every memory-safety violation found, with a witness.
@@ -74,7 +74,15 @@ USAGE:
                                     per-function wall-clock limit by default (termination is
                                     bounded by construction); --time-limit <secs> restores a
                                     per-function cap for a latency-bounded run.
-                                    (--entries <file>: treat ONLY functions whose name
+                                    (--attack-surface: opt-in REPORTING lens — list only
+                                    findings in functions directly reachable from a syscall
+                                    or *ioctl* entry, suppressing the internal driver-callback
+                                    mass (register accessors, clk/drm ops) that --auto-entries
+                                    promotes to free-parameter entries and that is reachable
+                                    only via indirect ops dispatch. Verdicts and coverage are
+                                    unchanged (a filter, never a false PASS); trades recall for
+                                    attack-surface precision.
+                                    --entries <file>: treat ONLY functions whose name
                                     matches a listed pattern — an exact name or a
                                     trailing-`*` prefix, one per line — as attacker
                                     entries; every other function's parameters are taken
@@ -249,6 +257,11 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             let cross_file = flag(args, "cross-file", true);
             let whole_program = flag(args, "whole-program", true);
             let auto_entries = flag(args, "auto-entries", true);
+            // `--attack-surface`: opt-in reporting lens (default OFF, so full recall by
+            // default). Report only findings in functions directly reachable from a
+            // syscall/ioctl entry — cuts the internal-callback false-positive mass that
+            // `--auto-entries` produces. Sound (a reporting filter; verdicts unchanged).
+            let attack_surface_only = args.iter().any(|a| a == "--attack-surface");
             // **No wall-clock time limit by default.** A per-function clock is a hard timeout: on
             // expiry the function truncates to UNKNOWN, dropping a slow-but-provable result for a
             // resource reason. Termination is already guaranteed *by construction* — the merged
@@ -281,10 +294,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     eprintln!("--reachable: no --entries given — deriving the attacker surface automatically");
                     derive_auto_entries(Path::new(dir), None)
                 });
-                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, assume_param_buffer_len, assume_struct_tail, assume_valid_mmio, assume_field_invariants, aliasing_model, entry_patterns: Some(pats.clone()), time_budget, ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, assume_param_buffer_len, assume_struct_tail, assume_valid_mmio, assume_field_invariants, aliasing_model, entry_patterns: Some(pats.clone()), time_budget, attack_surface_only, ..Config::default() };
                 scan_reachable(Path::new(dir), &config, &pats)
             } else {
-                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, assume_param_buffer_len, assume_struct_tail, assume_valid_mmio, assume_field_invariants, aliasing_model, entry_patterns, time_budget, ..Config::default() };
+                let config = Config { closed_world, bug_finding, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs, assume_param_buffer_len, assume_struct_tail, assume_valid_mmio, assume_field_invariants, aliasing_model, entry_patterns, time_budget, attack_surface_only, ..Config::default() };
                 scan_dir(Path::new(dir), &config, cross_file, whole_program)
             }
         }
