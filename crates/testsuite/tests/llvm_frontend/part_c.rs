@@ -48,6 +48,50 @@ entry:
         "assume_valid_params materialises the loaded child pointer as a valid struct");
 }
 
+/// A Rust slice reference `&mut [T]` built via `from_raw_parts` erases to a bare pointer at
+/// `-O`, but its length survives as a fat-pointer fragment in debug info
+/// (`#dbg_value(iN len, !V, fragment 64 64)`). Recovering `len` sizes the backing region
+/// `len * sizeof(T)`, so a constant-index access into it proves in-bounds (under
+/// `--assume-valid-params`, the same gate as any raw-pointer region — the backing's
+/// *validity* is the unsafe caller's contract). Without the flag the pointer stays opaque.
+#[test]
+fn slice_from_raw_parts_length_sizes_the_region() {
+    // `s: &mut [i64]` of length 4 (region = 32 bytes) at an int-to-pointer address; two
+    // in-bounds stores (`s[0]` at offset 0, `s[3]` at offset 24..32).
+    let src = r#"
+define void @slice_store(i64 %addr) !dbg !4 {
+entry:
+  %p = inttoptr i64 %addr to ptr, !dbg !20
+    #dbg_value(ptr %p, !21, !DIExpression(DW_OP_LLVM_fragment, 0, 64), !20)
+    #dbg_value(i64 4, !21, !DIExpression(DW_OP_LLVM_fragment, 64, 64), !20)
+  store i64 7, ptr %p, align 8, !dbg !20
+  %q = getelementptr inbounds i64, ptr %p, i64 3, !dbg !20
+  store i64 8, ptr %q, align 8, !dbg !20
+  ret void
+}
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!3}
+!0 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !1, emissionKind: FullDebug)
+!1 = !DIFile(filename: "s.rs", directory: "/")
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = distinct !DISubprogram(name: "slice_store", scope: !1, file: !1, type: !5, unit: !0, retainedNodes: !30)
+!5 = !DISubroutineType(types: !6)
+!6 = !{null, !7}
+!7 = !DIBasicType(name: "u64", size: 64)
+!12 = !DICompositeType(tag: DW_TAG_structure_type, name: "&mut [i64]", size: 128, align: 64, elements: !13)
+!13 = !{}
+!20 = !DILocation(line: 1, scope: !4)
+!21 = !DILocalVariable(name: "s", scope: !4, file: !1, type: !12)
+!30 = !{!21}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "s".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Pass,
+        "an int-to-pointer slice is not assumed valid by default");
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "the recovered slice length (4) sizes a 32-byte region, so both stores prove in-bounds");
+}
+
 /// Soundness of `--assume-valid-params` under bug-finding: an assumed-valid pointer's
 /// pointee size is a *guess* (from debug info / use), not a proven allocation bound. The
 /// pervasive kernel `container_of` idiom steps **backward** off the member pointer to the

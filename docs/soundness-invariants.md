@@ -37,6 +37,12 @@ Each entry: **invariant — the check — where.**
 - **`fence` is a supported construct, not a dropped function.** An atomic `fence` lowers
   to a memory `Barrier` (no memory-safety obligation) instead of aborting the whole
   function as an unsupported instruction. — `part_b.rs::fence_does_not_drop_the_function`.
+- **A Rust slice reference recovers its length from debug info.** `&[T]`/`&mut [T]` built via
+  `from_raw_parts(ptr, N)` erases to a bare pointer at `-O`, but `N` survives as the fat-pointer
+  length fragment (`#dbg_value(iN N, !V, fragment 64 64)`); it sizes the backing region
+  `N * sizeof(T)`, applied under `--assume-valid-params` (the region's *validity* is the unsafe
+  caller's contract, the same gate as any raw-pointer region — so no false PASS by default). —
+  `part_c.rs::slice_from_raw_parts_length_sizes_the_region`.
 
 ## Whole-program summaries (`crates/symbolic/src/summary`)
 

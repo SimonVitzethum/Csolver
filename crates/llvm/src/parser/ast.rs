@@ -67,6 +67,13 @@ pub struct LFunc {
     /// pointer's pointee size — is recoverable at `-O1`/`-O2`, where the struct type is
     /// canonicalised out of the `getelementptr`. See `DebugInfo::local_pointee_bytes`.
     pub dbg_values: Vec<(String, u32)>,
+    /// Slice-length fragments: `(!DILocalVariable id, constant length)` from a
+    /// `#dbg_value(iN <len>, !V, !DIExpression(DW_OP_LLVM_fragment, 64, 64))` record — the
+    /// length field of a Rust fat pointer (`&[T]`/`&mut [T]`, a 128-bit `{data, len}`). Joined
+    /// by `!V` with the pointer fragment in [`LFunc::dbg_values`] to size a slice region:
+    /// a `from_raw_parts(ptr, N)` slice erases to a bare pointer at `-O`, but the source-level
+    /// length survives here. See `DebugInfo::slice_ref_elem` and the lowering that seeds it.
+    pub dbg_slice_lens: Vec<(u32, u64)>,
 }
 
 /// A parsed function parameter with the attributes relevant to memory safety.

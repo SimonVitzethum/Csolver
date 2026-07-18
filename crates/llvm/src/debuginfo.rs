@@ -80,6 +80,14 @@ enum DiNode {
     /// A struct/union (`DICompositeType`): its `elements` metadata-list id (the
     /// members), byte size, and byte alignment.
     Composite { elements: Option<u32>, size_bytes: Option<u64>, align_bytes: Option<u32> },
+    /// A Rust **slice reference** (`&[T]` / `&mut [T]`): a `DICompositeType` whose name is
+    /// `&…[T]`, i.e. a 128-bit `{data: *T, len: usize}` fat pointer. Carries the element's
+    /// `(byte size, byte align)` and whether it is writable (`&mut`). The *length* is not
+    /// here — it lives in a `#dbg_value(iN len, !V, fragment 64 64)` record ([`LFunc::
+    /// dbg_slice_lens`]); the two combine to size the slice's backing region. Because the
+    /// name begins `&`, it is a Rust reference and the language guarantees its validity — the
+    /// same soundness basis as [`DiNode::Pointer { reference: true, .. }`].
+    SliceRef { elem_bytes: u64, elem_align: u32, writable: bool },
     /// A struct member (`DIDerivedType(tag: DW_TAG_member)`): its byte offset in
     /// the enclosing struct and its type.
     Member { offset_bytes: u64, base: u32 },
@@ -276,6 +284,21 @@ impl DebugInfo {
         }
     }
 
+    /// If a local's declared type is a Rust **slice reference** (`&[T]`/`&mut [T]`), the
+    /// element's `(byte size, byte align, writable)`. Combined with the slice's `len`
+    /// ([`LFunc::dbg_slice_lens`]), the backing region is `len * size` bytes — sizing a
+    /// `from_raw_parts(ptr, len)` slice whose `from_raw_parts` call the optimizer erased.
+    /// Same soundness basis as reference recovery: the `&`-named type is a Rust reference,
+    /// so the region is only *applied* under `--assume-valid-params` (the `PtrHint` path).
+    pub(crate) fn slice_local_elem(&self, var_id: u32) -> Option<(u64, u32, bool)> {
+        match self.nodes.get(self.locals.get(&var_id)?)? {
+            DiNode::SliceRef { elem_bytes, elem_align, writable } => {
+                Some((*elem_bytes, *elem_align, *writable))
+            }
+            _ => None,
+        }
+    }
+
     /// The declared byte alignment of a struct named as LLVM names it (`%struct.T` ⇒ `T`),
     /// or `None` when debug info records none. Lets a *type-directed* `gep %struct.T` hint
     /// carry the struct's real alignment, which the LLVM type alone does not record — an
@@ -372,17 +395,25 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
         } else if let Some(args) = tag_body(body, "!DIDerivedType(") {
             insert_derived(&mut di, id, args);
         } else if let Some(args) = tag_body(body, "!DICompositeType(") {
-            // A struct/union: its byte size and members-list (`elements: !L`).
-            di.nodes.insert(
-                id,
-                DiNode::Composite {
-                    elements: field_ref(args, "elements:"),
-                    size_bytes: bits_to_bytes(args),
-                    align_bytes: bits_to_bytes_u32(args, "align:"),
-                },
-            );
+            let name = field_str(args, "name:");
+            // A Rust slice reference `&[T]` / `&mut [T]` is a named 128-bit fat-pointer struct.
+            // Recognise it by name and record the element `(size, align)` + writability, so its
+            // backing region can be sized once the length fragment supplies `N`.
+            if let Some((elem_bytes, elem_align, writable)) = name.and_then(slice_ref_elem) {
+                di.nodes.insert(id, DiNode::SliceRef { elem_bytes, elem_align, writable });
+            } else {
+                // A struct/union: its byte size and members-list (`elements: !L`).
+                di.nodes.insert(
+                    id,
+                    DiNode::Composite {
+                        elements: field_ref(args, "elements:"),
+                        size_bytes: bits_to_bytes(args),
+                        align_bytes: bits_to_bytes_u32(args, "align:"),
+                    },
+                );
+            }
             // Index it by name so an LLVM `%struct.<name>` gep can find it. First wins.
-            if let Some(name) = field_str(args, "name:") {
+            if let Some(name) = name {
                 di.by_name.entry(name.to_string()).or_insert(id);
             }
         } else if let Some(args) = tag_body(body, "!DIBasicType(") {
@@ -418,6 +449,27 @@ pub(crate) fn parse(src: &str) -> DebugInfo {
         }
     }
     di
+}
+
+/// Recognise a Rust slice-reference DWARF name — `&[T]` or `&mut [T]` — and return the
+/// element's `(byte size, byte align, writable)`. `&mut` ⇒ writable. Only a **primitive**
+/// element is sized here (`u8`…`u128`, `i8`…`i128`, `usize`/`isize`, `f32`/`f64`, `bool`,
+/// `char`) — the common case for raw-memory slices (`&mut [u64]` page tables, `&[u8]`
+/// buffers). A composite element yields `None`, so its slice simply gets no region (sound:
+/// a conservative miss, never a wrong size). Returns `None` for any non-slice-reference name.
+fn slice_ref_elem(name: &str) -> Option<(u64, u32, bool)> {
+    let writable = name.starts_with("&mut ");
+    let rest = name.strip_prefix("&mut ").or_else(|| name.strip_prefix('&'))?;
+    let inner = rest.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let (size, align): (u64, u32) = match inner {
+        "u8" | "i8" | "bool" => (1, 1),
+        "u16" | "i16" => (2, 2),
+        "u32" | "i32" | "f32" | "char" => (4, 4),
+        "u64" | "i64" | "f64" | "usize" | "isize" => (8, 8),
+        "u128" | "i128" => (16, 16),
+        _ => return None,
+    };
+    Some((size, align, writable))
 }
 
 /// Parse a bare metadata tuple `!{!a, !b, …}` into its element ids, or `None` if

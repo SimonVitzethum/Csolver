@@ -3,7 +3,7 @@ use super::*;
 /// A parsed function body: its blocks, plus the `#dbg_value(<local>, !V, …)` pairs found in
 /// them — `(local name, !DILocalVariable id)`, the only place a local's declared type survives
 /// at `-O1`/`-O2` (see [`LFunc::dbg_values`]).
-pub(crate) type ParsedBody = (Vec<LBlock>, Vec<(String, u32)>);
+pub(crate) type ParsedBody = (Vec<LBlock>, Vec<(String, u32)>, Vec<(u32, u64)>);
 
 impl Parser {
     pub(crate) fn function(&mut self) -> Result<LFunc> {
@@ -68,7 +68,7 @@ impl Parser {
             self.pos += 1;
         }
         self.expect_punct('{')?;
-        let (blocks, dbg_values) = self.blocks(params.len())?;
+        let (blocks, dbg_values, dbg_slice_lens) = self.blocks(params.len())?;
         self.expect_punct('}')?;
         Ok(LFunc {
             name,
@@ -78,6 +78,7 @@ impl Parser {
             internal,
             dbg,
             dbg_values,
+            dbg_slice_lens,
         })
     }
 
@@ -85,6 +86,8 @@ impl Parser {
         let mut blocks = Vec::new();
         // `#dbg_value(<local>, !V, …)` pairs collected across the whole body (see below).
         let mut dbg_values: Vec<(String, u32)> = Vec::new();
+        // Slice-length fragments `(!V, len)` from `#dbg_value(iN len, !V, fragment 64 64)`.
+        let mut dbg_slice_lens: Vec<(u32, u64)> = Vec::new();
         let mut auto = 0;
         loop {
             self.skip_newlines();
@@ -129,12 +132,29 @@ impl Parser {
                 if matches!(self.peek(), Tok::Punct('#')) {
                     if matches!(self.peek2(), Tok::Word(w) if w == "dbg_value") {
                         let (mut local, mut var) = (None, None);
+                        // For a *constant-valued* record (the length fragment), the value operand
+                        // is an integer, and a `DW_OP_LLVM_fragment, <off>, 64` says which half of
+                        // a fat pointer it describes (`off = 64` ⇒ the length). Track both.
+                        let mut val_const: Option<u64> = None;
+                        let mut after_frag = false;
+                        let mut frag_off: Option<u64> = None;
                         let mut i = self.pos;
                         while !matches!(self.toks.get(i), Some(Tok::Newline) | Some(Tok::Eof) | None) {
                             match self.toks.get(i) {
                                 Some(Tok::Local(l)) if local.is_none() => local = Some(l.clone()),
-                                // The first `!<int>` after the value is the DILocalVariable ref.
-                                Some(Tok::Punct('!')) if local.is_some() && var.is_none() => {
+                                // The value operand's integer constant (before the `!V` ref, and
+                                // only when the value is not a local) — a fat-pointer field value.
+                                Some(Tok::Int(n)) if local.is_none() && var.is_none() && val_const.is_none() => {
+                                    val_const = u64::try_from(*n).ok();
+                                }
+                                Some(Tok::Word(w)) if w == "DW_OP_LLVM_fragment" => after_frag = true,
+                                // The fragment's first integer is its bit offset (0 = data, 64 = len).
+                                Some(Tok::Int(n)) if after_frag && frag_off.is_none() => {
+                                    frag_off = u64::try_from(*n).ok();
+                                }
+                                // The first `!<int>` after the value is the DILocalVariable ref
+                                // (present in both the pointer and the constant-length records).
+                                Some(Tok::Punct('!')) if var.is_none() => {
                                     if let Some(Tok::Int(n)) = self.toks.get(i + 1) {
                                         var = u32::try_from(*n).ok();
                                     }
@@ -143,8 +163,12 @@ impl Parser {
                             }
                             i += 1;
                         }
-                        if let (Some(l), Some(v)) = (local, var) {
-                            dbg_values.push((l, v));
+                        match (local, var, val_const, frag_off) {
+                            // Pointer fragment (or a whole-value record): ties the SSA local to `!V`.
+                            (Some(l), Some(v), _, _) => dbg_values.push((l, v)),
+                            // Length fragment of a fat pointer: `!V`'s slice is `len` elements long.
+                            (None, Some(v), Some(len), Some(64)) => dbg_slice_lens.push((v, len)),
+                            _ => {}
                         }
                     }
                     self.skip_to_eol();
@@ -167,7 +191,7 @@ impl Parser {
                 term,
             });
         }
-        Ok((blocks, dbg_values))
+        Ok((blocks, dbg_values, dbg_slice_lens))
     }
 
     pub(crate) fn try_terminator(&mut self) -> Result<Option<LTerm>> {

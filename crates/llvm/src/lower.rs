@@ -491,6 +491,23 @@ fn lower_function(
             }
         }
     }
+    // Rust slice references (`&[T]`/`&mut [T]`): a `from_raw_parts(ptr, N)` slice erases to a
+    // bare pointer at `-O`, but the element type survives as the local's DWARF type and the
+    // length `N` as a fat-pointer fragment (`dbg_slice_lens`). Join them by `!V` to size the
+    // backing region `N * sizeof(T)`. Applied via `PtrHint`, so it only takes effect under
+    // `--assume-valid-params` — the region's *validity* is the (unsafe) caller's contract,
+    // same as any raw-pointer parameter; the length itself is exact from the source.
+    let slice_lens: HashMap<u32, u64> = f.dbg_slice_lens.iter().copied().collect();
+    for (local, var) in &f.dbg_values {
+        if let (Some(&r), Some((elem, align, _writable)), Some(&len)) =
+            (ctx.regs.get(local), debuginfo.slice_local_elem(*var), slice_lens.get(var))
+        {
+            if let Some(size) = len.checked_mul(elem).filter(|&s| s > 0) {
+                // A slice hint never shrinks a region already recovered by a more specific rule.
+                reg_ptr_hints.entry(r).or_insert(PtrHint { size, align, tail: 0 });
+            }
+        }
+    }
     for (local, (size, struct_name)) in typed_gep_pointee_sizes(f) {
         if let Some(&r) = ctx.regs.get(local) {
             let align = struct_name
