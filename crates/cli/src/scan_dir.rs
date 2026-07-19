@@ -28,6 +28,57 @@ pub(crate) fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, Str
     Ok(ExitCode::SUCCESS)
 }
 
+/// Incremental, **de-duplicated** aggregate of the whole scan — folded per unit as it
+/// finishes, so no per-unit `FileScan` is retained. This is what keeps a full-kernel scan
+/// (37k units) within a few GB instead of tens: kernel `static inline`s are compiled into
+/// *every* translation unit, so the same function name / call edge / lock edge recurs in
+/// hundreds of units; the set/map dedup collapses those copies to one. The counts are
+/// running totals; the program-wide graph inputs (lock, race, call) are kept only in their
+/// deduplicated form, which is exactly what the end-of-scan oracles consume.
+#[derive(Default)]
+struct Agg {
+    pass: u64,
+    fail: u64,
+    unknown: u64,
+    dropped: u64,
+    errored: u64,
+    seen_find: std::collections::HashSet<FindingKey>,
+    findings: Vec<Finding>,
+    lock_edges: std::collections::HashSet<(String, String, String)>,
+    race_accesses: std::collections::HashSet<(String, String, bool, Vec<String>)>,
+    race_traces: std::collections::HashSet<(String, Vec<(u8, String)>)>,
+    call_edges: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    defined_fns: std::collections::HashSet<String>,
+    addr_taken: std::collections::HashSet<String>,
+    indirect_callers: std::collections::HashSet<String>,
+}
+
+impl Agg {
+    /// Fold one finished unit's result in, deduplicating. Consumes `fs` (its strings move
+    /// into the shared sets/maps or are dropped), so the unit's memory is released at once.
+    fn fold(&mut self, fs: FileScan) {
+        self.pass += fs.pass;
+        self.fail += fs.fail;
+        self.unknown += fs.unknown;
+        self.dropped += fs.dropped;
+        self.errored += fs.errored;
+        for f in fs.findings {
+            if self.seen_find.insert(finding_key(&f)) {
+                self.findings.push(f);
+            }
+        }
+        self.lock_edges.extend(fs.lock_edges);
+        self.race_accesses.extend(fs.race_accesses);
+        self.race_traces.extend(fs.race_traces);
+        for (caller, callees) in fs.call_edges {
+            self.call_edges.entry(caller).or_default().extend(callees);
+        }
+        self.defined_fns.extend(fs.defined_fns);
+        self.addr_taken.extend(fs.addr_taken);
+        self.indirect_callers.extend(fs.indirect_callers);
+    }
+}
+
 pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) -> Result<ExitCode, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -129,7 +180,9 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // Byte-identical units are verified once (see `scan_one_unit`): skips re-analysis of
     // literally duplicated files and keeps the coverage counts free of those duplicates.
     let content_seen: Mutex<std::collections::HashSet<u64>> = Mutex::new(std::collections::HashSet::new());
-    let results: Mutex<Vec<(usize, FileScan)>> = Mutex::new(Vec::with_capacity(total_units));
+    // Incremental de-duplicated aggregate (see `Agg`): folded per unit, so no per-unit
+    // `FileScan` is retained — this is what bounds peak memory on a full-kernel scan.
+    let agg: Mutex<Agg> = Mutex::new(Agg::default());
     // Units whose exploration hit the budget: deferred to a full-effort serial phase
     // instead of being counted as Unknown now (A3 — "pause the file until the others
     // are done, then finish it with the whole machine").
@@ -163,7 +216,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
                     deferred.lock().unwrap_or_else(|p| p.into_inner()).push(i);
                 } else {
                     stream_findings(&fs, &found, &seen_find);
-                    results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
+                    agg.lock().unwrap_or_else(|p| p.into_inner()).fold(fs);
                 }
             });
         }
@@ -185,41 +238,40 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
             let (label, unit) = &units[i];
             let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen, wp_ctx);
             stream_findings(&fs, &found, &seen_find);
-            results.lock().unwrap_or_else(|p| p.into_inner()).push((i, fs));
+            agg.lock().unwrap_or_else(|p| p.into_inner()).fold(fs);
         }
     }
 
-    // Aggregate in unit order (deterministic output).
-    let mut all = results.into_inner().unwrap_or_else(|p| p.into_inner());
-    all.sort_by_key(|(i, _)| *i);
-    let (mut pass, mut fail, mut unknown, mut dropped, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    let mut findings: Vec<Finding> = Vec::new();
-    let mut lock_edges: Vec<(String, String, String)> = Vec::new();
-    let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
-    let mut race_traces: Vec<(String, Vec<(u8, String)>)> = Vec::new();
-    let mut call_edges: Vec<(String, Vec<String>)> = Vec::new();
-    let mut defined_fns: Vec<String> = Vec::new();
-    let mut addr_taken: Vec<String> = Vec::new();
-    let mut indirect_callers: Vec<String> = Vec::new();
-    for (_, fs) in all {
-        pass += fs.pass;
-        fail += fs.fail;
-        unknown += fs.unknown;
-        dropped += fs.dropped;
-        errored += fs.errored;
-        findings.extend(fs.findings);
-        lock_edges.extend(fs.lock_edges);
-        race_accesses.extend(fs.race_accesses);
-        race_traces.extend(fs.race_traces);
-        call_edges.extend(fs.call_edges);
-        defined_fns.extend(fs.defined_fns);
-        addr_taken.extend(fs.addr_taken);
-        indirect_callers.extend(fs.indirect_callers);
-    }
-    // De-duplicate the inventory: the same bug in many files (a duplicated / static-inline
-    // function) is one finding, not N. Keeps the first (unit-ordered) occurrence.
-    let mut seen: std::collections::HashSet<FindingKey> = std::collections::HashSet::new();
-    findings.retain(|f| seen.insert(finding_key(f)));
+    // Extract the incremental aggregate. The per-unit `FileScan`s were folded in (and freed)
+    // as the scan ran, deduplicated (see `Agg`), so this is already the whole-program view;
+    // the graph inputs only need converting from their set/map form to the slices the oracles
+    // take. Findings were deduped on the fly; sort them for deterministic report order (the
+    // fold order is worker-completion order, not unit order).
+    let Agg {
+        pass,
+        fail,
+        unknown,
+        dropped,
+        errored,
+        seen_find: _,
+        mut findings,
+        lock_edges,
+        race_accesses,
+        race_traces,
+        call_edges,
+        defined_fns,
+        addr_taken,
+        indirect_callers,
+    } = agg.into_inner().unwrap_or_else(|p| p.into_inner());
+    findings.sort_by_cached_key(finding_key);
+    let lock_edges: Vec<(String, String, String)> = lock_edges.into_iter().collect();
+    let race_accesses: Vec<(String, String, bool, Vec<String>)> = race_accesses.into_iter().collect();
+    let race_traces: Vec<(String, Vec<(u8, String)>)> = race_traces.into_iter().collect();
+    let call_edges: Vec<(String, Vec<String>)> =
+        call_edges.into_iter().map(|(c, cs)| (c, cs.into_iter().collect())).collect();
+    let defined_fns: Vec<String> = defined_fns.into_iter().collect();
+    let addr_taken: Vec<String> = addr_taken.into_iter().collect();
+    let indirect_callers: Vec<String> = indirect_callers.into_iter().collect();
 
     // Attack-surface reporting lens (opt-in `--attack-surface`): keep only findings in
     // functions directly reachable from a syscall / `*ioctl*` entry, dropping the internal
