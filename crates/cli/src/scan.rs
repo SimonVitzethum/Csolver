@@ -240,6 +240,66 @@ pub(crate) fn await_memory(active: &std::sync::atomic::AtomicUsize) {
     }
 }
 
+/// **Working-set memory budget** (MiB) for the size-aware scan backpressure. `CSOLVER_MEM_TARGET_MB`
+/// if set; otherwise ~70 % of the memory available *right now*, so it **adapts to co-tenancy** — a
+/// machine already busy (e.g. sharing RAM with another job) yields a smaller budget, a free machine
+/// a larger one. Meant to be sampled once *after* pass 1, so the whole-program facts already
+/// resident are reflected in `available_mb()`. `u64::MAX` (no throttle) when meminfo is unreadable.
+pub(crate) fn mem_budget_mb() -> u64 {
+    if let Some(t) = std::env::var("CSOLVER_MEM_TARGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+    {
+        return t;
+    }
+    match available_mb() {
+        u64::MAX => u64::MAX,
+        a => a / 10 * 7,
+    }
+}
+
+/// Estimated peak resident memory (MiB) to analyse a unit holding `input_bytes` of `.ll` text:
+/// a fixed base plus a multiple of the input size — LLVM IR **text** expands to the in-memory IR
+/// plus the symbolic-execution / SAT state, and a cross-file unit links a whole directory into one
+/// module, so a big directory (AMD-display DML, `fs`, `net`) is the memory hog. `CSOLVER_MEM_FACTOR`
+/// overrides the multiple (default 12×). Deliberately an over-estimate: better to under-subscribe
+/// than to OOM. This lets many small units run concurrently while throttling concurrent *large* ones.
+pub(crate) fn unit_cost_mb(input_bytes: u64) -> u64 {
+    const BASE_MB: u64 = 64;
+    let factor = std::env::var("CSOLVER_MEM_FACTOR")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(12);
+    BASE_MB + input_bytes / (1024 * 1024) * factor
+}
+
+/// Reserve `cost_mb` of the working-set `budget_mb`, blocking until it fits alongside the units
+/// already in flight (`reserved`). **Progress guarantee:** if nothing is in flight (`reserved == 0`)
+/// the unit proceeds even when it alone exceeds the budget, so the scan never deadlocks on a single
+/// oversized unit. The caller MUST release with `reserved.fetch_sub(cost_mb, …)` when the unit
+/// finishes. Soundness- and result-neutral: it changes only *when* a unit starts running (fewer
+/// concurrent large modules ⇒ lower peak RSS), never *what* is analysed. Replaces the flat-reserve
+/// [`await_memory`] for the main directory scan, where per-unit sizes vary by orders of magnitude.
+pub(crate) fn reserve_budget(reserved: &std::sync::atomic::AtomicU64, cost_mb: u64, budget_mb: u64) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let r = reserved.load(Ordering::Acquire);
+        if r == 0 || r + cost_mb <= budget_mb {
+            // Reserve atomically; if another worker reserved first, retry the decision.
+            if reserved
+                .compare_exchange(r, r + cost_mb, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
 /// Worker count for the parallel scan/lowering loops. `CSOLVER_JOBS`, when set,
 /// caps it — a soundness-neutral RAM lever: fewer concurrent units means fewer
 /// large modules resident at once (lower peak memory), while every unit is still

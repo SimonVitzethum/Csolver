@@ -227,10 +227,16 @@ solver facts <dir> [--closed-world]         # streaming whole-program facts (no 
 ```
 
 **Memory / parallelism knobs** (soundness-neutral — they only throttle; every unit
-is still analysed identically): `CSOLVER_JOBS=<n>` caps the worker count (fewer
-concurrent modules ⇒ lower peak RSS), `CSOLVER_MEM_RESERVE_MB=<n>` raises the
-per-in-flight memory reserve so fewer large modules start together. Use them to fit
-a whole-kernel `--cross-file` scan under a memory ceiling.
+is still analysed identically): the directory scan uses **size-aware, budget-adaptive
+backpressure** — each unit reserves an estimated peak (∝ its `.ll` bytes) against a
+working-set budget, so a big cross-file directory (AMD-display DML, `fs`, `net`) waits for
+room instead of piling many multi-GB modules into RAM at once, while small units never wait.
+The budget defaults to **~70 % of the memory free when pass 1 finishes**, so it *adapts to
+co-tenancy* (a machine already busy gets a smaller budget) and keeps RSS tracking it rather
+than the 16-big-modules worst case. Override with `CSOLVER_MEM_TARGET_MB=<n>` (a hard
+working-set ceiling); `CSOLVER_MEM_FACTOR=<k>` tunes the per-MiB cost estimate (default 12).
+`CSOLVER_JOBS=<n>` still caps the worker count. Use these to fit a whole-kernel
+`--cross-file` scan under a memory ceiling.
 
 **Pause / resume a long scan** (`CSOLVER_PAUSE_FILE=<path>`): launch a `scan` with this
 set, then `touch <path>` to pause and `rm <path>` to resume. The scan checks the file at

@@ -137,6 +137,13 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
             .collect()
     };
     let total_units = units.len();
+    // Per-unit input size (bytes of `.ll` text) — the size-aware backpressure reserves memory
+    // proportional to this, so a big cross-file directory throttles concurrent starts while many
+    // small units run freely. A one-time `stat` per file; cheap next to lowering + analysis.
+    let unit_sizes: Vec<u64> = units
+        .iter()
+        .map(|(_, ps)| ps.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum())
+        .collect();
 
     // Parallelise across UNITS (work-stealing). With many units (a big tree) each worker
     // takes a whole core; with few large units (cross-file groups) we also hand each unit
@@ -163,15 +170,23 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or((cores / workers).max(1))
         .max(1);
+    // Working-set memory budget for the size-aware backpressure — sampled *now*, after pass 1,
+    // so the whole-program facts already resident are reflected and the budget adapts to how much
+    // RAM is actually free (co-tenancy aware). The scan keeps the concurrent set of in-flight
+    // units within this budget, so RSS tracks it instead of the 16-big-modules worst case.
+    let budget_mb = mem_budget_mb();
     eprintln!(
-        "scanning {total_files} .ll files under {} … ({total_units} units, {workers} workers × {threads_per_unit} threads{})",
+        "scanning {total_files} .ll files under {} … ({total_units} units, {workers} workers × {threads_per_unit} threads{}; mem budget {} MiB{})",
         dir.display(),
-        if cross_file { ", cross-file" } else { "" }
+        if cross_file { ", cross-file" } else { "" },
+        budget_mb,
+        if std::env::var_os("CSOLVER_MEM_TARGET_MB").is_some() { "" } else { ", ~70% of free — CSOLVER_MEM_TARGET_MB to set" },
     );
 
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let active = AtomicUsize::new(0);
+    // Reserved working-set memory (MiB) across in-flight units — the size-aware backpressure.
+    let reserved = std::sync::atomic::AtomicU64::new(0);
     // Live findings counter + de-dup set: each bug is streamed to stderr the moment its
     // unit finishes (unbuffered, so a long scan surfaces bugs as they are found — visible
     // in `tail -f`), and the same bug appearing in many files is reported once.
@@ -199,13 +214,15 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
                 if i >= total_units {
                     break;
                 }
-                // Memory backpressure: hold off starting this file while RAM is tight and
-                // other files are still in flight (they free memory as they finish).
-                await_memory(&active);
-                active.fetch_add(1, Ordering::Relaxed);
+                // Size-aware memory backpressure: reserve this unit's estimated peak against the
+                // working-set budget, blocking until it fits alongside the units already running.
+                // A big cross-file directory therefore waits for room instead of piling 16 giant
+                // modules into RAM at once; small units never wait. Released after the unit.
+                let cost = unit_cost_mb(unit_sizes[i]);
+                reserve_budget(&reserved, cost, budget_mb);
                 let (label, unit) = &units[i];
                 let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit, &content_seen, wp_ctx);
-                active.fetch_sub(1, Ordering::Relaxed);
+                reserved.fetch_sub(cost, Ordering::Relaxed);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d.is_multiple_of(50) {
                     eprintln!("  … {d}/{total_units} units");

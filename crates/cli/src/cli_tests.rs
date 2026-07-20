@@ -78,6 +78,27 @@ fn whole_program_oracle_admits_indirect_targets() {
 /// guard. A `PASS` set means nothing if a function silently never reached the
 /// analyzer.
 #[test]
+fn size_aware_backpressure_reserves_and_guarantees_progress() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Cost scales with input size (12×/MiB by default, plus a 64 MiB base).
+    assert_eq!(unit_cost_mb(0), 64);
+    assert_eq!(unit_cost_mb(10 * 1024 * 1024), 64 + 120);
+
+    let reserved = AtomicU64::new(0);
+    // A unit that fits is admitted and reserves its cost.
+    reserve_budget(&reserved, 500, 1000);
+    assert_eq!(reserved.load(Ordering::Relaxed), 500);
+    // A second unit that still fits (500 + 400 ≤ 1000) is admitted too.
+    reserve_budget(&reserved, 400, 1000);
+    assert_eq!(reserved.load(Ordering::Relaxed), 900);
+    // Progress guarantee: with nothing in flight, a unit larger than the whole budget still
+    // runs (never a deadlock on one oversized cross-file directory).
+    reserved.store(0, Ordering::Relaxed);
+    reserve_budget(&reserved, 5000, 1000);
+    assert_eq!(reserved.load(Ordering::Relaxed), 5000);
+}
+
+#[test]
 fn attack_surface_keeps_syscall_ioctl_reachable_only() {
     // foo_ioctl (matches *ioctl*) → helper ; __x64_sys_read (syscall) → vfs_read ;
     // drm_reg_write → reg_poke is an internal driver callback: in the real kernel it is
