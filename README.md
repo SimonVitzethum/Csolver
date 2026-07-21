@@ -238,6 +238,16 @@ working-set ceiling); `CSOLVER_MEM_FACTOR=<k>` tunes the per-MiB cost estimate (
 `CSOLVER_JOBS=<n>` still caps the worker count. Use these to fit a whole-kernel
 `--cross-file` scan under a memory ceiling.
 
+**Restart safety** (`CSOLVER_SCAN_CHECKPOINT=<file>`): a long full-kernel scan that is
+interrupted — crash, reboot, OOM, `kill` — **resumes from where it left off** instead of
+redoing everything. Set the env var to a checkpoint path; the scan records each finished
+unit, the coverage counts, and the de-duplicated findings, rewriting the file atomically
+every ~50 units. On restart with the same path it logs `resuming from checkpoint: N of M
+units already done`, skips those units, and continues; a re-run after completion goes
+straight to the report. (The program-wide concurrency graph is not checkpointed, so the
+race/lock oracle reports cover only the resumed pass's units — the memory-safety findings
+and coverage, the payload, are fully recovered.) Unset ⇒ no checkpoint.
+
 **Pause / resume a long scan** (`CSOLVER_PAUSE_FILE=<path>`): launch a `scan` with this
 set, then `touch <path>` to pause and `rm <path>` to resume. The scan checks the file at
 **unit boundaries** (never mid-analysis), so a pause withholds *starting the next unit*

@@ -51,12 +51,17 @@ struct Agg {
     defined_fns: std::collections::HashSet<String>,
     addr_taken: std::collections::HashSet<String>,
     indirect_callers: std::collections::HashSet<String>,
+    /// Labels of units already folded in — the resume set. On a checkpointed scan these are
+    /// written out and, on restart, reloaded so their units are skipped rather than re-scanned.
+    done: std::collections::HashSet<String>,
 }
 
 impl Agg {
     /// Fold one finished unit's result in, deduplicating. Consumes `fs` (its strings move
     /// into the shared sets/maps or are dropped), so the unit's memory is released at once.
-    fn fold(&mut self, fs: FileScan) {
+    /// `label` records the unit as done (for checkpoint/resume).
+    fn fold(&mut self, label: &str, fs: FileScan) {
+        self.done.insert(label.to_string());
         self.pass += fs.pass;
         self.fail += fs.fail;
         self.unknown += fs.unknown;
@@ -77,6 +82,88 @@ impl Agg {
         self.addr_taken.extend(fs.addr_taken);
         self.indirect_callers.extend(fs.indirect_callers);
     }
+}
+
+/// Escape a field for the one-record-per-line checkpoint format: tabs and newlines (which the
+/// format uses as separators) become spaces. Function names, witnesses and paths never contain
+/// them in practice; this only guards against a pathological name corrupting the file.
+fn ckpt_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+/// **Write the scan checkpoint** atomically (temp file + rename), so a crash/reboot mid-write
+/// never corrupts it. Records the coverage counts, every finished unit's label (the resume set),
+/// and the de-duplicated findings — enough to reconstruct the coverage report and the full bug
+/// inventory after a restart. The program-wide *concurrency* graph (lock/race/call) is NOT
+/// checkpointed: those oracles re-run over whatever units the resumed pass covers, so their
+/// reports may be partial after a resume — an accepted trade-off, as the memory-safety findings
+/// and coverage (the payload) are fully recovered and the race report is intentionally capped.
+fn write_checkpoint(path: &Path, agg: &Agg) {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(agg.findings.len() * 64 + agg.done.len() * 32);
+    s.push_str("CSOLVER-SCAN-CKPT 1\n");
+    let _ = writeln!(s, "C\t{}\t{}\t{}\t{}\t{}", agg.pass, agg.fail, agg.unknown, agg.dropped, agg.errored);
+    for label in &agg.done {
+        let _ = writeln!(s, "D\t{}", ckpt_field(label));
+    }
+    for f in &agg.findings {
+        let _ = writeln!(
+            s, "F\t{}\t{}\t{}\t{}",
+            ckpt_field(&f.file), ckpt_field(&f.function), ckpt_field(&f.property), ckpt_field(&f.witness),
+        );
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, s.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// **Load a scan checkpoint** written by [`write_checkpoint`], seeding an `Agg` with the counts,
+/// resume set (`done`) and findings from the interrupted run. Returns `None` if the file is
+/// absent or not a recognised checkpoint (a fresh scan). Unknown/short lines are skipped, so a
+/// checkpoint truncated by a crash still loads every complete record before the tear-off.
+fn read_checkpoint(path: &Path) -> Option<Agg> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "CSOLVER-SCAN-CKPT 1" {
+        return None;
+    }
+    let mut agg = Agg::default();
+    for line in lines {
+        let mut it = line.split('\t');
+        match it.next() {
+            Some("C") => {
+                let mut n = || it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                agg.pass = n();
+                agg.fail = n();
+                agg.unknown = n();
+                agg.dropped = n();
+                agg.errored = n();
+            }
+            Some("D") => {
+                if let Some(label) = it.next() {
+                    agg.done.insert(label.to_string());
+                }
+            }
+            Some("F") => {
+                if let (Some(file), Some(function), Some(property), Some(witness)) =
+                    (it.next(), it.next(), it.next(), it.next())
+                {
+                    let f = Finding {
+                        file: file.to_string(),
+                        function: function.to_string(),
+                        property: property.to_string(),
+                        witness: witness.to_string(),
+                    };
+                    if agg.seen_find.insert(finding_key(&f)) {
+                        agg.findings.push(f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(agg)
 }
 
 pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) -> Result<ExitCode, String> {
@@ -195,9 +282,27 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // Byte-identical units are verified once (see `scan_one_unit`): skips re-analysis of
     // literally duplicated files and keeps the coverage counts free of those duplicates.
     let content_seen: Mutex<std::collections::HashSet<u64>> = Mutex::new(std::collections::HashSet::new());
+    // **Restart safety** (opt-in `CSOLVER_SCAN_CHECKPOINT=<file>`): a long full-kernel scan that
+    // is interrupted (crash, reboot, OOM, kill) resumes from where it left off instead of redoing
+    // everything. The checkpoint records finished units + their counts + findings; on start it is
+    // loaded, its units are skipped, and it is rewritten periodically. Absent env ⇒ no checkpoint.
+    let checkpoint: Option<std::path::PathBuf> = std::env::var_os("CSOLVER_SCAN_CHECKPOINT").map(Into::into);
+    let (initial_agg, resume_done) = match checkpoint.as_deref().and_then(read_checkpoint) {
+        Some(a) => {
+            eprintln!(
+                "  resuming from checkpoint: {} of {total_units} units already done, {} findings recovered",
+                a.done.len(),
+                a.findings.len(),
+            );
+            let done_set = a.done.clone();
+            (a, done_set)
+        }
+        None => (Agg::default(), std::collections::HashSet::new()),
+    };
+    done.fetch_add(resume_done.len(), Ordering::Relaxed);
     // Incremental de-duplicated aggregate (see `Agg`): folded per unit, so no per-unit
     // `FileScan` is retained — this is what bounds peak memory on a full-kernel scan.
-    let agg: Mutex<Agg> = Mutex::new(Agg::default());
+    let agg: Mutex<Agg> = Mutex::new(initial_agg);
     // Units whose exploration hit the budget: deferred to a full-effort serial phase
     // instead of being counted as Unknown now (A3 — "pause the file until the others
     // are done, then finish it with the whole machine").
@@ -214,13 +319,18 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
                 if i >= total_units {
                     break;
                 }
+                let (label, unit) = &units[i];
+                // Restart safety: a unit finished in a prior checkpointed run is already counted
+                // and its findings recovered — skip it (no re-scan, no memory reserved).
+                if resume_done.contains(label) {
+                    continue;
+                }
                 // Size-aware memory backpressure: reserve this unit's estimated peak against the
                 // working-set budget, blocking until it fits alongside the units already running.
                 // A big cross-file directory therefore waits for room instead of piling 16 giant
                 // modules into RAM at once; small units never wait. Released after the unit.
                 let cost = unit_cost_mb(unit_sizes[i]);
                 reserve_budget(&reserved, cost, budget_mb);
-                let (label, unit) = &units[i];
                 let fs = scan_one_unit(unit, label, dir, config, cross_file, threads_per_unit, &content_seen, wp_ctx);
                 reserved.fetch_sub(cost, Ordering::Relaxed);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -233,7 +343,15 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
                     deferred.lock().unwrap_or_else(|p| p.into_inner()).push(i);
                 } else {
                     stream_findings(&fs, &found, &seen_find);
-                    agg.lock().unwrap_or_else(|p| p.into_inner()).fold(fs);
+                    let mut g = agg.lock().unwrap_or_else(|p| p.into_inner());
+                    g.fold(label, fs);
+                    // Restart safety: persist progress periodically (atomic write), so an
+                    // interruption costs at most the last ~50 units, not the whole run.
+                    if let Some(cp) = &checkpoint {
+                        if d.is_multiple_of(50) {
+                            write_checkpoint(cp, &g);
+                        }
+                    }
                 }
             });
         }
@@ -255,8 +373,13 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
             let (label, unit) = &units[i];
             let fs = scan_one_unit(unit, label, dir, &unbounded, cross_file, all_threads, &content_seen, wp_ctx);
             stream_findings(&fs, &found, &seen_find);
-            agg.lock().unwrap_or_else(|p| p.into_inner()).fold(fs);
+            agg.lock().unwrap_or_else(|p| p.into_inner()).fold(label, fs);
         }
+    }
+    // Final checkpoint: the run completed, so the checkpoint now reflects every unit — a
+    // re-run with it present skips straight to the report instead of re-scanning.
+    if let Some(cp) = &checkpoint {
+        write_checkpoint(cp, &agg.lock().unwrap_or_else(|p| p.into_inner()));
     }
 
     // Extract the incremental aggregate. The per-unit `FileScan`s were folded in (and freed)
@@ -279,6 +402,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         defined_fns,
         addr_taken,
         indirect_callers,
+        done: _,
     } = agg.into_inner().unwrap_or_else(|p| p.into_inner());
     findings.sort_by_cached_key(finding_key);
     let lock_edges: Vec<(String, String, String)> = lock_edges.into_iter().collect();
