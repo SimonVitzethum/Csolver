@@ -402,6 +402,17 @@ pub(crate) fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
                 // no-op intrinsics stay argument-free.
                 let ptr = args.last().and_then(|a| ctx.operand(a, 64).ok());
                 Inst::Intrinsic { dst, name: callee.clone(), args: ptr.into_iter().collect() }
+            } else if is_ptr_identity_intrinsic(callee) {
+                // Returns its pointer argument unchanged (same address + provenance): lower to an
+                // identity copy so provenance survives instead of being havoc'd to a fresh scalar
+                // (the `intrinsic/asm` scalar-as-pointer residual). Sound — address-preserving by
+                // the LLVM spec. Falls back to a no-op if the argument/dst is missing.
+                match (dst, args.first().and_then(|a| ctx.operand(a, 64).ok())) {
+                    (Some(d), Some(p)) => {
+                        Inst::Assign { dst: d, ty: Type::ptr(Type::int(8)), value: RValue::Use(p) }
+                    }
+                    _ => Inst::Intrinsic { dst, name: callee.clone(), args: Vec::new() },
+                }
             } else if is_noop_intrinsic(callee) {
                 // Modelled as a no-op (does not touch caller-visible memory).
                 Inst::Intrinsic { dst, name: callee.clone(), args: Vec::new() }

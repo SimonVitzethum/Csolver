@@ -269,3 +269,19 @@ pub(crate) fn is_noop_intrinsic(name: &str) -> bool {
         || name.starts_with("llvm.expect")
         || name == "llvm.assume"
 }
+
+/// Intrinsics that return their **pointer argument unchanged** — same address and provenance,
+/// by the LLVM spec: the invariant-group launder/strip/barrier (an optimisation fence that
+/// forbids no memory), `llvm.ptr.annotation` (returns the annotated pointer), and `llvm.ssa.copy`
+/// (a value copy the optimiser inserts). Lowered to an identity copy so provenance flows through
+/// the normal copy path instead of being havoc'd to a fresh scalar (the `intrinsic/asm`
+/// scalar-as-pointer UNKNOWN cause). Must be checked **before** [`is_noop_intrinsic`], since the
+/// group barrier also matches the `llvm.invariant.` prefix — but `llvm.invariant.start/end` (a
+/// memory-invariant descriptor / void, *not* a forwarded pointer) must stay a no-op.
+pub(crate) fn is_ptr_identity_intrinsic(name: &str) -> bool {
+    name.starts_with("llvm.launder.invariant.group")
+        || name.starts_with("llvm.strip.invariant.group")
+        || name.starts_with("llvm.invariant.group.barrier")
+        || name.starts_with("llvm.ptr.annotation")
+        || name == "llvm.ssa.copy"
+}

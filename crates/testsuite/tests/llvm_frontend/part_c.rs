@@ -102,6 +102,32 @@ entry:
         "the ValidRef return summary sizes the call result so the access proves");
 }
 
+/// A pointer laundered through `llvm.launder.invariant.group` keeps its provenance: an access
+/// through the laundered pointer is decided exactly as through the original. Without forwarding
+/// the intrinsic's result the pointer would be havoc'd to a fresh scalar (the `intrinsic/asm`
+/// scalar-as-pointer UNKNOWN cause) and the safe store would go UNKNOWN. In-bounds ⇒ PASS; the
+/// out-of-bounds counterpart still refutes (provenance is preserved, not fabricated).
+#[test]
+fn launder_invariant_group_preserves_pointer_provenance() {
+    let mk = |off: i64| format!(r#"
+declare ptr @llvm.launder.invariant.group.p0(ptr)
+define void @f() {{
+entry:
+  %arr = alloca [4 x i32], align 4
+  %p = call ptr @llvm.launder.invariant.group.p0(ptr %arr)
+  %q = getelementptr inbounds i32, ptr %p, i64 {off}
+  store i32 7, ptr %q, align 4
+  ret void
+}}
+"#);
+    let safe = LlvmFrontend.lower(LlvmInput { source: mk(2).into(), name: "c".into() }).expect("lower");
+    assert_eq!(verify_module(&safe, &Config::default()).verdict, Verdict::Pass,
+        "an in-bounds store through a laundered pointer proves (provenance preserved)");
+    let oob = LlvmFrontend.lower(LlvmInput { source: mk(9).into(), name: "c".into() }).expect("lower");
+    assert_eq!(verify_module(&oob, &Config::default()).verdict, Verdict::Fail,
+        "an out-of-bounds store through a laundered pointer still refutes");
+}
+
 /// `--assume-field-invariants` also assumes a **guarded array index** is in-bounds: the kernel
 /// idiom `if (i >= n) return -EINVAL; … arr[i]`, where the guard's bound `n` is the array's own
 /// length (a struct invariant the type system does not record). The per-path solver havocs the
