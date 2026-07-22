@@ -178,12 +178,20 @@ pub fn summarize_module(module: &Module) -> HashMap<FuncId, Summary> {
     loop {
         let mut changed = false;
         for f in &module.functions {
-            let inherits = map.get(&f.id).is_some_and(|s| s.ret == RetSummary::Unknown)
-                && ret_callee[&f.id]
-                    .is_some_and(|g| map.get(&g).is_some_and(|s| s.ret == RetSummary::DanglingStack));
-            if inherits {
+            if !map.get(&f.id).is_some_and(|s| s.ret == RetSummary::Unknown) {
+                continue;
+            }
+            // A wrapper that returns callee `g`'s result verbatim inherits `g`'s return
+            // characterization when it composes argument-independently (dangling / fresh alloc /
+            // typed valid reference — see `composes_through_wrapper`). Monotone (`Unknown → concrete`
+            // once per function), so the loop terminates.
+            let inherited = ret_callee[&f.id]
+                .and_then(|g| map.get(&g))
+                .map(|s| s.ret.clone())
+                .filter(RetSummary::composes_through_wrapper);
+            if let Some(ret) = inherited {
                 if let Some(s) = map.get_mut(&f.id) {
-                    s.ret = RetSummary::DanglingStack;
+                    s.ret = ret;
                     changed = true;
                 }
             }

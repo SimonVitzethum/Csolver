@@ -421,6 +421,29 @@ impl Explorer<'_> {
                         borrow: None,
                     })
                 }
+                // The callee returns a valid typed reference (a field accessor,
+                // `return sk->sk_prot;`) on every path — the frontend recovered the pointee
+                // size as a `RefWitness`. Hand the caller a sized valid-reference region (the
+                // same region the `RefWitness` arm builds), so accesses through the result are
+                // decided instead of the opaque `POrigin::Call`. A raw-pointer field (`assumed`)
+                // is valid only under `--assume-valid-params`; without the opt-in the call
+                // still havocs (no false PASS). A real `&T` field is unconditional.
+                Some(&RetSummary::ValidRef { size, align, writable, assumed }) => {
+                    if assumed && !self.assume_valid_params {
+                        self.fresh_value(ret_ty, POrigin::Call)
+                    } else {
+                        if assumed {
+                            self.assumptions.insert(PARAM_VALID);
+                        }
+                        let rid = self.materialize_ref_region(size, writable, assumed, state);
+                        SymValue::Ptr(SymPointer {
+                            prov: Prov::Region(rid),
+                            offset: self.ctx.int(PTR_WIDTH, 0),
+                            align: (align as u64).max(1),
+                            borrow: None,
+                        })
+                    }
+                }
                 // No precise summary, but the result type is a reference: it is
                 // valid by Rust's type invariant (a safe callee cannot return a
                 // dangling `&T`). Materialise a valid-reference region instead of

@@ -565,6 +565,74 @@ fn returning_a_local_stack_pointer_is_dangling() {
     );
 }
 
+/// A field accessor (`return sk->sk_prot;`) whose loaded result the frontend typed as a
+/// `RefWitness` summarizes to `RetSummary::ValidRef` of the recovered pointee size — so a
+/// caller sizes the returned pointer instead of havocking it (the dominant `opaque call
+/// result` cause). A plain wrapper that returns such an accessor inherits it, and a disagreeing
+/// second return degrades to `Unknown` (a *must* result).
+#[test]
+fn field_accessor_summarizes_to_valid_ref_and_composes_through_a_wrapper() {
+    let base = RegId(0);
+    let loaded = RegId(1);
+    // fn get(base) { return load(base) [typed &struct of 48 bytes] }
+    let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(Some(Operand::Reg(loaded))));
+    bb.insts.push(Inst::Load {
+        dst: loaded,
+        ty: Type::ptr(Type::int(8)),
+        ptr: Operand::Reg(base),
+        align: 8,
+        volatile: false,
+    });
+    bb.insts.push(Inst::RefWitness {
+        dst: loaded,
+        size: Some(48),
+        align: 8,
+        writable: true,
+        assumed: true,
+        src: Some(Operand::Reg(base)),
+    });
+    let get = Function {
+        id: FuncId(0),
+        name: "get".into(),
+        params: vec![(base, Type::ptr(Type::int(8)))],
+        ret_ty: Type::ptr(Type::int(8)),
+        blocks: vec![bb],
+        entry: BlockId(0),
+    };
+    assert_eq!(
+        summarize_fn(&get).ret,
+        RetSummary::ValidRef { size: Some(48), align: 8, writable: true, assumed: true },
+        "a loaded typed field pointer is a valid-reference return"
+    );
+
+    // fn wrap(base) { return get(base) } — inherits the accessor's ValidRef through the fixpoint.
+    let mut wb = BasicBlock::new(BlockId(0), Terminator::Return(Some(Operand::Reg(loaded))));
+    wb.insts.push(Inst::Call {
+        dst: Some(loaded),
+        callee: Callee::Direct(FuncId(0)),
+        args: vec![Operand::Reg(base)],
+        ret_ty: Type::ptr(Type::int(8)),
+        ret_ref: None,
+    });
+    let wrap = Function {
+        id: FuncId(1),
+        name: "wrap".into(),
+        params: vec![(base, Type::ptr(Type::int(8)))],
+        ret_ty: Type::ptr(Type::int(8)),
+        blocks: vec![wb],
+        entry: BlockId(0),
+    };
+    let mut module = Module::new("m");
+    module.functions.push(get);
+    module.functions.push(wrap);
+    let summ = summarize_module(&module);
+    assert_eq!(
+        summ[&FuncId(1)].ret,
+        RetSummary::ValidRef { size: Some(48), align: 8, writable: true, assumed: true },
+        "a plain wrapper inherits the field accessor's valid-reference return"
+    );
+}
+
 /// Disagreeing return sites (`ret p` vs `ret p+4`) must yield `Unknown` —
 /// the caller trusts a summary to rebuild the result *exactly*, so a "may"
 /// summary would be unsound. Likewise a loop-varying pointer: the back-edge

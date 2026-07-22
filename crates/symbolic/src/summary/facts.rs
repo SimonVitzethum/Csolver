@@ -223,10 +223,14 @@ impl SummaryFacts {
         loop {
             let mut changed = false;
             for gid in 0..n {
-                if summ[gid].ret == RetSummary::Unknown
-                    && ret_callee[gid].is_some_and(|g| summ[g.0 as usize].ret == RetSummary::DanglingStack)
-                {
-                    summ[gid].ret = RetSummary::DanglingStack;
+                if summ[gid].ret != RetSummary::Unknown {
+                    continue;
+                }
+                let inherited = ret_callee[gid]
+                    .map(|g| summ[g.0 as usize].ret.clone())
+                    .filter(RetSummary::composes_through_wrapper);
+                if let Some(ret) = inherited {
+                    summ[gid].ret = ret;
                     changed = true;
                 }
             }

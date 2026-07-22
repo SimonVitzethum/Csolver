@@ -119,6 +119,42 @@ pub enum RetSummary {
         /// leaves it unsized (a live, non-null region whose bounds stay prove-only).
         size: Option<u64>,
     },
+    /// The function returns a **valid typed reference** of recovered pointee size on every
+    /// returning path — a field accessor (`return sk->sk_prot;`, `return dev->driver_data;`)
+    /// whose loaded result the frontend already typed as an [`Inst::RefWitness`]. Applied at a
+    /// call site as a fresh valid-reference region (exactly the `RefWitness` executor arm), so
+    /// accesses through the returned pointer are decided instead of falling to the opaque
+    /// `POrigin::Call` (the dominant `opaque call result` UNKNOWN cause). A real `&T`/`&mut T`
+    /// field is unconditional; a **raw-pointer** field (`assumed`) rests on `--assume-valid-params`
+    /// — so without the opt-in the call still havocs (no false PASS), and being an `assumed`
+    /// region a constant offset past the recovered size is not refuted (no false FAIL when the
+    /// pointee is embedded in a larger object).
+    ValidRef {
+        /// Recovered pointee byte size; `None` for an unsized (`slice`/`str`) reference
+        /// (a live non-null region whose bounds stay prove-only).
+        size: Option<u64>,
+        /// The reference's natural/declared alignment (`0` = none recorded).
+        align: u32,
+        /// Whether the reference is writable (`&mut`/a non-const field).
+        writable: bool,
+        /// Whether validity rests on `--assume-valid-params` (a raw-pointer field).
+        assumed: bool,
+    },
+}
+
+impl RetSummary {
+    /// Whether this return characterization composes **unchanged** through a wrapper that
+    /// returns a callee's result verbatim (`fn w(a) { return g(a) }`): a dangling pointer, a
+    /// fresh allocation, and a typed valid reference are the *same* regardless of the wrapper's
+    /// own arguments, so a wrapper inherits them directly. `PtrFromArg`/`Scalar` depend on the
+    /// callee's arguments (which the wrapper maps from *its* arguments) and would need
+    /// remapping, so they do not compose here (the caller soundly havocs instead).
+    pub fn composes_through_wrapper(&self) -> bool {
+        matches!(
+            self,
+            RetSummary::DanglingStack | RetSummary::Alloc { .. } | RetSummary::ValidRef { .. }
+        )
+    }
 }
 
 /// A function's **provenance-transfer** summary: how a call moves provenance labels
@@ -197,6 +233,11 @@ pub(crate) enum AbsVal {
     /// returning path yields a heap alloc of the same size (else `Opaque`), so it is claimed
     /// only for a genuine allocator wrapper.
     HeapAlloc { size: Option<u64> },
+    /// A pointer the frontend typed as a **valid reference** via [`Inst::RefWitness`] (a loaded
+    /// field pointer of recovered pointee size). Returning it hands the caller a valid typed
+    /// reference; `join` keeps it only when every returning path yields the same shape (else
+    /// `Opaque`), so [`RetSummary::ValidRef`] is claimed only for a genuine field accessor.
+    ValidRef { size: Option<u64>, align: u32, writable: bool, assumed: bool },
     /// The **result of the observable call** at this index (in body-call order, matching
     /// `SummaryFacts`' collection). Used only to propagate a callee's `DanglingStack`
     /// return through a wrapper (`fn w() { return leak() }`): the cross-function fixpoint

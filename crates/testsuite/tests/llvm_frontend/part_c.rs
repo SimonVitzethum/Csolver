@@ -48,6 +48,60 @@ entry:
         "assume_valid_params materialises the loaded child pointer as a valid struct");
 }
 
+/// A **field-accessor call** (`get_child(d)` returning `d->child`) is summarized as
+/// `RetSummary::ValidRef`, so a caller that indexes the returned pointer sizes it instead of
+/// falling to an opaque `POrigin::Call` (the dominant `opaque call result` UNKNOWN cause). Under
+/// `--assume-valid-params` the access through the call result is decided (the callee's loaded
+/// raw-pointer field is `assumed`); UNKNOWN by default. This is the interprocedural face of the
+/// loaded-field recovery above — the recovery now survives a call boundary.
+#[test]
+fn field_accessor_call_result_is_sized_under_assume_valid_params() {
+    // struct child { i32; [4 x i64] }; struct dev { i32; child* }.
+    // get_child(d) = d->child (a raw-pointer field, typed by DWARF).
+    // caller(d)    = get_child(d)->data[2]  — offset 24 into the 40-byte child, in bounds.
+    let src = r#"
+%struct.child = type { i32, [4 x i64] }
+%struct.dev = type { i32, ptr }
+define ptr @get_child(ptr %d) !dbg !4 {
+entry:
+  %c = getelementptr inbounds i8, ptr %d, i64 8
+  %child = load ptr, ptr %c, align 8
+  ret ptr %child
+}
+define i64 @caller(ptr %d) {
+entry:
+  %child = call ptr @get_child(ptr %d)
+  %p = getelementptr inbounds i8, ptr %child, i64 24
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)
+!1 = !DIFile(filename: "d.c", directory: "/")
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!4 = distinct !DISubprogram(name: "get_child", scope: !1, file: !1, type: !5, unit: !0, retainedNodes: !20)
+!5 = !DISubroutineType(types: !6)
+!6 = !{!8, !8}
+!7 = !DIBasicType(name: "long", size: 64)
+!8 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !9, size: 64)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, name: "dev", size: 128, elements: !10)
+!10 = !{!11, !12}
+!11 = !DIDerivedType(tag: DW_TAG_member, name: "id", baseType: !7, size: 32, offset: 0)
+!12 = !DIDerivedType(tag: DW_TAG_member, name: "child", baseType: !13, size: 64, offset: 64)
+!13 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !14, size: 64)
+!14 = !DICompositeType(tag: DW_TAG_structure_type, name: "child", size: 320)
+!20 = !{!21}
+!21 = !DILocalVariable(name: "d", arg: 1, scope: !4, file: !1, type: !8)
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "c".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Pass,
+        "a field-accessor call result is not assumed valid by default");
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "the ValidRef return summary sizes the call result so the access proves");
+}
+
 /// `--assume-field-invariants` also assumes a **guarded array index** is in-bounds: the kernel
 /// idiom `if (i >= n) return -EINVAL; … arr[i]`, where the guard's bound `n` is the array's own
 /// length (a struct invariant the type system does not record). The per-path solver havocs the

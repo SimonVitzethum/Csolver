@@ -287,6 +287,20 @@ pub(crate) fn ret_of_fn(f: &Function) -> (RetSummary, Option<usize>) {
         }
     }
 
+    // Registers the frontend re-defines with a `RefWitness` (a typed field load: the plain
+    // `Load` and the `RefWitness` write the *same* register). The witness supplies the value;
+    // the load's own (Opaque) definition is skipped below, or the two writes would oscillate the
+    // fixpoint (Opaque ⇄ ValidRef every pass → the cap → a spurious `Unknown`).
+    let refwitness_dsts: std::collections::HashSet<RegId> = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| match i {
+            Inst::RefWitness { dst, .. } => Some(*dst),
+            _ => None,
+        })
+        .collect();
+
     let mut env: HashMap<RegId, AbsVal> = HashMap::new();
     for (k, (reg, ty)) in f.params.iter().enumerate() {
         let v = if ty.is_ptr() {
@@ -318,6 +332,16 @@ pub(crate) fn ret_of_fn(f: &Function) -> (RetSummary, Option<usize>) {
                 }
             }
             for inst in &b.insts {
+                // Skip a non-witness definition of a register a `RefWitness` re-defines (the
+                // plain field load): its value comes from the witness, and letting the load
+                // reset it each pass would prevent the fixpoint from converging.
+                if !matches!(inst, Inst::RefWitness { .. }) {
+                    if let Some(d) = inst.defined_reg() {
+                        if refwitness_dsts.contains(&d) {
+                            continue;
+                        }
+                    }
+                }
                 let (dst, v) = match inst {
                     Inst::Assign { dst, value, .. } => (*dst, eval_rvalue(value, &env)),
                     Inst::PtrOffset { dst, base, index, elem } => {
@@ -352,6 +376,13 @@ pub(crate) fn ret_of_fn(f: &Function) -> (RetSummary, Option<usize>) {
                         (*dst, AbsVal::HeapAlloc { size })
                     }
                     Inst::Alloc { dst, .. } => (*dst, AbsVal::Opaque),
+                    // A loaded field pointer the frontend typed as a valid reference
+                    // (`RefWitness`): returning it makes the function a field accessor whose
+                    // result the caller can size. The witness overwrites the plain load's
+                    // register, so this (later) instruction wins.
+                    Inst::RefWitness { dst, size, align, writable, assumed, .. } => {
+                        (*dst, AbsVal::ValidRef { size: *size, align: *align, writable: *writable, assumed: *assumed })
+                    }
                     // A call result: tracked as `Call(index)` so a wrapper that returns it
                     // can inherit the callee's dangling-stack return in the cross-fn fixpoint.
                     Inst::Call { dst: Some(d), .. } => {
@@ -411,6 +442,9 @@ pub(crate) fn ret_of_fn(f: &Function) -> (RetSummary, Option<usize>) {
                 Some(AbsVal::Scalar(a)) => (RetSummary::Scalar(a), None),
                 Some(AbsVal::LocalStack) => (RetSummary::DanglingStack, None),
                 Some(AbsVal::HeapAlloc { size }) => (RetSummary::Alloc { size }, None),
+                Some(AbsVal::ValidRef { size, align, writable, assumed }) => {
+                    (RetSummary::ValidRef { size, align, writable, assumed }, None)
+                }
                 // The return is a bare call result — no local RetSummary, but the callee index
                 // is handed to the cross-function fixpoint for dangling-return propagation.
                 Some(AbsVal::Call(i)) => (RetSummary::Unknown, Some(i)),
