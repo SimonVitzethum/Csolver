@@ -60,11 +60,25 @@ pub(crate) fn report_data_races(accesses: &[(String, String, bool, Vec<String>)]
     if races.is_empty() {
         return;
     }
+    // Cap the output: at whole-kernel scale there are tens of thousands of candidate locations,
+    // each accessed by potentially hundreds of functions — printing them all is tens of MB and
+    // buries the signal. Show the first `RACE_CAP` locations, and per location at most `FN_CAP`
+    // functions, with an "and N more" tail. (These are heuristic candidates, not proven bugs.)
+    const RACE_CAP: usize = 500;
+    const FN_CAP: usize = 20;
     println!("\n== data races (lockset / Eraser) ({}) [bug-finding] ==", races.len());
-    for r in &races {
+    for r in races.iter().take(RACE_CAP) {
         let tag = if r.irq_unsafe { "  [IRQ-unsafe: plain lock on IRQ-shared data]" } else { "" };
         println!("  location: {}{tag}", r.location);
-        println!("    accessed under inconsistent locking in: {}", r.functions.join(", "));
+        let fns = if r.functions.len() > FN_CAP {
+            format!("{}, … and {} more", r.functions[..FN_CAP].join(", "), r.functions.len() - FN_CAP)
+        } else {
+            r.functions.join(", ")
+        };
+        println!("    accessed under inconsistent locking in: {fns}");
+    }
+    if races.len() > RACE_CAP {
+        println!("  … and {} more candidate locations (capped)", races.len() - RACE_CAP);
     }
 }
 
@@ -104,6 +118,20 @@ pub(crate) fn report_atomicity(
         .filter(|(name, _)| entry_patterns.is_empty() || csolver_verifier::matches_entry(name, entry_patterns))
         .map(|(name, tr)| csolver_verifier::trace_to_thread(name, tr))
         .collect();
+    // The interleaving searches below are **pairwise (O(n²))** over the thread traces. At
+    // whole-kernel scale `conc_threads`/`entry_threads` reach the thousands, where n² pairs ×
+    // per-pair interleaving is intractable (it stalls the whole scan) *and* the heuristic is too
+    // noisy to be useful. Cap it: above the threshold, skip the pairwise passes with a note. Below
+    // it (any realistic subsystem scan) they run unchanged. Soundness-neutral — these are
+    // bug-finding heuristics, and the memory-safety report has already been printed.
+    const PAIR_CAP: usize = 3000;
+    if conc_threads.len() > PAIR_CAP {
+        println!(
+            "\n== atomicity / cross-thread UAF: skipped — {} concurrent traces exceed the {}-trace pairwise-search cap (whole-kernel scale) ==",
+            conc_threads.len(), PAIR_CAP,
+        );
+        return;
+    }
     let violations = csolver_verifier::find_atomicity_violations(&conc_threads);
     let ev = |e: &csolver_verifier::interleave::Event| -> String {
         use csolver_verifier::interleave::Event::*;
@@ -149,7 +177,11 @@ pub(crate) fn report_atomicity(
     // Cross-entry (cross-syscall) use-after-free: a free of a global-rooted object in one entry and
     // a dereference/free of it in another, sequentially composable entry (no common caller). Runs
     // over every trace; the global-root restriction keeps it to persistent shared state.
-    let cross_entry = csolver_verifier::find_cross_entry_uaf(&entry_threads);
+    let cross_entry = if entry_threads.len() > PAIR_CAP {
+        Vec::new()
+    } else {
+        csolver_verifier::find_cross_entry_uaf(&entry_threads)
+    };
     if !cross_entry.is_empty() {
         println!("\n== cross-entry (cross-syscall) use-after-free / double-free ({}) [bug-finding] ==",
             cross_entry.len());

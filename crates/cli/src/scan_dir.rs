@@ -446,10 +446,15 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         &indirect_callers,
     );
 
+    // Print the **payload first** — the coverage summary and the memory-safety findings (incl.
+    // the `--attack-surface` subset) — then the concurrency heuristics. At whole-kernel scale the
+    // concurrency reports are large and their pairwise search is expensive; running them last means
+    // a slow or capped concurrency pass never delays or blocks the result the scan exists to give.
+    let code = report_scan(&findings, pass, fail, unknown, dropped, errored);
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses);
     report_atomicity(&race_traces, entry_patterns, concurrent.as_ref());
-    report_scan(&findings, pass, fail, unknown, dropped, errored)
+    code
 }
 
 /// The set of functions that can run concurrently (for the whole-program concurrency oracle): the
