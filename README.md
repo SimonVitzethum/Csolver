@@ -170,10 +170,17 @@ what is done about each, are tracked in
   new `FAIL`s and both differential oracles still `SOUND`.
 
 - **opaque call result** — *closed*: an allocator wrapper returns a sized live heap region
-  (`RetSummary::Alloc`, sound, default); and under `--assume-valid-params` a call result the
-  caller then indexes as `gep %struct.T` gets a sized region of that type. Whole-program
-  summaries (`--whole-program`) resolve cross-file callees. This residual class goes to **zero**
-  on a kernel sample.
+  (`RetSummary::Alloc`, sound, default); a **field accessor** (`return sk->sk_prot;`) returns a
+  sized valid reference (`RetSummary::ValidRef`, from the loaded field's recovered pointee type —
+  raw-pointer fields under `--assume-valid-params`, real `&T` fields unconditional), and a plain
+  wrapper inherits either through the cross-function fixpoint; and under `--assume-valid-params` a
+  call result the caller then indexes as `gep %struct.T` gets a sized region of that type.
+  Whole-program summaries (`--whole-program`) resolve cross-file callees. This residual class goes
+  to **zero** on a kernel sample.
+- **scalar-as-pointer (intrinsic)** — *closed*: pointer-identity intrinsics
+  (`llvm.launder`/`strip.invariant.group`, `llvm.invariant.group.barrier`, `llvm.ptr.annotation`,
+  `llvm.ssa.copy`) forward their pointer argument's provenance instead of havocking it — sound and
+  unconditional (address-preserving by the LLVM spec).
 - **null / opaque provenance** — *closed*: a `if (p != null)` guard now carries to the
   dereference (stable opaque-pointer address symbols), sound and on by default.
 - **loop-havocked pointer** — *closed behind a flag*: `--assume-valid-loop-ptrs` proves

@@ -27,6 +27,18 @@ UBSan) + einen `mm`-Scan zu validieren, bevor die nächste beginnt.
 
 ---
 
+> **Fortschritt (2026-07-22).** Umgesetzt: `RetSummary::Alloc` (Allocator-Wrapper) und
+> **`RetSummary::ValidRef { size, align, writable, assumed }`** — ein Feld-Accessor
+> (`return sk->sk_prot;`), dessen geladener Zeiger vom Frontend als `RefWitness` typisiert ist,
+> wird als valide Referenz zusammengefasst und am Call-Site siziert (statt opaker `POrigin::Call`);
+> Wrapper erben jede argument-unabhängige Rückgabe (`DanglingStack | Alloc | ValidRef`) über den
+> Cross-Fn-Fixpunkt (link-frei + linked identisch, Losslessness-Orakel). Damit sind Phase 0/1 für
+> den größten Einzelhebel (opaque call result) gelandet. **Offen:** `RetSummary::Field`-Variante
+> mit Offset (nicht offset-0), `Global`/`NonNull`; ERR_PTR/IS_ERR-Branch-Refinement (bewusst
+> zurückgestellt — berührt den soundness-tragenden Branch-Pfad, Nutzen von `--assume-valid-returns`
+> subsumiert). Ebenfalls umgesetzt: provenance-transparente Pointer-Intrinsics
+> (`llvm.launder/strip.invariant.group`, …) und interval-gestützte UB-Checks (div/shift/overflow).
+
 ## Phase 0 — Fundament: reiche interprozedurale Zeiger-Provenance-Summaries
 
 Der Enabler für Phase 1–3. Heute trägt `Summary.ret` nur `Unknown | Scalar | PtrFromArg |
