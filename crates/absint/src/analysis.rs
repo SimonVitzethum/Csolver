@@ -66,6 +66,28 @@ impl IntervalAnalysis {
         }
     }
 
+    /// The interval inferred for `reg` immediately **before** instruction `inst_index` of
+    /// `block` — the block-entry invariant with the block's earlier instructions folded on, so a
+    /// register defined earlier in the same block (a mask `x & 0xFF`, a prior arithmetic step) is
+    /// accounted for, not just a block parameter. `top` if the block is unreachable / out of
+    /// range or the register is unconstrained there.
+    pub fn interval_at(&self, f: &Function, block: BlockId, inst_index: usize, reg: RegId) -> Interval {
+        let Some(node) = self.cfg.index_of(block) else {
+            return Interval::top();
+        };
+        let entry = &self.solution.in_states[node];
+        if !entry.is_reachable() {
+            return Interval::top();
+        }
+        let mut state = entry.clone();
+        if let Some(b) = f.block(block) {
+            for inst in b.insts.iter().take(inst_index) {
+                apply_inst(inst, &mut state);
+            }
+        }
+        state.get(reg)
+    }
+
     /// Evaluate `cond` using the intervals that hold immediately before
     /// instruction `inst_index` of `block`.
     ///

@@ -47,8 +47,14 @@ impl Explorer<'_> {
                         let a = self.eval_scalar(lhs, state);
                         let b = self.eval_scalar(rhs, state);
                         if let Some(goal) = self.arith_no_overflow(*op, a, b, *flags) {
+                            // Bound the operands by the sound interval analysis (a guarded /
+                            // masked value) so an addition/product that provably cannot wrap is
+                            // proven instead of left UNKNOWN. Facts truncated right after.
+                            let base = state.facts.len();
+                            self.push_bound_facts(block, idx, &[lhs, rhs], state);
                             let decision =
                                 self.decide(&[goal], state, RefuteMode::Possible, &[]);
+                            state.facts.truncate(base);
                             self.record_mem(
                                 block,
                                 idx,
@@ -66,7 +72,13 @@ impl Explorer<'_> {
                         let decision = if self.assume_field_scalar(rhs, state) {
                             Decision::Proven
                         } else {
-                            self.decide(&[nonzero], state, RefuteMode::Possible, &[])
+                            // A divisor the interval analysis bounds to `[1, N]` is provably
+                            // non-zero — bound it before deciding, then drop the facts.
+                            let base = state.facts.len();
+                            self.push_bound_facts(block, idx, &[rhs], state);
+                            let d = self.decide(&[nonzero], state, RefuteMode::Possible, &[]);
+                            state.facts.truncate(base);
+                            d
                         };
                         self.record_mem(
                             block,
@@ -96,7 +108,13 @@ impl Explorer<'_> {
                         let decision = if self.assume_field_scalar(rhs, state) {
                             Decision::Proven
                         } else {
-                            self.decide(&[in_range], state, RefuteMode::Possible, &[])
+                            // A shift amount the interval analysis bounds below the bit width
+                            // (a `& 63` mask, a loop-bounded count) proves in range.
+                            let base = state.facts.len();
+                            self.push_bound_facts(block, idx, &[rhs], state);
+                            let d = self.decide(&[in_range], state, RefuteMode::Possible, &[]);
+                            state.facts.truncate(base);
+                            d
                         };
                         self.record_mem(
                             block,

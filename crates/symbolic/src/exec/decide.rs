@@ -118,6 +118,53 @@ impl Explorer<'_> {
         false
     }
 
+    /// Assert the **non-negative interval bounds** of the scalar operands `ops` (from the sound
+    /// block-level interval analysis at `block`) onto `state.facts`, returning the number pushed
+    /// so the caller can `truncate` them after the decision. Only finite, non-negative bounds
+    /// that fit the operand's *signed* width are asserted — the same faithful, unsigned-safe
+    /// encoding the loop-invariant seeding uses — so an asserted fact always holds on every real
+    /// execution (the interval domain is a sound over-approximation). This lets the div-by-zero /
+    /// shift-in-range / no-overflow checks prove an obligation whose operands the analysis bounds
+    /// (e.g. a loop index `∈ [0, n]`, a masked amount `∈ [0, 63]`) instead of leaving it UNKNOWN.
+    /// Sound: a true fact can only *add* a proof or prune an infeasible refutation — never a false
+    /// PASS (nothing is asserted that a real run could violate) or a false FAIL.
+    pub(crate) fn push_bound_facts(&mut self, block: BlockId, idx: usize, ops: &[&Operand], state: &mut PathState) -> usize {
+        let mut n = 0;
+        for op in ops {
+            let Operand::Reg(r) = op else { continue };
+            // Instruction-precise interval: the block-entry invariant with the earlier
+            // instructions of this block folded on, so an operand masked/derived within the same
+            // block (`x & 0xFF`) carries its bound, not only a block parameter.
+            let iv = self.analysis.interval_at(self.f, block, idx, *r);
+            let val = self.eval_scalar(op, state);
+            let w = self.ctx.width(val);
+            if w == 0 || w > csolver_solver::bitblast::MAX_WIDTH {
+                continue;
+            }
+            // Largest value representable as a *positive* signed w-bit constant; a non-negative
+            // bound above it would wrap into negative territory under the signed `Sle`, so it is
+            // skipped (it carries no usable information there anyway).
+            let smax: i128 = if w >= 128 { i128::MAX } else { (1i128 << (w - 1)) - 1 };
+            if let Some(Bound::Fin(lo)) = iv.lower() {
+                if (0..=smax).contains(&lo) {
+                    let k = self.ctx.int(w, lo as u128);
+                    let fact = self.ctx.cmp(SCmp::Sle, k, val);
+                    state.facts.push(fact);
+                    n += 1;
+                }
+            }
+            if let Some(Bound::Fin(hi)) = iv.upper() {
+                if (0..=smax).contains(&hi) {
+                    let k = self.ctx.int(w, hi as u128);
+                    let fact = self.ctx.cmp(SCmp::Sle, val, k);
+                    state.facts.push(fact);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     pub(crate) fn decide(
         &mut self,
         conjuncts: &[ExprId],

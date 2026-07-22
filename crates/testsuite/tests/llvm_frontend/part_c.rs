@@ -102,6 +102,58 @@ entry:
         "the ValidRef return summary sizes the call result so the access proves");
 }
 
+/// An `i128`/`u128` checked multiply must not crash the analysis: its no-overflow goal would
+/// need a 256-bit (`2·128`) product, past the bit-precise domain. It is skipped (stays UNKNOWN),
+/// never a `BitVector` width panic — the crypto (`u128` multiply) case that whole-program
+/// reachability surfaces and that previously aborted whole scans.
+#[test]
+fn i128_checked_multiply_does_not_panic() {
+    let src = r#"
+declare {i128, i1} @llvm.umul.with.overflow.i128(i128, i128)
+define i128 @f(i128 %a, i128 %b) {
+entry:
+  %m = mul nuw i128 %a, %b
+  ret i128 %m
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "c".into() }).expect("lower");
+    // The point is that verification completes without panicking (the verdict itself is
+    // immaterial — the wide mul is soundly left undecided).
+    let _ = verify_module(&m, &Config { bug_finding: true, ..Config::default() }).verdict;
+}
+
+/// A bounded shift amount proves `NoShiftOverflow`; an unbounded one is a genuine bug. The
+/// operand bound is fed from the sound interval analysis (instruction-precise, so a value
+/// derived earlier in the same block carries its range). Bug-finding mode, where the arithmetic
+/// UB obligation is enumerated: a shift by `%s & 63 ∈ [0,63]` PASSES; a shift by an unconstrained
+/// amount FAILS with a witness. This regression-guards the interval-fact seeding around the
+/// shift/div/overflow checks (a true bound only ever *adds* a proof — never a false verdict).
+#[test]
+fn bounded_shift_amount_proves_and_unbounded_is_refuted() {
+    let cfg = Config { bug_finding: true, ..Config::default() };
+    let masked = r#"
+define i64 @f(i64 %x, i64 %s) {
+entry:
+  %m = and i64 %s, 63
+  %r = shl i64 %x, %m
+  ret i64 %r
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: masked.into(), name: "c".into() }).expect("lower");
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "a shift amount bounded to [0,63] proves in range");
+    let unmasked = r#"
+define i64 @f(i64 %x, i64 %s) {
+entry:
+  %r = shl i64 %x, %s
+  ret i64 %r
+}
+"#;
+    let u = LlvmFrontend.lower(LlvmInput { source: unmasked.into(), name: "c".into() }).expect("lower");
+    assert_eq!(verify_module(&u, &cfg).verdict, Verdict::Fail,
+        "an unbounded shift amount is a genuine shift-overflow bug");
+}
+
 /// A pointer laundered through `llvm.launder.invariant.group` keeps its provenance: an access
 /// through the laundered pointer is decided exactly as through the original. Without forwarding
 /// the intrinsic's result the pointer would be havoc'd to a fresh scalar (the `intrinsic/asm`

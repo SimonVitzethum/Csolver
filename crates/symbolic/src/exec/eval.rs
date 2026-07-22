@@ -154,6 +154,14 @@ impl Explorer<'_> {
         let w = self.ctx.width(a);
         let zero = self.ctx.int(w, 0);
         let mut goals: Vec<ExprId> = Vec::new();
+        // The multiplication no-overflow goal builds a **double-width** (`2w`) product. For a
+        // `w = 128` (`i128`/`u128`) operation — which passes the caller's `op_wide` gate, since
+        // 128 ≤ `MAX_WIDTH` — `2w = 256` exceeds the bit-precise domain and constructing the
+        // `sext`/`zext` to 256 bits would panic (`BitVector::new`). Skip only the mul goal in
+        // that case (add/sub need no doubling): the operation stays UNKNOWN rather than crashing
+        // the scan. Sound — a skipped goal is never a false PASS. Reached via wide-integer code
+        // (crypto `u128` multiply) that whole-program reachability surfaces.
+        let can_double = w * 2 <= csolver_solver::bitblast::MAX_WIDTH;
         if flags.nsw {
             // Signed: overflow iff the operand signs and the result sign disagree in
             // the characteristic way. sign(x) := x <s 0.
@@ -181,7 +189,7 @@ impl Explorer<'_> {
                     let ovf = self.ctx.and(vec![diff_ab, diff_s]);
                     goals.push(self.ctx.not(ovf));
                 }
-                BinOp::Mul => {
+                BinOp::Mul if can_double => {
                     // no overflow = sext(a*b, 2w) == sext(a,2w) * sext(b,2w): the w-bit
                     // signed product, sign-extended, equals the exact double-width product.
                     let pw = self.ctx.bin(BvOp::Mul, a, b);
@@ -205,7 +213,7 @@ impl Explorer<'_> {
                     // no borrow = a >=u b
                     goals.push(self.ctx.cmp(SCmp::Uge, a, b));
                 }
-                BinOp::Mul => {
+                BinOp::Mul if can_double => {
                     // no overflow = zext(a*b, 2w) == zext(a,2w) * zext(b,2w)
                     let pw = self.ctx.bin(BvOp::Mul, a, b);
                     let pw2 = self.ctx.zext(pw, w * 2);

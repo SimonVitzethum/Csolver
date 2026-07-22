@@ -291,7 +291,14 @@ pub(crate) fn discharge_inner(
                 // at a value no caller can produce. Not applied to an adversarial entry,
                 // whose parameters are attacker-controlled. Prove-only (a `caller-range`
                 // assumption), so an out-of-range witness is not a real counterexample.
-                if !limits.exported {
+                // A parameter wider than the bit-precise domain (`MAX_WIDTH` = 128 bits — an
+                // `i256`/`i512` crypto big-integer) cannot be encoded as a `BitVector`: building
+                // the precondition constants would panic (`ctx.int(width>128, …)`). Skip the
+                // seeding for such a parameter — it stays a free symbol (sound: no bound asserted,
+                // never a false verdict). This unblocks whole-program scans of corpora containing
+                // wide-integer code (crypto), where `scalar_pre` is populated and single-file
+                // verification — which has none — never reached this construction.
+                if !limits.exported && width <= csolver_solver::bitblast::MAX_WIDTH {
                     if let Some(Some((lo, hi))) = scalar_pre.get(i) {
                         let mask = |v: i128| if width >= 128 { v as u128 } else { (v as u128) & ((1u128 << width) - 1) };
                         let lo_e = ex.ctx.int(width, mask(*lo));
