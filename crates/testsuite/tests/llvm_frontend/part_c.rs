@@ -48,6 +48,50 @@ entry:
         "assume_valid_params materialises the loaded child pointer as a valid struct");
 }
 
+/// `--assume-field-invariants` also assumes a **guarded array index** is in-bounds: the kernel
+/// idiom `if (i >= n) return -EINVAL; … arr[i]`, where the guard's bound `n` is the array's own
+/// length (a struct invariant the type system does not record). The per-path solver havocs the
+/// bound and reports a spurious OOB at `i = UINT_MAX`; the flag trusts the guard. It must fire
+/// only for an index the path actually bounds — an *unguarded* access stays refuted.
+#[test]
+fn assume_field_invariants_trusts_a_guarded_array_index() {
+    let src = r#"
+define void @guarded(i32 %i, i32 %n) {
+entry:
+  %arr = alloca [16 x i32], align 4
+  %c = icmp uge i32 %i, %n
+  br i1 %c, label %fail, label %ok
+fail:
+  ret void
+ok:
+  %idx = zext i32 %i to i64
+  %p = getelementptr inbounds [16 x i32], ptr %arr, i64 0, i64 %idx
+  store i32 42, ptr %p, align 4
+  ret void
+}
+define void @unguarded(i32 %i) {
+entry:
+  %arr = alloca [16 x i32], align 4
+  %idx = zext i32 %i to i64
+  %p = getelementptr inbounds [16 x i32], ptr %arr, i64 0, i64 %idx
+  store i32 42, ptr %p, align 4
+  ret void
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "g".into() }).expect("lower");
+    let verdict = |name: &str, cfg: &Config| {
+        verify_module(&m, cfg).functions.into_iter().find(|f| f.function == name).expect(name).verdict
+    };
+    let bugs = Config { bug_finding: true, entry_patterns: Some(vec!["guarded".into(), "unguarded".into()]), ..Config::default() };
+    // By default the guarded access is refuted (the index is only bounded by an unconstrained `n`).
+    assert_eq!(verdict("guarded", &bugs), Verdict::Fail, "guarded index refutes without the flag");
+    let assume = Config { assume_field_invariants: true, ..bugs.clone() };
+    // With the flag, the guard is trusted — the guarded access no longer refutes …
+    assert_ne!(verdict("guarded", &assume), Verdict::Fail, "the guarded index is assumed in-bounds");
+    // … but an unguarded access is still refuted (the assumption does not over-apply).
+    assert_eq!(verdict("unguarded", &assume), Verdict::Fail, "an unguarded access is not assumed safe");
+}
+
 /// A Rust slice reference `&mut [T]` built via `from_raw_parts` erases to a bare pointer at
 /// `-O`, but its length survives as a fat-pointer fragment in debug info
 /// (`#dbg_value(iN len, !V, fragment 64 64)`). Recovering `len` sizes the backing region

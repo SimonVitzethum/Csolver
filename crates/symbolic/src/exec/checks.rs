@@ -121,6 +121,17 @@ impl Explorer<'_> {
             mode = RefuteMode::Off;
         }
         let decision = self.decide(&conjuncts, state, mode, &extra);
+        // `--assume-field-invariants`: a guarded index (`if (i >= n) return; … arr[i]`) whose bound
+        // the per-path solver cannot relate to the array length is assumed in-bounds (see
+        // `assume_guarded_index`). Only when the solver did not already decide it, and only for an
+        // offset upper-bounded by a path guard — never a constant offset.
+        let decision = if matches!(decision, Decision::Unknown | Decision::Refuted(_))
+            && self.assume_guarded_index(p.offset, state)
+        {
+            Decision::Proven
+        } else {
+            decision
+        };
         self.record_mem(block, idx, InBounds, decision, "access stays within the allocation", "could not prove the access stays in bounds");
 
         // Alignment. First the concrete guarantee (`p.align` is the gcd-folded alignment through

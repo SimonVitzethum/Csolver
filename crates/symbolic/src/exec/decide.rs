@@ -28,6 +28,67 @@ impl Explorer<'_> {
         false
     }
 
+    /// Under `--assume-field-invariants`, an array/buffer access whose **index is bounded above by
+    /// a guard on the path** (`if (i >= n) return -EINVAL; … arr[i]`) is assumed in-bounds — the
+    /// pervasive kernel idiom where the guard's bound `n` is the array's own length (a constant like
+    /// `CH_TYPES`, or a runtime count field `dev->n_subdevices`). The relationship `len(arr) == n`
+    /// is a struct invariant the source maintains but the type system does not record, so the
+    /// per-path solver, which havocs the loaded `arr`/`n`, cannot prove it and reports a spurious
+    /// OOB at `i = UINT_MAX`. This trusts the guard: if the access offset is upper-bounded by any
+    /// fact on the path, treat the access as in-bounds. Prove-only, opt-in, unsound in general (a
+    /// guard against the *wrong* bound is a real bug it would hide) — surfaced as `field-invariants`.
+    pub(crate) fn assume_guarded_index(&mut self, offset: ExprId, state: &PathState) -> bool {
+        if !self.limits.assume_field_invariants {
+            return false;
+        }
+        let syms: HashSet<ExprId> = self.ctx.symbols_of(offset).into_iter().collect();
+        if syms.is_empty() {
+            return false; // a constant offset is not an index — nothing to guard.
+        }
+        // The branch guards live in `pathcond`; `facts` holds derived predicates — scan both, as
+        // `prove` does, so `if (i >= n) …` (a `pathcond` entry) is found.
+        if state
+            .pathcond
+            .iter()
+            .chain(state.facts.iter())
+            .any(|&f| self.fact_upper_bounds(f, &syms))
+        {
+            self.assumptions.insert(FIELD_INVARIANTS);
+            return true;
+        }
+        false
+    }
+
+    /// Whether path fact `f` places an **upper bound** on some symbol in `syms` — i.e. it is an
+    /// unsigned/signed `<`/`≤` whose smaller side (or the larger side of a `>`/`≥`, or the negation
+    /// of the opposite) mentions one of those symbols. This is the guard `i < n` (or `!(i >= n)`)
+    /// that dominates a subsequent `arr[i]`. Used only by [`Self::assume_guarded_index`].
+    fn fact_upper_bounds(&self, f: ExprId, syms: &HashSet<ExprId>) -> bool {
+        let shares = |e: ExprId| self.ctx.symbols_of(e).iter().any(|s| syms.contains(s));
+        match self.ctx.node(f) {
+            Node::Cmp { op, a, b } => match *op {
+                // `a < b` / `a <= b`: `a` is bounded above.
+                SCmp::Ult | SCmp::Ule | SCmp::Slt | SCmp::Sle => shares(*a),
+                // `a > b` / `a >= b`: `b` is bounded above.
+                SCmp::Ugt | SCmp::Uge | SCmp::Sgt | SCmp::Sge => shares(*b),
+                _ => false,
+            },
+            // `!(i >= n)` ⇒ `i < n`: recurse on the comparison with the predicate negated.
+            Node::Not(inner) => {
+                if let Node::Cmp { op, a, b } = self.ctx.node(*inner) {
+                    match op.negate() {
+                        SCmp::Ult | SCmp::Ule | SCmp::Slt | SCmp::Sle => shares(*a),
+                        SCmp::Ugt | SCmp::Uge | SCmp::Sgt | SCmp::Sge => shares(*b),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `expr` contains at least one `fld…` leaf — a symbol minted for a scalar read of
     /// unknown memory (see `fresh_value`). Mirrors the [`Explorer::goal_is_genuine`] walk.
     fn expr_has_field_load(&self, expr: ExprId) -> bool {
