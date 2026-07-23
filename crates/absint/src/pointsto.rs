@@ -265,7 +265,7 @@ impl PointsTo {
 }
 
 // ---------------------------------------------------------------------------
-// P2: constraint generation from MSIR.
+// P2/P3: constraint generation from MSIR — per-module and whole-program (streaming).
 // ---------------------------------------------------------------------------
 
 use csolver_ir::{
@@ -274,23 +274,39 @@ use csolver_ir::{
 
 const LAYOUT: DataLayout = DataLayout::LP64;
 
-/// The whole-module points-to result: the solved relation plus the register→node and
-/// object→global maps needed to resolve a register to the single global it points to.
+/// The solved whole-program points-to result: the relation plus the maps needed to resolve a
+/// register to the single global it points to. Registers are keyed by a **global function id**
+/// (assigned in module-then-function push order — the same id space as the other whole-program
+/// fact builders); look one up by name with [`gfid_of`](Self::gfid_of).
 pub struct ModulePointsTo {
     pt: PointsTo,
-    reg_node: HashMap<(FuncId, RegId), Node>,
+    reg_node: HashMap<(u32, RegId), Node>,
     obj_global: HashMap<Node, String>,
+    name_to_gfid: HashMap<String, u32>,
 }
 
 impl ModulePointsTo {
-    /// The **single global** that register `r` of function `f` provably points to (its points-to
-    /// set is a clean singleton object that is a named global), if any. This is the resolvable
-    /// devirtualisation case — sound because a singleton over-approximation is exact. `None` when
-    /// the register is unresolved, ambiguous, or points to a non-global / poisoned object.
-    pub fn devirt_global(&self, f: FuncId, r: RegId) -> Option<&str> {
-        let &n = self.reg_node.get(&(f, r))?;
+    /// The **single global** that register `r` of the function with global id `gfid` provably
+    /// points to (its points-to set is a clean-singleton object that is a named global), if any.
+    /// This is the resolvable devirtualisation case — sound because a singleton over-approximation
+    /// is exact. `None` when the register is unresolved, ambiguous, or points to a non-global /
+    /// poisoned object.
+    pub fn devirt(&self, gfid: u32, r: RegId) -> Option<&str> {
+        let &n = self.reg_node.get(&(gfid, r))?;
         let obj = self.pt.singleton_object(n)?;
         self.obj_global.get(&obj).map(String::as_str)
+    }
+
+    /// The global id of an external function by name (first definition wins), for pairing a
+    /// per-file function back to its whole-program register nodes.
+    pub fn gfid_of(&self, name: &str) -> Option<u32> {
+        self.name_to_gfid.get(name).copied()
+    }
+
+    /// Single-module convenience: resolve by the module-local [`FuncId`] (its own id is its
+    /// global id when only one module was pushed, as in [`analyze_module`]).
+    pub fn devirt_global(&self, f: FuncId, r: RegId) -> Option<&str> {
+        self.devirt(f.0, r)
     }
 
     /// The underlying solver (for tests / further queries).
@@ -299,20 +315,61 @@ impl ModulePointsTo {
     }
 }
 
-struct Builder {
-    pt: PointsTo,
-    reg_node: HashMap<(FuncId, RegId), Node>,
-    global_obj: HashMap<String, Node>,
-    obj_global: HashMap<Node, String>,
+/// A deferred call's callee, resolved at [`ProgramPointsTo::finalize`]: an in-module direct call
+/// (already a global id), a cross-module `Symbol` (resolved by name), or an opaque indirect call.
+enum DeferredCallee {
+    Gfid(u32),
+    Name(String),
+    Opaque,
 }
 
-impl Builder {
-    fn reg(&mut self, f: FuncId, r: RegId) -> Node {
-        if let Some(&n) = self.reg_node.get(&(f, r)) {
+/// Whole-program field-sensitive points-to, built **incrementally** (P3): fold each module in with
+/// [`push_module`](Self::push_module) — after which it may be dropped — then
+/// [`finalize`](Self::finalize) resolves cross-module call edges by name and solves. Ids are
+/// assigned module-then-function in push order (the same space as `SummaryFacts`/`ContractFacts`),
+/// so a `Symbol` call resolves to the same callee the linked program would.
+pub struct ProgramPointsTo {
+    pt: PointsTo,
+    reg_node: HashMap<(u32, RegId), Node>,
+    global_obj: HashMap<String, Node>,
+    obj_global: HashMap<Node, String>,
+    /// Next global function id.
+    next: u32,
+    /// External function name → global id (first definition wins).
+    name_to_gfid: HashMap<String, u32>,
+    /// Global id → its parameter registers (for connecting a resolved call's args at finalize).
+    fn_params: HashMap<u32, Vec<RegId>>,
+    /// Deferred calls `(caller gfid, callee, args)` — resolved at finalize.
+    deferred: Vec<(u32, DeferredCallee, Vec<Operand>)>,
+}
+
+impl Default for ProgramPointsTo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProgramPointsTo {
+    /// A fresh, empty whole-program points-to builder.
+    pub fn new() -> ProgramPointsTo {
+        ProgramPointsTo {
+            pt: PointsTo::new(),
+            reg_node: HashMap::new(),
+            global_obj: HashMap::new(),
+            obj_global: HashMap::new(),
+            next: 0,
+            name_to_gfid: HashMap::new(),
+            fn_params: HashMap::new(),
+            deferred: Vec::new(),
+        }
+    }
+
+    fn reg(&mut self, gfid: u32, r: RegId) -> Node {
+        if let Some(&n) = self.reg_node.get(&(gfid, r)) {
             return n;
         }
         let n = self.pt.new_var();
-        self.reg_node.insert((f, r), n);
+        self.reg_node.insert((gfid, r), n);
         n
     }
 
@@ -326,11 +383,12 @@ impl Builder {
         o
     }
 
-    /// A node standing for the pointer *value* of an operand: a register maps to its node; the
-    /// address of a global becomes a fresh var pointing at that global; anything else is unknown.
-    fn operand_ptr(&mut self, f: FuncId, op: &Operand) -> Option<Node> {
+    /// A node standing for the pointer *value* of an operand under function `gfid`: a register maps
+    /// to its node; a global symbol's address becomes a fresh var pointing at that global; anything
+    /// else is unknown (`None`).
+    fn operand_ptr(&mut self, gfid: u32, op: &Operand) -> Option<Node> {
         match op {
-            Operand::Reg(r) => Some(self.reg(f, *r)),
+            Operand::Reg(r) => Some(self.reg(gfid, *r)),
             Operand::Const(Const::Symbol(g)) | Operand::Const(Const::SymbolOffset(g, _)) => {
                 let obj = self.global(g);
                 let v = self.pt.new_var();
@@ -338,6 +396,133 @@ impl Builder {
                 Some(v)
             }
             _ => None,
+        }
+    }
+
+    /// A gep at the reserved unknown offset through a pointer operand — poisons every object it may
+    /// reach (a byte/symbolic/opaque write the analysis cannot pin to a specific field).
+    fn poison_through(&mut self, gfid: u32, op: &Operand) {
+        if let Some(p) = self.operand_ptr(gfid, op) {
+            let anyf = self.pt.new_var();
+            self.pt.gep(anyf, p, ANY_OFFSET);
+        }
+    }
+
+    /// Fold one module in (droppable afterwards): assign its functions global ids `base..`, record
+    /// their parameters and external names, generate the intra-function constraints, and defer the
+    /// calls (resolved at finalize).
+    pub fn push_module(&mut self, m: &Module) {
+        let base = self.next;
+        for (i, f) in m.functions.iter().enumerate() {
+            let gfid = base + i as u32;
+            self.fn_params.insert(gfid, f.params.iter().map(|(r, _)| *r).collect());
+            if !m.internal.contains(&f.id) {
+                self.name_to_gfid.entry(f.name.clone()).or_insert(gfid);
+            }
+        }
+        for (i, f) in m.functions.iter().enumerate() {
+            let gfid = base + i as u32;
+            for inst in f.blocks.iter().flat_map(|bl| &bl.insts) {
+                match inst {
+                    Inst::Alloc { dst, .. } => {
+                        let o = self.pt.new_object("alloc");
+                        let d = self.reg(gfid, *dst);
+                        self.pt.address_of(d, o);
+                    }
+                    Inst::Assign { dst, value, .. } => {
+                        let src = match value {
+                            RValue::Use(op) | RValue::Cast { operand: op, .. } => {
+                                self.operand_ptr(gfid, op)
+                            }
+                            _ => None,
+                        };
+                        if let Some(s) = src {
+                            let d = self.reg(gfid, *dst);
+                            self.pt.assign(d, s);
+                        }
+                    }
+                    Inst::PtrOffset { dst, base: Operand::Reg(bs), index, elem } => {
+                        let base_n = self.reg(gfid, *bs);
+                        let off = const_byte_offset(index, elem).unwrap_or(ANY_OFFSET);
+                        let d = self.reg(gfid, *dst);
+                        self.pt.gep(d, base_n, off);
+                    }
+                    // A typed MIR field access carries no byte offset here — conservatively unknown.
+                    Inst::FieldPtr { dst, base: Operand::Reg(bs), .. } => {
+                        let base_n = self.reg(gfid, *bs);
+                        let d = self.reg(gfid, *dst);
+                        self.pt.gep(d, base_n, ANY_OFFSET);
+                    }
+                    Inst::Load { dst, ty, ptr: Operand::Reg(p), .. } if ty.is_ptr() => {
+                        let pn = self.reg(gfid, *p);
+                        let d = self.reg(gfid, *dst);
+                        self.pt.load(d, pn);
+                    }
+                    Inst::Store { ptr: Operand::Reg(p), value, .. } => {
+                        if let Some(v) = self.operand_ptr(gfid, value) {
+                            let pn = self.reg(gfid, *p);
+                            self.pt.store(v, pn);
+                        }
+                    }
+                    // A bulk write (memcpy/memset) writes an unknown extent of its destination.
+                    Inst::MemIntrinsic { dst, .. } => self.poison_through(gfid, dst),
+                    Inst::Call { dst, callee, args, .. } => {
+                        let callee = match callee {
+                            Callee::Direct(g) => DeferredCallee::Gfid(base + g.0),
+                            Callee::Symbol(n) => DeferredCallee::Name(n.clone()),
+                            Callee::Indirect(_) => DeferredCallee::Opaque,
+                        };
+                        self.deferred.push((gfid, callee, args.clone()));
+                        // The call result is an unknown pointer (return modelling is a later refinement).
+                        if let Some(d) = dst {
+                            let dn = self.reg(gfid, *d);
+                            let top = self.pt.top();
+                            self.pt.address_of(dn, top);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.next += m.functions.len() as u32;
+    }
+
+    /// Resolve the deferred calls (arg→param for a known callee, poison the args of an opaque one)
+    /// and solve to a fixpoint. A resolved callee needs no arg poisoning: its own body's stores
+    /// into its parameters flow back to the caller's objects through the arg→param edges, so a
+    /// callee that writes `param->ops` is captured exactly (and makes the field ambiguous if it
+    /// disagrees with another site) — the interprocedural soundness.
+    pub fn finalize(mut self) -> ModulePointsTo {
+        let deferred = std::mem::take(&mut self.deferred);
+        for (caller, callee, args) in deferred {
+            let target = match callee {
+                DeferredCallee::Gfid(g) => Some(g),
+                DeferredCallee::Name(n) => self.name_to_gfid.get(&n).copied(),
+                DeferredCallee::Opaque => None,
+            };
+            match target.and_then(|g| self.fn_params.get(&g).cloned().map(|p| (g, p))) {
+                Some((g, params)) => {
+                    for (i, arg) in args.iter().enumerate() {
+                        if let (Some(&preg), Some(an)) = (params.get(i), self.operand_ptr(caller, arg)) {
+                            let pn = self.reg(g, preg);
+                            self.pt.assign(pn, an);
+                        }
+                    }
+                }
+                // Unresolved external / indirect: it may write through its pointer arguments.
+                None => {
+                    for arg in &args {
+                        self.poison_through(caller, arg);
+                    }
+                }
+            }
+        }
+        self.pt.solve();
+        ModulePointsTo {
+            pt: self.pt,
+            reg_node: self.reg_node,
+            obj_global: self.obj_global,
+            name_to_gfid: self.name_to_gfid,
         }
     }
 }
@@ -351,106 +536,13 @@ fn const_byte_offset(index: &Operand, elem: &Type) -> Option<u64> {
     k.checked_mul(stride)
 }
 
-/// Build and solve the field-sensitive points-to relation for a whole module (P2). Direct calls
-/// connect each argument to the callee's matching parameter (interprocedural, so a value set up
-/// in one function and dispatched in another is tracked); an **opaque** call (indirect / external)
-/// conservatively poisons its pointer arguments — it may write through them, and without a summary
-/// the analysis cannot know it does not. Sound for a module that is the whole (closed) program.
+/// Build and solve the field-sensitive points-to relation for a **single** module (P2) — the whole
+/// program in one module. A thin wrapper over the streaming [`ProgramPointsTo`] (push one, finalize),
+/// so both paths share one implementation.
 pub fn analyze_module(m: &Module) -> ModulePointsTo {
-    let mut b = Builder {
-        pt: PointsTo::new(),
-        reg_node: HashMap::new(),
-        global_obj: HashMap::new(),
-        obj_global: HashMap::new(),
-    };
-    // Poison an object's fields through a pointer operand (a byte/symbolic/opaque write): a gep at
-    // the reserved unknown offset marks every reachable object poisoned when the relation is solved.
-    let poison_through = |b: &mut Builder, f: FuncId, op: &Operand| {
-        if let Some(p) = b.operand_ptr(f, op) {
-            let anyf = b.pt.new_var();
-            b.pt.gep(anyf, p, ANY_OFFSET);
-        }
-    };
-    for f in &m.functions {
-        let fid = f.id;
-        for inst in f.blocks.iter().flat_map(|bl| &bl.insts) {
-            match inst {
-                Inst::Alloc { dst, .. } => {
-                    let o = b.pt.new_object("alloc");
-                    let d = b.reg(fid, *dst);
-                    b.pt.address_of(d, o);
-                }
-                Inst::Assign { dst, value, .. } => {
-                    let src = match value {
-                        RValue::Use(op) | RValue::Cast { operand: op, .. } => b.operand_ptr(fid, op),
-                        _ => None,
-                    };
-                    if let Some(s) = src {
-                        let d = b.reg(fid, *dst);
-                        b.pt.assign(d, s);
-                    }
-                }
-                Inst::PtrOffset { dst, base: Operand::Reg(bs), index, elem } => {
-                    let base = b.reg(fid, *bs);
-                    let off = const_byte_offset(index, elem).unwrap_or(ANY_OFFSET);
-                    let d = b.reg(fid, *dst);
-                    b.pt.gep(d, base, off);
-                }
-                // A typed MIR field access carries no byte offset here — conservatively unknown.
-                Inst::FieldPtr { dst, base: Operand::Reg(bs), .. } => {
-                    let base = b.reg(fid, *bs);
-                    let d = b.reg(fid, *dst);
-                    b.pt.gep(d, base, ANY_OFFSET);
-                }
-                Inst::Load { dst, ty, ptr: Operand::Reg(p), .. } if ty.is_ptr() => {
-                    let pn = b.reg(fid, *p);
-                    let d = b.reg(fid, *dst);
-                    b.pt.load(d, pn);
-                }
-                Inst::Store { ptr: Operand::Reg(p), value, .. } => {
-                    if let Some(v) = b.operand_ptr(fid, value) {
-                        let pn = b.reg(fid, *p);
-                        b.pt.store(v, pn);
-                    }
-                }
-                // A bulk write (memcpy/memset) writes an unknown extent of its destination.
-                Inst::MemIntrinsic { dst, .. } => poison_through(&mut b, fid, dst),
-                Inst::Call { dst, callee: Callee::Direct(g), args, .. } => {
-                    // Connect each argument to the callee's matching parameter (interprocedural).
-                    if let Some(callee) = m.functions.iter().find(|c| c.id == *g) {
-                        for (i, arg) in args.iter().enumerate() {
-                            if let (Some((preg, _)), Some(an)) =
-                                (callee.params.get(i), b.operand_ptr(fid, arg))
-                            {
-                                let pn = b.reg(*g, *preg);
-                                b.pt.assign(pn, an);
-                            }
-                        }
-                    }
-                    // The call result is an unknown pointer (return modelling is a later refinement).
-                    if let Some(d) = dst {
-                        let dn = b.reg(fid, *d);
-                        let top = b.pt.top();
-                        b.pt.address_of(dn, top);
-                    }
-                }
-                // An opaque call (indirect / external symbol) may write through its pointer args.
-                Inst::Call { dst, args, .. } => {
-                    for arg in args {
-                        poison_through(&mut b, fid, arg);
-                    }
-                    if let Some(d) = dst {
-                        let dn = b.reg(fid, *d);
-                        let top = b.pt.top();
-                        b.pt.address_of(dn, top);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    b.pt.solve();
-    ModulePointsTo { pt: b.pt, reg_node: b.reg_node, obj_global: b.obj_global }
+    let mut p = ProgramPointsTo::new();
+    p.push_module(m);
+    p.finalize()
 }
 
 #[cfg(test)]
@@ -662,6 +754,63 @@ mod tests {
         m.functions.push(f);
         let mp = analyze_module(&m);
         assert_eq!(mp.devirt_global(FuncId(0), opsp), None, "a bulk-written object's field is poisoned");
+    }
+
+    // P3: cross-module. Module A allocates an object, stores `&G_ops` into its ops field, and
+    // passes it to `use` — defined in module B — which loads the field back. The streaming
+    // Symbol-call resolution connects A's argument to B's parameter, so the store flows across the
+    // module boundary and B's load resolves to `G_ops`.
+    #[test]
+    fn p3_cross_module_dispatch_resolves() {
+        // Module A: fn make() { obj = alloc; obj.ops(@8) = &G_ops; use(obj); }
+        let (obj, field) = (RegId(0), RegId(1));
+        let mut abb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        abb.insts.push(IrInst::Alloc {
+            dst: obj, region: RegionKind::Heap, elem: IrTy::int(8), count: IrOp::int(64, 64), align: 8,
+        });
+        abb.insts.push(IrInst::PtrOffset {
+            dst: field, base: IrOp::Reg(obj), index: IrOp::int(64, 8), elem: IrTy::int(8),
+        });
+        abb.insts.push(IrInst::Store {
+            ty: ptr_ty(), ptr: IrOp::Reg(field), value: IrOp::Const(IrConst::Symbol("G_ops".into())),
+            align: 8, volatile: false,
+        });
+        abb.insts.push(IrInst::Call {
+            dst: None,
+            callee: csolver_ir::Callee::Symbol("use".into()),
+            args: vec![IrOp::Reg(obj)],
+            ret_ty: IrTy::Unit,
+            ret_ref: None,
+        });
+        let make = IrFunc {
+            id: FuncId(0), name: "make".into(), params: vec![], ret_ty: IrTy::Unit,
+            blocks: vec![abb], entry: BlockId(0),
+        };
+        let mut ma = IrModule::new("a");
+        ma.functions.push(make);
+
+        // Module B: fn use(o) { p = o.ops(@8); }
+        let (o, field2, p) = (RegId(0), RegId(1), RegId(2));
+        let mut bbb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bbb.insts.push(IrInst::PtrOffset {
+            dst: field2, base: IrOp::Reg(o), index: IrOp::int(64, 8), elem: IrTy::int(8),
+        });
+        bbb.insts.push(IrInst::Load {
+            dst: p, ty: ptr_ty(), ptr: IrOp::Reg(field2), align: 8, volatile: false,
+        });
+        let usef = IrFunc {
+            id: FuncId(0), name: "use".into(), params: vec![(o, ptr_ty())], ret_ty: IrTy::Unit,
+            blocks: vec![bbb], entry: BlockId(0),
+        };
+        let mut mb = IrModule::new("b");
+        mb.functions.push(usef);
+
+        let mut pp = ProgramPointsTo::new();
+        pp.push_module(&ma);
+        pp.push_module(&mb);
+        let mp = pp.finalize();
+        let use_gfid = mp.gfid_of("use").expect("use resolved");
+        assert_eq!(mp.devirt(use_gfid, p), Some("G_ops"), "the store flows across the module boundary");
     }
 
     // Termination + a two-hop chain `obj.ops -> g_ops`, `g_ops.fn -> target`.
