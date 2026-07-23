@@ -204,6 +204,54 @@ pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, (u64, Option<&
     pointee
 }
 
+/// The **observed access extent** of each pointer register: the largest byte extent
+/// (`offset + access_size`) the function itself dereferences through it — a direct `load`/`store`
+/// (offset 0) or one behind a *constant* `i8` byte offset. This bounds the region an untyped
+/// pointer must span to make the code's own accesses in-bounds — the `list_for_each`-style cursor
+/// and hand-rolled walk cursors that carry no `struct T` gep and therefore no type-derived size.
+/// Honoured only under the opt-in region assumptions and as an `assumed` region (a constant
+/// access past it is never refuted), so it only ever *adds* recall, never a false FAIL.
+pub(crate) fn reg_access_extents(f: &LFunc) -> HashMap<String, u64> {
+    // A constant byte offset `g = getelementptr i8, base, K` (K ≥ 0) — so an access through `g` is
+    // an access at offset `K` through `base`.
+    let mut offset_of: HashMap<&str, (&str, u64)> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::Gep {
+            dst,
+            elem: LType::Int(8),
+            base: LValue::Local(b),
+            index: LValue::Int(k),
+        } = inst
+        {
+            if *k >= 0 {
+                offset_of.insert(dst.as_str(), (b.as_str(), *k as u64));
+            }
+        }
+    }
+    let mut out: HashMap<String, u64> = HashMap::new();
+    let record = |ptr: &LValue, ty: &LType, out: &mut HashMap<String, u64>| {
+        let LValue::Local(p) = ptr else { return };
+        let Some(sz) = lower_type(ty).size_bytes(&LAYOUT).filter(|&s| s > 0) else { return };
+        let e = out.entry(p.clone()).or_insert(0);
+        *e = (*e).max(sz);
+        // If `p` is a constant byte offset of `base`, the same access reaches `off + sz` of `base`.
+        if let Some(&(base, off)) = offset_of.get(p.as_str()) {
+            if let Some(ext) = off.checked_add(sz) {
+                let e = out.entry(base.to_string()).or_insert(0);
+                *e = (*e).max(ext);
+            }
+        }
+    };
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst {
+            LInst::Load { ty, ptr, .. } => record(ptr, ty, &mut out),
+            LInst::Store { ty, ptr, .. } => record(ptr, ty, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Recover **container-of / intrusive-list** hints: a register `p` used as `c = getelementptr
 /// i8, p, -C` (a byte gep with a negative constant) whose result `c` is then indexed as a
 /// `struct T` (`gep %struct.T, c, …`, so `c ∈ typed_gep_pointee_sizes`) points *into* a `struct
@@ -217,6 +265,9 @@ pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, (u64, Option<&
 /// `valid_pointer_arith` UNKNOWN, the residual that dominates real kernel list walks).
 pub(crate) fn container_loop_hints(f: &LFunc) -> HashMap<String, (u64, u64)> {
     let pointee = typed_gep_pointee_sizes(f);
+    // Fallback container size for a hand-rolled walk whose container carries no `struct T` gep:
+    // the byte range the code dereferences through the container itself.
+    let extents = reg_access_extents(f);
     let mut out: HashMap<String, (u64, u64)> = HashMap::new();
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
         if let LInst::Gep {
@@ -227,9 +278,17 @@ pub(crate) fn container_loop_hints(f: &LFunc) -> HashMap<String, (u64, u64)> {
         } = inst
         {
             if *off < 0 {
-                if let Some(&(size, _)) = pointee.get(dst.as_str()) {
-                    // `dst` (the container) is a `size`-byte `struct T`; `base` (the cursor) is a
-                    // member at offset `|off|`. First hit wins (a stable, deterministic choice).
+                // `dst` (the container) is a member at offset `|off|` below `base` (the cursor).
+                // Prefer the container's *typed* size (`struct T` gep); fall back to the observed
+                // access extent through the container (an untyped hand-rolled walk, e.g. af_alg's
+                // `container_of(next, alg_type_list, list)` whose container is only bare-`load`ed).
+                let size = pointee
+                    .get(dst.as_str())
+                    .map(|&(s, _)| s)
+                    .or_else(|| extents.get(dst.as_str()).copied())
+                    .filter(|&s| s > 0);
+                if let Some(size) = size {
+                    // First hit wins (a stable, deterministic choice).
                     out.entry(base.clone()).or_insert((size, (-*off) as u64));
                 }
             }

@@ -48,6 +48,52 @@ entry:
         "assume_valid_params materialises the loaded child pointer as a valid struct");
 }
 
+/// A **hand-rolled** intrusive walk whose container carries no `struct T` gep — af_alg's
+/// `container_of(next, alg_type_list, list)` shape — is decided too. Two mechanisms: (1) the
+/// untyped loop cursor is sized from its observed access extent (the `load it` that reads
+/// `it->next`); (2) the loaded `next` pointer, used as `next − C` then bare-`load`ed, is placed at
+/// offset C inside a node sized from the container's observed access extent. Under
+/// `--assume-valid-loop-ptrs` + `--assume-valid-params` the loaded-value residuals collapse (was
+/// the dominant real-kernel list-walk cause). Nothing is fabricated: the regions are `assumed`.
+#[test]
+fn hand_rolled_untyped_container_walk_is_decided() {
+    let src = r#"
+%struct.list_head = type { ptr, ptr }
+@head = internal global %struct.list_head zeroinitializer
+define i64 @walk() {
+entry:
+  %first = load ptr, ptr @head, align 8
+  br label %loop
+loop:
+  %it = phi ptr [ %first, %entry ], [ %next, %body ]
+  %isend = icmp eq ptr %it, @head
+  br i1 %isend, label %done, label %body
+body:
+  %next = load ptr, ptr %it, align 8
+  %node = getelementptr i8, ptr %next, i64 -8
+  %data = load ptr, ptr %node, align 8
+  br label %loop
+done:
+  ret i64 0
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "c".into() }).expect("lower");
+    let cfg = Config { assume_valid_params: true, assume_valid_loop_ptrs: true, bug_finding: true, ..Config::default() };
+    let rep = verify_module(&m, &cfg);
+    let walk = rep.functions.iter().find(|f| f.function == "walk").expect("walk report");
+    // Bounds / non-null / liveness / read all decide; only `alignment` may remain — for an
+    // untyped extent/container region `base_align` is left conservative (1) so an alignment claim
+    // is never over-stated (sound). Count the non-alignment residuals: they must be gone.
+    let non_align_unknown = walk
+        .outcomes
+        .iter()
+        .filter(|o| o.verdict() == Verdict::Unknown && o.obligation.property != csolver_core::SafetyProperty::Alignment)
+        .count();
+    assert_eq!(non_align_unknown, 0,
+        "the untyped container walk's bounds/read/liveness all decide (only an alignment tail may remain)");
+    assert!(walk.count(Verdict::Pass) >= 14, "most obligations proven, got {}", walk.count(Verdict::Pass));
+}
+
 /// A `list_for_each_entry` cursor's backward `container_of` (`pos = cursor − offsetof(member)`)
 /// stays **in-object**: the loop-pointer materialisation now places the cursor at the member
 /// offset inside its *whole node* (recovered from the typed container gep), so the subtraction

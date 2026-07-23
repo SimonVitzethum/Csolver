@@ -360,6 +360,15 @@ pub struct PtrHint {
     /// node — `offsetof(T, member)`, recovered from the `container_of` subtraction. Meaningful
     /// only when `container_size > 0`.
     pub container_offset: u64,
+    /// **Observed access extent**: the largest byte extent (`offset + access_size`) the function
+    /// itself dereferences through this pointer — a direct `load`/`store` (offset 0) or one behind
+    /// a *constant* offset. When the pointer has no type-derived `size`, this bounds the region a
+    /// valid instance must span to make the code's own accesses in-bounds (the untyped
+    /// `list_for_each`-style cursor and hand-rolled walk cursors that carry no `struct T` gep).
+    /// Honoured only under the opt-in region assumptions (`--assume-valid-params` /
+    /// `--assume-valid-loop-ptrs`) and as an `assumed` region — a constant access past it is never
+    /// refuted (no false FAIL), only an input-driven overrun is; `0` when nothing is observed.
+    pub access_extent: u64,
 }
 
 impl PtrHint {

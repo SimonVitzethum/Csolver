@@ -146,7 +146,17 @@ impl Explorer<'_> {
                             Some((csize, coff)) => {
                                 (Some(csize), self.ctx.int(PTR_WIDTH, coff as u128))
                             }
-                            None => (hint.map(|h| h.size), offset),
+                            // No container: the type-derived pointee size, else the observed access
+                            // extent (an untyped hand-rolled list cursor carries no `struct T` gep,
+                            // so `size == 0` — size it to the bytes the code actually dereferences).
+                            None => {
+                                let sz = hint.and_then(|h| match (h.size, h.access_extent) {
+                                    (s, _) if s > 0 => Some(s),
+                                    (_, e) if e > 0 => Some(e),
+                                    _ => None,
+                                });
+                                (sz, offset)
+                            }
                         };
                         let rid = self.materialize_ref_region(region_size, true, true, state);
                         state.regions[rid].prov_labels.extend(labels);

@@ -546,9 +546,27 @@ impl Explorer<'_> {
         {
             return v;
         }
-        let Some(hint) = self.reg_ptr_hints.get(&dst).copied().filter(|h| h.size > 0) else {
+        let Some(hint) = self.reg_ptr_hints.get(&dst).copied() else {
             return v;
         };
+        // **container_of / intrusive-list member** (a hand-rolled walk whose container carries no
+        // `struct T` gep): the pointer is a member at `container_offset` inside a `container_size`-
+        // byte node. Materialise the *whole node* and place the pointer at that offset, so the
+        // backward `container_of` subtraction (`ptr - container_offset`) lands at the node base
+        // (in-object). The node validity/size rests on the same `--assume-valid-params` opt-in.
+        if let Some((csize, coff)) = hint.container() {
+            self.assumptions.insert(PARAM_VALID);
+            let rid = self.materialize_ref_region(Some(csize), true, true, state);
+            return SymValue::Ptr(SymPointer {
+                prov: Prov::Region(rid),
+                offset: self.ctx.int(PTR_WIDTH, coff as u128),
+                align: 1,
+                borrow: None,
+            });
+        }
+        if hint.size == 0 {
+            return v;
+        }
         self.assumptions.insert(PARAM_VALID);
         let tail = self.limits.assume_struct_tail && hint.tail > hint.size;
         if tail {

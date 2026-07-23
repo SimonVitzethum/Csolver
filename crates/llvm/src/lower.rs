@@ -487,7 +487,7 @@ fn lower_function(
                     asserted.get(local.as_str()).map_or(0, |&a| a.max(derived(size)))
                 };
                 let tail = tails.get(local.as_str()).copied().unwrap_or(0);
-                reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0 });
+                reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0, access_extent: 0 });
             }
         }
     }
@@ -504,7 +504,7 @@ fn lower_function(
         {
             if let Some(size) = len.checked_mul(elem).filter(|&s| s > 0) {
                 // A slice hint never shrinks a region already recovered by a more specific rule.
-                reg_ptr_hints.entry(r).or_insert(PtrHint { size, align, tail: 0, container_size: 0, container_offset: 0 });
+                reg_ptr_hints.entry(r).or_insert(PtrHint { size, align, tail: 0, container_size: 0, container_offset: 0, access_extent: 0 });
             }
         }
     }
@@ -515,7 +515,7 @@ fn lower_function(
                 .or_else(|| asserted.get(local).map(|&a| a.max(derived(size))))
                 .unwrap_or(0);
             let tail = tails.get(local).copied().unwrap_or(0);
-            reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0 });
+            reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0, access_extent: 0 });
         }
     }
     // container_of / intrusive-list cursors: record the enclosing node's size and the member
@@ -526,9 +526,24 @@ fn lower_function(
         if let Some(&r) = ctx.regs.get(local.as_str()) {
             let e = reg_ptr_hints
                 .entry(r)
-                .or_insert(PtrHint { size: 0, align: 0, tail: 0, container_size: 0, container_offset: 0 });
+                .or_insert(PtrHint { size: 0, align: 0, tail: 0, container_size: 0, container_offset: 0, access_extent: 0 });
             e.container_size = csize;
             e.container_offset = coff;
+        }
+    }
+    // Observed access extents: size an untyped pointer (a hand-rolled list-walk cursor) to the
+    // byte range the code actually dereferences through it, so the loop-pointer materialisation
+    // can bound it instead of leaving it unsized. Only fills the `access_extent` field; a
+    // type-derived `size` still wins in the consumer.
+    for (local, ext) in reg_access_extents(f) {
+        if ext == 0 {
+            continue;
+        }
+        if let Some(&r) = ctx.regs.get(local.as_str()) {
+            let e = reg_ptr_hints
+                .entry(r)
+                .or_insert(PtrHint { size: 0, align: 0, tail: 0, container_size: 0, container_offset: 0, access_extent: 0 });
+            e.access_extent = e.access_extent.max(ext);
         }
     }
     let reg_ptr_hints: Vec<(RegId, PtrHint)> = reg_ptr_hints.into_iter().collect();
