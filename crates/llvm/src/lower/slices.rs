@@ -204,6 +204,40 @@ pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, (u64, Option<&
     pointee
 }
 
+/// Recover **container-of / intrusive-list** hints: a register `p` used as `c = getelementptr
+/// i8, p, -C` (a byte gep with a negative constant) whose result `c` is then indexed as a
+/// `struct T` (`gep %struct.T, c, …`, so `c ∈ typed_gep_pointee_sizes`) points *into* a `struct
+/// T` — at byte offset `C` (the intrusive member's `offsetof`). This is exactly `container_of(p,
+/// T, member)`: `p = &node.member`, `c = node`. Returns `member local → (sizeof(T), C)`.
+///
+/// The dominant `list_for_each_entry` shape: the cursor `p` walks `list_head`s, and each is a
+/// member at offset `C` of its enclosing node. Sizing `p`'s region as the *whole* node with the
+/// cursor at offset `C` (see the loop-pointer materialisation) keeps the backward `container_of`
+/// subtraction in-object — otherwise `p - C` underflows a `list_head`-sized region (a false
+/// `valid_pointer_arith` UNKNOWN, the residual that dominates real kernel list walks).
+pub(crate) fn container_loop_hints(f: &LFunc) -> HashMap<String, (u64, u64)> {
+    let pointee = typed_gep_pointee_sizes(f);
+    let mut out: HashMap<String, (u64, u64)> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::Gep {
+            dst,
+            elem: LType::Int(8),
+            base: LValue::Local(base),
+            index: LValue::Int(off),
+        } = inst
+        {
+            if *off < 0 {
+                if let Some(&(size, _)) = pointee.get(dst.as_str()) {
+                    // `dst` (the container) is a `size`-byte `struct T`; `base` (the cursor) is a
+                    // member at offset `|off|`. First hit wins (a stable, deterministic choice).
+                    out.entry(base.clone()).or_insert((size, (-*off) as u64));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Recover a pointee size for a **loaded pointer** directly from the struct type of the gep
 /// that indexes it — no DWARF needed. A `gep %struct.T, ptr %b, …` proves `%b` points at a
 /// `%struct.T`, whose LLVM size bounds every access through it. This reaches the dominant

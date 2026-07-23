@@ -348,6 +348,18 @@ pub struct PtrHint {
     /// Honoured only under `--assume-struct-tail`; otherwise the region keeps `size` and every
     /// access into the tail stays UNKNOWN — soundly, since the tail's real size is unknown.
     pub tail: u64,
+    /// **Container size** for a `container_of`/intrusive-list pointer: when this register is used
+    /// as `c = ptr − container_offset` (a byte `getelementptr` with a negative constant) whose
+    /// result `c` is then indexed as a `struct T`, the register points *into* a `struct T` of this
+    /// many bytes, at [`container_offset`](Self::container_offset). `0` when it is not a container
+    /// member. Lets the loop-pointer materialisation put a `list_for_each_entry` cursor at the
+    /// right offset inside its whole node, so the backward `container_of` offset stays in-object
+    /// (otherwise it underflows the region — the dominant list-walk `valid_pointer_arith` residual).
+    pub container_size: u64,
+    /// The byte offset of this pointer *within* its [`container_size`](Self::container_size)-byte
+    /// node — `offsetof(T, member)`, recovered from the `container_of` subtraction. Meaningful
+    /// only when `container_size > 0`.
+    pub container_offset: u64,
 }
 
 impl PtrHint {
@@ -374,6 +386,14 @@ impl PtrHint {
         } else {
             1u64 << self.size.trailing_zeros().min(4)
         }
+    }
+
+    /// The container `(size, member_offset)` when this hint records a `container_of` pointer — a
+    /// register that points at `member_offset` inside a `size`-byte node. `None` for an ordinary
+    /// pointee hint. Consumed by the loop-pointer materialisation to place a `list_for_each_entry`
+    /// cursor inside its whole node so the backward container offset stays in-object.
+    pub fn container(&self) -> Option<(u64, u64)> {
+        (self.container_size > 0).then_some((self.container_size, self.container_offset))
     }
 }
 

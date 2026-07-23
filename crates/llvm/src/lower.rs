@@ -487,7 +487,7 @@ fn lower_function(
                     asserted.get(local.as_str()).map_or(0, |&a| a.max(derived(size)))
                 };
                 let tail = tails.get(local.as_str()).copied().unwrap_or(0);
-                reg_ptr_hints.insert(r, PtrHint { size, align, tail });
+                reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0 });
             }
         }
     }
@@ -504,7 +504,7 @@ fn lower_function(
         {
             if let Some(size) = len.checked_mul(elem).filter(|&s| s > 0) {
                 // A slice hint never shrinks a region already recovered by a more specific rule.
-                reg_ptr_hints.entry(r).or_insert(PtrHint { size, align, tail: 0 });
+                reg_ptr_hints.entry(r).or_insert(PtrHint { size, align, tail: 0, container_size: 0, container_offset: 0 });
             }
         }
     }
@@ -515,7 +515,20 @@ fn lower_function(
                 .or_else(|| asserted.get(local).map(|&a| a.max(derived(size))))
                 .unwrap_or(0);
             let tail = tails.get(local).copied().unwrap_or(0);
-            reg_ptr_hints.insert(r, PtrHint { size, align, tail });
+            reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0 });
+        }
+    }
+    // container_of / intrusive-list cursors: record the enclosing node's size and the member
+    // offset on the cursor's hint (creating a hint if the cursor has no pointee type of its own).
+    // The loop-pointer materialisation places the cursor at `container_offset` inside a
+    // `container_size`-byte node so the backward `container_of` subtraction stays in-object.
+    for (local, (csize, coff)) in container_loop_hints(f) {
+        if let Some(&r) = ctx.regs.get(local.as_str()) {
+            let e = reg_ptr_hints
+                .entry(r)
+                .or_insert(PtrHint { size: 0, align: 0, tail: 0, container_size: 0, container_offset: 0 });
+            e.container_size = csize;
+            e.container_offset = coff;
         }
     }
     let reg_ptr_hints: Vec<(RegId, PtrHint)> = reg_ptr_hints.into_iter().collect();

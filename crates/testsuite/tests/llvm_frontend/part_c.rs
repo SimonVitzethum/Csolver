@@ -48,6 +48,47 @@ entry:
         "assume_valid_params materialises the loaded child pointer as a valid struct");
 }
 
+/// A `list_for_each_entry` cursor's backward `container_of` (`pos = cursor − offsetof(member)`)
+/// stays **in-object**: the loop-pointer materialisation now places the cursor at the member
+/// offset inside its *whole node* (recovered from the typed container gep), so the subtraction
+/// lands at the node base instead of underflowing a member-sized region. Under
+/// `--assume-valid-loop-ptrs` the container access and the walk decide (was 5 UNKNOWN — the
+/// dominant real-kernel list-walk residual — now at most a lone alignment tail).
+#[test]
+fn list_for_each_entry_container_of_stays_in_object() {
+    let src = r#"
+%struct.node = type { i64, %struct.list_head }
+%struct.list_head = type { ptr, ptr }
+@head = internal global %struct.list_head zeroinitializer
+define i64 @walk() {
+entry:
+  %first = load ptr, ptr @head, align 8
+  br label %loop
+loop:
+  %it = phi ptr [ %first, %entry ], [ %next, %body ]
+  %isend = icmp eq ptr %it, @head
+  br i1 %isend, label %done, label %body
+body:
+  %pos = getelementptr i8, ptr %it, i64 -8
+  %valp = getelementptr %struct.node, ptr %pos, i64 0, i32 0
+  %v = load i64, ptr %valp, align 8
+  %nextp = getelementptr %struct.list_head, ptr %it, i64 0, i32 0
+  %next = load ptr, ptr %nextp, align 8
+  br label %loop
+done:
+  ret i64 0
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "c".into() }).expect("lower");
+    let cfg = Config { assume_valid_params: true, assume_valid_loop_ptrs: true, bug_finding: true, ..Config::default() };
+    let rep = verify_module(&m, &cfg);
+    let walk = rep.functions.iter().find(|f| f.function == "walk").expect("walk report");
+    assert!(walk.count(Verdict::Unknown) <= 1,
+        "the container_of list-walk decides except at most an alignment tail, got {} unknown",
+        walk.count(Verdict::Unknown));
+    assert!(walk.count(Verdict::Pass) >= 18, "most obligations proven, got {}", walk.count(Verdict::Pass));
+}
+
 /// A2: an internal helper's uncontracted pointer parameter is sized from the **typed pointer
 /// its caller passes** — the interprocedural pointer-contract synthesis now grounds a
 /// call site from the argument's pointee hint (not only a constant `alloca`). The helper reads

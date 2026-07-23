@@ -136,21 +136,34 @@ impl Explorer<'_> {
                         // a larger object); only a genuine input-driven overrun is. `None` when
                         // the frontend carries no type for it — the sound, unsized default.
                         let hint = self.reg_ptr_hints.get(&reg).copied();
-                        let rid =
-                            self.materialize_ref_region(hint.map(|h| h.size), true, true, state);
+                        // A `container_of`/`list_for_each_entry` cursor points at `member_offset`
+                        // inside its *whole node* (size `container_size`): materialise the node and
+                        // place the cursor at that offset, so the backward `container_of`
+                        // subtraction (`cursor - member_offset`) lands at the node base (offset 0,
+                        // in-object) instead of underflowing a member-sized region. An ordinary
+                        // iterator keeps the pointee-typed size at offset 0.
+                        let (region_size, ptr_offset) = match hint.and_then(|h| h.container()) {
+                            Some((csize, coff)) => {
+                                (Some(csize), self.ctx.int(PTR_WIDTH, coff as u128))
+                            }
+                            None => (hint.map(|h| h.size), offset),
+                        };
+                        let rid = self.materialize_ref_region(region_size, true, true, state);
                         state.regions[rid].prov_labels.extend(labels);
                         // A valid object is aligned to its type's alignment, so give the region
                         // that alignment — the same rule the DWARF field/param recoveries use.
                         // Without it every access through the iterator would stay UNKNOWN on
-                        // `alignment` alone.
-                        if let Some(h) = hint.filter(|h| h.size > 0) {
+                        // `alignment` alone. (For a container, the member type's alignment is a
+                        // sound lower bound on the node's — a struct is at least as aligned as any
+                        // member — so it never over-claims.)
+                        if let Some(h) = hint.filter(|h| h.size > 0 || h.container_size > 0) {
                             state.regions[rid].base_align = h.region_align();
                         }
                         state.env.insert(
                             reg,
                             SymValue::Ptr(SymPointer {
                                 prov: Prov::Region(rid),
-                                offset,
+                                offset: ptr_offset,
                                 align: 1,
                                 borrow: None,
                             }),
