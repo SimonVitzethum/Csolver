@@ -175,6 +175,21 @@ impl Explorer<'_> {
             }
             _ => None,
         };
+        // Closed-world points-to devirtualisation (call-target resolution ONLY). When the region-
+        // precise `fn_ptrs` above did not resolve, the whole-program points-to may know the single
+        // function this indirect target register designates (a heap/param `obj->ops->fn()`). We use
+        // it purely to pick the callee — the loaded pointer keeps its real (opaque) provenance, so
+        // its null/uninit/bounds checks below are untouched: a genuinely null/uninitialised target
+        // still faults first, and the resolved effect is used only on the paths that proceed.
+        let devirt_name: Option<String> = match callee {
+            Callee::Indirect(Operand::Reg(r)) if resolved_fid.is_none() => {
+                self.devirt.get(r).cloned()
+            }
+            _ => None,
+        };
+        if devirt_name.is_some() {
+            self.assumptions.insert("closed-world-devirt");
+        }
         // Valid indirect target (a CFI slice): an indirect call is a definite control-flow-
         // integrity bug when the target pointer is provably (a) **null** (a null/uninit
         // callback) or (b) into a **stack or heap region** — executing data as code (the
@@ -185,7 +200,7 @@ impl Explorer<'_> {
         // witness on a feasible path.
         if let Callee::Indirect(op) = callee {
             let mut violation = false;
-            if resolved_fid.is_none() {
+            if resolved_fid.is_none() && devirt_name.is_none() {
                 if let SymValue::Ptr(p) = self.eval_value(op, state) {
                     violation = match &p.prov {
                         Prov::Null => true,
@@ -216,7 +231,12 @@ impl Explorer<'_> {
             .or_else(|| match callee {
                 Callee::Symbol(name) => self.name_summaries.get(name).cloned(),
                 _ => None,
-            });
+            })
+            // A points-to-devirtualised indirect call resolves to its target's whole-program
+            // summary by name (precise effects instead of havoc). A name with no summary — e.g. a
+            // file-local `static` callee, excluded from the name-keyed summaries to avoid cross-file
+            // collisions — still falls through to the opaque havoc below (sound, just less precise).
+            .or_else(|| devirt_name.as_ref().and_then(|n| self.name_summaries.get(n).cloned()));
 
         // Double-free through a freeing *wrapper*: a callee that definitely frees its
         // parameter `k` (`Summary.frees_arg`) re-frees a base an earlier freeing call

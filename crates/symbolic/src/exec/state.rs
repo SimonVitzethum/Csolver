@@ -219,6 +219,13 @@ pub(crate) struct Explorer<'f> {
     /// header under `--assume-valid-loop-ptrs`, so accesses through a moving iterator get real
     /// bounds instead of an unsized (always-UNKNOWN) region. Empty for typeless frontends.
     pub(crate) reg_ptr_hints: &'f HashMap<RegId, PtrHint>,
+    /// **Closed-world devirtualisation** for this function: register → the name of the single
+    /// function it provably points to (a heap/param `obj->ops->fn()` resolved by the whole-program
+    /// points-to). An indirect call through such a register is analysed with that callee's summary
+    /// instead of an opaque havoc. Call-target resolution **only**: the loaded pointer keeps its
+    /// real provenance, so its null/uninit/bounds checks are unaffected (no masking). Empty unless
+    /// `--closed-world` whole-program — the store-completeness that makes a singleton exact.
+    pub(crate) devirt: &'f HashMap<RegId, String>,
     /// Set when this function is a **MMIO dispatch handler** (`Module::mmio_handlers`): its
     /// `(addr, size)` parameters are constrained by the memory core's dispatch guarantee
     /// (`size ∈ {1,2,4,8}`, and `addr + size ≤ region_size` when the inner `Some` gives the

@@ -283,6 +283,15 @@ pub struct ModulePointsTo {
     reg_node: HashMap<(u32, RegId), Node>,
     obj_global: HashMap<Node, String>,
     name_to_gfid: HashMap<String, u32>,
+    /// Per global function id: its name and whether it is internal (file-local `static`). Used to
+    /// re-key a resolved devirt by the **external** function name — the same soundness discipline
+    /// as the other whole-program facts (an internal/static's name may collide across files, so it
+    /// is never matched cross-file).
+    gfid_meta: HashMap<u32, (String, bool)>,
+    /// Every function symbol name in the program. A points-to singleton is only turned into a
+    /// devirt target when it names a real function (not a data global), so a data pointer that
+    /// happens to be a clean singleton never resolves a call.
+    fn_names: HashSet<String>,
 }
 
 impl ModulePointsTo {
@@ -307,6 +316,30 @@ impl ModulePointsTo {
     /// global id when only one module was pushed, as in [`analyze_module`]).
     pub fn devirt_global(&self, f: FuncId, r: RegId) -> Option<&str> {
         self.devirt(f.0, r)
+    }
+
+    /// The resolved indirect-call devirtualisations, keyed by **`(external function name, register)`**
+    /// — a register that provably (clean-singleton) points to a named function is mapped to that
+    /// function's name. Restricted to **external** (non-internal) caller functions so the key is
+    /// unambiguous across files (a static's name may recur), mirroring the whole-program fact
+    /// overlays. This is the executor-facing product: an indirect call through such a register is
+    /// resolved to a direct call on the named callee (call-target resolution **only** — the loaded
+    /// pointer's provenance/safety is untouched, so no uninitialised/null deref is masked).
+    pub fn name_keyed_devirt(&self) -> HashMap<(String, RegId), String> {
+        let mut out = HashMap::new();
+        for (&(gfid, r), &node) in &self.reg_node {
+            let Some((name, internal)) = self.gfid_meta.get(&gfid) else { continue };
+            if *internal {
+                continue;
+            }
+            let Some(obj) = self.pt.singleton_object(node) else { continue };
+            let Some(target) = self.obj_global.get(&obj) else { continue };
+            if !self.fn_names.contains(target) {
+                continue;
+            }
+            out.insert((name.clone(), r), target.clone());
+        }
+        out
     }
 
     /// The underlying solver (for tests / further queries).
@@ -341,6 +374,17 @@ pub struct ProgramPointsTo {
     fn_params: HashMap<u32, Vec<RegId>>,
     /// Deferred calls `(caller gfid, callee, args)` — resolved at finalize.
     deferred: Vec<(u32, DeferredCallee, Vec<Operand>)>,
+    /// Global id → `(name, internal)` — carried into the result for name-keyed devirt.
+    gfid_meta: HashMap<u32, (String, bool)>,
+    /// Every function symbol name seen (devirt targets must name a real function).
+    fn_names: HashSet<String>,
+    /// Names of globals whose contents are **known ground truth** — a constant (`!writable`)
+    /// initializer was ingested via [`global_field_init`]. Every *other* global is poisoned at
+    /// [`finalize`], so a load of one of its fields yields TOP rather than the empty set. This is
+    /// the soundness fix for the ambiguous-dispatch collapse: if `obj->ops ∈ {G_known, G_unknown}`,
+    /// the load of `->fn` must NOT resolve to `G_known`'s target just because `G_unknown`'s field
+    /// cell happens to be empty — `G_unknown` could hold any function, so its field is TOP.
+    known_const_globals: HashSet<String>,
 }
 
 impl Default for ProgramPointsTo {
@@ -361,7 +405,24 @@ impl ProgramPointsTo {
             name_to_gfid: HashMap::new(),
             fn_params: HashMap::new(),
             deferred: Vec::new(),
+            gfid_meta: HashMap::new(),
+            fn_names: HashSet::new(),
+            known_const_globals: HashSet::new(),
         }
+    }
+
+    /// Seed a constant-global initializer edge `*(global + offset) = &target` — the vtable content
+    /// that the module carries out-of-line (in `Module::global_fn_ptrs` / `global_ptr_fields`), not
+    /// in any function body. Feeding it as an address-of into the field cell lets the **second hop**
+    /// of `obj->ops->fn()` resolve inside the points-to relation: once a heap/param field is known
+    /// (hop 1) to hold `&G_ops`, the load of `G_ops->fn` reads back `&target` here. A constant
+    /// initializer is ground truth, so this edge is exact (no assumption).
+    fn global_field_init(&mut self, gname: &str, offset: u64, target: &str) {
+        let obj = self.global(gname);
+        let cell = self.pt.intern_field(obj, offset);
+        let tobj = self.global(target);
+        self.pt.address_of(cell, tobj);
+        self.known_const_globals.insert(gname.to_string());
     }
 
     fn reg(&mut self, gfid: u32, r: RegId) -> Node {
@@ -415,9 +476,29 @@ impl ProgramPointsTo {
         let base = self.next;
         for (i, f) in m.functions.iter().enumerate() {
             let gfid = base + i as u32;
+            let internal = m.internal.contains(&f.id);
             self.fn_params.insert(gfid, f.params.iter().map(|(r, _)| *r).collect());
-            if !m.internal.contains(&f.id) {
+            self.gfid_meta.insert(gfid, (f.name.clone(), internal));
+            self.fn_names.insert(f.name.clone());
+            if !internal {
                 self.name_to_gfid.entry(f.name.clone()).or_insert(gfid);
+            }
+        }
+        // Ingest the out-of-line constant-global initializers (vtables / ops-struct chains). A
+        // function-pointer field names a real function (recorded as a devirt-eligible target); a
+        // pointer-to-global field chains one constant global to another. Both are ground truth.
+        for (gname, entries) in &m.global_fn_ptrs {
+            for (off, fid) in entries {
+                if let Some(tf) = m.functions.iter().find(|f| f.id == *fid) {
+                    let tname = tf.name.clone();
+                    self.fn_names.insert(tname.clone());
+                    self.global_field_init(gname, *off, &tname);
+                }
+            }
+        }
+        for (gname, entries) in &m.global_ptr_fields {
+            for (off, target) in entries {
+                self.global_field_init(gname, *off, target);
             }
         }
         for (i, f) in m.functions.iter().enumerate() {
@@ -487,12 +568,119 @@ impl ProgramPointsTo {
         self.next += m.functions.len() as u32;
     }
 
+    /// Remap a node of `other` into this builder, unifying **named globals by name** (the same
+    /// global in two files is one object) and giving every shard-local node (variables, allocation
+    /// objects, field cells) a fresh identity here. Field cells recurse through their base object,
+    /// so a global's field cell unifies too (via [`PointsTo::intern_field`] reuse) — which is what
+    /// lets a vtable initialized in one file resolve a dispatch loaded in another. Memoized in `map`.
+    fn remap(
+        &mut self,
+        n: Node,
+        other: &ProgramPointsTo,
+        cell_of: &HashMap<Node, (Node, u64)>,
+        map: &mut HashMap<Node, Node>,
+    ) -> Node {
+        if let Some(&m) = map.get(&n) {
+            return m;
+        }
+        let out = if let Some(&(obj, off)) = cell_of.get(&n) {
+            let so = self.remap(obj, other, cell_of, map);
+            self.pt.intern_field(so, off)
+        } else if other.obj_global.contains_key(&n) {
+            // A named global: unify by name across shards.
+            let name = other.pt.name.get(&n).cloned().unwrap_or_default();
+            self.global(&name)
+        } else if let Some(nm) = other.pt.name.get(&n).cloned() {
+            // A named-but-local object (an allocation site): stays distinct per shard.
+            self.pt.new_object(nm)
+        } else {
+            self.pt.new_var()
+        };
+        map.insert(n, out);
+        out
+    }
+
+    /// Fold `other` (a points-to built over a *later* file shard) into this one so shards extracted
+    /// concurrently merge in file order into one whole-program relation — the counterpart to
+    /// [`WholeProgramFacts::merge`](../../csolver_verifier/wholeprog/struct.WholeProgramFacts.html).
+    /// Global ids are rebased by this builder's function count (identical to a single sequential
+    /// push), named globals unify, and every local node/constraint is translated through [`remap`].
+    /// Called **before** [`finalize`](Self::finalize) — no points-to set has been solved yet, so
+    /// only the constraint graph is translated; the fixpoint runs once over the merged whole.
+    pub fn merge(&mut self, other: ProgramPointsTo) {
+        let gbase = self.next;
+        let cell_of: HashMap<Node, (Node, u64)> =
+            other.pt.field_cell.iter().map(|(&(o, off), &c)| (c, (o, off))).collect();
+        let mut map: HashMap<Node, Node> = HashMap::new();
+        map.insert(other.pt.top, self.pt.top);
+        for &(p, o) in &other.pt.addr {
+            let (a, b) = (self.remap(p, &other, &cell_of, &mut map), self.remap(o, &other, &cell_of, &mut map));
+            self.pt.address_of(a, b);
+        }
+        for &(d, s) in &other.pt.copy {
+            let (a, b) = (self.remap(d, &other, &cell_of, &mut map), self.remap(s, &other, &cell_of, &mut map));
+            self.pt.assign(a, b);
+        }
+        for &(d, s, off) in &other.pt.gep {
+            let (a, b) = (self.remap(d, &other, &cell_of, &mut map), self.remap(s, &other, &cell_of, &mut map));
+            self.pt.gep(a, b, off);
+        }
+        for &(d, s) in &other.pt.load {
+            let (a, b) = (self.remap(d, &other, &cell_of, &mut map), self.remap(s, &other, &cell_of, &mut map));
+            self.pt.load(a, b);
+        }
+        for &(v, p) in &other.pt.store {
+            let (a, b) = (self.remap(v, &other, &cell_of, &mut map), self.remap(p, &other, &cell_of, &mut map));
+            self.pt.store(a, b);
+        }
+        for &o in &other.pt.poisoned {
+            let a = self.remap(o, &other, &cell_of, &mut map);
+            self.pt.poison(a);
+        }
+        for (&(g, r), &nd) in &other.reg_node {
+            let a = self.remap(nd, &other, &cell_of, &mut map);
+            self.reg_node.insert((g + gbase, r), a);
+        }
+        for (&g, ps) in &other.fn_params {
+            self.fn_params.insert(g + gbase, ps.clone());
+        }
+        for (&g, meta) in &other.gfid_meta {
+            self.gfid_meta.insert(g + gbase, meta.clone());
+        }
+        for (nm, &g) in &other.name_to_gfid {
+            self.name_to_gfid.entry(nm.clone()).or_insert(g + gbase);
+        }
+        self.fn_names.extend(other.fn_names.iter().cloned());
+        self.known_const_globals.extend(other.known_const_globals.iter().cloned());
+        for (caller, callee, args) in other.deferred {
+            let callee = match callee {
+                DeferredCallee::Gfid(g) => DeferredCallee::Gfid(g + gbase),
+                c => c,
+            };
+            self.deferred.push((caller + gbase, callee, args));
+        }
+        self.next += other.next;
+    }
+
     /// Resolve the deferred calls (arg→param for a known callee, poison the args of an opaque one)
     /// and solve to a fixpoint. A resolved callee needs no arg poisoning: its own body's stores
     /// into its parameters flow back to the caller's objects through the arg→param edges, so a
     /// callee that writes `param->ops` is captured exactly (and makes the field ambiguous if it
     /// disagrees with another site) — the interprocedural soundness.
     pub fn finalize(mut self) -> ModulePointsTo {
+        // Poison every global whose constant initializer was NOT ingested: its field contents are
+        // unknown, so a load of one of its fields must be TOP, never the empty set. Without this an
+        // ambiguous `obj->ops ∈ {G_known, G_unknown}` would unsoundly collapse to `G_known`'s target
+        // at the second hop (the unknown's empty field cell contributing nothing to the union).
+        let unknown: Vec<Node> = self
+            .global_obj
+            .iter()
+            .filter(|(name, _)| !self.known_const_globals.contains(*name))
+            .map(|(_, &node)| node)
+            .collect();
+        for n in unknown {
+            self.pt.poison(n);
+        }
         let deferred = std::mem::take(&mut self.deferred);
         for (caller, callee, args) in deferred {
             let target = match callee {
@@ -523,6 +711,8 @@ impl ProgramPointsTo {
             reg_node: self.reg_node,
             obj_global: self.obj_global,
             name_to_gfid: self.name_to_gfid,
+            gfid_meta: self.gfid_meta,
+            fn_names: self.fn_names,
         }
     }
 }
@@ -848,5 +1038,179 @@ mod tests {
         pt.load(fnp, fnfield);
         pt.solve();
         assert_eq!(pt.singleton_object(fnp), Some(target), "the dispatch resolves to target");
+    }
+
+    // --- P4: heap/param-rooted `obj->ops->fn()` via the constant vtable initializer ---
+
+    // Build a module whose `dispatch` fn allocates an object, stores `&G_ops` into its `ops`
+    // field (offset 8), loads it, geps the `fn` field (offset 16) and loads the function pointer
+    // — the classic heap dispatch. `G_ops.fn` is supplied out-of-line by `global_fn_ptrs`
+    // (the constant vtable), pointing at `target`. `ambiguous` stores a *second* ops global into
+    // the same field first, to make the field non-singleton.
+    fn dispatch_module(ambiguous: bool) -> (IrModule, RegId) {
+        let (obj, opsfield, opsp, fnfield, fnp) = (RegId(0), RegId(1), RegId(2), RegId(3), RegId(4));
+        let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb.insts.push(IrInst::Alloc {
+            dst: obj, region: RegionKind::Heap, elem: IrTy::int(8), count: IrOp::int(64, 64), align: 8,
+        });
+        bb.insts.push(IrInst::PtrOffset {
+            dst: opsfield, base: IrOp::Reg(obj), index: IrOp::int(64, 8), elem: IrTy::int(8),
+        });
+        if ambiguous {
+            bb.insts.push(IrInst::Store {
+                ty: ptr_ty(), ptr: IrOp::Reg(opsfield),
+                value: IrOp::Const(IrConst::Symbol("G_other".into())), align: 8, volatile: false,
+            });
+        }
+        bb.insts.push(IrInst::Store {
+            ty: ptr_ty(), ptr: IrOp::Reg(opsfield),
+            value: IrOp::Const(IrConst::Symbol("G_ops".into())), align: 8, volatile: false,
+        });
+        bb.insts.push(IrInst::Load {
+            dst: opsp, ty: ptr_ty(), ptr: IrOp::Reg(opsfield), align: 8, volatile: false,
+        });
+        bb.insts.push(IrInst::PtrOffset {
+            dst: fnfield, base: IrOp::Reg(opsp), index: IrOp::int(64, 16), elem: IrTy::int(8),
+        });
+        bb.insts.push(IrInst::Load {
+            dst: fnp, ty: ptr_ty(), ptr: IrOp::Reg(fnfield), align: 8, volatile: false,
+        });
+        let dispatch = IrFunc {
+            id: FuncId(0), name: "dispatch".into(), params: vec![], ret_ty: IrTy::Unit,
+            blocks: vec![bb], entry: BlockId(0),
+        };
+        let target = IrFunc {
+            id: FuncId(1), name: "target".into(), params: vec![], ret_ty: IrTy::Unit,
+            blocks: vec![BasicBlock::new(BlockId(0), Terminator::Return(None))], entry: BlockId(0),
+        };
+        let mut m = IrModule::new("m");
+        m.functions.push(dispatch);
+        m.functions.push(target);
+        // The constant vtable: `G_ops.fn` (offset 16) holds `&target`.
+        m.global_fn_ptrs.insert("G_ops".into(), vec![(16, FuncId(1))]);
+        (m, fnp)
+    }
+
+    #[test]
+    fn p4_heap_dispatch_devirts_via_vtable_initializer() {
+        let (m, fnp) = dispatch_module(false);
+        let mp = analyze_module(&m);
+        assert_eq!(mp.devirt_global(FuncId(0), fnp), Some("target"), "the loaded fn ptr resolves");
+        let dv = mp.name_keyed_devirt();
+        assert_eq!(dv.get(&("dispatch".to_string(), fnp)).map(String::as_str), Some("target"));
+    }
+
+    #[test]
+    fn p4_ambiguous_ops_field_does_not_devirt() {
+        let (m, fnp) = dispatch_module(true);
+        let mp = analyze_module(&m);
+        // Two different ops globals reach `obj->ops`, so `opsp` is not a singleton; the `fn` load
+        // sees both vtables' entries (only `G_ops`'s is populated, but the field is ambiguous), so
+        // no clean devirt. Soundness: an ambiguous dispatch must NOT resolve to one target.
+        assert_eq!(mp.name_keyed_devirt().get(&("dispatch".to_string(), fnp)), None);
+    }
+
+    // A data global (not a function) that a register cleanly points to must NOT be devirt'd — the
+    // resolution is only for call targets that name a real function.
+    #[test]
+    fn p4_data_singleton_is_not_a_devirt_target() {
+        let mut pp = ProgramPointsTo::new();
+        let (obj, field, loaded) = (RegId(0), RegId(1), RegId(2));
+        let mut bb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bb.insts.push(IrInst::Alloc {
+            dst: obj, region: RegionKind::Heap, elem: IrTy::int(8), count: IrOp::int(64, 64), align: 8,
+        });
+        bb.insts.push(IrInst::PtrOffset {
+            dst: field, base: IrOp::Reg(obj), index: IrOp::int(64, 8), elem: IrTy::int(8),
+        });
+        bb.insts.push(IrInst::Store {
+            ty: ptr_ty(), ptr: IrOp::Reg(field),
+            value: IrOp::Const(IrConst::Symbol("some_data".into())), align: 8, volatile: false,
+        });
+        bb.insts.push(IrInst::Load {
+            dst: loaded, ty: ptr_ty(), ptr: IrOp::Reg(field), align: 8, volatile: false,
+        });
+        let f = IrFunc {
+            id: FuncId(0), name: "reader".into(), params: vec![], ret_ty: IrTy::Unit,
+            blocks: vec![bb], entry: BlockId(0),
+        };
+        let mut m = IrModule::new("m");
+        m.functions.push(f);
+        pp.push_module(&m);
+        let mp = pp.finalize();
+        assert_eq!(mp.devirt_global(FuncId(0), loaded), Some("some_data"), "resolves the object");
+        assert_eq!(mp.name_keyed_devirt().get(&("reader".to_string(), loaded)), None, "but not as a call");
+    }
+
+    // `merge` of two shards must give the same devirt as a single sequential push: split the
+    // cross-module dispatch (module A stores `&G_ops` and passes the object; module B loads the
+    // field and the `fn`) across two independently-built `ProgramPointsTo`, merge in order, and
+    // confirm B's function-pointer load still resolves to `target` (globals unified across shards).
+    #[test]
+    fn p4_merge_across_shards_resolves_like_sequential() {
+        // Module A: fn make() { obj = alloc; obj.ops(@8) = &G_ops; use(obj); }  + vtable G_ops.fn=&target
+        let (obj, field) = (RegId(0), RegId(1));
+        let mut abb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        abb.insts.push(IrInst::Alloc {
+            dst: obj, region: RegionKind::Heap, elem: IrTy::int(8), count: IrOp::int(64, 64), align: 8,
+        });
+        abb.insts.push(IrInst::PtrOffset {
+            dst: field, base: IrOp::Reg(obj), index: IrOp::int(64, 8), elem: IrTy::int(8),
+        });
+        abb.insts.push(IrInst::Store {
+            ty: ptr_ty(), ptr: IrOp::Reg(field), value: IrOp::Const(IrConst::Symbol("G_ops".into())),
+            align: 8, volatile: false,
+        });
+        abb.insts.push(IrInst::Call {
+            dst: None, callee: csolver_ir::Callee::Symbol("use".into()), args: vec![IrOp::Reg(obj)],
+            ret_ty: IrTy::Unit, ret_ref: None,
+        });
+        let make = IrFunc {
+            id: FuncId(0), name: "make".into(), params: vec![], ret_ty: IrTy::Unit,
+            blocks: vec![abb], entry: BlockId(0),
+        };
+        let target = IrFunc {
+            id: FuncId(1), name: "target".into(), params: vec![], ret_ty: IrTy::Unit,
+            blocks: vec![BasicBlock::new(BlockId(0), Terminator::Return(None))], entry: BlockId(0),
+        };
+        let mut ma = IrModule::new("a");
+        ma.functions.push(make);
+        ma.functions.push(target);
+        ma.global_fn_ptrs.insert("G_ops".into(), vec![(16, FuncId(1))]);
+
+        // Module B: fn use(o) { opsp = o.ops(@8); fnp = opsp.fn(@16); }
+        let (o, field2, opsp, fnfield, fnp) = (RegId(0), RegId(1), RegId(2), RegId(3), RegId(4));
+        let mut bbb = BasicBlock::new(BlockId(0), Terminator::Return(None));
+        bbb.insts.push(IrInst::PtrOffset {
+            dst: field2, base: IrOp::Reg(o), index: IrOp::int(64, 8), elem: IrTy::int(8),
+        });
+        bbb.insts.push(IrInst::Load {
+            dst: opsp, ty: ptr_ty(), ptr: IrOp::Reg(field2), align: 8, volatile: false,
+        });
+        bbb.insts.push(IrInst::PtrOffset {
+            dst: fnfield, base: IrOp::Reg(opsp), index: IrOp::int(64, 16), elem: IrTy::int(8),
+        });
+        bbb.insts.push(IrInst::Load {
+            dst: fnp, ty: ptr_ty(), ptr: IrOp::Reg(fnfield), align: 8, volatile: false,
+        });
+        let usef = IrFunc {
+            id: FuncId(0), name: "use".into(), params: vec![(o, ptr_ty())], ret_ty: IrTy::Unit,
+            blocks: vec![bbb], entry: BlockId(0),
+        };
+        let mut mb = IrModule::new("b");
+        mb.functions.push(usef);
+
+        // Build each shard independently, then merge in file order (A before B).
+        let mut sa = ProgramPointsTo::new();
+        sa.push_module(&ma);
+        let mut sb = ProgramPointsTo::new();
+        sb.push_module(&mb);
+        sa.merge(sb);
+        let mp = sa.finalize();
+        assert_eq!(
+            mp.name_keyed_devirt().get(&("use".to_string(), fnp)).map(String::as_str),
+            Some("target"),
+            "the vtable (shard A) and the dispatch (shard B) unify across the merge",
+        );
     }
 }

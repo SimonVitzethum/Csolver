@@ -86,16 +86,35 @@ Kernel-Größe; whole-program über den Streaming-Facts-Pfad wie A2). Klassisch,
    **nicht** auflösen (Poison), ein eindeutiges muss.
 4. Nur unter `--closed-world`; ohne das Flag unverändert.
 
-## 6. Phasen (fokussierte Folge-Tasks)
+## 5b. Umsetzungsbefund (P4/P5 abgeschlossen)
+
+Beim Bau von P4 kam ein **weiterer Soundness-Aspekt** ans Licht, der in §1–§5 implizit war:
+Ein Load `%fn = *(opsp + off)` unioniert über `pts(opsp)`. Ist `obj->ops` mehrdeutig
+(`pts(opsp) = {G_known, G_unknown}`), so trägt eine **leere** Feldzelle `G_unknown.off` nichts
+zur Union bei — und `%fn` kollabiert fälschlich zum Singleton `{G_known.target}`. Leere Zelle heißt
+„zeigt auf nichts" (⊥); die sound Bedeutung eines *unbekannten* Global-Feldes ist aber „könnte auf
+alles zeigen" (⊤). **Fix:** jedes Global, dessen konstanter Initializer *nicht* eingespeist wurde
+(kein `global_field_init`), wird bei `finalize` vergiftet → seine Feld-Loads liefern ⊤, nie ∅. Nur
+bekannte const-Vtables bleiben exakt. (Unit-Test `p4_ambiguous_ops_field_does_not_devirt`, e2e
+`p4_ambiguous_heap_dispatch_does_not_devirtualise`.)
+
+**Präzisionsgrenze (sound, kein Regress):** das devirtualisierte Ziel wird über `name_summaries`
+(nur *externe* Namen) aufgelöst. Ein **static** ops-Ziel löst den Namen auf, bekommt aber keine
+Summary → havoc (wie der bisherige opake indirekte Call). Externe/co-lokalisierte Ziele bekommen
+die präzise Callee-Summary. Follow-up: global-eindeutige Static-Namen als Summary-Quelle.
+
+## 6. Phasen (fokussierte Folge-Tasks) — **ALLE ERLEDIGT**
 
 1. **P1 — Points-to-Kern:** die Constraint-Sammlung + der Worklist-Solver als neues Modul
    (`crates/absint/src/pointsto.rs` o. ä.), feld-sensitiv, mit ⊤-Vergiftung. Unit-getestet
    isoliert (Constraints → pts).
 2. **P2 — Feld-Ziel-Extraktion:** `field_target[(T, off)]` aus dem pts-Ergebnis; Singleton-Regel.
 3. **P3 — whole-program (Streaming):** über den Facts-Pfad wie A2/Phase D, damit der Scan profitiert.
-4. **P4 — Executor-Integration:** `reg_devirt_points_to` + Seiten-Annotation für die
-   Call-Auflösung; `--closed-world`-Gate; Assumption.
-5. **P5 — Validierung:** Orakel + Devirt-Differential + `mm`/af_alg-Messung.
+4. **P4 — Executor-Integration:** ✅ `name_devirt` (`(caller, reg) → callee`) auf
+   `WholeProgramContext`, pro Funktion projiziert, als `Explorer.devirt` in `step_call` konsumiert
+   (call-resolution-only, Provenance unberührt); `--closed-world`-Gate; Assumption `closed-world-devirt`.
+5. **P5 — Validierung:** ✅ beide Orakel SOUND; e2e Devirt-Differential (eindeutig löst, mehrdeutig
+   nicht) grün; volle Testsuite grün. `mm`/af_alg-Kernel-Messung offen (frischer Scan nötig).
 
 **Verdikt:** sound machbar, aber es ist die whole-program Points-to-Analyse als eigene Komponente
 (P1–P5), nicht ein fokussierter Patch. Der Entkopplungs-Trick (§2) ist der Schlüssel, der es

@@ -10,7 +10,8 @@
 //! proven equivalent in `contracts` / `csolver_symbolic`).
 
 use crate::contracts::{ContractFacts, FieldFacts, ScalarFacts};
-use csolver_ir::{FieldContract, FuncId, Module, PtrContract};
+use csolver_absint::ProgramPointsTo;
+use csolver_ir::{FieldContract, FuncId, Module, PtrContract, RegId};
 use csolver_symbolic::{Summary, SummaryFacts};
 use std::collections::HashMap;
 
@@ -28,6 +29,12 @@ pub struct WholeProgramFacts {
     /// precondition for each, keyed by name, so the per-file overlay applies it wherever the
     /// handler is actually defined.
     mmio_handlers: HashMap<String, csolver_ir::MmioHandler>,
+    /// Whole-program field-sensitive points-to, folded in the same streaming order. Powers the
+    /// closed-world devirtualisation of heap/param-rooted `obj->ops->fn()` dispatch: it resolves
+    /// which single function a loaded function-pointer register provably designates (see
+    /// [`ProgramPointsTo`]). Only *used* (finalized) under closed-world — store-completeness, the
+    /// premise that a resolved singleton is exact, holds only over the whole program.
+    pointsto: ProgramPointsTo,
 }
 
 impl WholeProgramFacts {
@@ -47,6 +54,7 @@ impl WholeProgramFacts {
         for (name, h) in &m.mmio_handlers {
             self.mmio_handlers.entry(name.clone()).or_insert(*h);
         }
+        self.pointsto.push_module(m);
     }
 
     /// Absorb a fact set built in parallel over a *later* range of files, so shards
@@ -61,11 +69,20 @@ impl WholeProgramFacts {
         for (name, h) in other.mmio_handlers {
             self.mmio_handlers.entry(name).or_insert(h);
         }
+        self.pointsto.merge(other.pointsto);
     }
 
     /// Finalize all four passes. Pointer contracts feed member-provenance, exactly
     /// as in the linked pipeline (`verify_module`).
     pub fn finalize(self, closed_world: bool, assume_valid_params: bool) -> ProgramFacts {
+        // Devirtualisation map — built only closed-world. A points-to singleton is exact only when
+        // the program's stores are complete (no unseen file may write `obj->ops`); that premise is
+        // the closed-world assumption itself. Open-world, the map is empty and devirt is off.
+        let name_devirt = if closed_world {
+            self.pointsto.finalize().name_keyed_devirt()
+        } else {
+            HashMap::new()
+        };
         // Grab the external name → global-id map before `finalize` consumes the
         // builder, so each finalized fact can be paired back to its function's name
         // for on-demand cross-file resolution (2b). All four builders assign ids in the
@@ -121,6 +138,7 @@ impl WholeProgramFacts {
             name_ptr_contracts,
             name_field_contracts,
             name_mmio: self.mmio_handlers,
+            name_devirt,
         }
     }
 }
@@ -154,6 +172,11 @@ pub struct ProgramFacts {
     /// how the handler is invoked, not a caller convention, so unlike `name_scalars` it is not
     /// gated on non-exported linkage.
     pub name_mmio: HashMap<String, csolver_ir::MmioHandler>,
+    /// Closed-world indirect-call devirtualisation, keyed by `(external caller name, register)` →
+    /// the single function that register provably points to (heap/param `obj->ops->fn()`). Empty
+    /// open-world. Consumed by the executor to resolve an indirect call to a direct callee summary
+    /// (call-target only — the loaded pointer's memory-safety checks are untouched).
+    pub name_devirt: HashMap<(String, RegId), String>,
 }
 
 impl ProgramFacts {
@@ -168,6 +191,7 @@ impl ProgramFacts {
             name_ptr_contracts: &self.name_ptr_contracts,
             name_field_contracts: &self.name_field_contracts,
             name_mmio: &self.name_mmio,
+            name_devirt: &self.name_devirt,
         }
     }
 }
@@ -192,4 +216,6 @@ pub struct WholeProgramContext<'a> {
     pub name_field_contracts: &'a HashMap<(String, u32), Vec<FieldContract>>,
     /// Whole-program MMIO dispatch handlers, keyed by function name (applied even when exported).
     pub name_mmio: &'a HashMap<String, csolver_ir::MmioHandler>,
+    /// Closed-world indirect-call devirtualisation, keyed by `(external caller name, register)`.
+    pub name_devirt: &'a HashMap<(String, RegId), String>,
 }

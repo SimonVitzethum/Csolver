@@ -166,6 +166,91 @@ entry:
     assert_eq!(dispatch.verdict, Verdict::Pass, "the dispatch decides through the devirtualised call");
 }
 
+/// P4 — the **heap/param-rooted** `obj->ops->fn()` dispatch (the common kernel case the constant-
+/// global chain above does NOT cover): `obj` is a fresh allocation whose `ops` field is filled by
+/// a store, then handed to a dispatcher that loads `obj->ops->fn` and calls it. Resolving this
+/// needs the whole-program field-sensitive points-to (which store fills the field program-wide),
+/// so it fires only through the closed-world whole-program path, surfaced as the
+/// `closed-world-devirt` assumption. This is a **differential**: one ops global ⇒ resolves; two
+/// different ops globals reaching the same field ⇒ ambiguous ⇒ must NOT resolve (soundness).
+#[cfg(test)]
+fn run_pointsto_dispatch(src: &str) -> csolver_verifier::ModuleReport {
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "d".into() }).expect("lower");
+    // Whole-program closed-world path: build the streaming facts (which now include the points-to),
+    // finalize closed-world, and verify the module against that context — the same wiring the scan
+    // uses. `verify_module` (single-file) would NOT build the points-to devirt (ctx is None).
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    wpf.push_module(&m);
+    let facts = wpf.finalize(true, false);
+    csolver_verifier::verify_module_whole_program(&m, &Config::default(), 1, facts.context())
+}
+
+const POINTSTO_DISPATCH_HEADER: &str = r#"
+%struct.ops = type { i64, ptr }
+%struct.obj = type { i64, ptr }
+@G_ops = internal constant %struct.ops { i64 0, ptr @target }, align 8
+define void @target(ptr %p) {
+  ret void
+}
+define void @run(ptr %o) {
+entry:
+  %opsf = getelementptr %struct.obj, ptr %o, i64 0, i32 1
+  %opsp = load ptr, ptr %opsf, align 8
+  %fnf = getelementptr %struct.ops, ptr %opsp, i64 0, i32 1
+  %fn = load ptr, ptr %fnf, align 8
+  call void %fn(ptr %o)
+  ret void
+}
+define void @setup() {
+entry:
+  %obj = alloca %struct.obj, align 8
+  %of = getelementptr %struct.obj, ptr %obj, i64 0, i32 1
+  store ptr @G_ops, ptr %of, align 8
+  call void @run(ptr %obj)
+  ret void
+}
+"#;
+
+#[test]
+fn p4_heap_dispatch_devirtualises_closed_world() {
+    let rep = run_pointsto_dispatch(POINTSTO_DISPATCH_HEADER);
+    assert!(
+        rep.assumptions.iter().any(|a| a.id == "closed-world-devirt"),
+        "the heap-rooted obj->ops->fn() resolves through the whole-program points-to: {:?}",
+        rep.assumptions.iter().map(|a| &a.id).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn p4_ambiguous_heap_dispatch_does_not_devirtualise() {
+    // A second, different ops global (`G_ops2` → `target2`) reaches the SAME `obj->ops` field
+    // through a second allocation also passed to `run`. `run`'s `obj->ops` is now {G_ops, G_ops2},
+    // so the loaded `fn` is {target, target2} — not a clean singleton. No devirt may fire.
+    let ambiguous = format!(
+        "{POINTSTO_DISPATCH_HEADER}\n{}",
+        r#"
+@G_ops2 = internal constant %struct.ops { i64 0, ptr @target2 }, align 8
+define void @target2(ptr %p) {
+  ret void
+}
+define void @setup2() {
+entry:
+  %obj = alloca %struct.obj, align 8
+  %of = getelementptr %struct.obj, ptr %obj, i64 0, i32 1
+  store ptr @G_ops2, ptr %of, align 8
+  call void @run(ptr %obj)
+  ret void
+}
+"#,
+    );
+    let rep = run_pointsto_dispatch(&ambiguous);
+    assert!(
+        !rep.assumptions.iter().any(|a| a.id == "closed-world-devirt"),
+        "an ambiguous obj->ops (two different ops globals) must NOT devirtualise (soundness): {:?}",
+        rep.assumptions.iter().map(|a| &a.id).collect::<Vec<_>>(),
+    );
+}
+
 /// A2: an internal helper's uncontracted pointer parameter is sized from the **typed pointer
 /// its caller passes** — the interprocedural pointer-contract synthesis now grounds a
 /// call site from the argument's pointee hint (not only a constant `alloca`). The helper reads

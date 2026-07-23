@@ -85,7 +85,7 @@ fn indirect_call_devirtualised_to_a_pure_summary_preserves_state() {
     table.insert("G".to_string(), vec![(0u64, FuncId(1))]);
     let r = discharge_inner(
         &f, ExecLimits::default(), &summaries, &HashMap::new(), &[], &[], &[], &globals,
-        &empty_grants, &table, None, &HashMap::new(), None,
+        &empty_grants, &table, &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
     );
     assert!(
         r.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
@@ -98,7 +98,7 @@ fn indirect_call_devirtualised_to_a_pure_summary_preserves_state() {
     // havoc ⇒ the final write is not proven safe.
     let r2 = discharge_inner(
         &f, ExecLimits::default(), &summaries, &HashMap::new(), &[], &[], &[], &globals,
-        &empty_grants, &HashMap::new(), None, &HashMap::new(), None,
+        &empty_grants, &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
     );
     assert!(
         !r2.assumptions.iter().any(|a| a == "devirtualized-indirect-call"),
@@ -133,7 +133,7 @@ fn indirect_call_through_null_fn_ptr_is_refuted() {
     let empty_grants = HashMap::new();
     let r = discharge_inner(
         &f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[],
-        &HashMap::new(), &empty_grants, &HashMap::new(), None, &HashMap::new(), None,
+        &HashMap::new(), &empty_grants, &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
     );
     let d = r
         .mem_decision(BlockId(0), 0, SafetyProperty::ValidIndirectTarget)
@@ -152,7 +152,7 @@ fn indirect_call_into_stack_data_is_refuted() {
     let run = |f: &Function| {
         discharge_inner(
             f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[],
-            &HashMap::new(), &empty_grants, &HashMap::new(), None, &HashMap::new(), None,
+            &HashMap::new(), &empty_grants, &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
         )
     };
     // `%p = alloca i32; call %p()` — calling the address of a stack local as code.
@@ -236,7 +236,7 @@ fn write_to_constant_global_is_refuted() {
     let run = |f: &Function| {
         discharge_inner(
             f, ExecLimits { bug_finding: true, ..ExecLimits::default() }, &HashMap::new(),
-            &HashMap::new(), &[], &[], &[], &globals, &empty, &HashMap::new(), None, &HashMap::new(), None,
+            &HashMap::new(), &[], &[], &[], &globals, &empty, &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
         )
     };
     let ro = run(&mk("ro"));
@@ -293,7 +293,7 @@ fn cross_file_symbol_call_resolves_via_name_summaries() {
     // so the following store is NOT proven free of use-after-free.
     let opaque = discharge_inner(
         &f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[],
-        &HashMap::new(), &empty_grants, &HashMap::new(), None, &HashMap::new(), None,
+        &HashMap::new(), &empty_grants, &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
     );
     let uaf = opaque.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
     assert!(!uaf.proven, "an unresolved cross-file symbol must havoc (may free)");
@@ -306,7 +306,7 @@ fn cross_file_symbol_call_resolves_via_name_summaries() {
     );
     let r_pure = discharge_inner(
         &f, ExecLimits::default(), &HashMap::new(), &pure, &[], &[], &[], &HashMap::new(),
-        &empty_grants, &HashMap::new(), None, &HashMap::new(), None,
+        &empty_grants, &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
     );
     let uaf_pure = r_pure.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
     assert!(uaf_pure.proven, "a pure remote callee must preserve liveness: {}", uaf_pure.residual);
@@ -320,7 +320,7 @@ fn cross_file_symbol_call_resolves_via_name_summaries() {
     );
     let r_free = discharge_inner(
         &f, ExecLimits::default(), &HashMap::new(), &frees, &[], &[], &[], &HashMap::new(),
-        &empty_grants, &HashMap::new(), None, &HashMap::new(), None,
+        &empty_grants, &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new(),
     );
     let uaf_free = r_free.mem_decision(BlockId(0), 2, SafetyProperty::NoUseAfterFree).expect("uaf");
     assert!(!uaf_free.proven, "a remote callee that frees the arg makes the store a UAF");

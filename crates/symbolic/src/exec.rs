@@ -189,7 +189,7 @@ impl SymbolicReport {
 /// Symbolically discharge the obligations of `f` (default limits, no
 /// interprocedural summaries — calls are havoc'd).
 pub fn discharge_function(f: &Function) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new())
 }
 
 /// As [`discharge_function`], but using the given function summaries to reason
@@ -198,7 +198,7 @@ pub fn discharge_with_summaries(
     f: &Function,
     summaries: &HashMap<FuncId, Summary>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new())
 }
 
 /// As [`discharge_with_summaries`], plus per-parameter pointer contracts: a
@@ -211,7 +211,7 @@ pub fn discharge_full(
     contracts: &[Option<PtrContract>],
     globals: &HashMap<String, GlobalDef>,
 ) -> SymbolicReport {
-    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), contracts, &[], &[], globals, &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None)
+    discharge_inner(f, ExecLimits::default(), summaries, &HashMap::new(), contracts, &[], &[], globals, &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new())
 }
 
 /// As [`discharge_full`], plus interprocedural **member-provenance**:
@@ -236,6 +236,7 @@ pub fn discharge_with_fields(
         f, summaries, &HashMap::new(), contracts, field_contracts, &[], globals, prov_grants,
         &HashMap::new(), &HashMap::new(), None, ExecLimits::default().time_budget, bug_finding, exported,
         assume_valid_params, false, false, false, false, false, false, false, false, &HashMap::new(), None,
+        &HashMap::new(),
     )
 }
 
@@ -271,6 +272,7 @@ pub fn discharge_with_scalars(
     assume_field_invariants: bool,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
     mmio_region: Option<csolver_ir::MmioHandler>,
+    devirt: &HashMap<RegId, String>,
 ) -> SymbolicReport {
     let limits = ExecLimits {
         bug_finding, exported, assume_valid_params, assume_valid_returns, assume_valid_loop_ptrs,
@@ -281,6 +283,7 @@ pub fn discharge_with_scalars(
     discharge_inner(
         f, limits, summaries, name_summaries, contracts, field_contracts, scalar_pre, globals,
         prov_grants, global_fn_ptrs, global_ptr_fields, analysis_in, reg_ptr_hints, mmio_region,
+        devirt,
     )
 }
 
@@ -292,7 +295,7 @@ pub fn discharge_with_scalars(
 /// under that invariant plus the loop guard (a path condition) — therefore
 /// covers every iteration.
 pub fn discharge_with(f: &Function, limits: ExecLimits) -> SymbolicReport {
-    discharge_inner(f, limits, &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None)
+    discharge_inner(f, limits, &HashMap::new(), &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &HashMap::new(), None, &HashMap::new())
 }
 
 /// Nesting depth of a `Select` provenance (to cap join growth).

@@ -88,6 +88,22 @@ pub(crate) fn assumption_record(id: String) -> Assumption {
                             live region of at least the synthesized size"
                 .into(),
         },
+        "closed-world-devirt" => Assumption {
+            id,
+            statement: "an indirect call through a heap/parameter-rooted function pointer \
+                        (`obj->ops->fn()`) resolves to the single function the whole-program \
+                        points-to analysis proves it designates; that callee's effects are \
+                        used in place of an opaque call"
+                .into(),
+            justification: "the run was told the module is the whole program (`--closed-world`), \
+                            so the field-sensitive points-to sees every store to the dispatch \
+                            field and resolves it only when a *single* function is possible — an \
+                            over-approximation of size one, hence exact; any ambiguous or \
+                            unknown-written field stays unresolved (opaque). Call-target \
+                            resolution only: the loaded pointer keeps its provenance, so its \
+                            null/uninitialised/bounds checks are unchanged and nothing is masked"
+                .into(),
+        },
         "precondition" => Assumption {
             id,
             statement: "a caller-declared parameter precondition holds: the pointer is a \

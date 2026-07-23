@@ -104,6 +104,7 @@ pub(crate) fn discharge_inner(
     analysis_in: Option<&IntervalAnalysis>,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
     mmio_region: Option<csolver_ir::MmioHandler>,
+    devirt: &HashMap<RegId, String>,
 ) -> SymbolicReport {
     // Reuse the caller's interval analysis when supplied (the verifier already
     // computes it for interval-based discharge), so it is not recomputed here —
@@ -165,6 +166,7 @@ pub(crate) fn discharge_inner(
         exported: limits.exported,
         assume_valid_params: limits.assume_valid_params,
         reg_ptr_hints,
+        devirt,
         mmio_region,
         visits: 0,
         truncated: false,

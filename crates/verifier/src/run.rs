@@ -213,6 +213,21 @@ pub(crate) fn verify_one_function(
     };
     let empty_summaries = HashMap::new();
     let name_summaries = ctx.map(|c| c.name_summaries).unwrap_or(&empty_summaries);
+    // Closed-world devirtualisation for this function: the whole-program points-to's resolved
+    // `(caller name, register) → callee name` map, projected to this function's registers. Gated on
+    // **external** linkage (a static's name may recur across files, so the key would be ambiguous —
+    // the same discipline as the precondition overlays above) and non-empty only under closed-world
+    // (the store-completeness that makes a resolved singleton exact). Empty ⇒ inert; every indirect
+    // call stays opaque exactly as before.
+    let devirt: HashMap<csolver_ir::RegId, String> = match ctx {
+        Some(c) if !module.internal.contains(&f.id) => c
+            .name_devirt
+            .iter()
+            .filter(|((n, _), _)| *n == f.name)
+            .map(|((_, r), t)| (*r, t.clone()))
+            .collect(),
+        _ => HashMap::new(),
+    };
     let mut local_id = 0u32;
     verify_function_with(
         f,
@@ -244,6 +259,7 @@ pub(crate) fn verify_one_function(
             .get(&f.name)
             .copied()
             .or_else(|| ctx.and_then(|c| c.name_mmio.get(&f.name).copied())),
+        &devirt,
         config,
         exported,
         &mut local_id,
