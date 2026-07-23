@@ -582,22 +582,48 @@ fn lower_function(
     // a `struct T *`. Emit that as `(struct name, offset) → size` evidence, and record which field
     // each such load-result reads so the verifier can size it from evidence recovered elsewhere.
     let field_at = field_at_llvm(f);
+    let struct_of = struct_of_llvm(f);
     let pointee_sizes = typed_gep_pointee_sizes(f);
+    // The struct field a pointer operand addresses: an explicit `gep`'d field, or — when the
+    // operand is *itself* a struct pointer — the field at offset 0 (clang's bare form for the
+    // first field, which carries no `getelementptr`).
+    let field_of = |slot: &str| -> Option<(String, u64)> {
+        field_at
+            .get(slot)
+            .cloned()
+            .or_else(|| struct_of.get(slot).map(|s| (s.clone(), 0)))
+    };
+    // A typed pointer value's pointee size + declared align (from a `struct T` gep on it).
+    let typed_pointee = |local: &str| -> Option<(u64, u32)> {
+        let &(size, tname) = pointee_sizes.get(local)?;
+        (size > 0).then(|| {
+            let align = tname.and_then(|n| debuginfo.composite_align_by_llvm_name(n)).unwrap_or(0);
+            (size, align)
+        })
+    };
     let mut field_evidence: Vec<((String, u64), (u64, u32))> = Vec::new();
     let mut field_load_sites: Vec<(RegId, (String, u64))> = Vec::new();
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
-        let LInst::Load { dst, ty: LType::Ptr, ptr: LValue::Local(slot), .. } = inst else {
-            continue;
-        };
-        let Some((s, off)) = field_at.get(slot) else { continue };
-        if let Some(&r) = ctx.regs.get(dst) {
-            field_load_sites.push((r, (s.clone(), *off)));
-        }
-        if let Some(&(size, tname)) = pointee_sizes.get(dst.as_str()) {
-            if size > 0 {
-                let align = tname.and_then(|n| debuginfo.composite_align_by_llvm_name(n)).unwrap_or(0);
-                field_evidence.push(((s.clone(), *off), (size, align)));
+        match inst {
+            // A `%p = load obj->f` records the load-site (to size `%p` from whole-program evidence)
+            // and, when `%p` is itself typed here, contributes evidence for field `f`.
+            LInst::Load { dst, ty: LType::Ptr, ptr: LValue::Local(slot), .. } => {
+                let Some((s, off)) = field_of(slot) else { continue };
+                if let Some(&r) = ctx.regs.get(dst) {
+                    field_load_sites.push((r, (s.clone(), off)));
+                }
+                if let Some((size, align)) = typed_pointee(dst) {
+                    field_evidence.push(((s, off), (size, align)));
+                }
             }
+            // A `store &(typed value), obj->f` establishes the field's type directly (the driver-init
+            // pattern `obj->ops = &foo_ops`), even when no function loads and re-types it.
+            LInst::Store { val: LValue::Local(vsrc), ptr: LValue::Local(slot), .. } => {
+                if let (Some((s, off)), Some((size, align))) = (field_of(slot), typed_pointee(vsrc)) {
+                    field_evidence.push(((s, off), (size, align)));
+                }
+            }
+            _ => {}
         }
     }
     Ok((function, contracts, raw_ptr_hints, reg_ptr_hints, field_evidence, field_load_sites))

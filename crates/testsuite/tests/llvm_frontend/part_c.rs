@@ -339,6 +339,85 @@ entry:
     assert_ne!(user.verdict, Verdict::Pass, "a poisoned field must not be sized (soundness)");
 }
 
+/// §3 follow-up — **store-based evidence**: `obj->data = &priv` (a driver-init store of a typed
+/// pointer) types the field directly, even though no function loads-and-re-types it. `user` then
+/// sizes the loaded field from that store.
+#[test]
+fn field_type_store_based_evidence_sizes_field() {
+    let src = r#"
+%struct.priv = type { i64, [8 x i64] }
+%struct.dev = type { i64, ptr }
+define void @setup(ptr %d, ptr %pv) {
+entry:
+  %g = getelementptr %struct.priv, ptr %pv, i64 0, i32 0
+  %f = getelementptr %struct.dev, ptr %d, i64 0, i32 1
+  store ptr %pv, ptr %f, align 8
+  ret void
+}
+define i64 @user(ptr %d) {
+entry:
+  %f = getelementptr %struct.dev, ptr %d, i64 0, i32 1
+  %p = load ptr, ptr %f, align 8
+  %q = getelementptr inbounds i8, ptr %p, i64 40
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "d".into() }).expect("lower");
+    assert_eq!(
+        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _)| s),
+        Some(72),
+        "the store of a typed &priv into dev->data types the field",
+    );
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    wpf.push_module(&m);
+    let facts = wpf.finalize(true, true);
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    let rep = csolver_verifier::verify_module_whole_program(&m, &cfg, 1, facts.context());
+    let user = rep.functions.iter().find(|f| f.function == "user").expect("user");
+    assert_eq!(user.verdict, Verdict::Pass, "the store-typed field sizes the loaded pointer");
+}
+
+/// §3 follow-up — **offset-0 bare field load**: the first field of a struct is loaded with a bare
+/// `load ptr, ptr %base` (no `getelementptr`). Paired with field `(S, 0)` via `struct_of_llvm`
+/// (seeded by any typed gep on `%base`), so a `list->head` first-field chain types and sizes.
+#[test]
+fn field_type_offset_zero_first_field() {
+    let src = r#"
+%struct.node = type { ptr, i64 }
+%struct.list = type { ptr, i64 }
+define void @typer(ptr %l) {
+entry:
+  %seed = getelementptr %struct.list, ptr %l, i64 0, i32 1
+  %h = load ptr, ptr %l, align 8
+  %n = getelementptr %struct.node, ptr %h, i64 0, i32 1
+  store i64 0, ptr %n, align 8
+  ret void
+}
+define i64 @user(ptr %l) {
+entry:
+  %seed = getelementptr %struct.list, ptr %l, i64 0, i32 1
+  %h = load ptr, ptr %l, align 8
+  %q = getelementptr inbounds i8, ptr %h, i64 8
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "d".into() }).expect("lower");
+    assert_eq!(
+        m.field_ptr_evidence.get(&("struct.list".to_string(), 0)).map(|&(s, _)| s),
+        Some(16),
+        "the bare offset-0 load of list->head is typed as struct.node* (16 bytes)",
+    );
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    wpf.push_module(&m);
+    let facts = wpf.finalize(true, true);
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    let rep = csolver_verifier::verify_module_whole_program(&m, &cfg, 1, facts.context());
+    let user = rep.functions.iter().find(|f| f.function == "user").expect("user");
+    assert_eq!(user.verdict, Verdict::Pass, "the offset-0 field sizes the loaded first-field pointer");
+}
+
 /// A2: an internal helper's uncontracted pointer parameter is sized from the **typed pointer
 /// its caller passes** — the interprocedural pointer-contract synthesis now grounds a
 /// call site from the argument's pointee hint (not only a constant `alloca`). The helper reads

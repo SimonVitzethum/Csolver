@@ -202,6 +202,20 @@ pub(crate) fn field_at_llvm(f: &LFunc) -> HashMap<String, (String, u64)> {
     out
 }
 
+/// Which **LLVM struct** each register points at (by name): a `getelementptr %struct.S, ptr %base,
+/// …` proves `%base` designates a `struct S`. First seed wins. Lets a *bare* `load ptr, ptr %base`
+/// — clang's form for the **first field** (offset 0), which carries no `getelementptr` — be paired
+/// with field `(S, 0)`, so `p->first` chains resolve like explicit-gep fields.
+pub(crate) fn struct_of_llvm(f: &LFunc) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::GepChain { base: LValue::Local(b), struct_name: Some(s), .. } = inst {
+            out.entry(b.clone()).or_insert_with(|| s.clone());
+        }
+    }
+    out
+}
+
 /// The byte size of the struct each local is **indexed as**: a `gep %struct.T, ptr %b, …`
 /// proves `%b` points at a `%struct.T`, so `sizeof(%struct.T)` bounds every access through
 /// `%b` — recovered straight from the IR, no DWARF needed. The type is authoritative for the
