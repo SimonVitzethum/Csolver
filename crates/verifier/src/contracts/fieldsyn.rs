@@ -40,7 +40,7 @@ pub(crate) fn synthesize_fields(
     };
 
     for caller in &module.functions {
-        let defs = local_defs(caller, caller.id, &module.param_contracts, &module.layout, params);
+        let defs = local_defs(caller, caller.id, &module.param_contracts, &module.layout, params, &module.reg_ptr_hints, false);
         for block in &caller.blocks {
             // Per-block straight-line state (reset at each block entry, so
             // cross-block field setup is conservatively not credited):
@@ -263,6 +263,8 @@ pub(crate) fn synthesize_fields_program(
             && (params.contains_key(&(g, i)) || global_pc.contains_key(&(g, i)))
     };
 
+    // Field synthesis does not use A2 pointer-hint grounding (scoped to pointer contracts).
+    let no_hints: HashMap<(FuncId, RegId), PtrHint> = HashMap::new();
     let mut folded: HashMap<(FuncId, u32), Option<HashMap<u64, SiteGuarantee>>> = HashMap::new();
     for (mi, m) in mods.iter().enumerate() {
         let resolve = |callee: &Callee| -> Option<FuncId> {
@@ -274,7 +276,7 @@ pub(crate) fn synthesize_fields_program(
         };
         for caller in &m.functions {
             let caller_gid = remaps[mi][&caller.id];
-            let defs = local_defs(caller, caller_gid, &global_pc, &layout, params);
+            let defs = local_defs(caller, caller_gid, &global_pc, &layout, params, &no_hints, false);
             for block in &caller.blocks {
                 let mut field_of: HashMap<RegId, (RegId, u64)> = HashMap::new();
                 let mut slot: HashMap<(RegId, u64), SiteGuarantee> = HashMap::new();

@@ -396,6 +396,7 @@ pub(crate) fn stream_program_facts(
     dir: &Path,
     files: &[std::path::PathBuf],
     closed_world: bool,
+    assume_valid_params: bool,
 ) -> (csolver_verifier::ProgramFacts, usize, u64) {
     use csolver_ir::Frontend;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -468,7 +469,7 @@ pub(crate) fn stream_program_facts(
     }
     peak.fetch_max(rss_mb(), Ordering::Relaxed);
     eprintln!("  finalizing …");
-    let facts = merged.finalize(closed_world);
+    let facts = merged.finalize(closed_world, assume_valid_params);
     peak.fetch_max(rss_mb(), Ordering::Relaxed);
     (facts, lowered.load(Ordering::Relaxed), peak.load(Ordering::Relaxed))
 }

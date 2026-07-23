@@ -48,6 +48,40 @@ entry:
         "assume_valid_params materialises the loaded child pointer as a valid struct");
 }
 
+/// A2: an internal helper's uncontracted pointer parameter is sized from the **typed pointer
+/// its caller passes** — the interprocedural pointer-contract synthesis now grounds a
+/// call site from the argument's pointee hint (not only a constant `alloca`). The helper reads
+/// `p[10]` (offset 40, in bounds of the 64-byte `struct dev` the caller passes); under
+/// `--assume-valid-params` the synthesized contract sizes `p` and the read PROVES. UNKNOWN by
+/// default (no flag ⇒ no hint grounding ⇒ the parameter stays uncontracted).
+#[test]
+fn a2_internal_param_sized_from_caller_typed_pointer() {
+    // The caller types `%d` as a `struct.dev` (64 bytes) via a `getelementptr %struct.dev`,
+    // giving `%d` a pointee hint with no DWARF needed; that hint grounds the call site so the
+    // helper's parameter is synthesized at 64 bytes.
+    let src = r#"
+%struct.dev = type { [16 x i32] }
+define internal i32 @helper(ptr %p) {
+entry:
+  %q = getelementptr inbounds i8, ptr %p, i64 40
+  %v = load i32, ptr %q, align 4
+  ret i32 %v
+}
+define i32 @caller(ptr %d) {
+entry:
+  %t = getelementptr %struct.dev, ptr %d, i64 0, i32 0, i64 0
+  %r = call i32 @helper(ptr %d)
+  ret i32 %r
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "c".into() }).expect("lower");
+    assert_ne!(verify_module(&m, &Config::default()).verdict, Verdict::Pass,
+        "without the flag the helper's parameter stays uncontracted → UNKNOWN");
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    assert_eq!(verify_module(&m, &cfg).verdict, Verdict::Pass,
+        "the synthesized contract sizes the helper's parameter from the caller's typed pointer");
+}
+
 /// A **field-accessor call** (`get_child(d)` returning `d->child`) is summarized as
 /// `RetSummary::ValidRef`, so a caller that indexes the returned pointer sizes it instead of
 /// falling to an opaque `POrigin::Call` (the dominant `opaque call result` UNKNOWN cause). Under

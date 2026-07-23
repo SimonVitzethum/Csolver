@@ -14,7 +14,9 @@ pub(crate) fn facts_scan(dir: &Path, closed_world: bool) -> Result<ExitCode, Str
         dir.display()
     );
     let start = std::time::Instant::now();
-    let (facts, lowered, peak_rss) = stream_program_facts(dir, &files, closed_world);
+    // The `--facts` debug view only inspects effect summaries/preconditions; A2 hint-grounding
+    // (opt-in) is not needed here, so it runs without it.
+    let (facts, lowered, peak_rss) = stream_program_facts(dir, &files, closed_world, false);
 
     println!("== whole-program facts ==");
     println!("  files                : {} ({lowered} lowered)", files.len());
@@ -190,7 +192,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         eprintln!(
             "whole-program (2b): pass 1 — streaming whole-program facts over {total_files} files …"
         );
-        let (facts, lowered, peak_rss) = stream_program_facts(dir, &files, config.closed_world);
+        let (facts, lowered, peak_rss) = stream_program_facts(dir, &files, config.closed_world, config.assume_valid_params);
         eprintln!(
             "  … {} effect summaries, {} scalar / {} ptr / {} field preconditions \
              ({lowered} files lowered, peak RSS {peak_rss} MB); pass 2 — verifying",

@@ -43,14 +43,35 @@ pub(crate) fn derive_site(
 /// in a strictly earlier round (final by the induction in [`synthesize`]).
 /// Same-round synthesized contracts are never consulted — that would be
 /// circular.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn local_defs(
     f: &csolver_ir::Function,
     caller_id: FuncId,
     param_contracts: &HashMap<(FuncId, u32), PtrContract>,
     layout: &csolver_ir::DataLayout,
     prior: &HashMap<(FuncId, u32), PtrContract>,
+    hints: &HashMap<(FuncId, RegId), PtrHint>,
+    avp: bool,
 ) -> HashMap<RegId, SiteGuarantee> {
     let mut defs = HashMap::new();
+    // A2 (opt-in `--assume-valid-params`): a register the frontend typed with a DWARF/typed-use
+    // pointee hint guarantees a `sizeof(pointee)`-byte valid region. Seeded first (lowest
+    // precedence) so an exact `alloc`/declared-contract def below overrides it. Only for the
+    // caller's own registers (keyed by `caller_id`), matching the merged module's remapped hints.
+    if avp {
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Some(reg) = inst.defined_reg() {
+                if let Some(h) = hints.get(&(caller_id, reg)).filter(|h| h.size > 0) {
+                    defs.insert(reg, hint_guarantee(h));
+                }
+            }
+        }
+        for (reg, _) in &f.params {
+            if let Some(h) = hints.get(&(caller_id, *reg)).filter(|h| h.size > 0) {
+                defs.insert(*reg, hint_guarantee(h));
+            }
+        }
+    }
     for (i, (reg, _)) in f.params.iter().enumerate() {
         let key = (caller_id, i as u32);
         if let Some(c) = param_contracts.get(&key).or_else(|| prior.get(&key)) {

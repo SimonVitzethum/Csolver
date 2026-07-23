@@ -7,6 +7,10 @@ use super::*;
 pub(crate) struct CallerDefFacts {
     /// Alloc-derived region roots (fixed): `(dst, guarantee)`.
     pub(crate) alloc_defs: Vec<(RegId, SiteGuarantee)>,
+    /// DWARF/typed-use pointer-hint roots (fixed): `(reg, guarantee)` — the A2 lever, seeded only
+    /// under `--assume-valid-params` and overridden by an exact `alloc`/param def for the same
+    /// register (lowest precedence). Extracted here so `reconstruct_defs` matches `local_defs`.
+    pub(crate) hint_defs: Vec<(RegId, SiteGuarantee)>,
     /// Each parameter's register and index — its def comes from its contract.
     pub(crate) param_regs: Vec<(RegId, u32)>,
     /// Constant `PtrOffset` edges `(dst, base, byte_offset)` (fixed structure).
@@ -28,8 +32,16 @@ pub(crate) fn reconstruct_defs(
     caller_gid: FuncId,
     declared: &HashMap<(FuncId, u32), PtrContract>,
     prior: &HashMap<(FuncId, u32), PtrContract>,
+    avp: bool,
 ) -> HashMap<RegId, SiteGuarantee> {
     let mut defs: HashMap<RegId, SiteGuarantee> = HashMap::new();
+    // A2: DWARF/typed-use hint roots first (lowest precedence — exact params/allocs below win),
+    // only under `--assume-valid-params`. Mirrors `local_defs`' hint seeding for streaming==linked.
+    if avp {
+        for &(reg, sg) in &facts.hint_defs {
+            defs.insert(reg, sg);
+        }
+    }
     for &(reg, i) in &facts.param_regs {
         let key = (caller_gid, i);
         if let Some(c) = declared.get(&key).or_else(|| prior.get(&key)) {
@@ -134,6 +146,29 @@ impl ContractFacts {
             );
             self.param_count.push(f.params.len());
             let param_regs = f.params.iter().enumerate().map(|(i, (r, _))| (*r, i as u32)).collect();
+            // DWARF/typed-use hint roots for this caller (A2): the same registers `local_defs`
+            // seeds — instruction-defined regs then params — keyed by the function's *local* id
+            // (as `module.reg_ptr_hints` is before merge). Guarantee computed here so the streaming
+            // fixpoint needs no IR; consulted only under `--assume-valid-params` in reconstruct.
+            let mut hint_defs = Vec::new();
+            {
+                let mut seen: HashSet<RegId> = HashSet::new();
+                let add = |reg: RegId, hint_defs: &mut Vec<(RegId, SiteGuarantee)>, seen: &mut HashSet<RegId>| {
+                    if let Some(h) = m.reg_ptr_hints.get(&(f.id, reg)).filter(|h| h.size > 0) {
+                        if seen.insert(reg) {
+                            hint_defs.push((reg, hint_guarantee(h)));
+                        }
+                    }
+                };
+                for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+                    if let Some(reg) = inst.defined_reg() {
+                        add(reg, &mut hint_defs, &mut seen);
+                    }
+                }
+                for (reg, _) in &f.params {
+                    add(*reg, &mut hint_defs, &mut seen);
+                }
+            }
             let mut alloc_defs = Vec::new();
             let mut offset_edges = Vec::new();
             for inst in f.blocks.iter().flat_map(|b| &b.insts) {
@@ -158,7 +193,7 @@ impl ContractFacts {
                     _ => {}
                 }
             }
-            self.caller_defs.push(CallerDefFacts { alloc_defs, param_regs, offset_edges });
+            self.caller_defs.push(CallerDefFacts { alloc_defs, hint_defs, param_regs, offset_edges });
             let mut calls = Vec::new();
             for inst in f.blocks.iter().flat_map(|b| &b.insts) {
                 let Inst::Call { callee, args, .. } = inst else { continue };
@@ -209,10 +244,10 @@ impl ContractFacts {
 
     /// Run the pointer-contract fixpoint over the facts — the same result as
     /// `synthesize(&merge_modules(mods, …), closed_world)`.
-    pub(crate) fn finalize(self, closed_world: bool) -> HashMap<(FuncId, u32), PtrContract> {
+    pub(crate) fn finalize(self, closed_world: bool, avp: bool) -> HashMap<(FuncId, u32), PtrContract> {
         let mut acc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
         loop {
-            let round = self.round(&acc, closed_world);
+            let round = self.round(&acc, closed_world, avp);
             let mut grew = false;
             for (k, v) in round {
                 grew |= acc.insert(k, v).is_none();
@@ -227,6 +262,7 @@ impl ContractFacts {
         &self,
         prior: &HashMap<(FuncId, u32), PtrContract>,
         closed_world: bool,
+        avp: bool,
     ) -> HashMap<(FuncId, u32), PtrContract> {
         let n = self.name.len();
         let mut candidates: HashSet<(FuncId, u32)> = HashSet::new();
@@ -251,7 +287,7 @@ impl ContractFacts {
         };
         let mut folded: HashMap<(FuncId, u32), Option<SiteGuarantee>> = HashMap::new();
         for gid in 0..n {
-            let defs = reconstruct_defs(&self.caller_defs[gid], FuncId(gid as u32), &self.declared, prior);
+            let defs = reconstruct_defs(&self.caller_defs[gid], FuncId(gid as u32), &self.declared, prior, avp);
             for (cr, args) in &self.calls[gid] {
                 let Some(g) = resolve(cr) else { continue };
                 let params = self.param_count[g.0 as usize];

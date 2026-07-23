@@ -13,10 +13,11 @@ use super::*;
 pub(crate) fn synthesize(
     module: &Module,
     closed_world: bool,
+    avp: bool,
 ) -> HashMap<(FuncId, u32), PtrContract> {
     let mut acc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
     loop {
-        let round = synthesize_round(module, &acc, closed_world);
+        let round = synthesize_round(module, &acc, closed_world, avp);
         let mut grew = false;
         for (k, v) in round {
             grew |= acc.insert(k, v).is_none();
@@ -33,6 +34,7 @@ pub(crate) fn synthesize_round(
     module: &Module,
     prior: &HashMap<(FuncId, u32), PtrContract>,
     closed_world: bool,
+    avp: bool,
 ) -> HashMap<(FuncId, u32), PtrContract> {
     let escaped = address_taken_names(module);
 
@@ -63,7 +65,7 @@ pub(crate) fn synthesize_round(
     // site it could not derive — permanently ineligible.
     let mut folded: HashMap<(FuncId, u32), Option<SiteGuarantee>> = HashMap::new();
     for caller in &module.functions {
-        let defs = local_defs(caller, caller.id, &module.param_contracts, &module.layout, prior);
+        let defs = local_defs(caller, caller.id, &module.param_contracts, &module.layout, prior, &module.reg_ptr_hints, avp);
         for inst in caller.blocks.iter().flat_map(|b| &b.insts) {
             let Inst::Call { callee: Callee::Direct(g), args, .. } = inst else {
                 continue;
@@ -137,10 +139,11 @@ pub(crate) fn synthesize_round(
 pub(crate) fn synthesize_program(
     mods: &[&Module],
     closed_world: bool,
+    avp: bool,
 ) -> HashMap<(FuncId, u32), PtrContract> {
     let mut acc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
     loop {
-        let round = synthesize_round_program(mods, &acc, closed_world);
+        let round = synthesize_round_program(mods, &acc, closed_world, avp);
         let mut grew = false;
         for (k, v) in round {
             grew |= acc.insert(k, v).is_none();
@@ -161,6 +164,7 @@ pub(crate) fn synthesize_round_program(
     mods: &[&Module],
     prior: &HashMap<(FuncId, u32), PtrContract>,
     closed_world: bool,
+    avp: bool,
 ) -> HashMap<(FuncId, u32), PtrContract> {
     let (name_to_id, remaps) = csolver_ir::merge_id_plan(mods);
     let layout = mods.first().map_or(csolver_ir::DataLayout::LP64, |m| m.layout);
@@ -168,6 +172,9 @@ pub(crate) fn synthesize_round_program(
     let mut internal: HashSet<FuncId> = HashSet::new();
     let mut escaped: HashSet<String> = HashSet::new();
     let mut global_pc: HashMap<(FuncId, u32), PtrContract> = HashMap::new();
+    // Global (remapped) DWARF pointee hints, so a caller's typed argument grounds a site exactly
+    // as the merged-module linked path would (`local_defs` reads `module.reg_ptr_hints`).
+    let mut global_hints: HashMap<(FuncId, RegId), PtrHint> = HashMap::new();
     for (mi, m) in mods.iter().enumerate() {
         escaped.extend(address_taken_names(m));
         for f in &m.functions {
@@ -179,6 +186,9 @@ pub(crate) fn synthesize_round_program(
         }
         for (&(fid, idx), c) in &m.param_contracts {
             global_pc.insert((remaps[mi][&fid], idx), *c);
+        }
+        for (&(fid, reg), h) in &m.reg_ptr_hints {
+            global_hints.insert((remaps[mi][&fid], reg), *h);
         }
     }
 
@@ -211,7 +221,7 @@ pub(crate) fn synthesize_round_program(
     for (mi, m) in mods.iter().enumerate() {
         for caller in &m.functions {
             let caller_gid = remaps[mi][&caller.id];
-            let defs = local_defs(caller, caller_gid, &global_pc, &layout, prior);
+            let defs = local_defs(caller, caller_gid, &global_pc, &layout, prior, &global_hints, avp);
             for inst in caller.blocks.iter().flat_map(|b| &b.insts) {
                 let Inst::Call { callee, args, .. } = inst else { continue };
                 let Some(g) = resolve(mi, callee) else { continue };

@@ -20,7 +20,7 @@ pub(crate) fn verify_module_inner(
     let unit_cw = if ctx.is_some() { false } else { config.closed_world };
     // Interprocedural: contracts synthesized from the (complete) call sites of
     // internal functions overlay the declared ones (declared always wins).
-    let synthesized = contracts::synthesize(module, unit_cw);
+    let synthesized = contracts::synthesize(module, unit_cw, config.assume_valid_params);
     // Interprocedural member-provenance: which fields of a contracted parameter
     // every call site fills with a valid pointer (empty unless internal/closed).
     let field_synth = contracts::synthesize_fields(module, &synthesized, unit_cw);

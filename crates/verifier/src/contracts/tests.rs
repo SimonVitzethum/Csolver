@@ -75,7 +75,7 @@ fn whole_program_overlay_matches_linked_closed_world() {
     let mut wpf = crate::WholeProgramFacts::new();
     wpf.push_module(&a);
     wpf.push_module(&b);
-    let facts = wpf.finalize(true);
+    let facts = wpf.finalize(true, false);
     let wp_report = crate::verify_module_whole_program(&b, &cfg, 1, facts.context());
 
     // (3) Control: B's file alone, same entry policy but open-world and no overlay —
@@ -180,12 +180,12 @@ fn pointer_contracts_match_the_linked_module() {
     b.functions.push(func(0, "sink", pp(), vec![]));
 
     for cw in [true, false] {
-        let want = synthesize(&merge_modules(vec![a.clone(), b.clone()], "l"), cw);
-        let got = synthesize_program(&[&a, &b], cw);
+        let want = synthesize(&merge_modules(vec![a.clone(), b.clone()], "l"), cw, false);
+        let got = synthesize_program(&[&a, &b], cw, false);
         assert_eq!(got, want, "link-free pointer contracts must equal linked (cw={cw})");
     }
     // Under closed-world, sink (FuncId 1 after merge) gets a 16-byte contract.
-    let got = synthesize_program(&[&a, &b], true);
+    let got = synthesize_program(&[&a, &b], true, false);
     assert_eq!(got.get(&(FuncId(1), 0)).map(|c| c.size), Some(SizeSpec::Bytes(16)));
 }
 
@@ -259,8 +259,8 @@ fn pointer_contracts_match_linked_on_random_programs() {
         }
         let cw = rng() & 1 == 0;
         let refs: Vec<&Module> = modules.iter().collect();
-        let got = synthesize_program(&refs, cw);
-        let want = synthesize(&merge_modules(modules.clone(), "linked"), cw);
+        let got = synthesize_program(&refs, cw, false);
+        let want = synthesize(&merge_modules(modules.clone(), "linked"), cw, false);
         assert_eq!(got, want, "link-free != linked pointer contracts (cw={cw})");
     }
 }
@@ -349,8 +349,8 @@ fn contract_facts_match_synthesize_program_on_random() {
         for m in &refs {
             facts.push_module(m);
         }
-        let got = facts.finalize(cw);
-        let want = synthesize_program(&refs, cw);
+        let got = facts.finalize(cw, false);
+        let want = synthesize_program(&refs, cw, false);
         assert_eq!(got, want, "streamed pointer contracts != synthesize_program (cw={cw})");
         total_with_contracts += usize::from(!got.is_empty());
     }
@@ -391,7 +391,7 @@ fn contract_facts_stream_and_drop_equals_linked() {
         m.functions.push(func(0, "sink", vec![(RegId(0), Type::ptr(Type::int(32)))], vec![]));
         m
     };
-    let want = synthesize(&merge_modules(vec![caller.clone(), callee.clone()], "l"), true);
+    let want = synthesize(&merge_modules(vec![caller.clone(), callee.clone()], "l"), true, false);
     let mut facts = ContractFacts::default();
     {
         let m0 = caller;
@@ -401,5 +401,5 @@ fn contract_facts_stream_and_drop_equals_linked() {
         let m1 = callee;
         facts.push_module(&m1);
     }
-    assert_eq!(facts.finalize(true), want, "streamed+dropped == linked pointer contracts");
+    assert_eq!(facts.finalize(true, false), want, "streamed+dropped == linked pointer contracts");
 }

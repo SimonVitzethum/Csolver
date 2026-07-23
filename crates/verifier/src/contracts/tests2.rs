@@ -49,14 +49,14 @@ fn field_contracts_match_the_linked_module() {
 
     for cw in [true, false] {
         let merged = merge_modules(vec![a.clone(), b.clone()], "l");
-        let params = synthesize(&merged, cw);
+        let params = synthesize(&merged, cw, false);
         let want = synthesize_fields(&merged, &params, cw);
         let got = synthesize_fields_program(&[&a, &b], &params, cw);
         assert_eq!(got, want, "link-free field contracts must equal linked (cw={cw})");
     }
     // Under closed-world, sink (FuncId 1) gets a field at offset 0.
     let merged = merge_modules(vec![a.clone(), b.clone()], "l");
-    let params = synthesize(&merged, true);
+    let params = synthesize(&merged, true, false);
     let got = synthesize_fields_program(&[&a, &b], &params, true);
     assert_eq!(got.get(&(FuncId(1), 0)).map(|v| v.len()), Some(1), "sink gets one field");
 }
@@ -158,7 +158,7 @@ fn field_contracts_match_linked_on_random_programs() {
         let cw = rng() & 1 == 0;
         let refs: Vec<&Module> = modules.iter().collect();
         let merged = merge_modules(modules.clone(), "linked");
-        let params = synthesize(&merged, cw);
+        let params = synthesize(&merged, cw, false);
         let want = synthesize_fields(&merged, &params, cw);
         let got = synthesize_fields_program(&refs, &params, cw);
         assert_eq!(got, want, "link-free != linked field contracts (cw={cw})");
@@ -248,7 +248,7 @@ fn wholeprog_facts_shard_and_merge_equals_sequential() {
             for m in &modules {
                 w.push_module(m);
             }
-            w.finalize(cw)
+            w.finalize(cw, false)
         };
         let k = 1 + (rng() as usize % (n_mods - 1)); // split point in 1..n_mods
         let sharded = {
@@ -261,7 +261,7 @@ fn wholeprog_facts_shard_and_merge_equals_sequential() {
                 w2.push_module(m);
             }
             w1.merge(w2);
-            w1.finalize(cw)
+            w1.finalize(cw, false)
         };
         assert_eq!(seq.summaries, sharded.summaries, "summaries differ");
         assert_eq!(seq.scalars, sharded.scalars, "scalars differ");

@@ -98,7 +98,9 @@ impl FieldFacts {
                     _ => {}
                 }
             }
-            self.caller_defs.push(CallerDefFacts { alloc_defs, param_regs, offset_edges });
+            // Field synthesis does not use the A2 pointer-hint grounding (that is scoped to
+            // pointer contracts); an empty hint set keeps `reconstruct_defs(avp=false)` unchanged.
+            self.caller_defs.push(CallerDefFacts { alloc_defs, hint_defs: Vec::new(), param_regs, offset_edges });
             // Per-block field-event sequence.
             let mut fblocks = Vec::with_capacity(f.blocks.len());
             for block in &f.blocks {
@@ -195,7 +197,7 @@ impl FieldFacts {
 
         let mut folded: HashMap<(FuncId, u32), Option<HashMap<u64, SiteGuarantee>>> = HashMap::new();
         for gid in 0..n {
-            let defs = reconstruct_defs(&self.caller_defs[gid], FuncId(gid as u32), &self.declared, params);
+            let defs = reconstruct_defs(&self.caller_defs[gid], FuncId(gid as u32), &self.declared, params, false);
             for events in &self.blocks[gid] {
                 let mut field_of: HashMap<RegId, (RegId, u64)> = HashMap::new();
                 let mut slot: HashMap<(RegId, u64), SiteGuarantee> = HashMap::new();

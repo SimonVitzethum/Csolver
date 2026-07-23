@@ -65,7 +65,7 @@ impl WholeProgramFacts {
 
     /// Finalize all four passes. Pointer contracts feed member-provenance, exactly
     /// as in the linked pipeline (`verify_module`).
-    pub fn finalize(self, closed_world: bool) -> ProgramFacts {
+    pub fn finalize(self, closed_world: bool, assume_valid_params: bool) -> ProgramFacts {
         // Grab the external name → global-id map before `finalize` consumes the
         // builder, so each finalized fact can be paired back to its function's name
         // for on-demand cross-file resolution (2b). All four builders assign ids in the
@@ -81,7 +81,7 @@ impl WholeProgramFacts {
             .filter_map(|(name, id)| summaries.get(id).map(|s| (name.clone(), s.clone())))
             .collect();
         let scalars = self.scalars.finalize(closed_world);
-        let ptr_contracts = self.contracts.finalize(closed_world);
+        let ptr_contracts = self.contracts.finalize(closed_world, assume_valid_params);
         let field_contracts = self.fields.finalize(&ptr_contracts, closed_world);
         // Re-key each whole-program precondition by the **external name** of its
         // function, so pass 2 can overlay it onto the matching function in a per-file

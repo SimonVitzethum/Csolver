@@ -90,7 +90,7 @@ fn field_facts_match_synthesize_fields_program_on_random() {
         }
         let cw = rng() & 1 == 0;
         let refs: Vec<&Module> = modules.iter().collect();
-        let params = synthesize_program(&refs, cw);
+        let params = synthesize_program(&refs, cw, false);
         let want = synthesize_fields_program(&refs, &params, cw);
         let mut facts = FieldFacts::default();
         for m in &refs {
@@ -151,7 +151,7 @@ fn field_facts_stream_and_drop_equals_linked() {
         m
     };
     let merged = merge_modules(vec![caller.clone(), callee.clone()], "l");
-    let params = synthesize(&merged, true);
+    let params = synthesize(&merged, true, false);
     let want = synthesize_fields(&merged, &params, true);
     let mut facts = FieldFacts::default();
     {

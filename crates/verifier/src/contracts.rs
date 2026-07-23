@@ -42,7 +42,7 @@
 use csolver_absint::{analyze_intervals, Bound, IntervalAnalysis};
 use csolver_ir::{
     BlockId, Callee, Condition, Const, FieldContract, FuncId, Inst, Module, Operand, PtrContract,
-    RegId, SizeSpec, Terminator, Type,
+    PtrHint, RegId, SizeSpec, Terminator, Type,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -80,6 +80,27 @@ pub(crate) struct SiteGuarantee {
     align: u32,
     readable: bool,
     writable: bool,
+}
+
+/// The call-site guarantee a **DWARF/typed-use pointer hint** provides for an argument register
+/// (A2): the argument is used as / declared to be a `sizeof(pointee)`-byte object, so under the
+/// `--assume-valid-params` opt-in it designates a valid region of that size — the interprocedural
+/// lever for the pervasive `uncontracted pointer parameter` residual, where every call site
+/// passes a *typed* pointer (a field load, a heap object, a `current->…` chase) rather than a
+/// constant `alloca`. Read+write like the in-function `size_hinted_pointer` region; the size is
+/// the declared type only (never the `--assume-struct-tail` extent — that is a separate opt-in).
+/// Honoured only when `--assume-valid-params` is on, so without the flag the synthesis is
+/// unchanged; the resulting contract is prove-only (never a false FAIL) and rests on the same
+/// assumption `size_hinted_pointer` already surfaces.
+fn hint_guarantee(hint: &PtrHint) -> SiteGuarantee {
+    SiteGuarantee {
+        // `region_align` is a small power of two (declared alignment or a size-derived default),
+        // so it always fits a `u32`.
+        size: hint.size,
+        align: hint.region_align() as u32,
+        readable: true,
+        writable: true,
+    }
 }
 
 
