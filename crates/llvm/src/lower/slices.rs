@@ -181,6 +181,27 @@ pub(crate) fn dwarf_field_loads(
     out
 }
 
+/// Which struct field each register **addresses**, keyed by the **LLVM struct name** — the stable
+/// cross-module identity the anonymous MSIR `Type::Struct` lacks. A `getelementptr %struct.S, ptr
+/// %base, i64 0, i32 K` gives its result the field `(S, offsetof(S, K))`. Pairs a field-load result
+/// with the whole-program `Module::field_ptr_evidence` so an otherwise-untyped loaded pointer can be
+/// sized from the type the field is used as elsewhere in the program.
+pub(crate) fn field_at_llvm(f: &LFunc) -> HashMap<String, (String, u64)> {
+    let mut out = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::GepChain { dst, agg_ty, indices, struct_name, .. } = inst {
+            if let Some(s) = struct_name.as_deref() {
+                if matches!(indices.first(), Some(LValue::Int(0))) {
+                    if let Some(off) = gepchain_const_offset(&lower_type(agg_ty), &indices[1..]) {
+                        out.insert(dst.clone(), (s.to_string(), off));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The byte size of the struct each local is **indexed as**: a `gep %struct.T, ptr %b, …`
 /// proves `%b` points at a `%struct.T`, so `sizeof(%struct.T)` bounds every access through
 /// `%b` — recovered straight from the IR, no DWARF needed. The type is authoritative for the

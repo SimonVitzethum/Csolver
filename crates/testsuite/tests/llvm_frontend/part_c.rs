@@ -251,6 +251,94 @@ entry:
     );
 }
 
+/// §3 — the **whole-program field-type overlay**: an untyped field (`void *data`) is sized in a
+/// function that only byte-accesses it, from the type it is *used as* in another function. `typer`
+/// loads `dev->data` and indexes it as a `struct priv` (72 bytes) — evidence `(struct.dev, 8) → 72`.
+/// `user` loads the same field and reads at offset 40; on its own that pointer is untyped (opaque),
+/// but under `--closed-world`/`--assume-valid-params` the overlay sizes it to 72, so the in-bounds
+/// read decides. Sound: two functions typing the field differently would poison it (no size).
+const FIELD_TYPE_SRC: &str = r#"
+%struct.priv = type { i64, [8 x i64] }
+%struct.dev = type { i64, ptr }
+define void @typer(ptr %d) {
+entry:
+  %f = getelementptr %struct.dev, ptr %d, i64 0, i32 1
+  %p = load ptr, ptr %f, align 8
+  %g = getelementptr %struct.priv, ptr %p, i64 0, i32 0
+  store i64 0, ptr %g, align 8
+  ret void
+}
+define i64 @user(ptr %d) {
+entry:
+  %f = getelementptr %struct.dev, ptr %d, i64 0, i32 1
+  %p = load ptr, ptr %f, align 8
+  %q = getelementptr inbounds i8, ptr %p, i64 40
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+"#;
+
+#[test]
+fn field_type_overlay_sizes_untyped_field_from_cross_function_use() {
+    let m = LlvmFrontend.lower(LlvmInput { source: FIELD_TYPE_SRC.into(), name: "d".into() }).expect("lower");
+    // The evidence was recovered by the frontend from `typer`'s typed use.
+    assert_eq!(
+        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _)| s),
+        Some(72),
+        "typer's use of dev->data as struct.priv* is recorded as field-type evidence",
+    );
+    // Control: without the whole-program overlay, `user`'s access through the untyped field is
+    // UNKNOWN (the loaded pointer is opaque in its own function).
+    let cfg_local = Config { assume_valid_params: true, ..Config::default() };
+    let user_local = verify_module(&m, &cfg_local).functions.into_iter().find(|f| f.function == "user").unwrap();
+    assert_ne!(user_local.verdict, Verdict::Pass, "without the overlay the untyped field stays UNKNOWN");
+    // With the closed-world field-type overlay, the field is sized from `typer`'s use and the
+    // in-bounds read at offset 40 decides.
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    wpf.push_module(&m);
+    let facts = wpf.finalize(true, true);
+    let rep = csolver_verifier::verify_module_whole_program(&m, &cfg_local, 1, facts.context());
+    let user = rep.functions.iter().find(|f| f.function == "user").expect("user");
+    assert_eq!(user.verdict, Verdict::Pass, "the overlay sizes the untyped field so the read decides");
+}
+
+/// Soundness control: a field two functions use as **different** types is poisoned — the overlay
+/// must not size it from either, so the access stays UNKNOWN (no false PASS from a wrong size).
+#[test]
+fn field_type_overlay_poisons_a_disagreeing_field() {
+    let src = format!(
+        "{FIELD_TYPE_SRC}\n{}",
+        r#"
+%struct.priv2 = type { i64 }
+define void @typer2(ptr %d) {
+entry:
+  %f = getelementptr %struct.dev, ptr %d, i64 0, i32 1
+  %p = load ptr, ptr %f, align 8
+  %g = getelementptr %struct.priv2, ptr %p, i64 0, i32 0
+  store i64 0, ptr %g, align 8
+  ret void
+}
+"#,
+    );
+    let m = LlvmFrontend.lower(LlvmInput { source: src, name: "d".into() }).expect("lower");
+    assert_eq!(
+        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _)| s),
+        Some(0),
+        "two different types for dev->data poison the field (size 0)",
+    );
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    wpf.push_module(&m);
+    let facts = wpf.finalize(true, true);
+    let rep = csolver_verifier::verify_module_whole_program(
+        &m,
+        &Config { assume_valid_params: true, ..Config::default() },
+        1,
+        facts.context(),
+    );
+    let user = rep.functions.iter().find(|f| f.function == "user").expect("user");
+    assert_ne!(user.verdict, Verdict::Pass, "a poisoned field must not be sized (soundness)");
+}
+
 /// A2: an internal helper's uncontracted pointer parameter is sized from the **typed pointer
 /// its caller passes** — the interprocedural pointer-contract synthesis now grounds a
 /// call site from the argument's pointee hint (not only a constant `alloca`). The helper reads

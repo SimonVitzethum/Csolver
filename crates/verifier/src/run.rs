@@ -228,6 +228,53 @@ pub(crate) fn verify_one_function(
             .collect(),
         _ => HashMap::new(),
     };
+    // This function's register→pointee-size hints (from the typed geps that index each register).
+    let mut reg_hints: HashMap<csolver_ir::RegId, csolver_ir::PtrHint> = module
+        .reg_ptr_hints
+        .iter()
+        .filter(|((fid, _), _)| *fid == f.id)
+        .map(|((_, r), s)| (*r, *s))
+        .collect();
+    // Closed-world **field-type overlay**: size an otherwise-untyped loaded field pointer
+    // (`void*`/`union`/`private_data`) from the type the field is used as *elsewhere in the
+    // program* (whole-program `field_types`). Gated on `--assume-valid-params` — the loaded raw
+    // pointer is then an `assumed` valid instance of that type, exactly the `param-valid` basis the
+    // local DWARF/typed-use recovery already rests on; the type source is just whole-program. The
+    // facts are non-empty only closed-world (store-completeness), and only for external callers.
+    if config.assume_valid_params {
+        if let Some(ctx) = ctx {
+            if !module.internal.contains(&f.id) {
+                for ((n, r), (s, off)) in ctx.field_load_sites {
+                    if *n != f.name {
+                        continue;
+                    }
+                    // Keep a register already **type-sized locally** (a more specific recovery); only
+                    // fill a register with no size of its own (absent, or an access-extent-only hint).
+                    let existing = reg_hints.get(r).copied();
+                    if existing.is_some_and(|h| h.size > 0) {
+                        continue;
+                    }
+                    if let Some(&(size, align)) = ctx.field_types.get(&(s.clone(), *off)) {
+                        if size > 0 {
+                            let mut h = existing.unwrap_or(csolver_ir::PtrHint {
+                                size: 0,
+                                align: 0,
+                                tail: 0,
+                                container_size: 0,
+                                container_offset: 0,
+                                access_extent: 0,
+                            });
+                            h.size = size;
+                            if h.align == 0 {
+                                h.align = align;
+                            }
+                            reg_hints.insert(*r, h);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut local_id = 0u32;
     verify_function_with(
         f,
@@ -240,14 +287,9 @@ pub(crate) fn verify_one_function(
         &module.prov_grants,
         &module.global_fn_ptrs,
         &module.global_ptr_fields,
-        // This function's register→pointee-size hints (from the typed geps that index each
-        // register), used to size a loop-carried pointer under `--assume-valid-loop-ptrs`.
-        &module
-            .reg_ptr_hints
-            .iter()
-            .filter(|((fid, _), _)| *fid == f.id)
-            .map(|((_, r), s)| (*r, *s))
-            .collect(),
+        // This function's register→pointee-size hints (typed geps + the closed-world field-type
+        // overlay above), used to size loaded/loop-carried pointers under the region assumptions.
+        &reg_hints,
         // The MMIO dispatch bound applies wherever the handler is defined — including a handler
         // registered in another file (`register_read_memory`) and *including when it is an
         // auto-entry* (exported): it is a real dispatch invariant, not a caller convention, so it

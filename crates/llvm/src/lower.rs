@@ -93,7 +93,7 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);
         match lower_function(f, fid, &func_ids, &m.debuginfo) {
-            Ok((func, contracts, raw_ptr_hints, reg_ptr_hints)) => {
+            Ok((func, contracts, raw_ptr_hints, reg_ptr_hints, field_evidence, field_load_sites)) => {
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
                 }
@@ -102,6 +102,12 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
                 }
                 for (reg, hint) in reg_ptr_hints {
                     module.reg_ptr_hints.insert((fid, reg), hint);
+                }
+                for ((s, off), (size, align)) in field_evidence {
+                    csolver_ir::merge_field_evidence(&mut module.field_ptr_evidence, (s, off), size, align);
+                }
+                for (reg, site) in field_load_sites {
+                    module.field_load_sites.insert((fid, reg), site);
                 }
                 if f.internal {
                     module.internal.insert(fid);
@@ -278,7 +284,14 @@ fn lower_function(
     id: FuncId,
     func_ids: &HashMap<String, FuncId>,
     debuginfo: &crate::debuginfo::DebugInfo,
-) -> Result<(Function, Vec<(u32, PtrContract)>, Vec<(u32, (u64, u32))>, Vec<(RegId, PtrHint)>)> {
+) -> Result<(
+    Function,
+    Vec<(u32, PtrContract)>,
+    Vec<(u32, (u64, u32))>,
+    Vec<(RegId, PtrHint)>,
+    Vec<((String, u64), (u64, u32))>,
+    Vec<(RegId, (String, u64))>,
+)> {
     let mut ctx = Ctx {
         regs: HashMap::new(),
         next_reg: 0,
@@ -563,7 +576,31 @@ fn lower_function(
         }
     }
     let reg_ptr_hints: Vec<(RegId, PtrHint)> = reg_ptr_hints.into_iter().collect();
-    Ok((function, contracts, raw_ptr_hints, reg_ptr_hints))
+
+    // Whole-program field-type evidence (see `Module::field_ptr_evidence`): a `%p = load obj->f`
+    // whose result `%p` is later indexed as a `struct T` proves field `f` of `obj`'s struct holds
+    // a `struct T *`. Emit that as `(struct name, offset) → size` evidence, and record which field
+    // each such load-result reads so the verifier can size it from evidence recovered elsewhere.
+    let field_at = field_at_llvm(f);
+    let pointee_sizes = typed_gep_pointee_sizes(f);
+    let mut field_evidence: Vec<((String, u64), (u64, u32))> = Vec::new();
+    let mut field_load_sites: Vec<(RegId, (String, u64))> = Vec::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        let LInst::Load { dst, ty: LType::Ptr, ptr: LValue::Local(slot), .. } = inst else {
+            continue;
+        };
+        let Some((s, off)) = field_at.get(slot) else { continue };
+        if let Some(&r) = ctx.regs.get(dst) {
+            field_load_sites.push((r, (s.clone(), *off)));
+        }
+        if let Some(&(size, tname)) = pointee_sizes.get(dst.as_str()) {
+            if size > 0 {
+                let align = tname.and_then(|n| debuginfo.composite_align_by_llvm_name(n)).unwrap_or(0);
+                field_evidence.push(((s.clone(), *off), (size, align)));
+            }
+        }
+    }
+    Ok((function, contracts, raw_ptr_hints, reg_ptr_hints, field_evidence, field_load_sites))
 }
 
 

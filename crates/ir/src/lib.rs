@@ -35,8 +35,8 @@ pub mod ty;
 
 pub use frontend::Frontend;
 pub use func::{
-    merge_id_plan, merge_modules, BasicBlock, FieldContract, Function, GlobalDef, MmioHandler,
-    Module, PtrContract, PtrHint, SizeSpec, Terminator,
+    merge_field_evidence, merge_id_plan, merge_modules, BasicBlock, FieldContract, Function,
+    GlobalDef, MmioHandler, Module, PtrContract, PtrHint, SizeSpec, Terminator,
 };
 pub use id::{BlockId, FuncId, RegId};
 pub use inst::{

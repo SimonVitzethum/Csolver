@@ -297,6 +297,20 @@ pub struct Module {
     /// how big that object is. Empty for frontends that carry no type information — the sound
     /// default (the region stays unsized).
     pub reg_ptr_hints: HashMap<(FuncId, RegId), PtrHint>,
+    /// **Whole-program field-type evidence**: `(LLVM struct name, byte offset) → (pointee size,
+    /// align)`, recovered from a *typed use* of a field-load result — a `%p = load obj->f` whose
+    /// `%p` is then indexed as a `struct T` (`getelementptr %struct.T, ptr %p`) proves field `f`
+    /// of that struct holds a `struct T *`. This types the fields DWARF cannot (`void *`,
+    /// `union`, `private_data`): the type recovered in *any* file applies in *every* file. Unioned
+    /// whole-program; a field with conflicting evidence is dropped (see `FieldTypeFacts`). The LLVM
+    /// struct name is the stable cross-module key (unlike the anonymous MSIR `Type::Struct`). A
+    /// `0`-size entry is a **poison** marker (conflicting evidence within this module).
+    pub field_ptr_evidence: HashMap<(String, u64), (u64, u32)>,
+    /// Which struct field each pointer **load-result register** reads: `(FuncId, RegId) → (LLVM
+    /// struct name, byte offset)`. Pairs a register that is otherwise untyped in *its* function
+    /// with the whole-program [`field_ptr_evidence`](Self::field_ptr_evidence), so the verifier can
+    /// size it from the type recovered elsewhere (the closed-world field-type overlay).
+    pub field_load_sites: HashMap<(FuncId, RegId), (String, u64)>,
     /// Functions registered as a **memory-mapped-I/O dispatch handler** — the `.read`/`.write`
     /// of a `MemoryRegionOps` passed to `memory_region_init_io(mr, owner, ops, opaque, name,
     /// size)`. Such a handler is *only* ever called by the memory core's dispatch, which
@@ -442,6 +456,8 @@ impl Module {
             global_fn_ptrs: HashMap::new(),
             global_ptr_fields: HashMap::new(),
             reg_ptr_hints: HashMap::new(),
+            field_ptr_evidence: HashMap::new(),
+            field_load_sites: HashMap::new(),
             mmio_handlers: HashMap::new(),
         }
     }
@@ -541,6 +557,15 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         for ((fid, reg), hint) in m.reg_ptr_hints {
             merged.reg_ptr_hints.insert((remap[&fid], reg), hint);
         }
+        for ((fid, reg), site) in m.field_load_sites {
+            merged.field_load_sites.insert((remap[&fid], reg), site);
+        }
+        // Field-type evidence is keyed by symbol name + offset (no id remap). Union with
+        // disagreement → poison (a `0`-size entry): two files typing the same field differently
+        // means it is not consistently one type, so it must not be sized from either.
+        for (k, (size, align)) in m.field_ptr_evidence {
+            merge_field_evidence(&mut merged.field_ptr_evidence, k, size, align);
+        }
         for (name, h) in m.mmio_handlers {
             merged.mmio_handlers.insert(name, h);
         }
@@ -563,6 +588,31 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         merged.unanalyzed.extend(m.unanalyzed);
     }
     merged
+}
+
+/// Fold one field-type observation into the whole-program evidence map, keyed by `(struct name,
+/// offset)`. Agreement keeps the size; **any** disagreement (a different non-zero size, or an
+/// existing poison) sets the entry to the poison marker `(0, 0)` so the field is never sized — the
+/// same soundness rule as the points-to (a field that is not consistently one type is left untyped).
+pub fn merge_field_evidence(
+    map: &mut HashMap<(String, u64), (u64, u32)>,
+    key: (String, u64),
+    size: u64,
+    align: u32,
+) {
+    match map.get(&key) {
+        None => {
+            map.insert(key, (size, align));
+        }
+        Some(&(existing, _)) => {
+            if existing == 0 {
+                // already poisoned — stays poisoned
+            } else if existing != size || size == 0 {
+                map.insert(key, (0, 0));
+            }
+            // else: same non-zero size — agreement, keep it
+        }
+    }
 }
 
 #[cfg(test)]
