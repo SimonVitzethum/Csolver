@@ -5,7 +5,7 @@ use super::*;
 pub fn verify_function(f: &Function, config: &Config, next_id: &mut u32) -> FunctionReport {
     verify_function_with(
         f, None, &HashMap::new(), &[], &[], &[], &HashMap::new(), &HashMap::new(),
-        &HashMap::new(), &HashMap::new(), None, config, true, next_id,
+        &HashMap::new(), &HashMap::new(), &HashMap::new(), None, config, true, next_id,
     )
 }
 
@@ -22,6 +22,7 @@ pub(crate) fn verify_function_with(
     globals: &HashMap<String, csolver_ir::GlobalDef>,
     prov_grants: &HashMap<u32, std::collections::HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
+    global_ptr_fields: &HashMap<String, Vec<(u64, String)>>,
     reg_ptr_hints: &HashMap<csolver_ir::RegId, csolver_ir::PtrHint>,
     mmio_region: Option<csolver_ir::MmioHandler>,
     config: &Config,
@@ -34,7 +35,7 @@ pub(crate) fn verify_function_with(
         // the executor so it is not recomputed — a clone instead of a 2nd fixpoint.
         Some(s) => discharge_with_scalars(
             f, s, name_summaries, contracts, field_contracts, scalar_pre, globals, prov_grants,
-            global_fn_ptrs, analysis.as_ref(), config.time_budget, config.bug_finding, exported,
+            global_fn_ptrs, global_ptr_fields, analysis.as_ref(), config.time_budget, config.bug_finding, exported,
             config.assume_valid_params, config.aliasing_model,
             // Flat machine-code memory (a binary / assembly front-end): heap regions modelled
             // from a call contract are prove-only for bounds (guards on a heap index are not

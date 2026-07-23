@@ -224,6 +224,7 @@ pub(crate) fn verify_one_function(
         &module.globals,
         &module.prov_grants,
         &module.global_fn_ptrs,
+        &module.global_ptr_fields,
         // This function's register→pointee-size hints (from the typed geps that index each
         // register), used to size a loop-carried pointer under `--assume-valid-loop-ptrs`.
         &module

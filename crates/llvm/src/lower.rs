@@ -73,6 +73,22 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
         if !resolved.is_empty() {
             module.global_fn_ptrs.insert(g.name.clone(), resolved);
         }
+        // The *other* symbol fields — those naming a **global** (not a function) — record the
+        // constant `.field = &other_global` initializer so a `G->field->…` chain devirtualises:
+        // a load of this field resolves the loaded pointer to `other_global`'s region (which then
+        // carries its own function-pointer table). Sound: a constant global's initializer is
+        // ground truth. Only kept for a *constant* global (a `writable` one may be reassigned).
+        if !g.writable {
+            let ptr_fields: Vec<(u64, String)> = g
+                .fn_ptrs
+                .iter()
+                .filter(|(_, name)| !func_ids.contains_key(name))
+                .cloned()
+                .collect();
+            if !ptr_fields.is_empty() {
+                module.global_ptr_fields.insert(g.name.clone(), ptr_fields);
+            }
+        }
     }
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);

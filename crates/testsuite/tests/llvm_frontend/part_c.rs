@@ -135,6 +135,37 @@ done:
     assert!(walk.count(Verdict::Pass) >= 18, "most obligations proven, got {}", walk.count(Verdict::Pass));
 }
 
+/// Phase D: a `G_obj->ops->fn()` dispatch chain devirtualises when `G_obj` is a **constant
+/// global** whose initializer sets `.ops = &G_ops` — the initializer records the global-to-global
+/// pointer field, so a load of `G_obj->ops` reads back a pointer to `G_ops`'s region (which
+/// carries its own function-pointer table) and the subsequent `ops->fn` load resolves to the
+/// concrete callee. Sound and unconditional: a constant global's initializer is ground truth.
+#[test]
+fn constant_global_ops_chain_devirtualises() {
+    let src = r#"
+%struct.ops = type { ptr }
+%struct.obj = type { ptr }
+define void @target(ptr %p) {
+  ret void
+}
+@G_ops = internal constant %struct.ops { ptr @target }, align 8
+@G_obj = internal constant %struct.obj { ptr @G_ops }, align 8
+define void @dispatch(ptr %x) {
+entry:
+  %opsp = load ptr, ptr @G_obj, align 8
+  %fn = load ptr, ptr %opsp, align 8
+  call void %fn(ptr %x)
+  ret void
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "c".into() }).expect("lower");
+    let rep = verify_module(&m, &Config { bug_finding: true, ..Config::default() });
+    assert!(rep.assumptions.iter().any(|a| a.id == "devirtualized-indirect-call"),
+        "the constant-global ops chain resolves the indirect call to its concrete callee");
+    let dispatch = rep.functions.iter().find(|f| f.function == "dispatch").expect("dispatch");
+    assert_eq!(dispatch.verdict, Verdict::Pass, "the dispatch decides through the devirtualised call");
+}
+
 /// A2: an internal helper's uncontracted pointer parameter is sized from the **typed pointer
 /// its caller passes** — the interprocedural pointer-contract synthesis now grounds a
 /// call site from the argument's pointee hint (not only a constant `alloca`). The helper reads

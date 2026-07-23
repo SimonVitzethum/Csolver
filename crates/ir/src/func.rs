@@ -279,6 +279,13 @@ pub struct Module {
     /// an opaque havoc. Only external references that resolve to a defined
     /// function are kept; the rest stay opaque (sound).
     pub global_fn_ptrs: HashMap<String, Vec<(u64, FuncId)>>,
+    /// Per **constant global**, the byte offsets whose initializer stores the address of *another
+    /// global* — `(offset, target global name)`. `static struct dev D = { .ops = &d_ops };` records
+    /// `D → (offsetof(ops), "d_ops")`. A load of such a field, at a matching concrete offset from
+    /// `D`'s region, resolves the loaded pointer to `d_ops`'s region — so the `D->ops->fn()`
+    /// dispatch chain devirtualises (the loaded ops pointer then carries `d_ops`'s function-pointer
+    /// table). Sound and unconditional: a constant global's initializer is ground truth.
+    pub global_ptr_fields: HashMap<String, Vec<(u64, String)>>,
     /// **Pointee byte size of a register**, recovered from the struct type of the `gep` that
     /// indexes it: a `getelementptr %struct.T, ptr %r, …` proves `%r` designates a `%struct.T`,
     /// so `sizeof(%struct.T)` bounds every access through `%r`. Keyed by `(function, register)`.
@@ -433,6 +440,7 @@ impl Module {
             raw_ptr_hints: HashMap::new(),
             prov_grants: HashMap::new(),
             global_fn_ptrs: HashMap::new(),
+            global_ptr_fields: HashMap::new(),
             reg_ptr_hints: HashMap::new(),
             mmio_handlers: HashMap::new(),
         }
@@ -544,6 +552,10 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
                 .global_fn_ptrs
                 .entry(k)
                 .or_insert_with(|| v.into_iter().map(|(off, fid)| (off, remap[&fid])).collect());
+        }
+        // Global-to-global pointer fields need no id remapping (keyed and valued by symbol name).
+        for (k, v) in m.global_ptr_fields {
+            merged.global_ptr_fields.entry(k).or_insert(v);
         }
         for (k, v) in m.prov_grants {
             merged.prov_grants.entry(k).or_default().extend(v);
