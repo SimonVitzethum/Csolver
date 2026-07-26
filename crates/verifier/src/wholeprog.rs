@@ -33,7 +33,7 @@ pub struct WholeProgramFacts {
     /// align)`, unioned across every file with disagreement poisoning the field (a `0` size). Types
     /// the `void*`/`union`/`private_data` fields DWARF cannot, from a typed use recovered in *any*
     /// file — the closed-world field-type overlay (see [`ProgramFacts::field_types`]).
-    field_types: HashMap<(String, u64), (u64, u32)>,
+    field_types: HashMap<(String, u64), (u64, u32, String)>,
     /// Which field each pointer load-result register reads, `(function name, RegId) → (struct name,
     /// offset)` — re-keyed by the caller's **external name** so the per-file overlay can pair a load
     /// with the whole-program evidence. Restricted to external functions (a static's name may recur).
@@ -64,8 +64,8 @@ impl WholeProgramFacts {
             self.mmio_handlers.entry(name.clone()).or_insert(*h);
         }
         self.pointsto.push_module(m);
-        for (k, &(size, align)) in &m.field_ptr_evidence {
-            csolver_ir::merge_field_evidence(&mut self.field_types, k.clone(), size, align);
+        for (k, (size, align, pointee)) in &m.field_ptr_evidence {
+            csolver_ir::merge_field_evidence(&mut self.field_types, k.clone(), *size, *align, pointee);
         }
         // Re-key each load site by the caller's external name (a static's name may recur across
         // files, so it is never matched cross-file — the same discipline as the other overlays).
@@ -94,8 +94,8 @@ impl WholeProgramFacts {
             self.mmio_handlers.entry(name).or_insert(h);
         }
         self.pointsto.merge(other.pointsto);
-        for (k, (size, align)) in other.field_types {
-            csolver_ir::merge_field_evidence(&mut self.field_types, k, size, align);
+        for (k, (size, align, pointee)) in other.field_types {
+            csolver_ir::merge_field_evidence(&mut self.field_types, k, size, align, &pointee);
         }
         for (k, site) in other.field_load_sites {
             self.field_load_sites.entry(k).or_insert(site);
@@ -219,7 +219,7 @@ pub struct ProgramFacts {
     pub name_devirt: HashMap<(String, RegId), String>,
     /// Whole-program field-type map `(struct name, offset) → (pointee size, align)` (a `0` size is
     /// a poisoned/ambiguous field). Empty open-world.
-    pub field_types: HashMap<(String, u64), (u64, u32)>,
+    pub field_types: HashMap<(String, u64), (u64, u32, String)>,
     /// Load-result register → the field it reads, `(external caller, RegId) → (struct, offset)`.
     pub field_load_sites: HashMap<(String, RegId), (String, u64)>,
 }
@@ -266,7 +266,7 @@ pub struct WholeProgramContext<'a> {
     /// Closed-world indirect-call devirtualisation, keyed by `(external caller name, register)`.
     pub name_devirt: &'a HashMap<(String, RegId), String>,
     /// Whole-program field-type map `(struct name, offset) → (pointee size, align)`.
-    pub field_types: &'a HashMap<(String, u64), (u64, u32)>,
+    pub field_types: &'a HashMap<(String, u64), (u64, u32, String)>,
     /// Load-result register → field it reads, `(external caller, RegId) → (struct, offset)`.
     pub field_load_sites: &'a HashMap<(String, RegId), (String, u64)>,
 }

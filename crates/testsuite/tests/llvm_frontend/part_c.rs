@@ -251,6 +251,50 @@ entry:
     );
 }
 
+/// §3 deep chains — a **multi-hop** untyped pointer chain `dev->priv->inner->x` types through the
+/// whole-program field-type map: `typer` types `dev.priv` as `struct p1 *` and `p1.inner` as
+/// `struct p2 *`; `user` reaches `priv->inner` via bare byte-geps (both void*), yet the iterative
+/// overlay sizes `priv` (hop 1) → learns it is `p1` → sizes `inner` (hop 2) → the deep read decides.
+#[test]
+fn field_type_overlay_follows_multi_hop_chain() {
+    let src = r#"
+%struct.p2 = type { i64, [8 x i64] }
+%struct.p1 = type { i64, ptr }
+%struct.dev = type { i64, ptr }
+define void @typer(ptr %d) {
+entry:
+  %f1 = getelementptr %struct.dev, ptr %d, i64 0, i32 1
+  %priv = load ptr, ptr %f1, align 8
+  %g1 = getelementptr %struct.p1, ptr %priv, i64 0, i32 0
+  %f2 = getelementptr %struct.p1, ptr %priv, i64 0, i32 1
+  %inner = load ptr, ptr %f2, align 8
+  %g2 = getelementptr %struct.p2, ptr %inner, i64 0, i32 0
+  store i64 0, ptr %g2, align 8
+  ret void
+}
+define i64 @user(ptr %d) {
+entry:
+  %f1 = getelementptr %struct.dev, ptr %d, i64 0, i32 1
+  %priv = load ptr, ptr %f1, align 8
+  %f2 = getelementptr i8, ptr %priv, i64 8
+  %inner = load ptr, ptr %f2, align 8
+  %q = getelementptr inbounds i8, ptr %inner, i64 40
+  %v = load i64, ptr %q, align 8
+  ret i64 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "dc".into() }).expect("lower");
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    assert_ne!(verify_module(&m, &cfg).functions.into_iter().find(|f| f.function == "user").unwrap().verdict,
+        Verdict::Pass, "without the overlay the multi-hop void* chain stays UNKNOWN");
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    wpf.push_module(&m);
+    let facts = wpf.finalize(true, true);
+    let rep = csolver_verifier::verify_module_whole_program(&m, &cfg, 1, facts.context());
+    let user = rep.functions.iter().find(|f| f.function == "user").expect("user");
+    assert_eq!(user.verdict, Verdict::Pass, "the iterative overlay types both hops so the deep read decides");
+}
+
 /// P2 — **caller-directed parameter push**: an opaque pointer (a call result) passed to a callee
 /// with a pointer contract is sized from that contract, so the caller's own access to it decides.
 #[test]
@@ -354,7 +398,7 @@ fn field_type_overlay_sizes_untyped_field_from_cross_function_use() {
     let m = LlvmFrontend.lower(LlvmInput { source: FIELD_TYPE_SRC.into(), name: "d".into() }).expect("lower");
     // The evidence was recovered by the frontend from `typer`'s typed use.
     assert_eq!(
-        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _)| s),
+        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _, _)| s),
         Some(72),
         "typer's use of dev->data as struct.priv* is recorded as field-type evidence",
     );
@@ -393,7 +437,7 @@ entry:
     );
     let m = LlvmFrontend.lower(LlvmInput { source: src, name: "d".into() }).expect("lower");
     assert_eq!(
-        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _)| s),
+        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _, _)| s),
         Some(0),
         "two different types for dev->data poison the field (size 0)",
     );
@@ -436,7 +480,7 @@ entry:
 "#;
     let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "d".into() }).expect("lower");
     assert_eq!(
-        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _)| s),
+        m.field_ptr_evidence.get(&("struct.dev".to_string(), 8)).map(|&(s, _, _)| s),
         Some(72),
         "the store of a typed &priv into dev->data types the field",
     );
@@ -476,7 +520,7 @@ entry:
 "#;
     let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "d".into() }).expect("lower");
     assert_eq!(
-        m.field_ptr_evidence.get(&("struct.list".to_string(), 0)).map(|&(s, _)| s),
+        m.field_ptr_evidence.get(&("struct.list".to_string(), 0)).map(|&(s, _, _)| s),
         Some(16),
         "the bare offset-0 load of list->head is typed as struct.node* (16 bytes)",
     );

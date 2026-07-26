@@ -103,8 +103,8 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
                 for (reg, hint) in reg_ptr_hints {
                     module.reg_ptr_hints.insert((fid, reg), hint);
                 }
-                for ((s, off), (size, align)) in field_evidence {
-                    csolver_ir::merge_field_evidence(&mut module.field_ptr_evidence, (s, off), size, align);
+                for ((s, off), (size, align, pointee)) in field_evidence {
+                    csolver_ir::merge_field_evidence(&mut module.field_ptr_evidence, (s, off), size, align, &pointee);
                 }
                 for (reg, site) in field_load_sites {
                     module.field_load_sites.insert((fid, reg), site);
@@ -289,7 +289,7 @@ fn lower_function(
     Vec<(u32, PtrContract)>,
     Vec<(u32, (u64, u32))>,
     Vec<(RegId, PtrHint)>,
-    Vec<((String, u64), (u64, u32))>,
+    Vec<((String, u64), (u64, u32, String))>,
     Vec<(RegId, (String, u64))>,
 )> {
     let mut ctx = Ctx {
@@ -593,15 +593,16 @@ fn lower_function(
             .cloned()
             .or_else(|| struct_of.get(slot).map(|s| (s.clone(), 0)))
     };
-    // A typed pointer value's pointee size + declared align (from a `struct T` gep on it).
-    let typed_pointee = |local: &str| -> Option<(u64, u32)> {
+    // A typed pointer value's pointee size + declared align + LLVM struct name (from a `struct T`
+    // gep on it). The name lets the whole-program overlay follow a multi-hop pointer chain.
+    let typed_pointee = |local: &str| -> Option<(u64, u32, String)> {
         let &(size, tname) = pointee_sizes.get(local)?;
         (size > 0).then(|| {
             let align = tname.and_then(|n| debuginfo.composite_align_by_llvm_name(n)).unwrap_or(0);
-            (size, align)
+            (size, align, tname.unwrap_or("").to_string())
         })
     };
-    let mut field_evidence: Vec<((String, u64), (u64, u32))> = Vec::new();
+    let mut field_evidence: Vec<((String, u64), (u64, u32, String))> = Vec::new();
     let mut field_load_sites: Vec<(RegId, (String, u64))> = Vec::new();
     for inst in f.blocks.iter().flat_map(|b| &b.insts) {
         match inst {
@@ -612,15 +613,15 @@ fn lower_function(
                 if let Some(&r) = ctx.regs.get(dst) {
                     field_load_sites.push((r, (s.clone(), off)));
                 }
-                if let Some((size, align)) = typed_pointee(dst) {
-                    field_evidence.push(((s, off), (size, align)));
+                if let Some((size, align, pointee)) = typed_pointee(dst) {
+                    field_evidence.push(((s, off), (size, align, pointee)));
                 }
             }
             // A `store &(typed value), obj->f` establishes the field's type directly (the driver-init
             // pattern `obj->ops = &foo_ops`), even when no function loads and re-types it.
             LInst::Store { val: LValue::Local(vsrc), ptr: LValue::Local(slot), .. } => {
-                if let (Some((s, off)), Some((size, align))) = (field_of(slot), typed_pointee(vsrc)) {
-                    field_evidence.push(((s, off), (size, align)));
+                if let (Some((s, off)), Some((size, align, pointee))) = (field_of(slot), typed_pointee(vsrc)) {
+                    field_evidence.push(((s, off), (size, align, pointee)));
                 }
             }
             _ => {}

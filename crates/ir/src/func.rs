@@ -304,8 +304,11 @@ pub struct Module {
     /// `union`, `private_data`): the type recovered in *any* file applies in *every* file. Unioned
     /// whole-program; a field with conflicting evidence is dropped (see `FieldTypeFacts`). The LLVM
     /// struct name is the stable cross-module key (unlike the anonymous MSIR `Type::Struct`). A
-    /// `0`-size entry is a **poison** marker (conflicting evidence within this module).
-    pub field_ptr_evidence: HashMap<(String, u64), (u64, u32)>,
+    /// `0`-size entry is a **poison** marker (conflicting evidence within this module). The third
+    /// tuple element is the pointee's **LLVM struct name** (empty = none/ambiguous), which lets the
+    /// closed-world overlay follow a **multi-hop** pointer chain `a->b->c` — once `a->b` is typed as
+    /// `struct B *`, `b->c` resolves against `(struct B, off)`.
+    pub field_ptr_evidence: HashMap<(String, u64), (u64, u32, String)>,
     /// Which struct field each pointer **load-result register** reads: `(FuncId, RegId) → (LLVM
     /// struct name, byte offset)`. Pairs a register that is otherwise untyped in *its* function
     /// with the whole-program [`field_ptr_evidence`](Self::field_ptr_evidence), so the verifier can
@@ -563,8 +566,8 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         // Field-type evidence is keyed by symbol name + offset (no id remap). Union with
         // disagreement → poison (a `0`-size entry): two files typing the same field differently
         // means it is not consistently one type, so it must not be sized from either.
-        for (k, (size, align)) in m.field_ptr_evidence {
-            merge_field_evidence(&mut merged.field_ptr_evidence, k, size, align);
+        for (k, (size, align, pointee)) in m.field_ptr_evidence {
+            merge_field_evidence(&mut merged.field_ptr_evidence, k, size, align, &pointee);
         }
         for (name, h) in m.mmio_handlers {
             merged.mmio_handlers.insert(name, h);
@@ -595,22 +598,28 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
 /// existing poison) sets the entry to the poison marker `(0, 0)` so the field is never sized — the
 /// same soundness rule as the points-to (a field that is not consistently one type is left untyped).
 pub fn merge_field_evidence(
-    map: &mut HashMap<(String, u64), (u64, u32)>,
+    map: &mut HashMap<(String, u64), (u64, u32, String)>,
     key: (String, u64),
     size: u64,
     align: u32,
+    pointee: &str,
 ) {
     match map.get(&key) {
         None => {
-            map.insert(key, (size, align));
+            map.insert(key, (size, align, pointee.to_string()));
         }
-        Some(&(existing, _)) => {
+        Some((existing, _, ename)) => {
+            let (existing, ename) = (*existing, ename.clone());
             if existing == 0 {
                 // already poisoned — stays poisoned
             } else if existing != size || size == 0 {
-                map.insert(key, (0, 0));
+                map.insert(key, (0, 0, String::new()));
+            } else if ename != pointee {
+                // sizes agree but the pointee struct name is ambiguous — keep the size (still sizes
+                // the field), drop the name (no multi-hop chaining through an ambiguous type).
+                map.insert(key, (size, align, String::new()));
             }
-            // else: same non-zero size — agreement, keep it
+            // else: full agreement — keep it
         }
     }
 }

@@ -235,42 +235,86 @@ pub(crate) fn verify_one_function(
         .filter(|((fid, _), _)| *fid == f.id)
         .map(|((_, r), s)| (*r, *s))
         .collect();
-    // Closed-world **field-type overlay**: size an otherwise-untyped loaded field pointer
-    // (`void*`/`union`/`private_data`) from the type the field is used as *elsewhere in the
-    // program* (whole-program `field_types`). Gated on `--assume-valid-params` — the loaded raw
-    // pointer is then an `assumed` valid instance of that type, exactly the `param-valid` basis the
-    // local DWARF/typed-use recovery already rests on; the type source is just whole-program. The
-    // facts are non-empty only closed-world (store-completeness), and only for external callers.
-    if config.assume_valid_params {
+    // Closed-world **field-type overlay** (with multi-hop chaining): size an otherwise-untyped
+    // loaded field pointer (`void*`/`union`/`private_data`) from the type the field is used as
+    // *elsewhere in the program* (whole-program `field_types`), and **follow the chain** — once a
+    // field is typed as `struct T *`, a further field load off it resolves against `(struct T, off)`.
+    // Gated on `--assume-valid-params` (the loaded raw pointer is an `assumed` valid instance of that
+    // type — the same `param-valid` basis as the local DWARF/typed-use recovery); the facts are
+    // non-empty only closed-world (store-completeness), and only for external callers.
+    if config.assume_valid_params && !module.internal.contains(&f.id) {
         if let Some(ctx) = ctx {
-            if !module.internal.contains(&f.id) {
-                for ((n, r), (s, off)) in ctx.field_load_sites {
-                    if *n != f.name {
-                        continue;
-                    }
-                    // Keep a register already **type-sized locally** (a more specific recovery); only
-                    // fill a register with no size of its own (absent, or an access-extent-only hint).
-                    let existing = reg_hints.get(r).copied();
-                    if existing.is_some_and(|h| h.size > 0) {
-                        continue;
-                    }
-                    if let Some(&(size, align)) = ctx.field_types.get(&(s.clone(), *off)) {
-                        if size > 0 {
-                            let mut h = existing.unwrap_or(csolver_ir::PtrHint {
-                                size: 0,
-                                align: 0,
-                                tail: 0,
-                                container_size: 0,
-                                container_offset: 0,
-                                access_extent: 0,
-                            });
-                            h.size = size;
-                            if h.align == 0 {
-                                h.align = align;
-                            }
-                            reg_hints.insert(*r, h);
+            // The structural field a pointer load-result reads: `(base register, byte offset)`,
+            // accumulated through the frontend's `PtrOffset` chain (a `struct` field lowers to a
+            // 0-offset step then a byte step). Independent of any type — that is supplied by the map.
+            let mut gep_of: HashMap<csolver_ir::RegId, (csolver_ir::RegId, u64)> = HashMap::new();
+            let mut load_field: HashMap<csolver_ir::RegId, (csolver_ir::RegId, u64)> = HashMap::new();
+            for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+                match inst {
+                    csolver_ir::Inst::PtrOffset { dst, base: csolver_ir::Operand::Reg(b), index, elem } => {
+                        if let Some(off) = const_byte_offset(index, elem) {
+                            let (root, base_off) = gep_of.get(b).copied().unwrap_or((*b, 0));
+                            gep_of.insert(*dst, (root, base_off.saturating_add(off)));
                         }
                     }
+                    csolver_ir::Inst::Load { dst, ty, ptr: csolver_ir::Operand::Reg(g), .. } if ty.is_ptr() => {
+                        let field = gep_of.get(g).copied().unwrap_or((*g, 0));
+                        load_field.insert(*dst, field);
+                    }
+                    _ => {}
+                }
+            }
+            // Fixpoint: type & size a register from its field's `(struct, offset)`, learning the
+            // pointee struct name so the next hop resolves. First hop uses the frontend-recorded
+            // `(container struct, offset)` (a directly-typed container); deep hops use `load_field`
+            // + the struct learned for the base register.
+            let mut struct_of: HashMap<csolver_ir::RegId, String> = HashMap::new();
+            let mut sized: std::collections::HashSet<csolver_ir::RegId> = std::collections::HashSet::new();
+            loop {
+                let mut changed = false;
+                let try_type = |r: csolver_ir::RegId, s: &str, off: u64,
+                                    reg_hints: &mut HashMap<csolver_ir::RegId, csolver_ir::PtrHint>,
+                                    struct_of: &mut HashMap<csolver_ir::RegId, String>,
+                                    sized: &mut std::collections::HashSet<csolver_ir::RegId>| -> bool {
+                    if sized.contains(&r) {
+                        return false;
+                    }
+                    let Some(&(size, align, ref name)) = ctx.field_types.get(&(s.to_string(), off)) else {
+                        return false;
+                    };
+                    if size == 0 {
+                        return false;
+                    }
+                    sized.insert(r);
+                    // Only fill a register with no size of its own (a locally-typed one is more specific).
+                    let existing = reg_hints.get(&r).copied();
+                    if !existing.is_some_and(|h| h.size > 0) {
+                        let mut h = existing.unwrap_or(csolver_ir::PtrHint {
+                            size: 0, align: 0, tail: 0, container_size: 0, container_offset: 0, access_extent: 0,
+                        });
+                        h.size = size;
+                        if h.align == 0 {
+                            h.align = align;
+                        }
+                        reg_hints.insert(r, h);
+                    }
+                    if !name.is_empty() {
+                        struct_of.insert(r, name.clone());
+                    }
+                    true
+                };
+                for ((n, r), (s, off)) in ctx.field_load_sites {
+                    if *n == f.name {
+                        changed |= try_type(*r, s, *off, &mut reg_hints, &mut struct_of, &mut sized);
+                    }
+                }
+                for (&r, &(base, off)) in &load_field {
+                    if let Some(s) = struct_of.get(&base).cloned() {
+                        changed |= try_type(r, &s, off, &mut reg_hints, &mut struct_of, &mut sized);
+                    }
+                }
+                if !changed {
+                    break;
                 }
             }
         }
@@ -413,4 +457,13 @@ pub(crate) fn verify_functions(
     let mut v = out.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     v.sort_by_key(|&(i, _)| i);
     v.into_iter().map(|(_, r)| r).collect()
+}
+
+/// The constant byte offset of a `PtrOffset` (`index × stride`), or `None` for a symbolic index.
+/// Used by the deep-chain field-type overlay to reconstruct which struct field a load reads.
+fn const_byte_offset(index: &csolver_ir::Operand, elem: &csolver_ir::Type) -> Option<u64> {
+    let csolver_ir::Operand::Const(csolver_ir::Const::Int(bv)) = index else { return None };
+    let k = u64::try_from(bv.unsigned()).ok()?;
+    let stride = elem.stride_bytes(&csolver_ir::DataLayout::LP64)?;
+    k.checked_mul(stride)
 }
