@@ -339,32 +339,49 @@ impl Explorer<'_> {
     /// multiply, so the solver discharges it cheaply and can witness a violation.
     ///
     /// Returns `None` (obligation trivially satisfied) when the size is a bare
-    /// constant, has no constant factor `> 1`, or has *two or more* variable
-    /// factors (`n * m` — a wide multiply this path deliberately does not model;
-    /// its overflow, if any, still surfaces downstream as an OOB against the
-    /// wrapped region size). Sound: a `None` only ever *omits* a check.
+    /// constant, or has a single variable factor with no constant `> 1`. A product
+    /// of **two** variable factors (`n * m`, times any constant `c`) IS checked, in
+    /// double width so the product cannot itself wrap: overflow is exactly
+    /// `n * m >u ⌊UINT_MAX / c⌋`, so `zext(n)·zext(m) <=u ⌊UINT_MAX/c⌋` is the goal
+    /// (the floor-division identity makes it exact). Three or more variable factors
+    /// stay unmodelled (`None`) — their overflow still surfaces downstream as an OOB
+    /// against the wrapped region size. Sound: a `None` only ever *omits* a check.
     pub(crate) fn size_overflow_goal(&mut self, size: ExprId) -> Option<ExprId> {
         let factors = self.mul_factors(size);
         let mut c: u128 = 1;
-        let mut var: Option<ExprId> = None;
+        let mut vars: Vec<ExprId> = Vec::new();
         for f in factors {
             match self.ctx.node(f) {
                 Node::Const(bv) => c = c.checked_mul(bv.unsigned())?,
-                _ => {
-                    // More than one variable factor: not this path's job.
-                    if var.replace(f).is_some() {
-                        return None;
-                    }
-                }
+                _ => vars.push(f),
             }
         }
-        let var = var?;
-        if c <= 1 {
-            return None;
-        }
         let umax = (1u128 << PTR_WIDTH) - 1;
-        let bound = self.ctx.int(PTR_WIDTH, umax / c);
-        Some(self.ctx.cmp(SCmp::Ule, var, bound))
+        match vars.as_slice() {
+            // A bare constant, or a single variable with no constant factor > 1: cannot overflow
+            // the width from this multiply alone.
+            [] => None,
+            [_] if c <= 1 => None,
+            // `var * C`: overflow iff `var >u UINT_MAX / C` — a cheap constant-bound comparison.
+            [var] => {
+                let bound = self.ctx.int(PTR_WIDTH, umax / c);
+                Some(self.ctx.cmp(SCmp::Ule, *var, bound))
+            }
+            // `n * m` (× constant C): check the product in double width so it cannot wrap.
+            [v1, v2] => {
+                let w2 = PTR_WIDTH * 2;
+                if self.ctx.width(*v1) > w2 || self.ctx.width(*v2) > w2 {
+                    return None;
+                }
+                let a = self.ctx.zext(*v1, w2);
+                let b = self.ctx.zext(*v2, w2);
+                let prod = self.ctx.bin(BvOp::Mul, a, b);
+                let bound = self.ctx.int(w2, umax / c);
+                Some(self.ctx.cmp(SCmp::Ule, prod, bound))
+            }
+            // Three or more variable factors: not modelled here.
+            _ => None,
+        }
     }
 
     /// Flatten a tree of `BvOp::Mul` nodes into its leaf factors (a non-mul is one

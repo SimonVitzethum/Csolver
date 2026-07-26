@@ -19,7 +19,8 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
 
 ## B. Prove-only — sound, aber findet Bugs nicht (FAIL nie möglich)
 
-- [ ] **`NoNullDeref`** — selbst beweisbar `Null` → UNKNOWN, nie FAIL (`checks.rs:70`). **← Hebel 3**
+- [x] **`NoNullDeref`** — definite `Null`-Deref refutiert jetzt (Hebel 3, `checks.rs`); opake
+  „may-be-null" bleibt prove-only.
 - [ ] **`Alignment`** — echte Fehlausrichtung bleibt UNKNOWN (`checks.rs:154`).
 - [ ] **`ValidPointerArith`** — Refutation abgeschaltet (`RefuteMode::Off`, reitet auf `InBounds`).
 
@@ -31,7 +32,8 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 - [ ] **Truncation** (`size_t`→`int`) — kein dedizierter Check.
 - [ ] **signed/unsigned-Verwechslung** — kein dedizierter Check.
 - [ ] **Wide-Ints > 128 bit** (`i256`/`i512`) — UB-Checks komplett übersprungen (`step.rs:38`).
-- [ ] **`var*var`-Allokationsgröße** (≥2 variable Faktoren) — ungeprüft (`checks.rs:333`).
+- [x] **`var*var`-Allokationsgröße** (2 variable Faktoren) — jetzt in doppelter Breite geprüft
+  (`size_overflow_goal`, Hebel 2). ≥3 Faktoren weiter ungeprüft.
 - [ ] Erwägen: Integer-UB-Checks auch im strikten `verify`-Pfad (exakt-Pfad-Refutation).
 
 ## D. Nur mit Contract-Korpus (ohne Contracts still)

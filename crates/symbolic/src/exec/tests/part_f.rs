@@ -224,6 +224,48 @@ fn bounded_alloc_size_is_not_flagged_as_overflow() {
     );
 }
 
+// Hebel 2: a `kmalloc(n * m)` with **two** attacker-controlled factors can wrap the width and
+// under-allocate — now checked in double width (was unmodelled, `size_overflow_goal` returned None).
+#[test]
+fn two_variable_factor_alloc_size_overflow_is_flagged() {
+    let (n, m, sz, buf) = (RegId(0), RegId(1), RegId(2), RegId(3));
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Assign {
+        dst: sz,
+        ty: Type::int(64),
+        value: RValue::Bin {
+            op: BinOp::Mul,
+            lhs: Operand::Reg(n),
+            rhs: Operand::Reg(m),
+            flags: Default::default(),
+        },
+    });
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(8),
+        count: Operand::Reg(sz),
+        align: 8,
+    });
+    let f = Function {
+        id: FuncId(0),
+        name: "alloc_n_m".into(),
+        params: vec![(n, Type::int(64)), (m, Type::int(64))],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    };
+    let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+    let r = discharge_with(&f, limits);
+    let d = r
+        .mem_decision(BlockId(0), 1, SafetyProperty::NoSizeOverflow)
+        .expect("NoSizeOverflow obligation at the n*m alloc");
+    assert!(
+        d.refutation.is_some(),
+        "an unbounded n*m size (two variable factors) must be flagged: {d:?}"
+    );
+}
+
 #[test]
 fn copy_to_user_of_uninitialized_buffer_is_an_info_leak() {
     let f = info_leak_fn(false);
