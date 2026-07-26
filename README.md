@@ -136,7 +136,27 @@ rests on in its proof tree, so a `PASS` is never silently bought.
 | `--assume-field-invariants` | a scalar **loaded from memory** (a struct field / heap slot) holds a value valid for its use — a shift amount below the bit width, a non-zero divisor (`reg->data_size ∈ {1,2,4,8}` feeding `MAKE_64BIT_MASK`) — **and** a **guarded array index** (`if (i >= n) return -EINVAL; … arr[i]`) is in-bounds, i.e. the guard's bound `n` is the array's own length | an opaque write could store an out-of-range value the loaded scalar then feeds to a shift/divide; or the code guards the index against the *wrong* bound (`len(arr) ≠ n`, a real OOB the assumption would hide). Prove-only: never refutes, so with the flag off the operation stays UNKNOWN. The scalar/index analogue of `--assume-valid-params` for loaded pointers | `field-invariants` |
 | `--bugs` | refute on over-approximated paths when the witness is a genuine input | a branch on an over-approximated value is actually infeasible (small false-FAIL risk) | bug-finding mode |
 | `--aliasing-model` | Rust borrow-stack (Stacked/Tree Borrows) reconstruction | the reference model is only partially recovered from the frontend | opt-in |
-| `--closed-world` | the module's call sites are *all* call sites | a library with unseen callers | opt-in |
+| `--closed-world` | the module (or scanned tree) is the *whole program*: its call sites, its stores, and its ops-struct registrations are **all** of them | a library with unseen callers / unseen writers | opt-in, `closed-world-*` |
+
+**Closed-world whole-program provenance** (`--closed-world`, strongest with
+`--assume-valid-params`). Because the scanned tree is taken to be the whole program, three
+provenance recoveries that need *store/registration completeness* switch on — all reusing the
+`param-valid` basis (an otherwise-untyped raw pointer is an *assumed* valid instance of its
+recovered type), so a wrong recovery can only ever come from the closed-world premise being false,
+not from the type itself:
+
+- **Whole-program field types.** A `void *` / `union` / `private_data` field DWARF cannot type is
+  sized from the type it is *used as anywhere in the program*; a field two sites use as different
+  types is **poisoned** (left untyped). The typing **follows multi-hop chains** — once `dev->priv`
+  is typed `struct p1 *`, `priv->inner` resolves against `(p1, off)`, and so on.
+- **Caller-directed parameter push.** An opaque pointer (a call result, a loaded value) passed to a
+  callee with a pointer contract is sized in the *caller* from that contract (only an opaque
+  register — a known local keeps its real size).
+- **`obj->ops->fn()` devirtualisation.** A field-sensitive whole-program points-to (a scalable
+  worklist Andersen) resolves which single function a heap/parameter-rooted function-pointer field
+  designates, when the program's stores prove it is a clean singleton; the call is then analysed
+  with that callee's summary. Surfaced as `closed-world-devirt`. Call-target resolution only — the
+  loaded pointer keeps its provenance, so its null/uninit/bounds checks are unchanged.
 
 `--assume-valid-returns` proves `no_null_deref` and `no_use_after_free` through a call
 result; its **bounds stay `UNKNOWN`**, because no size for an external callee's return

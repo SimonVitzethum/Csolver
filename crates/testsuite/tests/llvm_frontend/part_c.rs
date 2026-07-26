@@ -691,10 +691,10 @@ entry:
   ret void
 }}
 "#);
-    let safe = LlvmFrontend.lower(LlvmInput { source: mk(2).into(), name: "c".into() }).expect("lower");
+    let safe = LlvmFrontend.lower(LlvmInput { source: mk(2), name: "c".into() }).expect("lower");
     assert_eq!(verify_module(&safe, &Config::default()).verdict, Verdict::Pass,
         "an in-bounds store through a laundered pointer proves (provenance preserved)");
-    let oob = LlvmFrontend.lower(LlvmInput { source: mk(9).into(), name: "c".into() }).expect("lower");
+    let oob = LlvmFrontend.lower(LlvmInput { source: mk(9), name: "c".into() }).expect("lower");
     assert_eq!(verify_module(&oob, &Config::default()).verdict, Verdict::Fail,
         "an out-of-bounds store through a laundered pointer still refutes");
 }

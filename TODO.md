@@ -70,9 +70,28 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 
 ## H. Skalierbarkeit
 
-- [ ] **Whole-program Points-to** (P4-Devirt) skaliert nicht auf Full-Kernel (naiver Andersen OOMt
-  bei ~112 GB; jetzt Budget-gedeckelt zu no-op > 2 M Knoten). Ersetzen durch skalierbaren Solver
-  (Worklist + Zyklen-Kollaps/HVN), damit Full-Kernel-Devirt reaktiviert.
+- [x] **Whole-program Points-to** (P4-Devirt) — **skalierbarer Worklist-Solver** (nur geänderte
+  Knoten neu propagiert, dynamische Copy-Kanten), Feldzellen ohne Debug-Name, `intern_field`-Cap,
+  Budget 2M→10M. Kernel (~3,4M Knoten) solved jetzt statt zu no-op-degradieren. (Frontier #1,
+  commit `d70d921`; Kernel-Skala per Rescan validiert.) Offen: Zyklen-Kollaps/HVN für noch mehr
+  Skala.
+
+## Frontier-Fortschritt (2026-07-23, vollständig-autonome Session)
+
+- **#1 skalierbarer Points-to** ✅ (siehe H).
+- **#2 vollständige Provenance** — **P2 caller-directed param push** ✅ (`e3de414`), **§3 Feld-Typ-
+  Karte** (getypt/offset-0/store-Evidenz) ✅, **§3 Deep-Chains** (mehr-Hop void*-Ketten) ✅
+  (`db88164`). Rest: **P3 inttoptr/Idiom-Typisierung** (fuzzy — hinter künftiger
+  `--assume-kernel-idioms`-Flag; getypte inttoptr sind via `size_hinted` schon geschlossen).
+- **#3 Nebenläufigkeit** — (a)/(b) HB-Pruning + 1a Init-HB + 1b Re-Entrancy ✅ (`3a37714`/`337401e`);
+  (c) atomic/READ_ONCE-Exclusion **war bereits implementiert** (step.rs `!*volatile`-Guard); (d)
+  Spawn/Join-HB ist **Interleave-Subsystem-Domäne** (weakmem.rs modelliert Spawn-Gating). #3 so
+  vollständig wie im Lockset-Ansatz sinnvoll.
+- **#4 Rust-Aliasing** — Modell ist bereits echte Stacked-Borrows-Under-Approximation
+  (checks.rs:440–494: Reborrow-Stacks, unique/shared, pop-on-write, poison-on-lost-parent).
+  „Vervollständigen" = Protectors + `&mut`-Uniqueness über Call-Grenzen — subtil, hohes false-FAIL-
+  Risiko (bräche Miri-Orakel), eigener Miri-getriebener Task. **Nicht** als ungetesteter Flag-Patch
+  geschifft (soundness-first).
 
 ## Doku-Diskrepanz
 
