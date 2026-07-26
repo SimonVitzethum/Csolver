@@ -70,11 +70,12 @@ pub const ANY_OFFSET: u64 = u64::MAX;
 /// never a resolvable singleton, so the cap loses no devirt).
 const MAX_PTS_SET: usize = 64;
 
-/// Whole-program node budget: above this the streaming points-to stops accumulating and does not
-/// solve (empty devirt — sound, just no resolution). The naive Andersen fixpoint does not scale to
-/// a full-kernel (tens-of-millions-of-node) relation; beyond the budget the analysis degrades to a
-/// no-op rather than exhausting memory. Smaller closed-world units stay under it and resolve.
-const MAX_NODES: usize = 2_000_000;
+/// Whole-program node budget (a memory backstop, not the normal path). The worklist [`solve`] scales
+/// to millions of nodes, so this is set well above a full-kernel relation (~3–4M nodes): the streaming
+/// builder stops accumulating past it, `solve` is skipped past it (empty devirt — sound), and
+/// [`intern_field`] resolves new field accesses to TOP past it (bounding solve-time node growth).
+/// Only a pathologically large relation hits it; everything real solves.
+const MAX_NODES: usize = 10_000_000;
 
 impl Default for PointsTo {
     fn default() -> Self {
@@ -176,9 +177,17 @@ impl PointsTo {
         if let Some(&c) = self.field_cell.get(&(obj, offset)) {
             return c;
         }
+        // Hard node cap: `solve` creates field cells on demand, so an unbounded relation could grow
+        // the node count past the budget mid-solve. Beyond the cap, a new field access resolves to
+        // TOP (unknown) instead of allocating — a sound over-approximation that bounds total nodes.
+        if self.n as usize >= MAX_NODES {
+            return self.top;
+        }
         let c = self.fresh();
         self.field_cell.insert((obj, offset), c);
-        self.name.insert(c, format!("{}.{offset}", self.name.get(&obj).map_or("?", |s| s.as_str())));
+        // No debug name for field cells: at whole-kernel scale there are millions of them and the
+        // `format!` string per cell is pure overhead — cells are never queried by name (only named
+        // globals matter for devirt, tracked separately in `ProgramPointsTo::obj_global`).
         if self.poisoned.contains(&obj) {
             self.pts[c.0 as usize].insert(self.top);
         }
@@ -247,38 +256,93 @@ impl PointsTo {
         changed
     }
 
-    /// Solve the constraints to a fixpoint (naive round-robin — correct and simple;
-    /// each round is monotone and the lattice is finite, so it terminates). Field
-    /// cells created mid-solve start empty and are filled by later rounds.
+    /// Solve the constraints to a fixpoint with a **worklist** (Andersen-style): only a node whose
+    /// points-to set just grew is reprocessed, and load/store constraints add *dynamic* copy edges
+    /// as the pointer's targets become known. This is the same least fixpoint the naive round-robin
+    /// computed, but O(propagated changes) instead of O(constraints × rounds) — so a whole-kernel
+    /// relation (millions of nodes) is tractable where re-scanning every constraint each round was
+    /// not. The [`MAX_PTS_SET`] cap still bounds each set (and hence peak memory); it is applied
+    /// identically through [`add`](Self::add)/[`union`](Self::union), so the result is unchanged.
     pub fn solve(&mut self) {
+        // Constraint indices, keyed by the node whose points-to set triggers the constraint.
+        let mut copy_to: HashMap<Node, HashSet<Node>> = HashMap::new(); // src → { dst : dst ⊇ src }
+        for &(d, s) in &self.copy {
+            copy_to.entry(s).or_default().insert(d);
+        }
+        let mut gep_to: HashMap<Node, Vec<(Node, u64)>> = HashMap::new(); // src → (dst, off)
+        for &(d, s, off) in &self.gep {
+            gep_to.entry(s).or_default().push((d, off));
+        }
+        let mut load_to: HashMap<Node, Vec<Node>> = HashMap::new(); // src → { dst : dst ⊇ *src }
+        for &(d, s) in &self.load {
+            load_to.entry(s).or_default().push(d);
+        }
+        let mut store_from: HashMap<Node, Vec<Node>> = HashMap::new(); // ptr → { v : *ptr ⊇ v }
+        for &(v, p) in &self.store {
+            store_from.entry(p).or_default().push(v);
+        }
+
+        let mut on_work: HashSet<Node> = HashSet::new();
+        let mut work: Vec<Node> = Vec::new();
+        let push = |n: Node, on: &mut HashSet<Node>, w: &mut Vec<Node>| {
+            if on.insert(n) {
+                w.push(n);
+            }
+        };
+        // Seed: address-of, plus every node already carrying points-to (poison-seeded field cells).
         for i in 0..self.addr.len() {
             let (p, o) = self.addr[i];
-            self.add(p, o);
+            if self.add(p, o) {
+                push(p, &mut on_work, &mut work);
+            }
         }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for i in 0..self.copy.len() {
-                let (d, s) = self.copy[i];
-                changed |= self.union(d, s);
+        for n in 0..self.n {
+            if !self.pts[n as usize].is_empty() {
+                push(Node(n), &mut on_work, &mut work);
             }
-            for i in 0..self.gep.len() {
-                let (d, s, off) = self.gep[i];
-                for o in self.pts[s.0 as usize].iter().copied().collect::<Vec<_>>() {
-                    let cell = self.intern_field(o, off);
-                    changed |= self.add(d, cell);
+        }
+
+        while let Some(n) = work.pop() {
+            on_work.remove(&n);
+            let pts_n: Vec<Node> = self.pts[n.0 as usize].iter().copied().collect();
+
+            // gep: dst ⊇ { field(o, off) : o ∈ pts(n) }.
+            if let Some(edges) = gep_to.get(&n).cloned() {
+                for (dst, off) in edges {
+                    for &o in &pts_n {
+                        let cell = self.intern_field(o, off);
+                        if self.add(dst, cell) {
+                            push(dst, &mut on_work, &mut work);
+                        }
+                    }
                 }
             }
-            for i in 0..self.load.len() {
-                let (d, s) = self.load[i];
-                for o in self.pts[s.0 as usize].iter().copied().collect::<Vec<_>>() {
-                    changed |= self.union(d, o);
+            // load: dst ⊇ *o for o ∈ pts(n) — a dynamic copy edge o → dst, and flow pts(o) now.
+            if let Some(dsts) = load_to.get(&n).cloned() {
+                for dst in dsts {
+                    for &o in &pts_n {
+                        if copy_to.entry(o).or_default().insert(dst) && self.union(dst, o) {
+                            push(dst, &mut on_work, &mut work);
+                        }
+                    }
                 }
             }
-            for i in 0..self.store.len() {
-                let (v, p) = self.store[i];
-                for o in self.pts[p.0 as usize].iter().copied().collect::<Vec<_>>() {
-                    changed |= self.union(o, v);
+            // store: *o ⊇ value for o ∈ pts(n) — a dynamic copy edge value → o, and flow pts(value).
+            if let Some(values) = store_from.get(&n).cloned() {
+                for value in values {
+                    for &o in &pts_n {
+                        if copy_to.entry(value).or_default().insert(o) && self.union(o, value) {
+                            push(o, &mut on_work, &mut work);
+                        }
+                    }
+                }
+            }
+            // copy: dst ⊇ n for each (static or dynamic) copy edge n → dst.
+            if let Some(dsts) = copy_to.get(&n).cloned() {
+                for dst in dsts {
+                    if self.union(dst, n) {
+                        push(dst, &mut on_work, &mut work);
+                    }
                 }
             }
         }
