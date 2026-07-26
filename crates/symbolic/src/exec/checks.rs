@@ -67,7 +67,28 @@ impl Explorer<'_> {
             return;
         }
 
-        self.record(block, idx, NoNullDeref, non_null, "pointer is non-null", "pointer may be null or have opaque provenance");
+        // NoNullDeref, three-way: a proven non-null pointer passes; a **definitely null** one
+        // dereferenced on a feasible/exact path is a certain null dereference — refuted with a
+        // witness (like use-after-free), which turns the dominant `Prov::Null` case from a silent
+        // UNKNOWN into a genuine FAIL; anything else (an opaque pointer that merely *may* be null)
+        // stays prove-only. A pointer is definitely null when its provenance is `Null`, or when the
+        // path condition forces its address to zero (`p = cond ? null : q; *p` on the null branch).
+        if non_null {
+            self.record(block, idx, NoNullDeref, true, "pointer is non-null", "");
+        } else {
+            let definitely_null = matches!(p.prov, Prov::Null)
+                || (matches!(p.prov, Prov::Unknown(_, Some(_))) && {
+                    let addr = self.scalarize(SymValue::Ptr(p.clone()));
+                    let zero = self.ctx.int(PTR_WIDTH, 0);
+                    let goal = self.ctx.cmp(SCmp::Eq, addr, zero);
+                    self.prove(goal, state)
+                });
+            if definitely_null {
+                self.record_temporal((block, idx), NoNullDeref, true, state, "pointer is non-null", "pointer is null (null dereference)");
+            } else {
+                self.record(block, idx, NoNullDeref, false, "pointer is non-null", "pointer may be null or have opaque provenance");
+            }
+        }
 
         let Prov::Region(rid) = p.prov else {
             let residual = p.prov.provenance_residual();

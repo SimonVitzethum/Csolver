@@ -251,6 +251,40 @@ entry:
     );
 }
 
+/// Hebel 3 — **NoNullDeref decided**: a load through a definitely-null pointer on a feasible path
+/// is a certain null dereference, now refuted with a witness (was a silent UNKNOWN). An opaque
+/// pointer that merely *may* be null stays UNKNOWN (no false FAIL).
+#[test]
+fn null_dereference_refutes_but_opaque_pointer_does_not() {
+    let null_src = r#"
+define i32 @deref_null() {
+entry:
+  %v = load i32, ptr null, align 4
+  ret i32 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: null_src.into(), name: "n".into() }).expect("lower");
+    assert_eq!(
+        verify_module(&m, &Config::default()).verdict,
+        Verdict::Fail,
+        "a load through a null pointer is a definite null dereference (FAIL)",
+    );
+    // Control: an opaque parameter pointer may or may not be null — it must NOT refute.
+    let opaque_src = r#"
+define i32 @deref_param(ptr %p) {
+entry:
+  %v = load i32, ptr %p, align 4
+  ret i32 %v
+}
+"#;
+    let m2 = LlvmFrontend.lower(LlvmInput { source: opaque_src.into(), name: "o".into() }).expect("lower");
+    assert_ne!(
+        verify_module(&m2, &Config::default()).verdict,
+        Verdict::Fail,
+        "an opaque (maybe-null) pointer must not be refuted as a null deref (no false FAIL)",
+    );
+}
+
 /// §3 — the **whole-program field-type overlay**: an untyped field (`void *data`) is sized in a
 /// function that only byte-accesses it, from the type it is *used as* in another function. `typer`
 /// loads `dev->data` and indexes it as a `struct priv` (72 bytes) — evidence `(struct.dev, 8) → 72`.
