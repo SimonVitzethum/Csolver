@@ -46,7 +46,20 @@ pub(crate) fn report_lock_cycles(edges: &[(String, String, String)]) {
 /// unit's shared-memory access records into one program-wide relation and flags locations with
 /// an inconsistent lockset (a write, ≥2 functions, protected on some access but not all). A
 /// bug-finding heuristic (see `csolver_verifier::datarace`) — reported as candidates.
-pub(crate) fn report_data_races(accesses: &[(String, String, bool, Vec<String>)]) {
+///
+/// **Happens-before pruning (concurrency oracle).** A data race requires two accesses that can
+/// execute *concurrently*; an access in a function that is not reachable from any concurrent
+/// context (an attacker entry or a spawned thread) cannot race. When the sound concurrent-function
+/// set is supplied (the closed-world call-graph closure), only accesses from those functions
+/// participate — so a `module_init`/setup helper that touches a location unlocked, before any
+/// runtime handler can run, no longer empties the candidate lockset (the dominant Eraser false
+/// positive). Excluding a non-concurrent access never drops a genuine race (the set is a sound
+/// over-approximation of what runs concurrently); with no set, every access participates (the
+/// heuristic default). Mirrors the same filter `report_atomicity` applies to its threads.
+pub(crate) fn report_data_races(
+    accesses: &[(String, String, bool, Vec<String>)],
+    concurrent: Option<&std::collections::HashSet<String>>,
+) {
     let tagged: Vec<csolver_verifier::TaggedAccess> = accesses
         .iter()
         .map(|(f, loc, w, ls)| csolver_verifier::TaggedAccess {
@@ -56,7 +69,7 @@ pub(crate) fn report_data_races(accesses: &[(String, String, bool, Vec<String>)]
             lockset: ls,
         })
         .collect();
-    let races = csolver_verifier::detect_races(&tagged);
+    let races = csolver_verifier::detect_races(&tagged, concurrent);
     if races.is_empty() {
         return;
     }

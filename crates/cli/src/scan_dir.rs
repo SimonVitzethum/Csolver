@@ -454,7 +454,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // a slow or capped concurrency pass never delays or blocks the result the scan exists to give.
     let code = report_scan(&findings, pass, fail, unknown, dropped, errored);
     report_lock_cycles(&lock_edges);
-    report_data_races(&race_accesses);
+    report_data_races(&race_accesses, concurrent.as_ref());
     report_atomicity(&race_traces, entry_patterns, concurrent.as_ref());
     code
 }

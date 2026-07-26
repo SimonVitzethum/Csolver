@@ -51,7 +51,19 @@ pub struct TaggedAccess<'a> {
 
 /// Detect all candidate data races in the program's shared-access records, most-accessed
 /// first. One [`DataRace`] per location whose lockset is inconsistent (Eraser signal).
-pub fn detect_races(accesses: &[TaggedAccess]) -> Vec<DataRace> {
+///
+/// **Happens-before pruning.** A data race needs two accesses that can run *concurrently*. When
+/// `concurrent` is `Some(set)` — the sound closed-world set of functions reachable from an attacker
+/// entry or a spawned thread — an access in a function outside it is dropped before the lockset is
+/// folded: a `module_init`/setup helper that touches a location unlocked, sequentially before any
+/// runtime handler can run, then neither empties the candidate lockset nor counts toward the
+/// ≥2-function proxy (the dominant Eraser false positive). Sound over-approximation: a genuinely
+/// concurrent function is always in the set, so pruning never hides a real race. `None` ⇒ every
+/// access participates (the heuristic default, e.g. a single-module run with no call graph).
+pub fn detect_races(
+    accesses: &[TaggedAccess],
+    concurrent: Option<&std::collections::HashSet<String>>,
+) -> Vec<DataRace> {
     // Per location: the running candidate lockset (intersection), whether any access wrote,
     // whether any access held a lock, and the set of functions touching it.
     struct Loc {
@@ -63,6 +75,10 @@ pub fn detect_races(accesses: &[TaggedAccess]) -> Vec<DataRace> {
     }
     let mut locs: HashMap<&str, Loc> = HashMap::new();
     for a in accesses {
+        // Happens-before pruning: only an access that can run concurrently participates.
+        if concurrent.is_some_and(|set| !set.contains(a.function)) {
+            continue;
+        }
         let ls: BTreeSet<String> = a.lockset.iter().cloned().collect();
         let loc = locs.entry(a.location).or_insert_with(|| Loc {
             candidate: None,
@@ -123,7 +139,7 @@ mod tests {
             acc("writer", "g:counter@0", true, &l),
             acc("reader", "g:counter@0", false, &[]),
         ];
-        let races = detect_races(&accesses);
+        let races = detect_races(&accesses, None);
         assert_eq!(races.len(), 1, "an unlocked access to an otherwise-locked shared write is a race");
         assert_eq!(races[0].location, "g:counter@0");
         assert_eq!(races[0].functions, vec!["reader".to_string(), "writer".to_string()]);
@@ -139,12 +155,12 @@ mod tests {
             acc("irq_handler", "g:shared@0", true, &irq),
             acc("process_ctx", "g:shared@0", false, &proc),
         ];
-        let races = detect_races(&accesses);
+        let races = detect_races(&accesses, None);
         assert_eq!(races.len(), 1, "inconsistent IRQ protection is a race despite a shared lock");
         assert!(races[0].irq_unsafe, "flagged as IRQ-unsafe");
         // Consistent irqsave on both sides → no race.
         let ok = vec![acc("a", "g:s@0", true, &irq), acc("b", "g:s@0", false, &irq)];
-        assert!(detect_races(&ok).is_empty(), "consistent irqsave is safe");
+        assert!(detect_races(&ok, None).is_empty(), "consistent irqsave is safe");
     }
 
     #[test]
@@ -154,7 +170,7 @@ mod tests {
             acc("writer", "g:counter@0", true, &l),
             acc("reader", "g:counter@0", false, &l),
         ];
-        assert!(detect_races(&accesses).is_empty(), "a consistently-locked location is not a race");
+        assert!(detect_races(&accesses, None).is_empty(), "a consistently-locked location is not a race");
     }
 
     #[test]
@@ -165,7 +181,39 @@ mod tests {
             acc("only", "g:x@0", true, &l),
             acc("only", "g:x@0", false, &[]),
         ];
-        assert!(detect_races(&accesses).is_empty(), "a single-function location is not flagged");
+        assert!(detect_races(&accesses, None).is_empty(), "a single-function location is not flagged");
+    }
+
+    #[test]
+    fn non_concurrent_access_is_pruned_by_happens_before() {
+        use std::collections::HashSet;
+        let l = vec!["g:lk@0".to_string()];
+        // A runtime handler writes the counter under a lock; `module_init` writes it unlocked.
+        // Without concurrency info this is the classic Eraser false positive (empty candidate).
+        let accesses = vec![
+            acc("handler", "g:counter@0", true, &l),
+            acc("module_init", "g:counter@0", true, &[]),
+        ];
+        assert_eq!(detect_races(&accesses, None).len(), 1, "no oracle → the init access is a false race");
+        // With the concurrency oracle: only `handler` runs concurrently; `module_init` happens
+        // before it, so its unlocked access neither empties the lockset nor forms a cross-thread
+        // pair → no race. Sound FP removal.
+        let concurrent: HashSet<String> = ["handler".to_string()].into_iter().collect();
+        assert!(
+            detect_races(&accesses, Some(&concurrent)).is_empty(),
+            "init happens-before the runtime handler → not a concurrent race",
+        );
+        // But two genuinely-concurrent handlers with inconsistent locking still race.
+        let two = vec![
+            acc("handler", "g:counter@0", true, &l),
+            acc("worker", "g:counter@0", false, &[]),
+        ];
+        let both: HashSet<String> = ["handler".to_string(), "worker".to_string()].into_iter().collect();
+        assert_eq!(
+            detect_races(&two, Some(&both)).len(),
+            1,
+            "two concurrent functions with inconsistent locking still race",
+        );
     }
 
     #[test]
@@ -175,6 +223,6 @@ mod tests {
             acc("a", "g:ro@0", false, &[]),
             acc("b", "g:ro@0", false, &[]),
         ];
-        assert!(detect_races(&accesses).is_empty(), "a never-locked read-only location is not flagged");
+        assert!(detect_races(&accesses, None).is_empty(), "a never-locked read-only location is not flagged");
     }
 }

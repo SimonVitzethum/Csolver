@@ -91,15 +91,19 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
    (`size_overflow_goal`). Commit `0c8d00d`. Bewusst NICHT: nsw/nuw-Checks im strikten Verify
    (unbeweisbar für opake Inputs → Recall-Verlust; Integer-Overflow außerhalb Kern-Memory-Safety).
 
-1. **[~] Inter-Thread-Data-Race** — **größere Frontier, kein sauberer Kleingewinn.** Befund beim
-   Angehen: (a) die ABBA-trylock-FP ist **bereits gemildert** — `lock_acquire("spin_trylock")`
-   gibt `None` (sync.rs:170), trylocks bilden also keine Lock-Order-Kante. (b) Die Lockset-Eraser-
-   FP (Init-Code happens-before Worker-Threads) und ein *sound* Inter-Thread-Race brauchen ein
-   **whole-program Happens-Before/Thread-Modell**: pro Zugriff den Thread-Entry/Spawn-Kontext
-   taggen (`Inst::Spawn` wird im Interleave-Subsystem schon gesehen, aber nicht in die flachen
-   `TaggedAccess`-Records durchgereicht), dann nur Zugriffe aus *konkurrierenden* Entries als
-   Race-Kandidaten. Das ist der dokumentierte „biggest single investment" — eigener Task, NICHT
-   marginal in `detect_races` machbar ohne die Reachability. Kein unsound Teilpatch geschifft.
+1. **[~] Inter-Thread-Data-Race** — **erster sound Increment erledigt; volle HB-Frontier offen.**
+   - **[x] Happens-before-Pruning** (`detect_races(accesses, concurrent)`): nur Zugriffe aus
+     *konkurrent-erreichbaren* Funktionen (die bestehende `whole_program_concurrent`-Closure:
+     erreichbar von Entry oder Spawn-Target) zählen. Ein `module_init`/Setup-Helper, der eine
+     Location ungelockt vor jedem Runtime-Handler berührt, vergiftet nicht mehr das Candidate-
+     Lockset — die dominante Eraser-FP fällt weg. Sound (Über-Approx, verliert keinen echten Race).
+   - **[x] trylock-ABBA-FP** ist bereits gemildert — `lock_acquire("spin_trylock")` gibt `None`.
+   - **[ ] Volle HB-Verfeinerungen (offen):** (a) Init *happens-before* Runtime als echte Kante
+     statt nur Reachability-Ausschluss (IRQ-Handler können *während* Init feuern → dort NICHT
+     ordnen); (b) same-Entry-Re-Entrancy (ein Syscall auf 2 CPUs racet mit sich selbst — der
+     `≥2-Funktionen`-Proxy verfehlt das); (c) `atomic`/`READ_ONCE`/per-CPU-Zugriffe als
+     race-frei taggen; (d) Spawn-before-child + Join-after HB in die Lockset-Relation. Das bleibt
+     der dokumentierte „biggest single investment".
 4. **[~] Rust-Aliasing** — **bereits substanzieller als der Audit sagte.** `checks.rs:440–494`
    implementiert echte Stacked-Borrows-Under-Approximation: Reborrow-Stacks (`region_borrows`),
    Tags, unique/shared-Unterscheidung, pop-on-write, poison-on-lost-parent. „Vervollständigen"

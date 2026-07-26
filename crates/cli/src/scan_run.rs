@@ -174,7 +174,7 @@ pub(crate) fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[Stri
     };
 
     report_lock_cycles(&lock_edges);
-    report_data_races(&race_accesses);
+    report_data_races(&race_accesses, Some(&concurrent_fns));
     report_atomicity(&race_traces, entry_patterns, Some(&concurrent_fns));
     report_scan(&findings, pass, fail, unknown, dropped, errored)
 }

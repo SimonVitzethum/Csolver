@@ -114,7 +114,9 @@ impl ModuleReport {
                 })
             })
             .collect();
-        crate::detect_races(&accesses)
+        // Single-module report: no whole-program call graph, so no concurrency oracle — every
+        // access participates (the whole-program scan supplies the concurrent-function set).
+        crate::detect_races(&accesses, None)
     }
 
     /// Candidate **atomicity violations** among this module's functions (the two-thread
