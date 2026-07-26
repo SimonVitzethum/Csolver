@@ -108,7 +108,14 @@ pub fn detect_races(
             // union) but not on every access (@irqoff not in the intersection) — a plain lock on
             // IRQ-shared data. Fires even when a *real* lock is shared by all accesses.
             let irq_unsafe = loc.irq_in_union && !candidate.contains(IRQOFF);
-            let is_race = (eraser || irq_unsafe) && loc.has_write && loc.functions.len() >= 2;
+            // Cross-thread proxy. Without the concurrency oracle, require ≥2 distinct functions (a
+            // single function's mixed locking in a single-threaded program is not a race). WITH the
+            // oracle every surviving function is reachable from a **re-entrant** entry (a syscall /
+            // ops-handler runs on many CPUs at once), so a *single* such function that accesses the
+            // location under an inconsistent lockset races with a **concurrent instance of itself**
+            // — the same-entry re-entrancy race the ≥2 proxy misses. So ≥1 suffices there.
+            let min_fns = if concurrent.is_some() { 1 } else { 2 };
+            let is_race = (eraser || irq_unsafe) && loc.has_write && loc.functions.len() >= min_fns;
             is_race.then(|| DataRace {
                 location: location.to_string(),
                 functions: loc.functions.into_iter().collect(),
@@ -213,6 +220,27 @@ mod tests {
             detect_races(&two, Some(&both)).len(),
             1,
             "two concurrent functions with inconsistent locking still race",
+        );
+    }
+
+    #[test]
+    fn single_reentrant_function_races_with_itself() {
+        use std::collections::HashSet;
+        let l = vec!["g:lk@0".to_string()];
+        // One syscall handler writes g:counter under a lock on one path and unlocked on another —
+        // two concurrent invocations (the same handler on two CPUs) race on the unlocked path.
+        let accesses = vec![
+            acc("sys_write", "g:counter@0", true, &l),
+            acc("sys_write", "g:counter@0", true, &[]),
+        ];
+        // Without the oracle we cannot confirm re-entrancy → not flagged (≥2 functions).
+        assert!(detect_races(&accesses, None).is_empty(), "no oracle → a single function is not a race");
+        // With the oracle, sys_write is a concurrent (re-entrant) entry → self-race candidate.
+        let conc: HashSet<String> = ["sys_write".to_string()].into_iter().collect();
+        assert_eq!(
+            detect_races(&accesses, Some(&conc)).len(),
+            1,
+            "a re-entrant entry with inconsistent locking races with a concurrent instance of itself",
         );
     }
 

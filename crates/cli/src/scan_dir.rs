@@ -466,6 +466,19 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
 /// paired, so a real race is never dropped. Direct calls only — a function reachable *solely* via an
 /// indirect call from a concurrent context may be missed (a recall trade-off), which the spawn/irq/
 /// work/timer handler seeds (themselves the indirect-call targets) largely cover.
+/// Whether a function is a **device-lifecycle callback** — invoked once, sequentially, by the
+/// driver/module framework during (de)registration (`*_probe`, `*_remove`, `*_shutdown`,
+/// `module_init`/`module_exit`), never through a runtime code path. Such a function runs strictly
+/// before (or after) any runtime handler, so it is not a concurrent race root. Matched on the bare
+/// function name (after any `path::` prefix), so `drivers/foo::foo_probe` counts.
+pub(crate) fn is_init_lifecycle(name: &str) -> bool {
+    let base = name.rsplit("::").next().unwrap_or(name);
+    const SUFFIXES: [&str; 5] = ["_probe", "_remove", "_shutdown", "module_init", "module_exit"];
+    base == "module_init"
+        || base == "module_exit"
+        || SUFFIXES.iter().any(|s| base.ends_with(s))
+}
+
 pub(crate) fn whole_program_concurrent(
     call_edges: &[(String, Vec<String>)],
     race_traces: &[(String, Vec<(u8, String)>)],
@@ -479,10 +492,15 @@ pub(crate) fn whole_program_concurrent(
     for (caller, callees) in call_edges {
         edges.entry(caller).or_default().extend(callees.iter().map(String::as_str));
     }
-    // Seed: entries + spawn targets (trace event kind 7).
+    // Seed: entries + spawn targets (trace event kind 7). **Init/probe happens-before runtime**:
+    // a device-lifecycle callback (`*_probe`/`*_remove`/`*_shutdown`/`module_init`) runs **once,
+    // sequentially**, during (de)registration — before any runtime handler can dispatch. So it is
+    // not a concurrent root even if it matched an entry pattern; its accesses are ordered before
+    // runtime and must not form a race with them. (Recall caveat: an IRQ handler registered mid-
+    // probe can fire *during* probe — that init-vs-IRQ race is not modelled here; documented.)
     let mut reach: HashSet<String> = HashSet::new();
     for (name, _) in call_edges {
-        if csolver_verifier::matches_entry(name, entry_patterns) {
+        if csolver_verifier::matches_entry(name, entry_patterns) && !is_init_lifecycle(name) {
             reach.insert(name.clone());
         }
     }
@@ -500,8 +518,17 @@ pub(crate) fn whole_program_concurrent(
     // the closure below can, on first reaching an indirect-call site, admit all of them at once.
     let defined: HashSet<&str> = defined_fns.iter().map(String::as_str).collect();
     let indirect_set: HashSet<&str> = indirect_callers.iter().map(String::as_str).collect();
-    let addr_fns: Vec<&str> =
-        addr_taken.iter().map(String::as_str).filter(|s| defined.contains(s)).collect();
+    // A runtime indirect call cannot dispatch to a device-lifecycle callback (probe/remove/… are
+    // invoked by the driver framework during registration, never through a runtime function
+    // pointer), so exclude them from the indirect-call over-approximation — otherwise every
+    // address-taken probe/remove is spuriously admitted as concurrent the moment any concurrent
+    // function makes an indirect call. Direct-call reachability into them is kept (that would be a
+    // genuine concurrent context).
+    let addr_fns: Vec<&str> = addr_taken
+        .iter()
+        .map(String::as_str)
+        .filter(|s| defined.contains(s) && !is_init_lifecycle(s))
+        .collect();
     let mut indirect_admitted = false;
     let mut work: Vec<String> = reach.iter().cloned().collect();
     while let Some(f) = work.pop() {
@@ -571,3 +598,24 @@ pub(crate) fn attack_surface_reachable(
 /// into every TU, a header helper, or literally copied code). The file is deliberately
 /// excluded so N copies collapse to one report.
 pub(crate) type FindingKey = (String, String, String);
+
+#[cfg(test)]
+mod tests {
+    use super::is_init_lifecycle;
+
+    #[test]
+    fn init_lifecycle_classification() {
+        // Device-lifecycle callbacks (run once during (de)registration) — excluded as concurrent.
+        assert!(is_init_lifecycle("drivers/net/foo::foo_probe"));
+        assert!(is_init_lifecycle("bar_remove"));
+        assert!(is_init_lifecycle("baz_shutdown"));
+        assert!(is_init_lifecycle("module_init"));
+        assert!(is_init_lifecycle("drivers/x::module_exit"));
+        // Runtime handlers — genuinely concurrent, must NOT be excluded.
+        assert!(!is_init_lifecycle("__x64_sys_read"));
+        assert!(!is_init_lifecycle("drivers/net/foo::foo_xmit"));
+        assert!(!is_init_lifecycle("tcp_recvmsg"));
+        // A `_resume`/`_suspend` PM callback can run concurrently with runtime → not excluded.
+        assert!(!is_init_lifecycle("foo_resume"));
+    }
+}

@@ -98,12 +98,18 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
      Location ungelockt vor jedem Runtime-Handler berührt, vergiftet nicht mehr das Candidate-
      Lockset — die dominante Eraser-FP fällt weg. Sound (Über-Approx, verliert keinen echten Race).
    - **[x] trylock-ABBA-FP** ist bereits gemildert — `lock_acquire("spin_trylock")` gibt `None`.
-   - **[ ] Volle HB-Verfeinerungen (offen):** (a) Init *happens-before* Runtime als echte Kante
-     statt nur Reachability-Ausschluss (IRQ-Handler können *während* Init feuern → dort NICHT
-     ordnen); (b) same-Entry-Re-Entrancy (ein Syscall auf 2 CPUs racet mit sich selbst — der
-     `≥2-Funktionen`-Proxy verfehlt das); (c) `atomic`/`READ_ONCE`/per-CPU-Zugriffe als
-     race-frei taggen; (d) Spawn-before-child + Join-after HB in die Lockset-Relation. Das bleibt
-     der dokumentierte „biggest single investment".
+   - **[x] 1a Init-happens-before-Runtime als echte Kante** — Device-Lifecycle-Callbacks
+     (`*_probe`/`*_remove`/`*_shutdown`/`module_init`/`module_exit`, `is_init_lifecycle`) laufen
+     einmalig sequenziell und werden aus dem Concurrent-Seed **und** aus der Indirect-Call-Über-
+     Approximation (`addr_fns`) ausgeschlossen — sie werden also nicht mehr fälschlich konkurrent,
+     wenn irgendeine konkurrente Funktion indirekt aufruft. Direct-Reachability in sie bleibt (echt
+     konkurrenter Kontext). Recall-Rest: IRQ-während-Probe nicht modelliert (dokumentiert).
+   - **[x] 1b same-Entry-Re-Entrancy** — bei aktivem Oracle genügt **eine** konkurrente Funktion
+     mit inkonsistentem Lockset (`min_fns=1`): ein Syscall/ops-Handler auf N CPUs racet mit einer
+     konkurrenten Instanz seiner selbst, was der `≥2`-Proxy verfehlte.
+   - **[ ] Rest offen:** (c) `atomic`/`READ_ONCE`/per-CPU-Zugriffe als race-frei taggen (braucht
+     einen Access-Flag im Executor); (d) Spawn-before-child + Join-after HB als echte Ordnung in
+     die Lockset-Relation (statt nur Concurrent-Membership).
 4. **[~] Rust-Aliasing** — **bereits substanzieller als der Audit sagte.** `checks.rs:440–494`
    implementiert echte Stacked-Borrows-Under-Approximation: Reborrow-Stacks (`region_borrows`),
    Tags, unique/shared-Unterscheidung, pop-on-write, poison-on-lost-parent. „Vervollständigen"
