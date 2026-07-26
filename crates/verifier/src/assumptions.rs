@@ -88,6 +88,20 @@ pub(crate) fn assumption_record(id: String) -> Assumption {
                             live region of at least the synthesized size"
                 .into(),
         },
+        "inttoptr-valid" => Assumption {
+            id,
+            statement: "an integer-to-pointer cast (`current`, per-cpu, `phys_to_virt`, a hashed \
+                        handle) yields a valid, non-null, live region of unknown size"
+                .into(),
+            justification: "opt-in `--assume-inttoptr-valid`: the kernel materialises real pointers \
+                            from integers (a per-cpu offset, a physical address, `current`), and the \
+                            analysis cannot recover their provenance — so with the flag they are \
+                            assumed valid (proving null/uninit/liveness through them). Unsound in \
+                            general (an `inttoptr` can fabricate any address); bounds stay UNKNOWN \
+                            (the region is unsized), so it never proves an in-bounds access it \
+                            cannot otherwise justify"
+                .into(),
+        },
         "closed-world-devirt" => Assumption {
             id,
             statement: "an indirect call through a heap/parameter-rooted function pointer \

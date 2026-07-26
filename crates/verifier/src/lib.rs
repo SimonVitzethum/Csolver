@@ -103,6 +103,9 @@ pub struct Config {
     /// stay prove-only (unknown size), so it can prove non-null / liveness / in-object access
     /// but never *refutes* against a guessed size (no false FAIL from the guess).
     pub assume_valid_returns: bool,
+    /// Opt-in: model an `inttoptr` result as a valid non-null live region (unsized). See
+    /// [`csolver_symbolic::ExecLimits::assume_inttoptr_valid`].
+    pub assume_inttoptr_valid: bool,
     /// **Assume a loop-carried pointer stays valid.** At a loop header a pointer the body
     /// modifies is havoc'd to an opaque value — it genuinely moves (`iter = iter->next`), so
     /// its region/bounds provenance cannot be carried soundly. With this on it becomes a valid
@@ -191,6 +194,7 @@ impl Default for Config {
             bug_finding: false,
             assume_valid_params: false,
             assume_valid_returns: false,
+            assume_inttoptr_valid: false,
             assume_valid_loop_ptrs: false,
             assume_param_buffer_len: false,
             assume_struct_tail: false,

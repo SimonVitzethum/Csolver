@@ -19,6 +19,25 @@ impl Explorer<'_> {
                 // a `container_of` backward gep): if the register is typed by its use, give it a
                 // sized region under `--assume-valid-params` — same rule as a loaded field pointer.
                 let v = if ty.is_ptr() { self.size_hinted_pointer(*dst, v, state) } else { v };
+                // `--assume-inttoptr-valid`: an `inttoptr` result the typed-use sizing above left
+                // opaque (`current`, per-cpu, `phys_to_virt`, a hashed handle) becomes a valid
+                // non-null live region of *unknown* size — so null/uninit/liveness decide, bounds
+                // stay UNKNOWN. Unsound in general (an inttoptr can fabricate any address); opt-in.
+                let v = match v {
+                    SymValue::Ptr(SymPointer { prov: Prov::Unknown(POrigin::IntToPtr, _), .. })
+                        if self.limits.assume_inttoptr_valid =>
+                    {
+                        self.assumptions.insert("inttoptr-valid");
+                        let rid = self.materialize_ref_region(None, true, true, state);
+                        SymValue::Ptr(SymPointer {
+                            prov: Prov::Region(rid),
+                            offset: self.ctx.int(PTR_WIDTH, 0),
+                            align: 1,
+                            borrow: None,
+                        })
+                    }
+                    other => other,
+                };
                 state.env.insert(*dst, v);
                 // Division / modulo by zero: the divisor of a `/` or `%` must be provably non-zero
                 // (a zero divisor is UB / a hardware trap). Refuted with a witness when the divisor

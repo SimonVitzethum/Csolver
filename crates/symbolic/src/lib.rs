@@ -80,6 +80,12 @@ pub struct ExecLimits {
     /// general — a call may return null / an error pointer / a dangling pointer); the
     /// interprocedural twin of `assume_valid_params`, surfaced as `valid-returns`.
     pub assume_valid_returns: bool,
+    /// **Assume an `inttoptr` result is a valid pointer.** Model an integer-to-pointer cast
+    /// (`current`, per-cpu, `phys_to_virt`, a hashed handle) as a valid non-null live region of
+    /// unknown size, instead of an opaque `POrigin::IntToPtr` pointer — so null/uninit/liveness
+    /// decide (bounds stay UNKNOWN, unsized). Off by default (unsound in general: an `inttoptr`
+    /// may fabricate any address); surfaced as `inttoptr-valid`.
+    pub assume_inttoptr_valid: bool,
     /// **Assume a loop-carried pointer stays valid.** At a loop header a pointer the body
     /// modifies is havoc'd to an opaque value (it genuinely moves: `iter = iter->next`).
     /// With this on, it becomes a valid live region of unknown size instead — liveness and
@@ -129,6 +135,7 @@ impl Default for ExecLimits {
             assume_param_buffer_len: false,
             assume_struct_tail: false,
             assume_valid_mmio: false,
+            assume_inttoptr_valid: false,
             assume_field_invariants: false,
             aliasing_model: false,
             flat_memory: false,
