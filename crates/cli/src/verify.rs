@@ -482,11 +482,12 @@ pub(crate) fn lower_elf(bytes: &[u8]) -> csolver_core::Result<csolver_ir::Module
 /// the flat decode has no allocator for — those leave the (named, still-summarisable) call in
 /// place: sound, only less precise. Reuses the same `crates/contracts` data as the LLVM path.
 fn apply_binary_call_contracts(m: &mut csolver_ir::Module) {
-    use csolver_contracts::{Contracts, Effect, Fill, ReadSink, SizeExpr};
+    use csolver_contracts::{Effect, Fill, ReadSink, SizeExpr};
     use csolver_core::RegionKind;
     use csolver_ir::{Callee, Inst, MemKind, Operand, Type};
-    static CONTRACTS: std::sync::OnceLock<Contracts> = std::sync::OnceLock::new();
-    let contracts = CONTRACTS.get_or_init(Contracts::defaults);
+    // The process-global contracts (defaults + any `--contracts` user overlay), so the binary path
+    // honours user-supplied contracts exactly like the LLVM path.
+    let contracts = csolver_contracts::contracts();
     // A size that references only arguments / constants; a `Product` needs a temp register
     // the flat decode cannot allocate, so it is treated as unresolvable (the call is kept).
     let size_op = |size: &SizeExpr, args: &[Operand]| -> Option<Operand> {

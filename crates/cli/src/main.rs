@@ -209,6 +209,16 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         Some(p) => Some(read_entry_patterns(p)?),
         None => None,
     };
+    // `--contracts <dir>`: layer user `*.contract` files (e.g. `gen-contracts` output, reviewed)
+    // over the built-in defaults. Must run before any lowering, so it is applied here up front.
+    if let Some(dir) = args
+        .iter()
+        .position(|a| a == "--contracts")
+        .and_then(|i| args.get(i + 1))
+    {
+        csolver_contracts::init_user_contracts(std::path::Path::new(dir))?;
+        eprintln!("loaded user contracts from {dir}");
+    }
     match command.as_str() {
         "--help" | "-h" | "help" => {
             print!("{HELP}");
@@ -309,6 +319,14 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .ok_or("`facts` needs a directory argument")?;
             facts_scan(Path::new(dir), closed_world)
         }
+        "gen-contracts" => {
+            let dir = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .ok_or("`gen-contracts` needs a directory argument")?;
+            gen_contracts::gen_contracts(std::path::Path::new(dir))
+        }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),
     }
@@ -317,6 +335,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
 // --- module split (mechanical refactor) ---
 mod findings;
+mod gen_contracts;
 mod scan;
 mod scan_dir;
 mod scan_run;

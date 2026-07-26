@@ -529,11 +529,25 @@ mod parse;
 pub use parse::RET_ARG;
 pub(crate) use parse::*;
 
-/// The compiled-in default contracts, as a process-global (built once). The single source of
-/// truth for the frontend, the executor, and the interner — so provenance label ids agree.
+static CONTRACTS: std::sync::OnceLock<Contracts> = std::sync::OnceLock::new();
+
+/// The active contracts, as a process-global (built once). The single source of truth for the
+/// frontend, the executor, and the interner — so provenance label ids agree. Defaults unless
+/// [`init_user_contracts`] layered a user directory on first.
 pub fn contracts() -> &'static Contracts {
-    static CONTRACTS: std::sync::OnceLock<Contracts> = std::sync::OnceLock::new();
     CONTRACTS.get_or_init(Contracts::defaults)
+}
+
+/// Layer every `*.contract` under `dir` on top of the built-in defaults, becoming the process-global
+/// contracts. Must run **before** the first [`contracts`] use (i.e. before any lowering); returns
+/// `Err` if the global was already initialized. This is what makes `gen-contracts` output take
+/// effect via `--contracts <dir>`.
+pub fn init_user_contracts(dir: &std::path::Path) -> Result<(), String> {
+    let mut c = Contracts::defaults();
+    c.load_dir(dir)?;
+    CONTRACTS
+        .set(c)
+        .map_err(|_| "contracts already initialized — pass --contracts before the analysis".to_string())
 }
 
 /// Interns provenance label and capability names (a shared namespace) to stable `u32` ids, and
