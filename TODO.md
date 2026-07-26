@@ -82,9 +82,30 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 
 ---
 
-## Aktiv in Arbeit (autonom, Hebel 1–4)
+## Hebel 1–4 — Stand (autonome Bearbeitung 2026-07-23)
 
-1. **Inter-Thread-Data-Race** — happens-before-Pruning (sound FP-Reduktion) → §E.
-2. **Integer-UB (sound-Teil)** — definite signed-Overflow/plain-wrap wo sound refutierbar → §C.
-3. **`NoNullDeref` decided** — definite `Prov::Null`-Deref auf feasiblem Pfad refutieren → §B.
-4. **Rust-Aliasing vervollständigen** — Reborrow-Stack-Modell erweitern → §F.
+3. **[x] `NoNullDeref` decided** — definite `Prov::Null`-Deref (oder pfad-erzwungene addr==0)
+   refutiert jetzt auf exaktem/feasiblem Pfad (`checks.rs`); opake may-be-null bleibt prove-only.
+   Commit `63ca5f6`. Orakel SOUND.
+2. **[x] Integer-UB (sound-Teil)** — `var*var`-Allokations-Overflow in doppelter Breite geprüft
+   (`size_overflow_goal`). Commit `0c8d00d`. Bewusst NICHT: nsw/nuw-Checks im strikten Verify
+   (unbeweisbar für opake Inputs → Recall-Verlust; Integer-Overflow außerhalb Kern-Memory-Safety).
+
+1. **[~] Inter-Thread-Data-Race** — **größere Frontier, kein sauberer Kleingewinn.** Befund beim
+   Angehen: (a) die ABBA-trylock-FP ist **bereits gemildert** — `lock_acquire("spin_trylock")`
+   gibt `None` (sync.rs:170), trylocks bilden also keine Lock-Order-Kante. (b) Die Lockset-Eraser-
+   FP (Init-Code happens-before Worker-Threads) und ein *sound* Inter-Thread-Race brauchen ein
+   **whole-program Happens-Before/Thread-Modell**: pro Zugriff den Thread-Entry/Spawn-Kontext
+   taggen (`Inst::Spawn` wird im Interleave-Subsystem schon gesehen, aber nicht in die flachen
+   `TaggedAccess`-Records durchgereicht), dann nur Zugriffe aus *konkurrierenden* Entries als
+   Race-Kandidaten. Das ist der dokumentierte „biggest single investment" — eigener Task, NICHT
+   marginal in `detect_races` machbar ohne die Reachability. Kein unsound Teilpatch geschifft.
+4. **[~] Rust-Aliasing** — **bereits substanzieller als der Audit sagte.** `checks.rs:440–494`
+   implementiert echte Stacked-Borrows-Under-Approximation: Reborrow-Stacks (`region_borrows`),
+   Tags, unique/shared-Unterscheidung, pop-on-write, poison-on-lost-parent. „Vervollständigen"
+   heißt Protector/Two-Phase-Borrows + `&mut`-Uniqueness über Call-Grenzen — subtil, groß, und ein
+   falscher FAIL hier wäre unsound. Eigener fokussierter Task; kein Schnellpatch.
+
+**Fazit:** 2 & 3 sind sound erledigt (+ der kritische P4-OOM-Fix `4c07ead`). 1 & 4 sind echte
+Mehr-Session-Komponenten (whole-program HB-Modell bzw. vollständige Borrow-Semantik); soundness-first
+verbietet einen marginalen/unsicheren Teilpatch. Nächster großer Task hier: das HB/Thread-Modell (1).
