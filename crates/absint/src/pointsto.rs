@@ -57,11 +57,24 @@ pub struct PointsTo {
     /// TOP, so no field of it is ever a clean singleton. This is what keeps the analysis sound in
     /// the presence of byte-level / aliased writes it cannot resolve to a specific field.
     poisoned: HashSet<Node>,
+    /// Nodes whose points-to set overflowed [`MAX_PTS_SET`] and was collapsed to `{TOP}` (see
+    /// [`saturate`](Self::saturate)); further additions to them are dropped, capping solver memory.
+    saturated: HashSet<Node>,
 }
 
 /// The reserved offset for an **unknown / symbolic** field access: a gep with this offset poisons
 /// the whole base object (any of its fields may be the target).
 pub const ANY_OFFSET: u64 = u64::MAX;
+
+/// Peak points-to set size before a node is collapsed to `{TOP}` (memory cap; a set this large is
+/// never a resolvable singleton, so the cap loses no devirt).
+const MAX_PTS_SET: usize = 64;
+
+/// Whole-program node budget: above this the streaming points-to stops accumulating and does not
+/// solve (empty devirt — sound, just no resolution). The naive Andersen fixpoint does not scale to
+/// a full-kernel (tens-of-millions-of-node) relation; beyond the budget the analysis degrades to a
+/// no-op rather than exhausting memory. Smaller closed-world units stay under it and resolve.
+const MAX_NODES: usize = 2_000_000;
 
 impl Default for PointsTo {
     fn default() -> Self {
@@ -84,6 +97,7 @@ impl PointsTo {
             name: HashMap::new(),
             top: Node(0),
             poisoned: HashSet::new(),
+            saturated: HashSet::new(),
         };
         let top = p.fresh();
         p.top = top;
@@ -193,18 +207,42 @@ impl PointsTo {
         self.field_cell.get(&(obj, offset)).copied()
     }
 
+    /// Collapse a node whose points-to set has grown past [`MAX_PTS_SET`] to the single absorbing
+    /// TOP object. A set this large is never a clean singleton anyway, so collapsing it loses no
+    /// resolvable devirt; it caps the solver's peak memory (a whole-kernel Andersen relation would
+    /// otherwise hold enormous sets). Sound: `{TOP}` over-approximates any set, and a saturated node
+    /// stays TOP (further additions are dropped), so the fixpoint still terminates monotonically.
+    fn saturate(&mut self, dst: Node) {
+        if self.pts[dst.0 as usize].len() > MAX_PTS_SET {
+            let top = self.top;
+            self.pts[dst.0 as usize].clear();
+            self.pts[dst.0 as usize].insert(top);
+            self.saturated.insert(dst);
+        }
+    }
+
     fn add(&mut self, dst: Node, obj: Node) -> bool {
-        self.pts[dst.0 as usize].insert(obj)
+        if self.saturated.contains(&dst) {
+            return false;
+        }
+        let changed = self.pts[dst.0 as usize].insert(obj);
+        if changed {
+            self.saturate(dst);
+        }
+        changed
     }
 
     fn union(&mut self, dst: Node, src: Node) -> bool {
-        if dst == src {
+        if dst == src || self.saturated.contains(&dst) {
             return false;
         }
         let srcs: Vec<Node> = self.pts[src.0 as usize].iter().copied().collect();
         let mut changed = false;
         for o in srcs {
             changed |= self.pts[dst.0 as usize].insert(o);
+        }
+        if changed {
+            self.saturate(dst);
         }
         changed
     }
@@ -473,6 +511,12 @@ impl ProgramPointsTo {
     /// their parameters and external names, generate the intra-function constraints, and defer the
     /// calls (resolved at finalize).
     pub fn push_module(&mut self, m: &Module) {
+        // Stop accumulating once the whole-program relation exceeds the node budget — the naive
+        // fixpoint would not scale, so beyond it the analysis degrades to a sound no-op (empty
+        // devirt) rather than exhausting memory.
+        if self.pt.n as usize >= MAX_NODES {
+            return;
+        }
         let base = self.next;
         for (i, f) in m.functions.iter().enumerate() {
             let gfid = base + i as u32;
@@ -608,6 +652,10 @@ impl ProgramPointsTo {
     /// Called **before** [`finalize`](Self::finalize) — no points-to set has been solved yet, so
     /// only the constraint graph is translated; the fixpoint runs once over the merged whole.
     pub fn merge(&mut self, other: ProgramPointsTo) {
+        // Over the node budget, drop the incoming shard's relation (degrade to a sound no-op).
+        if self.pt.n as usize >= MAX_NODES {
+            return;
+        }
         let gbase = self.next;
         let cell_of: HashMap<Node, (Node, u64)> =
             other.pt.field_cell.iter().map(|(&(o, off), &c)| (c, (o, off))).collect();
@@ -668,6 +716,23 @@ impl ProgramPointsTo {
     /// callee that writes `param->ops` is captured exactly (and makes the field ambiguous if it
     /// disagrees with another site) — the interprocedural soundness.
     pub fn finalize(mut self) -> ModulePointsTo {
+        // Over the node budget: skip the whole solve (it would not scale) and return an unsolved
+        // relation — every points-to set is empty, so `name_keyed_devirt` yields nothing. Sound
+        // (no devirt), and the scan completes instead of exhausting memory.
+        if self.pt.n as usize >= MAX_NODES {
+            eprintln!(
+                "  points-to: {} nodes exceeds budget ({}), skipping whole-program devirt",
+                self.pt.n, MAX_NODES
+            );
+            return ModulePointsTo {
+                pt: self.pt,
+                reg_node: self.reg_node,
+                obj_global: self.obj_global,
+                name_to_gfid: self.name_to_gfid,
+                gfid_meta: self.gfid_meta,
+                fn_names: self.fn_names,
+            };
+        }
         // Poison every global whose constant initializer was NOT ingested: its field contents are
         // unknown, so a load of one of its fields must be TOP, never the empty set. Without this an
         // ambiguous `obj->ops ∈ {G_known, G_unknown}` would unsoundly collapse to `G_known`'s target
@@ -833,6 +898,22 @@ mod tests {
         pt.solve();
         assert_eq!(pt.singleton_object(loaded), None, "a TOP-poisoned field is not resolvable");
         assert!(pt.points_to(loaded).contains(&pt.top()), "the field carries TOP");
+    }
+
+    // A points-to set that overflows the cap collapses to TOP (memory bound) and is then never a
+    // clean singleton — the solver stays memory-bounded on huge relations without a false devirt.
+    #[test]
+    fn oversized_set_saturates_to_top() {
+        let mut pt = PointsTo::new();
+        let p = pt.new_var();
+        // Point `p` at MAX_PTS_SET + 5 distinct objects.
+        for i in 0..(MAX_PTS_SET + 5) {
+            let o = pt.new_object(format!("o{i}"));
+            pt.address_of(p, o);
+        }
+        pt.solve();
+        assert!(pt.points_to(p).contains(&pt.top()), "an overflowing set collapses to TOP");
+        assert_eq!(pt.singleton_object(p), None, "a saturated node is never a clean singleton");
     }
 
     // --- P2: constraint generation from MSIR ---
