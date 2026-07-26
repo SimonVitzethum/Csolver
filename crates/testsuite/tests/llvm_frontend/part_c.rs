@@ -251,6 +251,43 @@ entry:
     );
 }
 
+/// P2 — **caller-directed parameter push**: an opaque pointer (a call result) passed to a callee
+/// with a pointer contract is sized from that contract, so the caller's own access to it decides.
+#[test]
+fn caller_directed_param_push_sizes_opaque_arg_from_callee_contract() {
+    let src = r#"
+declare ptr @get()
+define void @use_buf(ptr dereferenceable(64) %p) {
+entry:
+  %q = getelementptr inbounds i8, ptr %p, i64 60
+  %v = load i8, ptr %q, align 1
+  ret void
+}
+define i8 @caller() {
+entry:
+  %p = call ptr @get()
+  call void @use_buf(ptr %p)
+  %q = getelementptr inbounds i8, ptr %p, i64 40
+  %v = load i8, ptr %q, align 1
+  ret i8 %v
+}
+"#;
+    let m = LlvmFrontend.lower(LlvmInput { source: src.into(), name: "p2".into() }).expect("lower");
+    // Control: without the whole-program overlay, the opaque call result is unsized → the access
+    // through it is UNKNOWN.
+    let cfg = Config { assume_valid_params: true, ..Config::default() };
+    let caller_local = verify_module(&m, &cfg).functions.into_iter().find(|f| f.function == "caller").unwrap();
+    assert_ne!(caller_local.verdict, Verdict::Pass, "without the overlay the opaque arg stays UNKNOWN");
+    // With the whole-program pass, use_buf's 64-byte contract sizes the caller's opaque %p → the
+    // in-bounds read at offset 40 decides.
+    let mut wpf = csolver_verifier::WholeProgramFacts::new();
+    wpf.push_module(&m);
+    let facts = wpf.finalize(true, true);
+    let rep = csolver_verifier::verify_module_whole_program(&m, &cfg, 1, facts.context());
+    let caller = rep.functions.iter().find(|f| f.function == "caller").expect("caller");
+    assert_eq!(caller.verdict, Verdict::Pass, "P2 sizes the opaque arg from the callee's contract");
+}
+
 /// Hebel 3 — **NoNullDeref decided**: a load through a definitely-null pointer on a feasible path
 /// is a certain null dereference, now refuted with a witness (was a silent UNKNOWN). An opaque
 /// pointer that merely *may* be null stays UNKNOWN (no false FAIL).

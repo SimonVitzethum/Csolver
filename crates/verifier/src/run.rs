@@ -275,6 +275,66 @@ pub(crate) fn verify_one_function(
             }
         }
     }
+    // P2 — **caller-directed parameter push**: a call to a callee with a pointer contract reveals
+    // the required size of the argument, so size the caller's own *otherwise-untyped* argument
+    // register from the callee's synthesized/declared contract. Only affects an **opaque** register
+    // (`size_hinted_pointer` fires solely on `Prov::Unknown`, so a known alloca/region keeps its real
+    // size — no masking of a genuinely undersized local). Sound under `--assume-valid-params`: the
+    // caller is obliged to satisfy the callee's precondition (itself the weakest guarantee its call
+    // sites provide), so the opaque argument is an assumed valid region of that size — the same
+    // `param-valid` basis as the field-type overlay. Closes the "uncontracted pointer parameter"
+    // residual for a value whose only typing evidence is how a callee uses it.
+    if config.assume_valid_params {
+        if let Some(ctx) = ctx {
+            for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+                let csolver_ir::Inst::Call { callee, args, .. } = inst else { continue };
+                // The callee's declared contract (in-module `Direct` call, keyed by id) or its
+                // whole-program synthesized one (keyed by external name) — either bounds the argument.
+                let direct_fid = match callee {
+                    csolver_ir::Callee::Direct(fid) => Some(*fid),
+                    _ => None,
+                };
+                let callee_name = match callee {
+                    csolver_ir::Callee::Symbol(nm) => Some(nm.clone()),
+                    csolver_ir::Callee::Direct(fid) => {
+                        module.functions.iter().find(|g| g.id == *fid).map(|g| g.name.clone())
+                    }
+                    csolver_ir::Callee::Indirect(_) => None,
+                };
+                for (i, arg) in args.iter().enumerate() {
+                    let csolver_ir::Operand::Reg(r) = arg else { continue };
+                    if reg_hints.get(r).is_some_and(|h| h.size > 0) {
+                        continue;
+                    }
+                    let c = direct_fid
+                        .and_then(|fid| module.param_contracts.get(&(fid, i as u32)).copied())
+                        .or_else(|| {
+                            callee_name
+                                .as_ref()
+                                .and_then(|n| ctx.name_ptr_contracts.get(&(n.clone(), i as u32)).copied())
+                        });
+                    let Some(c) = c else { continue };
+                    if let csolver_ir::SizeSpec::Bytes(size) = c.size {
+                        if size > 0 {
+                            let mut h = reg_hints.get(r).copied().unwrap_or(csolver_ir::PtrHint {
+                                size: 0,
+                                align: 0,
+                                tail: 0,
+                                container_size: 0,
+                                container_offset: 0,
+                                access_extent: 0,
+                            });
+                            h.size = size;
+                            if h.align == 0 {
+                                h.align = c.align;
+                            }
+                            reg_hints.insert(*r, h);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut local_id = 0u32;
     verify_function_with(
         f,
