@@ -129,6 +129,8 @@ rests on in its proof tree, so a `PASS` is never silently bought.
 |---|---|---|---|
 | `--assume-valid-params` | a raw pointer **parameter** of known (DWARF) pointee size is valid | the caller passes a dangling/null pointer | `param-valid` |
 | `--assume-valid-returns` | a pointer returned by an **unsummarised call** (external/unanalysed callee) is valid + non-null | the callee returns `NULL`, an `ERR_PTR` error code, or a dangling pointer | `valid-returns` |
+| `--assume-inttoptr-valid` | an **`inttoptr`** result (`current`, per-cpu, `phys_to_virt`, a hashed handle) is a valid non-null live region of unknown size | the cast fabricates an address that is null / not a real object; bounds stay UNKNOWN (unsized), so it only ever proves null/uninit/liveness | `inttoptr-valid` |
+| `--contracts <dir>` | (not an assumption) layer user `*.contract` files over the built-in defaults; use with `gen-contracts` output | a user-supplied contract is wrong (a spurious `free`/`alloc`/`lock` effect can fabricate a false FAIL or mask a bug) — review generated contracts before loading | the loaded contract's own basis |
 | `--assume-valid-loop-ptrs` | a **loop-carried pointer** (a moving iterator, `iter = iter->next`) still designates a valid live object each iteration — the kernel's intrusive-container discipline | the cursor walks off its object, or a list node is already freed (UAF through the iterator) | `valid-loop-ptrs` |
 | `--assume-param-buffer-len` | a C `(buf, len)` **parameter pair** — the body indexes `buf` by something `len` bounds, or by a value *derived* from `len` (`buf[len - 4]`) — really is a buffer and its length | the caller passes a length longer than the buffer (C guarantees no such pairing; Rust's `&[T]` does, and rests on `slice-abi` instead) | `param-buffer-len` |
 | `--assume-struct-tail` | the C **"context behind the struct"** idiom — `gep %struct.T, ptr %p, i64 1` (`crypto_skcipher_ctx(tfm)` is `tfm + 1`, `netdev_priv(dev)` is `dev + 1`) — means the allocation holds the struct *plus a trailing context*, so the object is sized to the reach the code takes rather than stopping at the declared type | the tail's real size is known only at the allocation site (another translation unit, in per-file kernel IR), so a **symbolic** index could overrun into the assumed tail without being refuted. Constant-offset accesses lose nothing: through an `assumed` region they are never refuted anyway, so this only turns UNKNOWN into PASS | `struct-tail` |
@@ -251,7 +253,17 @@ solver facts <dir> [--closed-world]         # streaming whole-program facts (no 
                                             # extract summaries + pointer/scalar/field
                                             # contracts for a whole tree in bounded RAM,
                                             # report coverage + peak RSS
+solver gen-contracts <dir> > my.contract    # auto-generate CANDIDATE .contract entries for
+                                            # the external kernel APIs a corpus calls but
+                                            # does not define (allocator/free/lock/user-copy
+                                            # naming conventions). REVIEW, then load with
+                                            # `--contracts <dir>` — a wrong effect can
+                                            # fabricate a false FAIL, so it is never auto-applied.
 ```
+
+**CSolver vs Miri.** A grounded capability comparison (what each covers, where CSolver is strong,
+and the honest Miri-superior gaps a static solver should close) is in
+[docs/csolver-vs-miri.md](docs/csolver-vs-miri.md).
 
 **Memory / parallelism knobs** (soundness-neutral — they only throttle; every unit
 is still analysed identically): the directory scan uses **size-aware, budget-adaptive

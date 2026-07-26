@@ -93,6 +93,36 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
   Risiko (bräche Miri-Orakel), eigener Miri-getriebener Task. **Nicht** als ungetesteter Flag-Patch
   geschifft (soundness-first).
 
+## Autonome Session 2 (2026-07-23) — Miri-Bewertung, Contract-Auto-Gen, P3
+
+- **[x] CSolver-vs-Miri-Bewertung** — `docs/csolver-vs-miri.md`. Komplementär: CSolver beweist über
+  ALLE Inputs, multi-language, mit Annahmen-Schicht; Miri beobachtet UB auf ausgeführten Rust-Läufen
+  mit höherer Fidelity bei den schwer-statisch-modellierbaren Klassen.
+- **[x] `.contract`-Auto-Generierung** — `solver gen-contracts <dir>` (Naming-Heuristik über externe
+  Calls) + **`--contracts <dir>`-Lademechanismus** (`init_user_contracts`, fehlte komplett!). Emittiert
+  reviewbare Kandidaten, nicht auto-angewendet.
+- **[x] P3 inttoptr** — `--assume-inttoptr-valid` (untypisierte inttoptr → assumed valide unsized
+  Region; non-null/liveness decides, bounds UNKNOWN).
+
+### Offene Miri-Parität (statisch sinnvoll) + große Reste — mit Design
+
+- [ ] **#4 Stacked/Tree-Borrows vervollständigen** (die größte Rust-Fidelity-Lücke): Retag-
+  Derivation-Trees, `&mut`-Use-after-Invalidation, 2-live-`&mut`, Protectors. Braucht Frontend-
+  Retag-Events (teils da: `csolver.retag.mut/shared`) + Ableitungsbaum-Tracking im Executor
+  (`region_borrows` erweitern). Hinter `--aliasing-model`; hohes false-FAIL-Risiko → Miri-Orakel-
+  getrieben validieren.
+- [ ] **Value-Validity-Invarianten** (`bool ∉ {0,1}`, ungültiger Enum-Diskriminant, `NonNull`=null):
+  neue `ValidValue`-Obligation an getypten Loads (MIR-Frontend kennt die Typen). Statisch geringe
+  Ausbeute (nur *beweisbar* ungültige Werte refutierbar), aber im Bug-Finding-Modus findet es
+  transmute-von-untrusted-Daten. Frontend muss den Valid-Set am Load markieren.
+- [ ] **Echte Inter-Thread-Data-Races** — whole-program Happens-Before/Thread-Modell (jeden Zugriff
+  mit Spawn/Entry-Kontext taggen). HB-Pruning/1a/1b sind da; der volle Thread-Kalkül fehlt.
+- [ ] **`ValidReference` / `StackIntegrity` / Return-Address-Integrität** — echte Checks statt
+  Platzhalter; braucht Stack-Frame-/Canary-Modellierung.
+- [ ] **Frontend**: `inttoptr` typisiert ist zu (P3); **Wide-Ints > 128 bit** (Solver-BitVector-
+  Breite erweitern — groß), **inline-asm** via Contracts, restliche gep/switch-`unsupported`-Drops.
+- [ ] **Float-UB**, **unwind-across-FFI** — Miri deckt sie ab; für einen statischen Solver Nische.
+
 ## Doku-Diskrepanz
 
 - [ ] `docs/exploit-taxonomy.md` behauptet „jede Klasse ●" — die ●-Marks meinen *Mechanismus
