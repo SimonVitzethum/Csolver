@@ -258,6 +258,7 @@ pub(crate) fn report_scan(
     unknown: u64,
     dropped: u64,
     errored: u64,
+    residuals: &std::collections::HashMap<String, u64>,
 ) -> Result<ExitCode, String> {
     let total = pass + fail + unknown;
     let pct = |x: u64| if total == 0 { 0.0 } else { 100.0 * x as f64 / total as f64 };
@@ -277,6 +278,19 @@ pub(crate) fn report_scan(
     println!("decided (PASS+FAIL)  : {}  ({:.1}%)", pass + fail, pct(pass + fail));
     println!("dropped (unanalyzed) : {dropped}   (functions the frontend could not lower)");
     println!("files with tool error: {errored}");
+    // Residual histogram (Phase 0a): why functions were left UNKNOWN. The single measurement that
+    // drives the UNKNOWN-reduction plan — it shows which residual CLASS dominates, and (across
+    // runs) whether closing a class actually flips functions or just moves the residual elsewhere.
+    if !residuals.is_empty() {
+        let total_res: u64 = residuals.values().sum();
+        let mut ranked: Vec<(&String, &u64)> = residuals.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        println!("\n== why UNKNOWN (residual histogram, {total_res} open obligations) ==");
+        for (reason, n) in ranked.into_iter().take(25) {
+            let rp = if total_res == 0 { 0.0 } else { 100.0 * *n as f64 / total_res as f64 };
+            println!("  {n:>8}  ({rp:>4.1}%)  {reason}");
+        }
+    }
     // A scan is an inventory, not a single verdict — exit non-zero iff any bug was found.
     Ok(if fail > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }

@@ -56,6 +56,9 @@ struct Agg {
     /// Labels of units already folded in — the resume set. On a checkpointed scan these are
     /// written out and, on restart, reloaded so their units are skipped rather than re-scanned.
     done: std::collections::HashSet<String>,
+    /// **Residual histogram** `reason → count` over all UNKNOWN functions (Phase 0a): why the
+    /// scan left functions undecided. Checkpointed so a resumed scan keeps the tally.
+    residuals: std::collections::HashMap<String, u64>,
 }
 
 impl Agg {
@@ -83,6 +86,9 @@ impl Agg {
         self.defined_fns.extend(fs.defined_fns);
         self.addr_taken.extend(fs.addr_taken);
         self.indirect_callers.extend(fs.indirect_callers);
+        for (reason, n) in fs.residuals {
+            *self.residuals.entry(reason).or_default() += n;
+        }
     }
 }
 
@@ -113,6 +119,9 @@ fn write_checkpoint(path: &Path, agg: &Agg) {
             s, "F\t{}\t{}\t{}\t{}",
             ckpt_field(&f.file), ckpt_field(&f.function), ckpt_field(&f.property), ckpt_field(&f.witness),
         );
+    }
+    for (reason, n) in &agg.residuals {
+        let _ = writeln!(s, "R\t{n}\t{}", ckpt_field(reason));
     }
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, s.as_bytes()).is_ok() {
@@ -145,6 +154,11 @@ fn read_checkpoint(path: &Path) -> Option<Agg> {
             Some("D") => {
                 if let Some(label) = it.next() {
                     agg.done.insert(label.to_string());
+                }
+            }
+            Some("R") => {
+                if let (Some(n), Some(reason)) = (it.next().and_then(|v| v.parse::<u64>().ok()), it.next()) {
+                    *agg.residuals.entry(reason.to_string()).or_default() += n;
                 }
             }
             Some("F") => {
@@ -405,6 +419,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         addr_taken,
         indirect_callers,
         done: _,
+        residuals,
     } = agg.into_inner().unwrap_or_else(|p| p.into_inner());
     findings.sort_by_cached_key(finding_key);
     let lock_edges: Vec<(String, String, String)> = lock_edges.into_iter().collect();
@@ -452,7 +467,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // the `--attack-surface` subset) — then the concurrency heuristics. At whole-kernel scale the
     // concurrency reports are large and their pairwise search is expensive; running them last means
     // a slow or capped concurrency pass never delays or blocks the result the scan exists to give.
-    let code = report_scan(&findings, pass, fail, unknown, dropped, errored);
+    let code = report_scan(&findings, pass, fail, unknown, dropped, errored, &residuals);
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses, concurrent.as_ref());
     report_atomicity(&race_traces, entry_patterns, concurrent.as_ref());

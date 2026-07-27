@@ -47,6 +47,11 @@ pub(crate) struct FileScan {
     /// Symbolic exploration hit its budget on ≥1 function: the unit is a
     /// candidate for a full-effort *deferred* re-run rather than accepting Unknown.
     pub(crate) truncated: bool,
+    /// **Residual histogram** `reason → count`: every open (undecided) obligation's residual
+    /// reason, tallied over this unit's UNKNOWN functions. Aggregated program-wide so a scan
+    /// reports *why* functions are undecided — the measurement that drives the UNKNOWN-reduction
+    /// plan (a residual CLASS closing without functions flipping is not progress; this shows both).
+    pub(crate) residuals: std::collections::HashMap<String, u64>,
 }
 
 /// The syscall-wrapper name prefixes (SYSCALL_DEFINE* expands to these) — precise entry

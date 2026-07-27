@@ -120,6 +120,7 @@ pub(crate) fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[Stri
     let mut lock_edges: Vec<(String, String, String)> = Vec::new();
     let mut race_accesses: Vec<(String, String, bool, Vec<String>)> = Vec::new();
     let mut race_traces: Vec<(String, Vec<(u8, String)>)> = Vec::new();
+    let mut residuals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for fs in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -130,6 +131,7 @@ pub(crate) fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[Stri
         lock_edges.extend(fs.lock_edges);
         race_accesses.extend(fs.race_accesses);
         race_traces.extend(fs.race_traces);
+        for (reason, n) in fs.residuals { *residuals.entry(reason).or_default() += n; }
     }
     let mut seen_find = HashSet::new();
     findings.retain(|f| seen_find.insert(finding_key(f)));
@@ -176,10 +178,25 @@ pub(crate) fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[Stri
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses, Some(&concurrent_fns));
     report_atomicity(&race_traces, entry_patterns, Some(&concurrent_fns));
-    report_scan(&findings, pass, fail, unknown, dropped, errored)
+    report_scan(&findings, pass, fail, unknown, dropped, errored, &residuals)
 }
 
 /// Verify one already-linked whole-program module, collecting its verdicts + findings.
+/// Tally the residual reasons of one UNKNOWN function's open obligations into the histogram.
+/// Each distinct open residual on the function is counted (a function is UNKNOWN if *any* obligation
+/// is open, and typically several are — Befund: functions are multi-causal, so the occurrence
+/// histogram, not just the function verdict, is what tells us which classes to close).
+pub(crate) fn tally_residuals(f: &csolver_verifier::FunctionReport, hist: &mut std::collections::HashMap<String, u64>) {
+    use csolver_core::ObligationResult;
+    for o in &f.outcomes {
+        if let ObligationResult::Open { residual, .. } = &o.result {
+            for r in residual {
+                *hist.entry(r.reason.clone()).or_default() += 1;
+            }
+        }
+    }
+}
+
 pub(crate) fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: &Config) -> FileScan {
     use csolver_core::ObligationResult;
     let mut fs = FileScan { dropped: module.unanalyzed.len() as u64, ..Default::default() };
@@ -187,7 +204,7 @@ pub(crate) fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: 
     for f in &report.functions {
         match f.verdict {
             Verdict::Pass => fs.pass += 1,
-            Verdict::Unknown => fs.unknown += 1,
+            Verdict::Unknown => { fs.unknown += 1; tally_residuals(f, &mut fs.residuals); }
             Verdict::Fail => {
                 fs.fail += 1;
                 for o in &f.outcomes {
@@ -331,7 +348,7 @@ pub(crate) fn scan_one_unit(
     for f in &report.functions {
         match f.verdict {
             Verdict::Pass => fs.pass += 1,
-            Verdict::Unknown => fs.unknown += 1,
+            Verdict::Unknown => { fs.unknown += 1; tally_residuals(f, &mut fs.residuals); }
             Verdict::Fail => {
                 fs.fail += 1;
                 for o in &f.outcomes {
