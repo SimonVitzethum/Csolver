@@ -780,23 +780,6 @@ impl ProgramPointsTo {
     /// callee that writes `param->ops` is captured exactly (and makes the field ambiguous if it
     /// disagrees with another site) — the interprocedural soundness.
     pub fn finalize(mut self) -> ModulePointsTo {
-        // Over the node budget: skip the whole solve (it would not scale) and return an unsolved
-        // relation — every points-to set is empty, so `name_keyed_devirt` yields nothing. Sound
-        // (no devirt), and the scan completes instead of exhausting memory.
-        if self.pt.n as usize >= MAX_NODES {
-            eprintln!(
-                "  points-to: {} nodes exceeds budget ({}), skipping whole-program devirt",
-                self.pt.n, MAX_NODES
-            );
-            return ModulePointsTo {
-                pt: self.pt,
-                reg_node: self.reg_node,
-                obj_global: self.obj_global,
-                name_to_gfid: self.name_to_gfid,
-                gfid_meta: self.gfid_meta,
-                fn_names: self.fn_names,
-            };
-        }
         // Poison every global whose constant initializer was NOT ingested: its field contents are
         // unknown, so a load of one of its fields must be TOP, never the empty set. Without this an
         // ambiguous `obj->ops ∈ {G_known, G_unknown}` would unsoundly collapse to `G_known`'s target
@@ -834,6 +817,29 @@ impl ProgramPointsTo {
                 }
             }
         }
+        // Offline copy-cycle collapse + node compaction: the copy graph is now complete (build +
+        // merge + deferred arg→param edges), so collapse SCCs of the subset graph before solving.
+        // This shrinks the node count — dominated by per-function pointer registers in a whole-kernel
+        // relation — losslessly, which is what lets a relation that would otherwise exceed the budget
+        // (and skip devirt entirely) solve. See [`collapse_copy_cycles`].
+        self.collapse_copy_cycles();
+        // Over the node budget *after* compaction: skip the solve (it would not scale) and return an
+        // unsolved relation — every points-to set is empty, so `name_keyed_devirt` yields nothing.
+        // Sound (no devirt), and the scan completes instead of exhausting memory.
+        if self.pt.n as usize >= MAX_NODES {
+            eprintln!(
+                "  points-to: {} nodes exceeds budget ({}) after cycle-collapse, skipping whole-program devirt",
+                self.pt.n, MAX_NODES
+            );
+            return ModulePointsTo {
+                pt: self.pt,
+                reg_node: self.reg_node,
+                obj_global: self.obj_global,
+                name_to_gfid: self.name_to_gfid,
+                gfid_meta: self.gfid_meta,
+                fn_names: self.fn_names,
+            };
+        }
         self.pt.solve();
         ModulePointsTo {
             pt: self.pt,
@@ -843,6 +849,221 @@ impl ProgramPointsTo {
             gfid_meta: self.gfid_meta,
             fn_names: self.fn_names,
         }
+    }
+
+    /// Offline **copy-cycle collapse with node compaction** (Andersen cycle elimination, applied
+    /// offline). Nodes in a strongly-connected component of the copy (subset `⊇`) graph are mutually
+    /// inclusive, hence have identical points-to sets at the least fixpoint; collapsing each SCC to a
+    /// single representative and **renumbering** the survivors to a dense range shrinks the node
+    /// count — dominated by per-function pointer registers in a whole-kernel relation — without
+    /// changing any points-to result. This is what lets a relation that would otherwise exceed the
+    /// node budget (and thus skip whole-program devirt) fit and solve.
+    ///
+    /// **Precision- and soundness-preserving.** A `gep`/`load`/`store` keys on the byte offset and on
+    /// the (now equal) points-to set of its pointer, not on node identity, so field-sensitivity and
+    /// every devirt singleton are preserved. The whole relation *and* the node-keyed side tables
+    /// (`reg_node` values, `global_obj` values, `obj_global` keys) are translated together, so a
+    /// devirt query still lands on the right object. TOP stays node 0 (absorbing). Field-cell key
+    /// collisions (two now-merged objects with a field at the same offset) are equalised by adding
+    /// copy edges between the two cells — sound (they converge in `solve`); an `obj_global` name
+    /// collision (two *distinct named globals* merged — practically impossible, as function/data
+    /// objects are address-of targets, never copy-cycle members) drops the entry so devirt declines
+    /// rather than guessing (never a wrong resolution). Run at [`finalize`] after the deferred
+    /// arg→param edges exist (the copy graph is complete) and before [`PointsTo::solve`].
+    fn collapse_copy_cycles(&mut self) {
+        let n = self.pt.n as usize;
+        if n <= 1 {
+            return;
+        }
+        // --- 1. Tarjan SCC over the copy graph: edge `src → dst` for each `dst ⊇ src`. ---
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &(d, s) in &self.pt.copy {
+            adj[s.0 as usize].push(d.0);
+        }
+        let mut index = vec![u32::MAX; n];
+        let mut low = vec![0u32; n];
+        let mut on_stack = vec![false; n];
+        let mut stack: Vec<u32> = Vec::new();
+        let mut comp = vec![u32::MAX; n];
+        let mut ncomp = 0u32;
+        let mut idx = 0u32;
+        for start in 0..n as u32 {
+            if index[start as usize] != u32::MAX {
+                continue;
+            }
+            // Iterative DFS: (node, next-child-index).
+            let mut dfs: Vec<(u32, usize)> = vec![(start, 0)];
+            while let Some(&(v, ci)) = dfs.last() {
+                if ci == 0 {
+                    index[v as usize] = idx;
+                    low[v as usize] = idx;
+                    idx += 1;
+                    stack.push(v);
+                    on_stack[v as usize] = true;
+                }
+                if ci < adj[v as usize].len() {
+                    let w = adj[v as usize][ci];
+                    dfs.last_mut().unwrap().1 += 1;
+                    if index[w as usize] == u32::MAX {
+                        dfs.push((w, 0));
+                    } else if on_stack[w as usize] {
+                        low[v as usize] = low[v as usize].min(index[w as usize]);
+                    }
+                } else {
+                    // Finished v: if it roots an SCC, pop the component.
+                    if low[v as usize] == index[v as usize] {
+                        loop {
+                            let w = stack.pop().unwrap();
+                            on_stack[w as usize] = false;
+                            comp[w as usize] = ncomp;
+                            if w == v {
+                                break;
+                            }
+                        }
+                        ncomp += 1;
+                    }
+                    dfs.pop();
+                    if let Some(&(p, _)) = dfs.last() {
+                        low[p as usize] = low[p as usize].min(low[v as usize]);
+                    }
+                }
+            }
+        }
+        // --- 2. Representative (smallest old id) per component; TOP=0 is thus its own rep. ---
+        let mut comp_rep = vec![u32::MAX; ncomp as usize];
+        for v in 0..n as u32 {
+            let c = comp[v as usize] as usize;
+            if comp_rep[c] == u32::MAX || v < comp_rep[c] {
+                comp_rep[c] = v;
+            }
+        }
+        let rep: Vec<u32> = (0..n as u32).map(|v| comp_rep[comp[v as usize] as usize]).collect();
+        // Nothing merged → no compaction needed.
+        if rep.iter().enumerate().all(|(v, &r)| v as u32 == r) {
+            return;
+        }
+        // --- 3. Dense renumbering of representatives; TOP's rep gets dense id 0. ---
+        let mut dense = vec![u32::MAX; n];
+        let top_rep = rep[self.pt.top.0 as usize];
+        dense[top_rep as usize] = 0;
+        let mut nnew = 1u32;
+        for v in 0..n as u32 {
+            if rep[v as usize] == v && dense[v as usize] == u32::MAX {
+                dense[v as usize] = nnew;
+                nnew += 1;
+            }
+        }
+        let new_id = |old: Node| -> Node { Node(dense[rep[old.0 as usize] as usize]) };
+        // --- 4. Rebuild the points-to sets (elements remapped too). ---
+        let mut new_pts: Vec<HashSet<Node>> = vec![HashSet::new(); nnew as usize];
+        for (v, set) in self.pt.pts.iter().enumerate() {
+            let nv = new_id(Node(v as u32));
+            for &t in set {
+                new_pts[nv.0 as usize].insert(new_id(t));
+            }
+        }
+        // Names, poison, saturated.
+        let mut new_name: HashMap<Node, String> = HashMap::new();
+        for (&node, nm) in &self.pt.name {
+            new_name.entry(new_id(node)).or_insert_with(|| nm.clone());
+        }
+        let new_poisoned: HashSet<Node> = self.pt.poisoned.iter().map(|&x| new_id(x)).collect();
+        let new_saturated: HashSet<Node> = self.pt.saturated.iter().map(|&x| new_id(x)).collect();
+        // Field cells, with key-collision equalisation.
+        let mut new_field_cell: HashMap<(Node, u64), Node> = HashMap::new();
+        let mut equalize: Vec<(Node, Node)> = Vec::new();
+        for (&(obj, off), &cell) in &self.pt.field_cell {
+            let key = (new_id(obj), off);
+            let val = new_id(cell);
+            match new_field_cell.get(&key) {
+                Some(&existing) if existing != val => equalize.push((existing, val)),
+                Some(_) => {}
+                None => {
+                    new_field_cell.insert(key, val);
+                }
+            }
+        }
+        // Constraint vectors: remap endpoints, drop self-copies, dedup.
+        let dedup_pairs = |src: &[(Node, Node)], drop_self: bool, extra: &[(Node, Node)]| {
+            let mut seen: HashSet<(Node, Node)> = HashSet::new();
+            let mut out: Vec<(Node, Node)> = Vec::new();
+            for &(a, b) in src {
+                let (a, b) = (new_id(a), new_id(b));
+                if drop_self && a == b {
+                    continue;
+                }
+                if seen.insert((a, b)) {
+                    out.push((a, b));
+                }
+            }
+            for &(a, b) in extra {
+                if drop_self && a == b {
+                    continue;
+                }
+                if seen.insert((a, b)) {
+                    out.push((a, b));
+                }
+            }
+            out
+        };
+        let new_addr = dedup_pairs(&self.pt.addr, false, &[]);
+        // Equalise-edges are bidirectional copies between merged field cells.
+        let mut eq_edges: Vec<(Node, Node)> = Vec::with_capacity(equalize.len() * 2);
+        for (a, b) in equalize {
+            eq_edges.push((a, b));
+            eq_edges.push((b, a));
+        }
+        let new_copy = dedup_pairs(&self.pt.copy, true, &eq_edges);
+        let new_load = dedup_pairs(&self.pt.load, false, &[]);
+        let new_store = dedup_pairs(&self.pt.store, false, &[]);
+        let mut seen_gep: HashSet<(Node, Node, u64)> = HashSet::new();
+        let mut new_gep: Vec<(Node, Node, u64)> = Vec::new();
+        for &(d, s, off) in &self.pt.gep {
+            let e = (new_id(d), new_id(s), off);
+            if seen_gep.insert(e) {
+                new_gep.push(e);
+            }
+        }
+        // Commit the compacted relation.
+        self.pt.n = nnew;
+        self.pt.pts = new_pts;
+        self.pt.name = new_name;
+        self.pt.poisoned = new_poisoned;
+        self.pt.saturated = new_saturated;
+        self.pt.field_cell = new_field_cell;
+        self.pt.addr = new_addr;
+        self.pt.copy = new_copy;
+        self.pt.load = new_load;
+        self.pt.store = new_store;
+        self.pt.gep = new_gep;
+        // TOP is unchanged (rep of its component, dense id 0).
+        debug_assert_eq!(new_id(self.pt.top).0, 0);
+        // --- 5. Translate the node-keyed side tables. ---
+        for v in self.reg_node.values_mut() {
+            *v = new_id(*v);
+        }
+        for v in self.global_obj.values_mut() {
+            *v = new_id(*v);
+        }
+        // obj_global: on a name collision (two distinct named objects merged), drop the entry so
+        // devirt declines rather than resolving to an arbitrary one — sound (never a wrong target).
+        let mut new_obj_global: HashMap<Node, String> = HashMap::new();
+        let mut collided: HashSet<Node> = HashSet::new();
+        for (&node, nm) in &self.obj_global {
+            let k = new_id(node);
+            match new_obj_global.get(&k) {
+                Some(existing) if existing != nm => {
+                    collided.insert(k);
+                }
+                _ => {
+                    new_obj_global.insert(k, nm.clone());
+                }
+            }
+        }
+        for k in collided {
+            new_obj_global.remove(&k);
+        }
+        self.obj_global = new_obj_global;
     }
 }
 
@@ -867,6 +1088,64 @@ pub fn analyze_module(m: &Module) -> ModulePointsTo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Offline copy-cycle collapse must preserve a devirt singleton across a compaction. Build a
+    // register cycle `r1 ⊇ r2`, `r2 ⊇ r1` where `r1 = &G` (a named function object): the cycle
+    // compacts r1/r2 into one node, and BOTH registers must still resolve to the singleton `G` with
+    // its `obj_global` name intact.
+    #[test]
+    fn collapse_preserves_singleton_through_a_copy_cycle() {
+        let mut pp = ProgramPointsTo::new();
+        let g = pp.pt.new_object("G");
+        let r1 = pp.pt.new_var();
+        let r2 = pp.pt.new_var();
+        pp.pt.address_of(r1, g); // r1 ⊇ {G}
+        pp.pt.assign(r1, r2); // r1 ⊇ r2
+        pp.pt.assign(r2, r1); // r2 ⊇ r1  → a copy cycle
+        pp.obj_global.insert(g, "G".into());
+        pp.reg_node.insert((0, RegId(1)), r1);
+        pp.reg_node.insert((0, RegId(2)), r2);
+        let n_before = pp.pt.n;
+        pp.collapse_copy_cycles();
+        assert!(pp.pt.n < n_before, "the r1/r2 copy cycle must compact the node count");
+        pp.pt.solve();
+        for r in [RegId(1), RegId(2)] {
+            let node = pp.reg_node[&(0, r)];
+            let obj = pp.pt.singleton_object(node).expect("singleton survives collapse");
+            assert_eq!(
+                pp.obj_global.get(&obj).map(String::as_str),
+                Some("G"),
+                "obj_global name must survive the remap for {r:?}"
+            );
+        }
+    }
+
+    // Field-sensitivity must survive a collapse when the base pointer of a field access sits in a
+    // copy cycle: `p ⊇ q`, `q ⊇ p`, `p = &obj`; `*(p->8) = &target`; `ld = *(p->8)`. After p/q
+    // collapse, the gep endpoint remaps to the representative, the field cell `(obj, 8)` is created
+    // for it during solve, and `ld` must still resolve to the clean singleton `target`.
+    #[test]
+    fn collapse_preserves_field_through_a_cycle_pointer() {
+        let mut pp = ProgramPointsTo::new();
+        let obj = pp.pt.new_object("obj");
+        let target = pp.pt.new_object("target");
+        let p = pp.pt.new_var();
+        let q = pp.pt.new_var();
+        let av = pp.pt.new_var();
+        let gp = pp.pt.new_var();
+        let ld = pp.pt.new_var();
+        pp.pt.address_of(p, obj); // p ⊇ {obj}
+        pp.pt.assign(p, q); // p ⊇ q
+        pp.pt.assign(q, p); // q ⊇ p → cycle
+        pp.pt.address_of(av, target); // av ⊇ {target}
+        pp.pt.gep(gp, p, 8); // gp = &p->8 (gep off a cycle node)
+        pp.pt.store(av, gp); // *(p->8) = &target
+        pp.pt.load(ld, gp); // ld = *(p->8)
+        pp.collapse_copy_cycles();
+        pp.pt.solve();
+        let o = pp.pt.singleton_object(ld).expect("ld resolves to a singleton after collapse");
+        assert_eq!(pp.pt.name_of(o), Some("target"), "field-sensitivity survives the cycle collapse");
+    }
 
     // `p = &a` ⇒ pts(p) = {a}; a copy `q = p` shares it.
     #[test]

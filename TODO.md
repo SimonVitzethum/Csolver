@@ -24,19 +24,19 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
 - **[x] Aliasing-Doku korrigiert** (F/#4): der `NoAliasingViolation`-Kommentar war **stale** — Write-
   durch-`&T`, `&mut`-Use-after-Invalidation und Sibling-Invalidierung sind **implementiert + getestet**
   (part_g), nicht future work. Echte Restlücken jetzt präzise: Cross-Call-Protectors + Tree-Borrows-Gitter.
+- **[x] Full-Kernel-Devirt: kompaktierender Copy-Cycle-Collapse (H)** — `ProgramPointsTo::collapse_copy_cycles`:
+  Tarjan-SCC über den Copy-(Subset-)Graphen, jede SCC → ein Repräsentant, Survivors **dicht renumeriert**
+  (senkt `self.n`), sodass eine Relation, die sonst das Budget überschreitet (und Devirt komplett skippt),
+  passt und solved. Verlustfrei/präzisions-erhaltend: `gep`/`load`/`store` schlüsseln auf Offset + (gleiches)
+  Points-to-Set, nicht auf Knoten-Identität → Feld-Sensitivität + jeder Devirt-Singleton bleibt. Übersetzt die
+  ganze Relation **und** die node-tragenden Seitentabellen (`reg_node`/`global_obj`-Werte, `obj_global`-Keys)
+  konsistent; TOP bleibt Knoten 0; Field-Cell-Key-Kollisionen via Copy-Kanten equalisiert; `obj_global`-Namens-
+  kollision (praktisch unmöglich) droppt den Eintrag → Devirt lehnt ab statt zu raten (nie falsches Ziel).
+  Läuft in `finalize` nach der Deferred-Auflösung (Copy-Graph vollständig), vor `solve`. Validiert: gesamte
+  absint-Suite (42) grün + 2 adversariale Zyklus-Tests (Singleton + Feld-durch-Zyklus-Zeiger). **Offen:**
+  Kernel-Skala-Rescan zur Messung des tatsächlichen Node-Rückgangs (10,3M → ?) und Devirt-Reaktivierung.
 
 **Deferred mit präzisem Befund (soundness-first: NICHT halb-validiert geschiffft):**
-- **[ ] Full-Kernel-Devirt-Node-Reduktion (H)** — **Befund:** der Budget-Check `n >= MAX_NODES` greift in
-  `ProgramPointsTo::finalize` **vor** `solve()`; die gemessenen 10,3M sind **Build-Zeit-Knoten**
-  (überwiegend Zeiger-**Register** `reg_node`, eins pro (Funktion, Reg) whole-program, plus Objekte/Cells).
-  Ein Copy-Cycle-Collapse hilft daher **nur mit Kompaktierung** (neue dichte Knoten-IDs, `self.n` senken) —
-  ein nicht-kompaktierender Collapse spart nur Solve-Arbeit, läuft aber nie (solve wird bei Überbudget
-  übersprungen). Eine korrekte kompaktierende Ganz-Relations-Renumerierung muss `pts` + alle 5 Constraint-
-  Vektoren + `field_cell`-**Kollisionen** + `poisoned`/`name` **und** die externen node-tragenden Maps
-  `ProgramPointsTo::reg_node` (Werte) / `obj_global` (Keys) konsistent übersetzen. Ihre Korrektheit steuert
-  echte Devirt-PASS/FAIL-Verdikte (ein einziger verlorener Constraint → Unterapproximation → falscher
-  Singleton → false PASS). Design steht; **nicht in einer Session sicher validierbar** → nicht geschiffft.
-  Sicherer Alt-Zustand: Budget-Skip verhindert OOM, Devirt entfällt (nur Präzisionsverlust, kein false PASS).
 - **[ ] Wide-Ints > 128 bit (C/G)** — **Befund:** der Kern-`csolver_core::BitVector` ist fundamental
   `u128`-basiert (`words:[u64;2]` → immer als ein `u128` rekombiniert; `assert!(width<=128)`). Volle
   Bignum-Unterstützung ist ein Rewrite des **Kern-Werttyps** (value.rs + expr.rs fold_bin/cmp + bitblast
@@ -115,8 +115,11 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 - [x] **Whole-program Points-to** (P4-Devirt) — **skalierbarer Worklist-Solver** (nur geänderte
   Knoten neu propagiert, dynamische Copy-Kanten), Feldzellen ohne Debug-Name, `intern_field`-Cap,
   Budget 2M→10M. Kernel (~3,4M Knoten) solved jetzt statt zu no-op-degradieren. (Frontier #1,
-  commit `d70d921`; Kernel-Skala per Rescan validiert.) Offen: Zyklen-Kollaps/HVN für noch mehr
-  Skala.
+  commit `d70d921`; Kernel-Skala per Rescan validiert.)
+- [x] **Kompaktierender Copy-Cycle-Collapse** (`collapse_copy_cycles`, Session 3) — SCC-Zyklen-Elimination
+  mit Knoten-Renumerierung senkt `self.n`, damit eine sonst-über-Budget-Relation Devirt behält statt zu
+  skippen. Verlustfrei, absint-Suite + 2 adversariale Zyklus-Tests grün. Offen: HVN (Hash-Value-Numbering)
+  für Nicht-Zyklus-Äquivalenzen; Kernel-Rescan zur Node-Rückgang-Messung.
 
 ## Frontier-Fortschritt (2026-07-23, vollständig-autonome Session)
 
