@@ -72,6 +72,10 @@ pub(crate) fn decode_one(
     match op {
         0x90 => done(vec![], p),                                          // nop
         0xc3 => Ok(Decoded { insts: vec![], next: p, ctrl: Ctrl::Ret }),  // ret
+        // leave = `mov rsp, rbp; pop rbp` — the function-epilogue frame teardown. Nothing accesses
+        // the frame afterwards (a `ret` follows), so it is a no-op for the analysis, matching the
+        // `add rsp, N` teardown case.
+        0xc9 => done(vec![], p),
         0xb8..=0xbf => {
             // mov r, imm
             let r = reg(op - 0xb8 + if rex_b { 8 } else { 0 });
@@ -212,75 +216,156 @@ pub(crate) fn decode_one(
             insts.push(Inst::Assign { dst: reg(m.reg), ty, value: RValue::Use(Operand::Reg(ptr)) });
             done(insts, mem.next)
         }
-        // group 1: <op> r/m, imm8 — register target (mod 11) only.
-        // x86 sign-extends the 8-bit immediate to the operand width.
-        0x83 => {
+        // Accumulator forms: `<alu> AL, imm8` (even opcode) / `<alu> eAX, imm32` (odd). The ALU
+        // operation is encoded in bits 3-5 of the opcode — the same /digit as group-1. cmp (/7)
+        // and test only set the flags. adc (/2) and sbb (/3) carry the flags → unsupported (drop).
+        0x04 | 0x05 | 0x0c | 0x0d | 0x24 | 0x25 | 0x2c | 0x2d | 0x34 | 0x35 | 0x3c | 0xa8 | 0xa9 => {
+            let is_byte = op & 1 == 0;
+            let op_width = if is_byte { 8 } else { width };
+            let op_ty = Type::int(op_width);
+            let imm_len = if is_byte { 1 } else { 4 };
+            let raw = read_imm(code, p, imm_len)?;
+            p += imm_len;
+            let imm = raw & ((1u128 << op_width) - 1);
+            let target = reg(0); // AL / eAX / RAX
+            // `test AL/eAX, imm` (0xa8/0xa9): read-only, set flags.
+            if op == 0xa8 || op == 0xa9 {
+                *flags = Some((Operand::Reg(target), Operand::int(op_width, imm)));
+                return done(vec![], p);
+            }
+            let bin = match (op >> 3) & 7 {
+                0 => BinOp::Add,
+                1 => BinOp::Or,
+                4 => BinOp::And,
+                5 => BinOp::Sub,
+                6 => BinOp::Xor,
+                7 => {
+                    // cmp AL/eAX, imm — record the operands for a following `jcc`.
+                    *flags = Some((Operand::Reg(target), Operand::int(op_width, imm)));
+                    return done(vec![], p);
+                }
+                d => return Err(CoreError::unsupported(format!("x86: unsupported accumulator ALU /digit {d}"))),
+            };
+            done(vec![add_imm(target, op_ty, bin, imm, op_width)], p)
+        }
+        // imul r, r/m, imm — three-operand signed multiply: r = r/m * imm. 0x69 has an imm32,
+        // 0x6b an imm8 (sign-extended to the operand width). The low `width` bits of a signed and
+        // unsigned product coincide, so `BinOp::Mul` serves.
+        0x69 | 0x6b => {
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
-            if m.mode != 0b11 {
-                // `<op> [mem], imm8` — the imm8 follows the SIB/displacement, so parse the memory
-                // operand first, then the immediate at `mem.next`. add/or/and/sub/xor are a
-                // read-modify-write on memory; cmp (/7) is a read-only load feeding the flags.
+            let dst = reg(m.reg);
+            let (src_insts, src) = if m.mode == 0b11 {
+                (vec![], reg(m.rm))
+            } else {
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
-                let imm_raw = read_imm(code, mem.next, 1)?;
-                let imm = (imm_raw as u8 as i8 as i128) as u128;
-                let next = mem.next + 1;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
                 insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
-                let bin = match m.reg & 7 {
+                p = mem.next;
+                (insts, loaded)
+            };
+            let (imm_raw, imm_len) = if op == 0x69 { (read_imm(code, p, 4)?, 4) } else { (read_imm(code, p, 1)?, 1) };
+            let imm = if op == 0x69 { (imm_raw as u32 as i32 as i128) as u128 } else { (imm_raw as u8 as i8 as i128) as u128 };
+            let imm = imm & ((1u128 << width) - 1);
+            let mut insts = src_insts;
+            insts.push(Inst::Assign {
+                dst,
+                ty,
+                value: RValue::Bin { op: BinOp::Mul, lhs: Operand::Reg(src), rhs: Operand::int(width, imm), flags: Default::default() },
+            });
+            done(insts, p + imm_len)
+        }
+        // group 1: <op> r/m, imm — add/or/and/sub/xor/cmp with an immediate. Three encodings:
+        //   0x80  r/m8, imm8   (byte operand)
+        //   0x81  r/m,  imm32  (imm sign-extended to the operand width)
+        //   0x83  r/m,  imm8   (imm sign-extended to the operand width)
+        // adc (/2) and sbb (/3) carry the flags and are left unsupported (⇒ sound drop).
+        0x80 | 0x81 | 0x83 => {
+            let op_width = if op == 0x80 { 8 } else { width };
+            let op_ty = Type::int(op_width);
+            let mask = |v: u128| v & ((1u128 << op_width) - 1);
+            // Read the immediate at `at`, per the opcode, returning (masked value, byte length).
+            let read_grp1_imm = |at: usize| -> csolver_core::Result<(u128, usize)> {
+                Ok(match op {
+                    0x81 => {
+                        let raw = read_imm(code, at, 4)?;
+                        (mask((raw as u32 as i32 as i128) as u128), 4)
+                    }
+                    // 0x80 and 0x83 both take an imm8; 0x83 sign-extends to the operand width, 0x80
+                    // is a byte operand so its width IS 8 (sign-extension is within the byte).
+                    _ => {
+                        let raw = read_imm(code, at, 1)?;
+                        (mask((raw as u8 as i8 as i128) as u128), 1)
+                    }
+                })
+            };
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            let digit = m.reg & 7;
+            if m.mode != 0b11 {
+                // `<op> [mem], imm` — parse the memory operand first, then the immediate at
+                // `mem.next`. add/or/and/sub/xor are a read-modify-write; cmp (/7) is a read-only
+                // load feeding the flags.
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (imm, imm_len) = read_grp1_imm(mem.next)?;
+                let next = mem.next + imm_len;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: op_ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
+                let bin = match digit {
                     0 => BinOp::Add,
                     1 => BinOp::Or,
                     4 => BinOp::And,
                     5 => BinOp::Sub,
                     6 => BinOp::Xor,
                     7 => {
-                        // cmp [mem], imm8 — read-only; record the operands for a following `jcc`.
-                        *flags = Some((Operand::Reg(loaded), Operand::int(width, imm)));
+                        // cmp [mem], imm — read-only; record the operands for a following `jcc`.
+                        *flags = Some((Operand::Reg(loaded), Operand::int(op_width, imm)));
                         return done(insts, next);
                     }
                     d => return Err(CoreError::unsupported(format!("x86: unsupported group-1 /digit {d} with a memory operand"))),
                 };
                 insts.push(Inst::Assign {
                     dst: loaded,
-                    ty: ty.clone(),
-                    value: RValue::Bin { op: bin, lhs: Operand::Reg(loaded), rhs: Operand::int(width, imm), flags: Default::default() },
+                    ty: op_ty.clone(),
+                    value: RValue::Bin { op: bin, lhs: Operand::Reg(loaded), rhs: Operand::int(op_width, imm), flags: Default::default() },
                 });
-                insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::Reg(loaded), align: 1, volatile: false });
+                insts.push(Inst::Store { ty: op_ty, ptr: Operand::Reg(ptr), value: Operand::Reg(loaded), align: 1, volatile: false });
                 return done(insts, next);
             }
-            let imm_raw = read_imm(code, p, 1)?; // imm8, value 0..255
-            p += 1;
-            // Sign-extend imm8 to the operand width.
-            let imm = (imm_raw as u8 as i8 as i128) as u128;
-            let uns = |v: u128| v & ((1u128 << width) - 1); // mask to width
+            let (imm, imm_len) = read_grp1_imm(p)?;
+            p += imm_len;
             let target = reg(m.rm);
-            // The /digit (ModRM reg field, sans any REX.R) selects the operation.
-            match m.reg & 7 {
-                // `sub rsp, N` allocates the stack frame: model rsp as a pointer
-                // to a fresh N-byte stack region, so `[rsp+disp]` is checked
-                // against the frame. N is always positive in practice.
-                5 if m.rm == 4 => done(
+            // The /digit (ModRM reg field, sans any REX.R) selects the operation. The `sub/add rsp`
+            // frame idiom is byte-independent (never the 0x80 byte form).
+            match digit {
+                // `sub rsp, N` allocates the stack frame: model rsp as a pointer to a fresh N-byte
+                // stack region, so `[rsp+disp]` is checked against the frame. (0x81 covers frames
+                // larger than 127 bytes, which the old imm8-only path could not decode.)
+                5 if m.rm == 4 && op != 0x80 => done(
                     vec![Inst::Alloc {
                         dst: target,
                         region: RegionKind::Stack,
                         elem: Type::int(8),
-                        count: Operand::int(64, uns(imm)),
+                        count: Operand::int(64, imm),
                         align: 16,
                     }],
                     p,
                 ),
-                // `add rsp, N` tears the frame down; nothing accesses it after, so
-                // it is a no-op for the analysis.
-                0 if m.rm == 4 => done(vec![], p),
-                0 => done(vec![add_imm(target, ty, BinOp::Add, uns(imm), width)], p),
-                5 => done(vec![add_imm(target, ty, BinOp::Sub, uns(imm), width)], p),
+                // `add rsp, N` tears the frame down; nothing accesses it after → a no-op.
+                0 if m.rm == 4 && op != 0x80 => done(vec![], p),
+                0 => done(vec![add_imm(target, op_ty, BinOp::Add, imm, op_width)], p),
+                1 => done(vec![add_imm(target, op_ty, BinOp::Or, imm, op_width)], p),
+                4 => done(vec![add_imm(target, op_ty, BinOp::And, imm, op_width)], p),
+                5 => done(vec![add_imm(target, op_ty, BinOp::Sub, imm, op_width)], p),
+                6 => done(vec![add_imm(target, op_ty, BinOp::Xor, imm, op_width)], p),
                 7 => {
                     // cmp r, imm — record the operands for a following `jcc`.
-                    *flags = Some((Operand::Reg(target), Operand::int(width, uns(imm))));
+                    *flags = Some((Operand::Reg(target), Operand::int(op_width, imm)));
                     done(vec![], p)
                 }
-                _ => Err(CoreError::unsupported("x86: unsupported group-1 operation")),
+                d => Err(CoreError::unsupported(format!("x86: unsupported group-1 /digit {d}"))),
               }
           }
           // cmp r/m, r — record operands for a following `jcc` (reg/reg form).
@@ -630,36 +715,40 @@ pub(crate) fn decode_one(
                 done(insts, mem.next)
             }
         }
-        // Group 2 shift r/m, imm8 (0xc1) and shift r/m, 1 (0xd1).
-        0xc1 | 0xd1 => {
-            let shift_by_1 = op == 0xd1;
+        // Group 2 shift/rotate r/m by an immediate (0xc0 byte / 0xc1), by 1 (0xd0 byte / 0xd1), or
+        // by CL (0xd2 byte / 0xd3). Only the shifts SHL/SHR/SAR (/4,/5,/7) are modelled; the rotates
+        // ROL/ROR/RCL/RCR (/0-3) carry the flags and are left unsupported (⇒ sound drop).
+        0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3 => {
+            let is_byte = op == 0xc0 || op == 0xd0 || op == 0xd2;
+            let op_width = if is_byte { 8 } else { width };
+            let op_ty = Type::int(op_width);
             let m = modrm(code, p, rex_r, rex_b)?;
             p += 1;
             if m.mode != 0b11 {
                 return Err(CoreError::unsupported("x86: shift with a memory operand"));
             }
-            let count = if shift_by_1 { 1u128 } else {
-                let c = read_imm(code, p, 1)?;
-                p += 1;
-                c
-            };
-            let target = reg(m.rm);
             let bin_op = match m.reg & 7 {
                 4 => BinOp::Shl,
                 5 => BinOp::LShr,
                 7 => BinOp::AShr,
                 _ => return Err(CoreError::unsupported(format!("x86: unsupported group-2 operation /digit {}", m.reg & 7))),
             };
+            // The shift amount: an immediate (0xc0/0xc1), the constant 1 (0xd0/0xd1), or CL (0xd2/0xd3).
+            let count = match op {
+                0xc0 | 0xc1 => {
+                    let c = read_imm(code, p, 1)?;
+                    p += 1;
+                    Operand::int(op_width, c)
+                }
+                0xd0 | 0xd1 => Operand::int(op_width, 1),
+                _ => Operand::Reg(reg(1)), // CL (the low byte of RCX)
+            };
+            let target = reg(m.rm);
             done(
                 vec![Inst::Assign {
                     dst: target,
-                    ty,
-                    value: RValue::Bin {
-                        op: bin_op,
-                        lhs: Operand::Reg(target),
-                        rhs: Operand::int(width, count),
-                    flags: Default::default(),
-                    },
+                    ty: op_ty,
+                    value: RValue::Bin { op: bin_op, lhs: Operand::Reg(target), rhs: count, flags: Default::default() },
                 }],
                 p,
             )
@@ -747,6 +836,55 @@ pub(crate) fn decode_one(
                             flags: Default::default(),
                             },
                         }],
+                        p,
+                    )
+                }
+                // test r/m, imm32 — read-only, sets flags; record for a following `jcc`.
+                0 | 1 => {
+                    let imm = read_imm(code, p, 4)?;
+                    p += 4;
+                    *flags = Some((Operand::Reg(target), Operand::int(width, imm)));
+                    done(vec![], p)
+                }
+                // mul / imul r/m: RDX:RAX = RAX * r/m. The low half lands in RAX; the high half
+                // (RDX) is over-approximated as unknown. (Both `mul` and `imul` produce the same low
+                // 64 bits, so one model serves; signedness only affects the discarded high half.)
+                4 | 5 => {
+                    let rax = reg(0);
+                    let rdx = reg(2);
+                    done(
+                        vec![
+                            Inst::Assign {
+                                dst: rax,
+                                ty: ty.clone(),
+                                value: RValue::Bin { op: BinOp::Mul, lhs: Operand::Reg(rax), rhs: Operand::Reg(target), flags: Default::default() },
+                            },
+                            Inst::Assign { dst: rdx, ty, value: RValue::Use(Operand::Const(csolver_ir::Const::Undef)) },
+                        ],
+                        p,
+                    )
+                }
+                // div (/6, unsigned) / idiv (/7, signed) r/m: RAX = RDX:RAX / r/m, RDX = remainder.
+                // Modelled as 64-bit RAX / r/m (the RDX:RAX 128-bit dividend is over-approximated by
+                // RAX). The remainder is computed FIRST so both reads see the original RAX. Emitting
+                // the division makes the divisor carry the NoDivByZero obligation (a zero r/m traps).
+                6 | 7 => {
+                    let (dq, dr) = if (m.reg & 7) == 6 { (BinOp::UDiv, BinOp::URem) } else { (BinOp::SDiv, BinOp::SRem) };
+                    let rax = reg(0);
+                    let rdx = reg(2);
+                    done(
+                        vec![
+                            Inst::Assign {
+                                dst: rdx,
+                                ty: ty.clone(),
+                                value: RValue::Bin { op: dr, lhs: Operand::Reg(rax), rhs: Operand::Reg(target), flags: Default::default() },
+                            },
+                            Inst::Assign {
+                                dst: rax,
+                                ty,
+                                value: RValue::Bin { op: dq, lhs: Operand::Reg(rax), rhs: Operand::Reg(target), flags: Default::default() },
+                            },
+                        ],
                         p,
                     )
                 }
@@ -1045,6 +1183,92 @@ fn decode_two_byte(
                     ty: ty.clone(),
                     value: RValue::Cast { op: CastOp::SExt, operand: Operand::Reg(tmp), to: ty },
                 });
+                done(insts, mem.next)
+            }
+        }
+        // syscall (0f 05): a transfer to the kernel that returns — modelled as an opaque call
+        // (havocs the heap and binds rax to an unknown result), then fall through.
+        0x05 => Ok(Decoded { insts: vec![opaque_call()], next: p, ctrl: Ctrl::Fall }),
+        // ud2 (0f 0b): an intentional invalid-opcode trap (Rust/`BUG()` panic path) — control does
+        // not continue past it, so end the path (like `ret`). Sound: nothing after it executes.
+        0x0b => Ok(Decoded { insts: vec![], next: p, ctrl: Ctrl::Ret }),
+        // 0f ae /5,/6,/7: lfence / mfence / sfence — a memory barrier. (/0-4 are fxsave/xsave/…,
+        // which touch memory and are left unsupported ⇒ sound drop.) Modelled as `Inst::Barrier`
+        // (kind: 0 full = mfence, 1 write = sfence, 2 read = lfence), matching the LLVM fence lowering.
+        0xae => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            if m.mode != 0b11 {
+                return Err(CoreError::unsupported("x86: 0f ae with a memory operand (fxsave/xsave/clflush)"));
+            }
+            let kind = match m.reg & 7 {
+                5 => 2, // lfence — orders reads
+                6 => 0, // mfence — full
+                7 => 1, // sfence — orders writes
+                d => return Err(CoreError::unsupported(format!("x86: unsupported 0f ae /digit {d}"))),
+            };
+            done(vec![Inst::Barrier { kind, access: None }], p + 1)
+        }
+        // imul r, r/m (0f af): two-operand signed multiply, r = r * r/m. The low `width` bits of a
+        // signed and unsigned product coincide, so `BinOp::Mul` serves.
+        0xaf => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            let dst = reg(m.reg);
+            if m.mode == 0b11 {
+                done(
+                    vec![Inst::Assign {
+                        dst,
+                        ty,
+                        value: RValue::Bin { op: BinOp::Mul, lhs: Operand::Reg(dst), rhs: Operand::Reg(reg(m.rm)), flags: Default::default() },
+                    }],
+                    p,
+                )
+            } else {
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
+                insts.push(Inst::Assign {
+                    dst,
+                    ty,
+                    value: RValue::Bin { op: BinOp::Mul, lhs: Operand::Reg(dst), rhs: Operand::Reg(loaded), flags: Default::default() },
+                });
+                done(insts, mem.next)
+            }
+        }
+        // Bit ops: bt (a3, read-only), bts/btr/btc (ab/b3/bb, read-modify-write), bsf/bsr (bc/bd,
+        // scan → dst). The bit result value is not tracked precisely, so a written register / memory
+        // cell is over-approximated as unknown (`Undef`); the memory operand's read (and, for the
+        // RMW forms, write) still carries its in-bounds / permission obligation.
+        0xa3 | 0xab | 0xb3 | 0xbb | 0xbc | 0xbd => {
+            let m = modrm(code, p, rex_r, rex_b)?;
+            p += 1;
+            let is_scan = op2 == 0xbc || op2 == 0xbd; // bsf/bsr write reg(m.reg)
+            let is_rmw = op2 == 0xab || op2 == 0xb3 || op2 == 0xbb; // bts/btr/btc write r/m
+            let undef = || RValue::Use(Operand::Const(csolver_ir::Const::Undef));
+            if m.mode == 0b11 {
+                // Register form: bsf/bsr write reg(m.reg); bts/btr/btc write the r/m register; bt
+                // writes nothing (flags only).
+                let insts = if is_scan {
+                    vec![Inst::Assign { dst: reg(m.reg), ty, value: undef() }]
+                } else if is_rmw {
+                    vec![Inst::Assign { dst: reg(m.rm), ty, value: undef() }]
+                } else {
+                    vec![] // bt: read-only
+                };
+                done(insts, p)
+            } else {
+                let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
+                let (mut insts, ptr) = mem.lower(pos);
+                let loaded = RegId(3000 + pos as u32);
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
+                if is_scan {
+                    insts.push(Inst::Assign { dst: reg(m.reg), ty, value: undef() });
+                } else if is_rmw {
+                    // bts/btr/btc [mem], r: the bit is modified and written back — model the write
+                    // with an unknown value so its ValidWrite/in-bounds obligation is checked.
+                    insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr), value: Operand::Const(csolver_ir::Const::Undef), align: 1, volatile: false });
+                }
                 done(insts, mem.next)
             }
         }

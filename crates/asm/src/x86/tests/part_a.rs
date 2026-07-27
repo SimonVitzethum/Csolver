@@ -13,10 +13,52 @@ fn decodes_xor_eax_eax_ret() {
 
 #[test]
 fn unsupported_opcode_marks_unanalyzed() {
-    // 0x0f is a two-byte-opcode escape we do not decode.
-    let m = decode_function("f", &[0x0f, 0x05]);
+    // 0f a2 = cpuid — an instruction we deliberately do not model; the whole function drops to
+    // `unanalyzed` (⇒ UNKNOWN), never a silent guess (the sound fallback).
+    let m = decode_function("f", &[0x0f, 0xa2]);
     assert!(m.functions.is_empty());
     assert_eq!(m.unanalyzed.len(), 1);
+}
+
+#[test]
+fn decodes_expanded_alu_and_control() {
+    // Session-3 x86 coverage batch — each of these previously dropped the function:
+    //   48 81 ec 00 01 00 00   sub rsp, 0x100     (group-1 0x81: a >127-byte frame)
+    //   3c 05                  cmp al, 5          (accumulator cmp)
+    //   48 d3 e0               shl rax, cl        (shift by CL)
+    //   48 f7 f1               div rcx            (group-3 /6 — carries div-by-zero)
+    //   48 0f af c1            imul rax, rcx      (0f af two-operand imul)
+    //   0f ae f0               mfence             (barrier)
+    //   c9                     leave
+    //   c3                     ret
+    let code = [
+        0x48, 0x81, 0xec, 0x00, 0x01, 0x00, 0x00, 0x3c, 0x05, 0x48, 0xd3, 0xe0, 0x48, 0xf7, 0xf1,
+        0x48, 0x0f, 0xaf, 0xc1, 0x0f, 0xae, 0xf0, 0xc9, 0xc3,
+    ];
+    let m = decode_function("f", &code);
+    assert!(m.unanalyzed.is_empty(), "must fully decode: {:?}", m.unanalyzed);
+    let insts: Vec<&Inst> = m.functions[0].blocks.iter().flat_map(|b| &b.insts).collect();
+    // sub rsp, 0x100 → a 256-byte stack Alloc.
+    assert!(
+        insts.iter().any(|i| matches!(i, Inst::Alloc { region: RegionKind::Stack, count: Operand::Const(csolver_ir::Const::Int(bv)), .. } if bv.unsigned() == 256)),
+        "sub rsp,0x100 must allocate a 256-byte frame: {insts:?}"
+    );
+    // div rcx → a UDiv (the divisor now carries the NoDivByZero obligation).
+    assert!(
+        insts.iter().any(|i| matches!(i, Inst::Assign { value: RValue::Bin { op: BinOp::UDiv, .. }, .. })),
+        "div must emit a UDiv so div-by-zero is checked: {insts:?}"
+    );
+    // imul → a Mul; mfence → a Barrier.
+    assert!(insts.iter().any(|i| matches!(i, Inst::Assign { value: RValue::Bin { op: BinOp::Mul, .. }, .. })), "imul must emit a Mul");
+    assert!(insts.iter().any(|i| matches!(i, Inst::Barrier { .. })), "mfence must emit a Barrier");
+}
+
+#[test]
+fn ud2_ends_the_path() {
+    // 0f 0b = ud2 (BUG()/panic trap) — the path ends (like ret), nothing after executes.
+    let m = decode_function("f", &[0x0f, 0x0b]);
+    assert!(m.unanalyzed.is_empty(), "ud2 decodes: {:?}", m.unanalyzed);
+    matches!(m.functions[0].blocks[0].term, csolver_ir::Terminator::Return(_));
 }
 
 #[test]
