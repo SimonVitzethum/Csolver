@@ -300,6 +300,71 @@ fn decode_one(
         };
     }
 
+    // LDP/STP (load/store register pair), integer: bits[29:26] == 1010, bit[25] == 0. This is the
+    // ubiquitous prologue/epilogue instruction (`stp x29,x30,[sp,#-N]!` / `ldp x29,x30,[sp],#N`);
+    // without it essentially every AArch64 function dropped at its first instruction.
+    if (word >> 26) & 0xf == 0b1010 && (word >> 25) & 1 == 0 {
+        let idx = (word >> 23) & 3; // 0/2 = signed offset (no writeback), 1 = post-index, 3 = pre-index
+        let opc = (word >> 30) & 3; // 00 = 32-bit (4-byte), 10 = 64-bit (8-byte)
+        let l = (word >> 22) & 1; //   0 = STP, 1 = LDP
+        let access: u64 = match opc {
+            0 => 4,
+            2 => 8,
+            _ => return Err(CoreError::unsupported(format!("arm64: unsupported LDP/STP opc {opc}"))),
+        };
+        let off = sign_extend((word >> 15) & 0x7f, 7) * access as i64;
+        let rt2 = ((word >> 10) & 0x1f) as u8;
+        let rn = ((word >> 5) & 0x1f) as u8;
+        let rt = (word & 0x1f) as u8;
+        let writeback = idx == 1 || idx == 3;
+        let pre = idx == 3;
+        let width = (access * 8) as u32;
+        let ty = Type::int(width);
+        let wb = |base: u8, off: i64| Inst::Assign {
+            dst: reg(base),
+            ty: Type::int(64),
+            value: RValue::Bin {
+                op: if off < 0 { BinOp::Sub } else { BinOp::Add },
+                lhs: Operand::Reg(reg(base)),
+                rhs: Operand::int(64, off.unsigned_abs() as u128),
+                flags: Default::default(),
+            },
+        };
+        // SP-relative pairs are frame spills/reloads (fp/lr/callee-saved save & restore): safe by
+        // construction in the function's own frame, so model only the `sp` writeback and DO NOT emit
+        // bounds-checked accesses (checking a frame slot would risk a false FAIL). A pair through any
+        // OTHER base (a pair stored into a struct/heap object) IS a real access and is checked.
+        if rn == SP {
+            let mut insts = Vec::new();
+            if writeback {
+                insts.push(wb(SP, off));
+            }
+            return fall(insts);
+        }
+        let mut insts = Vec::new();
+        // Effective base: pre-index and plain-offset access at `Rn + off`; post-index at old `Rn`.
+        let base_off = if writeback && !pre { 0 } else { off };
+        let ptr = temp_reg(pos);
+        insts.push(Inst::PtrOffset { dst: ptr, base: Operand::Reg(reg(rn)), index: Operand::int(64, base_off as u128), elem: Type::int(8) });
+        let ptr2 = temp_reg(pos + 1);
+        insts.push(Inst::PtrOffset { dst: ptr2, base: Operand::Reg(ptr), index: Operand::int(64, access as u128), elem: Type::int(8) });
+        if l == 0 {
+            let v1 = if rt == 31 { Operand::int(width, 0) } else { Operand::Reg(reg(rt)) };
+            let v2 = if rt2 == 31 { Operand::int(width, 0) } else { Operand::Reg(reg(rt2)) };
+            insts.push(Inst::Store { ty: ty.clone(), ptr: Operand::Reg(ptr), value: v1, align: 1, volatile: false });
+            insts.push(Inst::Store { ty, ptr: Operand::Reg(ptr2), value: v2, align: 1, volatile: false });
+        } else {
+            let d1 = if rt == 31 { temp_reg(pos + 2) } else { reg(rt) };
+            let d2 = if rt2 == 31 { temp_reg(pos + 3) } else { reg(rt2) };
+            insts.push(Inst::Load { dst: d1, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
+            insts.push(Inst::Load { dst: d2, ty, ptr: Operand::Reg(ptr2), align: 1, volatile: false, valid_range: None });
+        }
+        if writeback {
+            insts.push(wb(rn, off));
+        }
+        return fall(insts);
+    }
+
     Err(CoreError::unsupported(format!(
         "arm64: unsupported instruction {word:#010x}"
     )))
@@ -377,6 +442,39 @@ mod tests {
         ));
         assert!(matches!(insts[1], Inst::PtrOffset { .. }));
         assert!(matches!(insts[2], Inst::Store { .. }));
+    }
+
+    #[test]
+    fn decodes_stp_ldp_prologue_epilogue() {
+        // stp x29, x30, [sp, #-16]!   (0xA9BF7BFD) — the canonical frame-setup pair
+        // ldp x29, x30, [sp], #16     (0xA8C17BFD) — the epilogue reload
+        // ret                          (0xD65F03C0)
+        // Previously the function dropped at the first `stp`; it must now fully decode and the
+        // `sp` writeback must be modelled (a frame spill is not bounds-checked → no false FAIL).
+        let code = [
+            0xfd, 0x7b, 0xbf, 0xa9, // stp x29, x30, [sp, #-16]!
+            0xfd, 0x7b, 0xc1, 0xa8, // ldp x29, x30, [sp], #16
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ];
+        let m = decode_function("f", &code);
+        assert!(m.unanalyzed.is_empty(), "stp/ldp prologue must decode: {:?}", m.unanalyzed);
+        let insts = &m.functions[0].blocks[0].insts;
+        // Both the pre-index stp and the post-index ldp write back sp (an Assign to the SP register).
+        let sp_writebacks = insts.iter().filter(|i| matches!(i, Inst::Assign { dst, .. } if *dst == reg(SP))).count();
+        assert_eq!(sp_writebacks, 2, "both stp(pre) and ldp(post) update sp: {insts:?}");
+        // A frame spill is NOT bounds-checked (safe by construction) → no Load/Store emitted for it.
+        assert!(!insts.iter().any(|i| matches!(i, Inst::Store { .. } | Inst::Load { .. })), "sp-relative pair must not emit a checked access: {insts:?}");
+    }
+
+    #[test]
+    fn decodes_non_sp_stp_as_checked_stores() {
+        // stp x0, x1, [x2, #16]  (0xA9020440) — a pair stored through a NON-sp base: this IS a real
+        // memory access, so it must emit checked stores carrying the in-bounds/permission obligations.
+        let code = [0x40, 0x04, 0x02, 0xa9, 0xc0, 0x03, 0x5f, 0xd6];
+        let m = decode_function("f", &code);
+        assert!(m.unanalyzed.is_empty(), "non-sp stp must decode: {:?}", m.unanalyzed);
+        let store_count = m.functions[0].blocks[0].insts.iter().filter(|i| matches!(i, Inst::Store { .. })).count();
+        assert_eq!(store_count, 2, "a stp of two registers emits two checked stores");
     }
 
     #[test]
