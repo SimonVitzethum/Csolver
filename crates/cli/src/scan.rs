@@ -52,6 +52,9 @@ pub(crate) struct FileScan {
     /// reports *why* functions are undecided — the measurement that drives the UNKNOWN-reduction
     /// plan (a residual CLASS closing without functions flipping is not progress; this shows both).
     pub(crate) residuals: std::collections::HashMap<String, u64>,
+    /// Phase 0b: sum over this unit's UNKNOWN functions of their **distinct** residual-cause count.
+    /// Divided by the UNKNOWN count → mean distinct causes per undecided function (Befund 2).
+    pub(crate) sum_distinct_residuals: u64,
 }
 
 /// The syscall-wrapper name prefixes (SYSCALL_DEFINE* expands to these) — precise entry

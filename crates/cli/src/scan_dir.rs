@@ -59,6 +59,8 @@ struct Agg {
     /// **Residual histogram** `reason → count` over all UNKNOWN functions (Phase 0a): why the
     /// scan left functions undecided. Checkpointed so a resumed scan keeps the tally.
     residuals: std::collections::HashMap<String, u64>,
+    /// Phase 0b: summed distinct-residual-cause count over UNKNOWN functions (mean via `unknown`).
+    sum_distinct_residuals: u64,
 }
 
 impl Agg {
@@ -89,6 +91,7 @@ impl Agg {
         for (reason, n) in fs.residuals {
             *self.residuals.entry(reason).or_default() += n;
         }
+        self.sum_distinct_residuals += fs.sum_distinct_residuals;
     }
 }
 
@@ -123,6 +126,7 @@ fn write_checkpoint(path: &Path, agg: &Agg) {
     for (reason, n) in &agg.residuals {
         let _ = writeln!(s, "R\t{n}\t{}", ckpt_field(reason));
     }
+    let _ = writeln!(s, "M\t{}", agg.sum_distinct_residuals);
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, s.as_bytes()).is_ok() {
         let _ = std::fs::rename(&tmp, path);
@@ -160,6 +164,9 @@ fn read_checkpoint(path: &Path) -> Option<Agg> {
                 if let (Some(n), Some(reason)) = (it.next().and_then(|v| v.parse::<u64>().ok()), it.next()) {
                     *agg.residuals.entry(reason.to_string()).or_default() += n;
                 }
+            }
+            Some("M") => {
+                agg.sum_distinct_residuals += it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
             }
             Some("F") => {
                 if let (Some(file), Some(function), Some(property), Some(witness)) =
@@ -420,6 +427,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         indirect_callers,
         done: _,
         residuals,
+        sum_distinct_residuals,
     } = agg.into_inner().unwrap_or_else(|p| p.into_inner());
     findings.sort_by_cached_key(finding_key);
     let lock_edges: Vec<(String, String, String)> = lock_edges.into_iter().collect();
@@ -467,7 +475,7 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // the `--attack-surface` subset) — then the concurrency heuristics. At whole-kernel scale the
     // concurrency reports are large and their pairwise search is expensive; running them last means
     // a slow or capped concurrency pass never delays or blocks the result the scan exists to give.
-    let code = report_scan(&findings, pass, fail, unknown, dropped, errored, &residuals);
+    let code = report_scan(&findings, pass, fail, unknown, dropped, errored, &residuals, sum_distinct_residuals);
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses, concurrent.as_ref());
     report_atomicity(&race_traces, entry_patterns, concurrent.as_ref());

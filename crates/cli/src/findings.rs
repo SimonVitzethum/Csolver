@@ -259,6 +259,7 @@ pub(crate) fn report_scan(
     dropped: u64,
     errored: u64,
     residuals: &std::collections::HashMap<String, u64>,
+    sum_distinct_residuals: u64,
 ) -> Result<ExitCode, String> {
     let total = pass + fail + unknown;
     let pct = |x: u64| if total == 0 { 0.0 } else { 100.0 * x as f64 / total as f64 };
@@ -285,7 +286,11 @@ pub(crate) fn report_scan(
         let total_res: u64 = residuals.values().sum();
         let mut ranked: Vec<(&String, &u64)> = residuals.iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        println!("\n== why UNKNOWN (residual histogram, {total_res} open obligations) ==");
+        let mean = if unknown == 0 { 0.0 } else { sum_distinct_residuals as f64 / unknown as f64 };
+        println!(
+            "\n== why UNKNOWN (residual histogram, {total_res} open obligations; \
+             {mean:.1} distinct causes per UNKNOWN function) =="
+        );
         for (reason, n) in ranked.into_iter().take(25) {
             let rp = if total_res == 0 { 0.0 } else { 100.0 * *n as f64 / total_res as f64 };
             println!("  {n:>8}  ({rp:>4.1}%)  {reason}");
