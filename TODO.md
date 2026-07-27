@@ -10,6 +10,41 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
 
 ---
 
+## Autonome Session 3b (2026-07-27) — Coverage-Sektionen A–D
+
+**Geschiffft (sound, beide Orakel: 0 false PASS / 0 false FAIL):**
+- **[x] C — ≥3-Faktoren-Allokationsgröße-Overflow** (`size_overflow_goal` generalisiert auf n Faktoren):
+  Produkt in **Summen-Breite** der Faktoren geprüft (Σwᵢ, sofern ≤ `MAX_WIDTH`), sonst `None` (sound —
+  omittiert nur). Subsumiert den 2-Faktoren-Fall, deckt 3+ schmale Faktoren (`kmalloc_array`-artig). Der
+  häufige all-`size_t`-3-Faktoren-Fall (Σ = 192 > 128) bleibt ungemodellt — dieselbe Wide-Int-Grenze.
+  Tests: 2- und 3-Faktoren refutiert.
+- **[x] C — Integer-UB im strikten `verify`-Pfad war BEREITS abgedeckt**: der `decide`-Gate refutiert
+  `(state.exact && !internal_free_param) || (bug_finding && …)` — div0/shift/overflow refutieren auf
+  exaktem Pfad auch ohne `--bugs`. „Erwägen"-Punkt erfüllt.
+- **[x] B — Alignment-Refutation**: eine beweisbar **misaligned** Zugriff (Basis beweisbar ≥ `aalign`
+  ausgerichtet, `aalign` echte 2er-Potenz-Anforderung, Offset beweisbar `≢ 0 (mod aalign)` auf exaktem
+  Pfad) wird jetzt mit Witness refutiert statt UNKNOWN. Drei-wege (kein false PASS bei „nur nicht
+  beweisbar aligned" → UNKNOWN). Tests: misaligned refutiert, aligned PASS, unbekannte Basis UNKNOWN.
+- **[x] D — Contract-Korpus war BEREITS default-aktiv** (via `include_str!` compiled-in; `contracts()`
+  → `Contracts::defaults`), also feuern Capability/Taint/Typestate **out-of-the-box** (TODO-Prämise
+  stale). Korpus **konservativ erweitert**: Format-String-Taint-Sinks (sprintf/snprintf/syslog),
+  erweitertes File-Protokoll (getc/fgets/… use-after-close), Kernel-Refcount-Paare (dget/dput,
+  fget/fput, mntget/mntput, module_get/put), sk_buff-Double-Free. Smoke-Test: Parse + Registrierung.
+
+**Bewusst NICHT als Refutation geschiffft (Soundness-Fallen / Redundanz):**
+- **A — `ValidReference`**: im symbolischen Executor durch NoNullDeref + NoUseAfterFree + InBounds +
+  Alignment + `ValidValue` **subsumiert** — eine dedizierte Refutation würde nur doppelt melden. Wie
+  `StackIntegrity` ein Katalog-Label. (Kein redundanter Check hinzugefügt.)
+- **A — `StackIntegrity`/RA-Integrität**: bräuchte Frontend-Frame-Umbau (RA-Slot), Korruption durch
+  InBounds/ValidIndirectTarget subsumiert — deferred (siehe Session-3-Befund).
+- **C — plain-wrapping add/sub/mul, Truncation, signed/unsigned-Verwechslung**: **definiertes** Verhalten
+  in C (unsigned-wrap, mod-2ⁿ-Truncation, -fwrapv) — eine Refutation wäre ein **false FAIL**, kein Bug.
+  Nur als contract-/taint-getriebene Heuristik sinnvoll (nicht als harte Obligation) → nicht geschiffft.
+- **B — `ValidPointerArith`-Refutation**: reitet bewusst auf `InBounds` (das den OOB-Witness trägt);
+  eine eigene Refutation würde nur redundant melden.
+
+---
+
 ## Autonome Session 3 (2026-07-27) — Value-Validity, inline-asm-Contracts, Aliasing-Doku; große Reste mit Befund
 
 **Geschiffft (sound, orakel-validiert — Miri RESULT: SOUND):**
@@ -63,7 +98,7 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
 
 - [x] **`NoNullDeref`** — definite `Null`-Deref refutiert jetzt (Hebel 3, `checks.rs`); opake
   „may-be-null" bleibt prove-only.
-- [ ] **`Alignment`** — echte Fehlausrichtung bleibt UNKNOWN (`checks.rs:154`).
+- [x] **`Alignment`** — beweisbare Fehlausrichtung wird jetzt refutiert (Session 3b, Basis ≥ aalign + Offset ≢ 0 mod aalign auf exaktem Pfad); sonst UNKNOWN.
 - [ ] **`ValidPointerArith`** — Refutation abgeschaltet (`RefuteMode::Off`, reitet auf `InBounds`).
 
 ## C. Integer-UB — nur teilweise (alle nur `--bugs`)
@@ -74,9 +109,10 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 - [ ] **Truncation** (`size_t`→`int`) — kein dedizierter Check.
 - [ ] **signed/unsigned-Verwechslung** — kein dedizierter Check.
 - [ ] **Wide-Ints > 128 bit** (`i256`/`i512`) — UB-Checks komplett übersprungen (`step.rs:38`).
-- [x] **`var*var`-Allokationsgröße** (2 variable Faktoren) — jetzt in doppelter Breite geprüft
-  (`size_overflow_goal`, Hebel 2). ≥3 Faktoren weiter ungeprüft.
-- [ ] Erwägen: Integer-UB-Checks auch im strikten `verify`-Pfad (exakt-Pfad-Refutation).
+- [x] **`var*var`-Allokationsgröße** — n-Faktoren-general (Session 3b): Produkt in Summen-Breite, sofern
+  ≤ MAX_WIDTH. Deckt 2 + 3 schmale Faktoren; all-`size_t`-3-Faktoren (192 bit) bleibt Wide-Int-begrenzt.
+- [x] Integer-UB im strikten `verify`-Pfad — BEREITS abgedeckt (der `decide`-Gate refutiert div0/shift/
+  overflow auf exaktem Pfad, nicht nur unter `--bugs`; Session-3b-Befund).
 
 ## D. Nur mit Contract-Korpus (ohne Contracts still)
 

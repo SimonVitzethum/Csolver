@@ -526,3 +526,66 @@ fn in_range_bool_load_is_proven() {
     assert!(d.proven, "a `1` is a valid bool: {}", d.residual);
     assert!(d.refutation.is_none(), "an in-range value must not be refuted: {d:?}");
 }
+
+/// Alignment refutation: a base provably aligned to `base_align`, accessed by an `i32` load
+/// (required alignment 4) at a byte offset. Offset 2 (from an 8-aligned base) is a *definite*
+/// misalignment → refuted; offset 4 is aligned → PASS; an unknown base alignment (1) stays UNKNOWN.
+fn align_fixture(byte_off: u128, base_align: u32) -> Function {
+    let (buf, p, v) = (RegId(0), RegId(1), RegId(2));
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Stack,
+        elem: Type::int(8),
+        count: Operand::int(64, 32),
+        align: base_align,
+    });
+    bb0.insts.push(Inst::PtrOffset {
+        dst: p,
+        base: Operand::Reg(buf),
+        index: Operand::int(64, byte_off),
+        elem: Type::int(8), // stride 1 → index is a byte offset
+    });
+    bb0.insts.push(Inst::Load {
+        dst: v,
+        ty: Type::int(32), // required alignment 4
+        ptr: Operand::Reg(p),
+        align: 4,
+        volatile: false,
+        valid_range: None,
+    });
+    Function {
+        id: FuncId(0),
+        name: "align".into(),
+        params: vec![],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
+#[test]
+fn definite_misalignment_is_refuted() {
+    let r = discharge_function(&align_fixture(2, 8)); // 8-aligned base, +2, i32 load → misaligned
+    let d = r.mem_decision(BlockId(0), 2, SafetyProperty::Alignment).expect("alignment obligation");
+    assert!(!d.proven, "a +2 i32 access off an 8-aligned base is misaligned");
+    assert!(d.refutation.is_some(), "a definite misalignment must be refuted: {d:?}");
+}
+
+#[test]
+fn aligned_access_passes() {
+    let r = discharge_function(&align_fixture(4, 8)); // +4 is a multiple of 4
+    let d = r.mem_decision(BlockId(0), 2, SafetyProperty::Alignment).expect("alignment obligation");
+    assert!(d.proven, "a +4 i32 access off an 8-aligned base is aligned: {}", d.residual);
+    assert!(d.refutation.is_none());
+}
+
+#[test]
+fn misalignment_with_unknown_base_alignment_stays_unknown() {
+    // base_align 1: the base's true alignment is unknown, so a misaligned offset cannot be
+    // concluded — UNKNOWN, never refuted (no false FAIL) and never proven (no false PASS).
+    let r = discharge_function(&align_fixture(2, 1));
+    let d = r.mem_decision(BlockId(0), 2, SafetyProperty::Alignment).expect("alignment obligation");
+    assert!(!d.proven, "unknown base alignment must not prove alignment");
+    assert!(d.refutation.is_none(), "unknown base alignment must not be refuted: {d:?}");
+}

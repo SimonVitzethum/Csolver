@@ -66,3 +66,36 @@ typestate-set arg0 objtype reply
 
 [handle_request]
 typestate-require arg0 objtype request
+
+# --- Extended file protocol: more accessors that must not run on a closed stream (use-after-close).
+# Same discipline as fread/fwrite above — a definite use of an fclose'd handle is refuted.
+[getc fgetc getc_unlocked fgets fputs fputc putc scanf fscanf vfscanf ungetc fgetpos fsetpos setbuf setvbuf]
+typestate-require-not arg0 file closed
+
+# --- More kernel refcount pairs (get/put must balance; a put on an already-zero ref is a UAF, a
+# missing put is a leak). Each pair mirrors the kref pattern: inc on get, dec on put. Keyed per
+# object family so an inc of one is not balanced by a put of another.
+[dget dget_parent]
+refcount-inc arg0 dentry
+[dput]
+refcount-dec arg0 dentry
+[fget fget_raw get_file]
+refcount-inc arg0 file_ref
+[fput]
+refcount-dec arg0 file_ref
+[mntget]
+refcount-inc arg0 mount
+[mntput]
+refcount-dec arg0 mount
+[try_module_get __module_get]
+refcount-inc arg0 module
+[module_put]
+refcount-dec arg0 module
+
+# --- sk_buff double-free / use-after-free: freeing an skb twice, or touching it after free, is a
+# common kernel bug. Mirror the fclose pattern — a free requires the skb is not already freed, then
+# marks it freed. (Only the free side is modelled: an accessor-side require would be broad and risk
+# a false FAIL on a legitimately-reallocated pointer.)
+[kfree_skb consume_skb kfree_skb_reason dev_kfree_skb kfree_skb_list]
+typestate-require-not arg0 skb freed
+typestate-set arg0 skb freed

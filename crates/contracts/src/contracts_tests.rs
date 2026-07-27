@@ -291,3 +291,35 @@ fn ordered_cmpxchg_carries_both_cas_and_ordering_barrier() {
     assert_eq!(relaxed, &vec![Effect::Cas { arg: 0 }]);
     assert!(!c.lookup("cmpxchg").unwrap().effects.iter().any(|e| matches!(e, Effect::Barrier { .. })));
 }
+
+// Session-3 corpus expansion (D): the new format-string taint sinks, extended file protocol,
+// kernel refcount pairs, and skb double-free entries parse into the built-in defaults and are
+// registered. `defaults()` itself panics on any malformed built-in file, so reaching the lookups
+// already proves the additions parse; the lookups confirm they are keyed and reachable.
+#[test]
+fn session3_corpus_additions_are_registered() {
+    let c = Contracts::defaults();
+    // Format-string taint sinks.
+    for name in ["snprintf", "vsnprintf", "sprintf", "syslog"] {
+        assert!(c.lookup(name).is_some(), "taint sink {name} must be registered");
+    }
+    // Extended file protocol (use-after-close).
+    for name in ["fgets", "fscanf", "getc"] {
+        assert!(c.lookup(name).is_some(), "file-protocol {name} must be registered");
+    }
+    // Kernel refcount pairs.
+    for name in ["dget", "dput", "fget", "fput", "mntget", "mntput", "module_put"] {
+        assert!(c.lookup(name).is_some(), "refcount {name} must be registered");
+    }
+    // sk_buff double-free.
+    for name in ["kfree_skb", "consume_skb", "dev_kfree_skb"] {
+        assert!(c.lookup(name).is_some(), "skb free {name} must be registered");
+    }
+    // The skb free carries BOTH a require-not (double-free guard) and a set (mark freed).
+    let skb = &c.lookup("kfree_skb").unwrap().effects;
+    assert!(
+        skb.iter().any(|e| matches!(e, Effect::TypestateRequire { .. }))
+            && skb.iter().any(|e| matches!(e, Effect::TypestateSet { .. })),
+        "kfree_skb must both require-not-freed and set-freed: {skb:?}"
+    );
+}

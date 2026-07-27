@@ -266,6 +266,52 @@ fn two_variable_factor_alloc_size_overflow_is_flagged() {
     );
 }
 
+// Hebel 2 extended: THREE attacker-controlled factors (`a * b * c`) at a narrow width whose sum
+// (32+32+32 = 96) fits the bit-precise domain — checked in that summed width so the product cannot
+// wrap the check itself. (The common all-`size_t` 3-factor case has Σ widths = 192 > MAX_WIDTH and
+// stays unmodelled — the same wide-integer limitation, sound: it only omits the check.)
+#[test]
+fn three_variable_factor_alloc_size_overflow_is_flagged() {
+    let (a, b, c, ab, sz, buf) = (RegId(0), RegId(1), RegId(2), RegId(3), RegId(4), RegId(5));
+    let mul = |dst: RegId, lhs: RegId, rhs: RegId| Inst::Assign {
+        dst,
+        ty: Type::int(32),
+        value: RValue::Bin {
+            op: BinOp::Mul,
+            lhs: Operand::Reg(lhs),
+            rhs: Operand::Reg(rhs),
+            flags: Default::default(),
+        },
+    };
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(mul(ab, a, b)); // ab = a * b
+    bb0.insts.push(mul(sz, ab, c)); // sz = (a * b) * c
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Heap,
+        elem: Type::int(8),
+        count: Operand::Reg(sz),
+        align: 8,
+    });
+    let f = Function {
+        id: FuncId(0),
+        name: "alloc_a_b_c".into(),
+        params: vec![(a, Type::int(32)), (b, Type::int(32)), (c, Type::int(32))],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    };
+    let limits = ExecLimits { bug_finding: true, exported: true, ..ExecLimits::default() };
+    let r = discharge_with(&f, limits);
+    let d = r
+        .mem_decision(BlockId(0), 2, SafetyProperty::NoSizeOverflow)
+        .expect("NoSizeOverflow obligation at the a*b*c alloc");
+    assert!(
+        d.refutation.is_some(),
+        "an unbounded a*b*c size (three variable factors) must be flagged: {d:?}"
+    );
+}
+
 #[test]
 fn copy_to_user_of_uninitialized_buffer_is_an_info_leak() {
     let f = info_leak_fn(false);

@@ -35,3 +35,16 @@ taint-sanitize ret user
 # branch condition and gep index enforce this — only active because `secret` is defined here.
 [load_secret_key crypto_get_key get_random_bytes read_mac]
 taint-source arg0 secret
+
+# Format-string sinks: the format argument of the sprintf/snprintf family is an injection sink
+# exactly like printf (a user-controlled format string is a %n/%s exploit). sprintf(buf, fmt, ...)
+# has the format at arg1; the n-variants (snprintf(buf, size, fmt, ...)) at arg2. Only the FORMAT
+# argument is a sink — the output buffer is not. Refuted only when the format is definitely tainted.
+[sprintf vsprintf]
+taint-sink arg1 user
+[snprintf vsnprintf]
+taint-sink arg2 user
+
+# syslog/vsyslog(priority, fmt, ...): the format is arg1 (a classic format-string sink).
+[syslog vsyslog]
+taint-sink arg1 user

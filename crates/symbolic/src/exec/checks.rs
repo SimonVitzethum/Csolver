@@ -160,11 +160,10 @@ impl Explorer<'_> {
         // if the region base is at least `aalign`-aligned, the address is aligned iff the offset is,
         // so prove `offset ≡ 0 (mod aalign)` (i.e. `offset & (aalign-1) == 0`) under the path. This
         // decides masked (`p & ~7`) and guarded (`if (off % 8 == 0)`) offsets the gcd cannot see.
-        // Proof-only: a genuinely unaligned access (common and legal in packed/network code) is left
-        // UNKNOWN, never refuted — no false FAIL.
+        let base_aligned_to_req = aalign.is_power_of_two() && base_align >= aalign;
         let aligned = aalign <= 1
             || p.align.is_multiple_of(aalign)
-            || (aalign.is_power_of_two() && base_align >= aalign && {
+            || (base_aligned_to_req && {
                 let w = self.ctx.width(p.offset);
                 let mask = self.ctx.int(w, (aalign - 1) as u128);
                 let masked = self.ctx.bin(BvOp::And, p.offset, mask);
@@ -172,7 +171,41 @@ impl Explorer<'_> {
                 let goal = self.ctx.cmp(SCmp::Eq, masked, zero);
                 self.prove(goal, state)
             });
-        self.record(block, idx, Alignment, aligned, "address meets the required alignment", "could not prove the required alignment");
+        if aligned {
+            self.record(block, idx, Alignment, true, "address meets the required alignment", "");
+        } else {
+            // **Refute** a definite misalignment. When the region base is provably aligned to at
+            // least `aalign` (`base_align >= aalign`, both powers of two, so `aalign | base_align`
+            // ⟹ `base ≡ 0 (mod aalign)`), the address is aligned iff the offset is; so if the offset
+            // is provably NOT `≡ 0 (mod aalign)` on an **exact** path, the address is *certainly*
+            // misaligned — genuine UB, refuted with a witness. `aalign` here is a real declared
+            // requirement (a legal unaligned access carries `align 1`, so `aalign <= 1` and no
+            // obligation). Otherwise it stays a prove-only UNKNOWN — never a PASS (that would be a
+            // false PASS) and never a false FAIL.
+            let definitely_misaligned = base_aligned_to_req && state.exact && {
+                let w = self.ctx.width(p.offset);
+                let mask = self.ctx.int(w, (aalign - 1) as u128);
+                let masked = self.ctx.bin(BvOp::And, p.offset, mask);
+                let zero = self.ctx.int(w, 0);
+                let goal = self.ctx.cmp(SCmp::Ne, masked, zero);
+                self.prove(goal, state)
+            };
+            if definitely_misaligned {
+                match self.feasibility_witness(state) {
+                    Some(model) => self.record_mem(
+                        block,
+                        idx,
+                        Alignment,
+                        Decision::Refuted(model),
+                        "address meets the required alignment",
+                        "access is misaligned (address is not a multiple of the required alignment)",
+                    ),
+                    None => self.record(block, idx, Alignment, false, "address meets the required alignment", "could not prove the required alignment"),
+                }
+            } else {
+                self.record(block, idx, Alignment, false, "address meets the required alignment", "could not prove the required alignment");
+            }
+        }
 
         // Permission. A write into a region that provably lacks write permission is a
         // real violation. When that region is a definitely read-only GLOBAL — a store
@@ -419,20 +452,29 @@ impl Explorer<'_> {
                 let bound = self.ctx.int(PTR_WIDTH, umax / c);
                 Some(self.ctx.cmp(SCmp::Ule, *var, bound))
             }
-            // `n * m` (× constant C): check the product in double width so it cannot wrap.
-            [v1, v2] => {
-                let w2 = PTR_WIDTH * 2;
-                if self.ctx.width(*v1) > w2 || self.ctx.width(*v2) > w2 {
+            // `v1 * v2 * … * vk` (× constant C), k ≥ 2: check the product in a width wide enough
+            // that it cannot itself wrap — the **sum** of the factors' widths (a product of values
+            // each `< 2^wᵢ` is `< 2^Σwᵢ`, so `Σwᵢ` bits represent it exactly). Overflow of the
+            // pointer-width allocation size is then `∏vᵢ >u ⌊UINT_MAX / C⌋`. Bounded by the
+            // bit-precise domain: if `Σwᵢ` exceeds `MAX_WIDTH` (e.g. three 64-bit factors → 192
+            // bits) the product is not representable, so leave it unmodelled — the wrap still
+            // surfaces downstream as an OOB against the (wrapped) region size. Sound: `None` only
+            // ever OMITS a check, never fabricates one. This subsumes the old two-factor case and
+            // extends it to the three-or-more narrow-factor case (`kmalloc_array`-style products of
+            // 32-bit counts).
+            vars => {
+                let total: u32 = vars.iter().map(|&v| self.ctx.width(v)).sum();
+                if total == 0 || total > csolver_solver::bitblast::MAX_WIDTH {
                     return None;
                 }
-                let a = self.ctx.zext(*v1, w2);
-                let b = self.ctx.zext(*v2, w2);
-                let prod = self.ctx.bin(BvOp::Mul, a, b);
-                let bound = self.ctx.int(w2, umax / c);
+                let mut prod = self.ctx.int(total, 1);
+                for &v in vars {
+                    let z = self.ctx.zext(v, total);
+                    prod = self.ctx.bin(BvOp::Mul, z, prod);
+                }
+                let bound = self.ctx.int(total, umax / c);
                 Some(self.ctx.cmp(SCmp::Ule, prod, bound))
             }
-            // Three or more variable factors: not modelled here.
-            _ => None,
         }
     }
 
