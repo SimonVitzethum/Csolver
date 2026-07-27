@@ -822,7 +822,18 @@ impl ProgramPointsTo {
         // This shrinks the node count — dominated by per-function pointer registers in a whole-kernel
         // relation — losslessly, which is what lets a relation that would otherwise exceed the budget
         // (and skip devirt entirely) solve. See [`collapse_copy_cycles`].
+        let n_before = self.pt.n;
         self.collapse_copy_cycles();
+        // Diagnostic on the whole-program-scale relation only (a per-module `analyze_module` relation
+        // is tiny and stays silent): report the compaction ratio so a kernel scan can confirm the
+        // node drop and whether it brought devirt back under budget.
+        if n_before >= 500_000 {
+            let pct = 100.0 * (n_before - self.pt.n) as f64 / n_before as f64;
+            eprintln!(
+                "  points-to: copy-cycle collapse {n_before} -> {} nodes ({pct:.1}% reduction)",
+                self.pt.n
+            );
+        }
         // Over the node budget *after* compaction: skip the solve (it would not scale) and return an
         // unsolved relation — every points-to set is empty, so `name_keyed_devirt` yields nothing.
         // Sound (no devirt), and the scan completes instead of exhausting memory.
