@@ -144,7 +144,12 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 - [ ] **Wide-Ints > 128 bit** nicht repräsentierbar.
 - [ ] `unsupported`-Drops zu `unanalyzed`: variable/unsizable struct-gep, switch auf Nicht-Integer,
   Typ-Zyklen.
-- [ ] **ASM**: nur Common-Instruction-Subset; unbekannte Mnemonik → Funktion `unanalyzed`.
+- [~] **ASM**: Common-Subset **deutlich erweitert** (Session 3, #8) — x86: group-1 vollständig
+  (`0x80/0x81`, große `sub rsp`-Frames), Akkumulator-ALU, MUL/IMUL/DIV/IDIV (Div-by-Zero-Check),
+  Shift-by-CL/Byte, IMUL 2/3-Operand, `leave`/`syscall`/`ud2`/Fences/Bit-Ops; ARM64: **LDP/STP**
+  (Prolog/Epilog-Gate). Unbekannte Mnemonik → weiter `unanalyzed` (sound). **Offen (Breite):** x86
+  String-Ops (rep movs/stos), SSE/AVX-Semantik (nur Länge), x87 FPU, cmpxchg/xadd-Atomics; ARM64
+  Register-Form ADD/SUB/logical, CBZ/CBNZ/TBZ, ADRP/ADR, LDP-Register-Offset, MUL/UDIV/SDIV, BLR/BR.
 
 ## H. Skalierbarkeit
 
