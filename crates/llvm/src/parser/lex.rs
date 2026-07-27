@@ -392,6 +392,29 @@ impl Parser {
         None
     }
 
+    /// Scan the current instruction's trailing metadata (without consuming) for
+    /// `!range !N`, returning the pre-scanned non-wrapping `(lo, hi)` pair. Mirrors
+    /// [`Self::peek_load_align_meta`]. A wrapping/multi-interval range is absent from
+    /// `meta_ranges`, so this returns `None` there — sound (no value-validity check).
+    pub(crate) fn peek_load_range_meta(&self) -> Option<(i128, i128)> {
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::Newline | Tok::Eof => break,
+                Tok::Punct('!') => {
+                    if matches!(self.toks.get(i + 1), Some(Tok::Word(w)) if w == "range") {
+                        if let Some(Tok::Int(n)) = self.toks.get(i + 3) {
+                            return u32::try_from(*n).ok().and_then(|id| self.meta_ranges.get(&id).copied());
+                        }
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
     /// Advance past any run of newline tokens.
     pub(crate) fn skip_newlines(&mut self) {
         while matches!(self.peek(), Tok::Newline) {

@@ -81,7 +81,7 @@ fn ptr_walk_to(end_elems: u128) -> Function {
         dst: x,
         ty: Type::int(32),
         ptr: Operand::Reg(iter),
-        align: 4, volatile: false
+        align: 4, volatile: false, valid_range: None
     });
     bb2.insts.push(Inst::PtrOffset {
         dst: nx,
@@ -188,7 +188,7 @@ fn ptr_walk_bottom_impl(guard: bool) -> Function {
         },
     );
     bb1.params = vec![(iter, Type::ptr(Type::int(32)))];
-    bb1.insts.push(Inst::Load { dst: x, ty: Type::int(32), ptr: Operand::Reg(iter), align: 4 , volatile: false});
+    bb1.insts.push(Inst::Load { dst: x, ty: Type::int(32), ptr: Operand::Reg(iter), align: 4 , volatile: false, valid_range: None });
     bb1.insts.push(Inst::PtrOffset {
         dst: nx,
         base: Operand::Reg(iter),

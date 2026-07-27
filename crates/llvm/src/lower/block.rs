@@ -24,6 +24,7 @@ pub(crate) fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<Basi
                 ptr: ctx.operand(ptr, 64)?,
                 align,
                 volatile: true, // an atomic RMW is race-free
+                valid_range: None,
             });
             insts.push(Inst::Store {
                 ty: msir_ty,
@@ -199,6 +200,19 @@ pub(crate) fn lower_block(ctx: &mut Ctx, b: &LBlock, id: BlockId) -> Result<Basi
                     false
                 };
                 let base: String = callee.split('|').next().unwrap_or(callee).to_string();
+                // A contract keyed on the **base** asm name (`<inline asm>` / `<inline asm nomem>`,
+                // via `--contracts`) models the asm's semantic effect — a memory barrier, a
+                // lock/unlock, a user-copy — in place of the bare clobber. This makes contract
+                // routing uniform: a *plain* asm call (no `|` operands) already matches the
+                // contract lookup at the top of the loop on its bare name; a structured-operand
+                // asm reaches here with a `|`-suffixed name that the top lookup misses, so consult
+                // the base name now. The per-operand memory obligations emitted above still stand.
+                if let Some(contract) = contracts().lookup(&base) {
+                    let cdst = if sem_bound { None } else { dst.as_deref() };
+                    if emit_contract(ctx, &mut insts, contract, cdst, args, ret)? {
+                        continue;
+                    }
+                }
                 let call_args = args.iter().map(|a| ctx.operand(a, 64)).collect::<Result<Vec<_>>>()?;
                 insts.push(Inst::Call {
                     // The output is bound by the semantic Assign above — don't re-havoc it here.
@@ -290,12 +304,13 @@ pub(crate) fn lower_inst(ctx: &Ctx, inst: &LInst) -> Result<Inst> {
             count: Operand::int(64, 1),
             align: align_or(*align, ty),
         },
-        LInst::Load { dst, ty, ptr, align, atomic, .. } => Inst::Load {
+        LInst::Load { dst, ty, ptr, align, atomic, range, .. } => Inst::Load {
             dst: ctx.reg(dst)?,
             ty: lower_type(ty),
             ptr: ctx.operand(ptr, 64)?,
             align: align_or(*align, ty),
             volatile: *atomic,
+            valid_range: *range,
         },
         LInst::Fence { .. } => Inst::Barrier { kind: 0, access: None },
         LInst::Store { ty, val, ptr, align, atomic, .. } => Inst::Store {

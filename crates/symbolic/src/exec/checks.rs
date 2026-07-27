@@ -203,6 +203,58 @@ impl Explorer<'_> {
         }
     }
 
+    /// Value-validity: the loaded scalar `v` must lie in the non-wrapping half-open range
+    /// `[lo, hi)` its `!range` metadata declares (a `bool` is `[0, 2)`, an enum discriminant its
+    /// declared set). Three-way and refutation-only (see [`SafetyProperty::ValidValue`]):
+    /// PASS when `v` is provably in range; a **refuted** FAIL with a witness only when `v` is
+    /// provably *outside* the range on an **exact** path; otherwise UNKNOWN. Sound — an
+    /// off-exact or opaque value is never refuted, so no false FAIL.
+    pub(crate) fn check_valid_value(
+        &mut self,
+        at: (BlockId, usize),
+        v: ExprId,
+        lo: i128,
+        hi: i128,
+        state: &PathState,
+    ) {
+        use SafetyProperty::ValidValue;
+        let (block, idx) = at;
+        let w = self.ctx.width(v);
+        // The bounds come from `scan_meta_ranges` as `0 <= lo < hi`. Only apply when they fit the
+        // value's bit width (they always do for a genuine `!range` on a `w`-bit load); otherwise
+        // skip — `int()` would mask an over-wide bound and misrepresent the range (sound to omit).
+        if w == 0 || w > 128 || (hi as u128) > (1u128 << w.min(127)) {
+            return;
+        }
+        let lo_e = self.ctx.int(w, lo as u128);
+        let hi_e = self.ctx.int(w, hi as u128);
+        let ge = self.ctx.cmp(SCmp::Ule, lo_e, v);
+        let lt = self.ctx.cmp(SCmp::Ult, v, hi_e);
+        let in_range = self.ctx.and(vec![ge, lt]);
+        if self.prove(in_range, state) {
+            self.record(block, idx, ValidValue, true, "loaded value is a valid instance of its type", "");
+            return;
+        }
+        // Not provably in range. Refute only when the value is *definitely* out of range on an
+        // exact path — then the stored byte pattern is a certain invalid instance.
+        let out = self.ctx.not(in_range);
+        if state.exact && self.prove(out, state) {
+            match self.feasibility_witness(state) {
+                Some(model) => self.record_mem(
+                    block,
+                    idx,
+                    ValidValue,
+                    Decision::Refuted(model),
+                    "loaded value is a valid instance of its type",
+                    "loaded value is outside its type's valid range (invalid bool/enum discriminant)",
+                ),
+                None => self.record(block, idx, ValidValue, false, "loaded value is a valid instance of its type", "value could not be proven in its type's valid range"),
+            }
+        } else {
+            self.record(block, idx, ValidValue, false, "loaded value is a valid instance of its type", "value could not be proven in its type's valid range");
+        }
+    }
+
     pub(crate) fn check_ptr_arith(&mut self, block: BlockId, idx: usize, p: &SymPointer, state: &PathState) {
         use SafetyProperty::ValidPointerArith;
         // A join: the arithmetic stays in-object iff it does for each alternative

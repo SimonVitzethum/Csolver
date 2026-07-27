@@ -34,7 +34,7 @@ fn devirt_caller() -> Function {
         dst: fp,
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Const(Const::Symbol("G".into())),
-        align: 8, volatile: false
+        align: 8, volatile: false, valid_range: None
     });
     bb0.insts.push(Inst::Call {
         dst: None,
@@ -47,7 +47,7 @@ fn devirt_caller() -> Function {
         dst: p,
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
-        align: 8, volatile: false
+        align: 8, volatile: false, valid_range: None
     });
     bb0.insts.push(Inst::Store {
         ty: Type::int(8),

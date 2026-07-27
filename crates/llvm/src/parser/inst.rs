@@ -50,12 +50,16 @@ impl Parser {
                 // LLVM guarantee independent of the pointee type, so it is recorded
                 // and later folded into the loaded reference's alignment.
                 let align_meta = self.peek_load_align_meta();
+                // `!range !N` states the loaded value's valid range (a `bool`/enum-discriminant
+                // load) — recorded as a non-wrapping `[lo, hi)` for the value-validity check.
+                let range = self.peek_load_range_meta();
                 LInst::Load {
                     dst: need_dst()?,
                     ty,
                     ptr,
                     align,
                     align_meta,
+                    range,
                     atomic,
                     ordering,
                 }

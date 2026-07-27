@@ -352,6 +352,7 @@ fn lower_load_store(mnem: &str, ops: &[&str], off: usize) -> Result<Vec<Inst>> {
             ptr: Operand::Reg(ptr),
             align: 1,
             volatile: false,
+            valid_range: None,
         });
     }
     Ok(insts)
@@ -401,6 +402,7 @@ fn lower_pair(mnem: &str, ops: &[&str], off: usize) -> Result<Vec<Inst>> {
                 ptr: Operand::Reg(ptr),
                 align: 1,
                 volatile: false,
+                valid_range: None,
             });
         }
         Ok(())

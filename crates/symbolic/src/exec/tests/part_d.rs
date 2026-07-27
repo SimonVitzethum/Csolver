@@ -31,7 +31,7 @@ fn call_then_load(kind: RegionKind) -> Function {
         ret_ty: Type::Unit,
         ret_ref: None,
     });
-    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false});
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false, valid_range: None });
     Function {
         id: FuncId(0),
         name: "call_then_load".into(),
@@ -218,7 +218,7 @@ fn indirect_store() -> Function {
         dst: p,
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
-        align: 8, volatile: false
+        align: 8, volatile: false, valid_range: None
     });
     bb0.insts.push(Inst::Store {
         ty: Type::int(8),
@@ -249,7 +249,7 @@ fn asm_roundtrip(asm_name: &str) -> Function {
     bb0.insts.push(Inst::Alloc { dst: buf, region: RegionKind::Heap, elem: Type::int(8), count: Operand::int(64, 8), align: 1 });
     bb0.insts.push(Inst::Store { ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), value: Operand::Reg(buf), align: 8 , volatile: false});
     bb0.insts.push(Inst::Call { dst: None, callee: csolver_ir::Callee::Symbol(asm_name.into()), args: vec![], ret_ty: Type::Unit, ret_ref: None });
-    bb0.insts.push(Inst::Load { dst: p, ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), align: 8 , volatile: false});
+    bb0.insts.push(Inst::Load { dst: p, ty: Type::ptr(Type::int(8)), ptr: Operand::Reg(slot), align: 8 , volatile: false, valid_range: None });
     bb0.insts.push(Inst::Store { ty: Type::int(8), ptr: Operand::Reg(p), value: Operand::int(8, 0), align: 1 , volatile: false});
     Function { id: FuncId(0), name: "asm_rt".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) }
 }
@@ -471,4 +471,58 @@ fn derive_frees_arg_only_for_single_block_wrapper() {
     assert_eq!(crate::summary::summarize_module(&{
         let mut m = csolver_ir::Module::new("m"); m.functions.push(wrapper); m
     }).get(&FuncId(0)).unwrap().frees_arg, Some(0));
+}
+
+/// Value-validity (`SafetyProperty::ValidValue`): a `!range`-annotated load whose stored byte
+/// pattern is outside the declared range is a definite invalid-value read — refuted with a
+/// witness, not merely unproven. Here a `7` is read back through a `bool`-ranged (`[0, 2)`) load.
+fn valid_value_fixture(stored: u128) -> Function {
+    let buf = RegId(0);
+    let v = RegId(1);
+    let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
+    bb0.insts.push(Inst::Alloc {
+        dst: buf,
+        region: RegionKind::Stack,
+        elem: Type::int(8),
+        count: Operand::int(64, 1),
+        align: 1,
+    });
+    bb0.insts.push(Inst::Store {
+        ty: Type::int(8),
+        ptr: Operand::Reg(buf),
+        value: Operand::int(8, stored),
+        align: 1, volatile: false
+    });
+    bb0.insts.push(Inst::Load {
+        dst: v,
+        ty: Type::int(8),
+        ptr: Operand::Reg(buf),
+        align: 1,
+        volatile: false,
+        valid_range: Some((0, 2)), // a `bool`
+    });
+    Function {
+        id: FuncId(0),
+        name: "valid_value".into(),
+        params: vec![],
+        ret_ty: Type::Unit,
+        blocks: vec![bb0],
+        entry: BlockId(0),
+    }
+}
+
+#[test]
+fn invalid_bool_load_is_refuted() {
+    let r = discharge_function(&valid_value_fixture(7));
+    let d = r.mem_decision(BlockId(0), 2, SafetyProperty::ValidValue).expect("value-validity obligation");
+    assert!(!d.proven, "a `7` read as a bool must not be proven valid");
+    assert!(d.refutation.is_some(), "an out-of-range bool value is definite UB: {d:?}");
+}
+
+#[test]
+fn in_range_bool_load_is_proven() {
+    let r = discharge_function(&valid_value_fixture(1));
+    let d = r.mem_decision(BlockId(0), 2, SafetyProperty::ValidValue).expect("value-validity obligation");
+    assert!(d.proven, "a `1` is a valid bool: {}", d.residual);
+    assert!(d.refutation.is_none(), "an in-range value must not be refuted: {d:?}");
 }

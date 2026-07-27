@@ -582,6 +582,7 @@ fn field_accessor_summarizes_to_valid_ref_and_composes_through_a_wrapper() {
         ptr: Operand::Reg(base),
         align: 8,
         volatile: false,
+        valid_range: None,
     });
     bb.insts.push(Inst::RefWitness {
         dst: loaded,

@@ -116,7 +116,7 @@ pub(crate) fn decode_one(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 insts.push(Inst::Assign {
                     dst: loaded,
                     ty: ty.clone(),
@@ -151,7 +151,7 @@ pub(crate) fn decode_one(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1 , volatile: false, valid_range: None });
                 insts.push(Inst::Assign {
                     dst,
                     ty,
@@ -196,7 +196,7 @@ pub(crate) fn decode_one(
             } else {
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
-                insts.push(Inst::Load { dst: reg(m.reg), ty, ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Load { dst: reg(m.reg), ty, ptr: Operand::Reg(ptr), align: 1 , volatile: false, valid_range: None });
                 done(insts, mem.next)
             }
         }
@@ -227,7 +227,7 @@ pub(crate) fn decode_one(
                 let next = mem.next + 1;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 let bin = match m.reg & 7 {
                     0 => BinOp::Add,
                     1 => BinOp::Or,
@@ -295,7 +295,7 @@ pub(crate) fn decode_one(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 *flags = Some((Operand::Reg(loaded), Operand::Reg(reg(m.reg))));
                 done(insts, mem.next)
             }
@@ -312,7 +312,7 @@ pub(crate) fn decode_one(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 *flags = Some((Operand::Reg(reg(m.reg)), Operand::Reg(loaded)));
                 done(insts, mem.next)
             }
@@ -333,7 +333,7 @@ pub(crate) fn decode_one(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 *flags = None;
                 done(insts, mem.next)
             } else {
@@ -399,7 +399,7 @@ pub(crate) fn decode_one(
         let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
         let (mut insts, ptr) = mem.lower(pos);
         let tmp = temp_reg(pos);
-        insts.push(Inst::Load { dst: tmp, ty: Type::int(32), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+        insts.push(Inst::Load { dst: tmp, ty: Type::int(32), ptr: Operand::Reg(ptr), align: 1 , volatile: false, valid_range: None });
         insts.push(Inst::Assign {
             dst: reg(m.reg),
             ty: ty.clone(),
@@ -440,7 +440,7 @@ pub(crate) fn decode_one(
                     dst: r,
                     ty: Type::int(size as u32 * 8),
                     ptr: Operand::Reg(reg(4)),
-                    align: if size == 8 { 8 } else { 4 }, volatile: false,
+                    align: if size == 8 { 8 } else { 4 }, volatile: false, valid_range: None,
                 }],
                 p,
             )
@@ -526,7 +526,7 @@ pub(crate) fn decode_one(
                 let (mut insts, ptr) = mem.lower(pos);
                 let t = RegId(3000 + pos as u32);
                 insts.push(Inst::Barrier { kind: 0, access: None });
-                insts.push(Inst::Load { dst: t, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: t, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 insts.push(Inst::Store { ty: ty.clone(), ptr: Operand::Reg(ptr), value: Operand::Reg(ra), align: 1, volatile: false });
                 insts.push(Inst::Assign { dst: ra, ty, value: RValue::Use(Operand::Reg(t)) });
                 done(insts, mem.next)
@@ -771,7 +771,7 @@ pub(crate) fn decode_one(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: loaded, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 insts.push(Inst::Assign { dst: loaded, ty: Type::int(8), value: inc(Operand::Reg(loaded)) });
                 insts.push(Inst::Store { ty: Type::int(8), ptr: Operand::Reg(ptr), value: Operand::Reg(loaded), align: 1, volatile: false });
                 done(insts, mem.next)
@@ -789,7 +789,7 @@ pub(crate) fn decode_one(
                     // inc/dec [mem] — a read-modify-write.
                     d @ (0 | 1) => {
                         let bin = if d == 0 { BinOp::Add } else { BinOp::Sub };
-                        insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                        insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                         insts.push(Inst::Assign {
                             dst: loaded,
                             ty: ty.clone(),
@@ -801,13 +801,13 @@ pub(crate) fn decode_one(
                     // call [mem] — load the target pointer (the read is checked), then an opaque
                     // call that falls through (havocs caller-saved + rax), as for the reg form.
                     2 => {
-                        insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                        insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                         insts.push(opaque_call());
                         Ok(Decoded { insts, next: mem.next, ctrl: Ctrl::Fall })
                     }
                     // jmp [mem] — load the target (checked), then stop (tail/switch; conservative).
                     4 => {
-                        insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                        insts.push(Inst::Load { dst: loaded, ty, ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                         Ok(Decoded { insts, next: mem.next, ctrl: Ctrl::Ret })
                     }
                     d => Err(CoreError::unsupported(format!("x86: unsupported group-5 /digit {d} with a memory operand"))),
@@ -888,7 +888,7 @@ fn decode_two_byte(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let loaded = RegId(3000 + pos as u32);
-                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false });
+                insts.push(Inst::Load { dst: loaded, ty: ty.clone(), ptr: Operand::Reg(ptr), align: 1, volatile: false, valid_range: None });
                 insts.push(Inst::Assign { dst: reg(m.reg), ty, value: undef });
                 done(insts, mem.next)
             }
@@ -949,7 +949,7 @@ fn decode_two_byte(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let tmp = temp_reg(pos);
-                insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false, valid_range: None });
                 insts.push(Inst::Assign {
                     dst: reg(m.reg),
                     ty: ty.clone(),
@@ -979,7 +979,7 @@ fn decode_two_byte(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let tmp = temp_reg(pos);
-                insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false, valid_range: None });
                 insts.push(Inst::Assign {
                     dst: reg(m.reg),
                     ty: ty.clone(),
@@ -1009,7 +1009,7 @@ fn decode_two_byte(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let tmp = temp_reg(pos);
-                insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(8), ptr: Operand::Reg(ptr), align: 1 , volatile: false, valid_range: None });
                 insts.push(Inst::Assign {
                     dst: reg(m.reg),
                     ty: ty.clone(),
@@ -1039,7 +1039,7 @@ fn decode_two_byte(
                 let mem = mem_operand(code, p, &m, rex_x, rex_b, resolve)?;
                 let (mut insts, ptr) = mem.lower(pos);
                 let tmp = temp_reg(pos);
-                insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false});
+                insts.push(Inst::Load { dst: tmp, ty: Type::int(16), ptr: Operand::Reg(ptr), align: 1 , volatile: false, valid_range: None });
                 insts.push(Inst::Assign {
                     dst: reg(m.reg),
                     ty: ty.clone(),

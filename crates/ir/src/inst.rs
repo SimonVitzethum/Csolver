@@ -35,6 +35,13 @@ pub enum Inst {
         /// construction**, so the data-race pass excludes it. Does not affect any
         /// memory-safety obligation (the access is still checked).
         volatile: bool,
+        /// The loaded value's valid range as a **non-wrapping** half-open `[lo, hi)`,
+        /// recovered from the source's `!range` metadata (rustc emits it on `bool`/enum
+        /// discriminant loads — a `bool` is `[0, 2)`). When `Some`, the executor raises a
+        /// [`SafetyProperty::ValidValue`] obligation that the loaded scalar lies in the
+        /// range; `None` carries no obligation. Only the LLVM frontend populates it — every
+        /// other producer leaves it `None`, so use `..Default::default()`-style `None`.
+        valid_range: Option<(i128, i128)>,
     },
     /// Write `value: ty` to `ptr`. Implies `ValidWrite`, `InBounds`,
     /// `Alignment`, `NoNullDeref`, `NoUseAfterFree`.

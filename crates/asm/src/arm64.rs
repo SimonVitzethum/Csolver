@@ -290,6 +290,7 @@ fn decode_one(
                         ptr: Operand::Reg(ptr),
                         align: 1,
                         volatile: false,
+                        valid_range: None,
                     },
                 ])
             }

@@ -120,7 +120,7 @@ fn masked_offset_load(base_align: u32) -> Function {
         elem: Type::int(8),
     });
     // v = load i32 from q, align 4
-    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(q), align: 4, volatile: false });
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(q), align: 4, volatile: false, valid_range: None });
     Function {
         id: FuncId(0),
         name: "masked".into(),
@@ -159,7 +159,7 @@ fn uninit() -> Function {
         count: Operand::int(64, 4),
         align: 4,
     });
-    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false});
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false, valid_range: None });
     Function {
         id: FuncId(0),
         name: "uninit".into(),
@@ -214,7 +214,7 @@ fn memcpy_transfers_initialization() {
         src: Some(Operand::Reg(a)),
         len: Operand::int(64, 4),
     });
-    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(b), align: 4 , volatile: false});
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(b), align: 4 , volatile: false, valid_range: None });
     let f = Function {
         id: FuncId(0),
         name: "copy_init".into(),

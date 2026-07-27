@@ -136,3 +136,32 @@ entry:
     assert_eq!(loads.next(), Some(Some(16)));
     assert_eq!(loads.next(), Some(None));
 }
+
+#[test]
+fn captures_load_range_metadata() {
+    // A `bool` load (`!range !{i8 0, i8 2}`) records `[0, 2)`; a wrapping range
+    // (`!{i8 -1, i8 1}`) is dropped (sound — omits the value-validity check); a plain
+    // load has no range.
+    let src = r#"
+define i8 @f(ptr %p) {
+entry:
+  %b = load i8, ptr %p, align 1, !range !0
+  %w = load i8, ptr %p, align 1, !range !1
+  %n = load i8, ptr %p, align 1
+  ret i8 %b
+}
+!0 = !{i8 0, i8 2}
+!1 = !{i8 -1, i8 1}
+"#;
+    let m = parse_module(src).expect("parse");
+    let f = &m.funcs[0];
+    let ranges: Vec<Option<(i128, i128)>> = f.blocks[0]
+        .insts
+        .iter()
+        .filter_map(|i| match i {
+            LInst::Load { range, .. } => Some(*range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ranges, vec![Some((0, 2)), None, None]);
+}

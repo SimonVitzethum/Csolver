@@ -140,6 +140,17 @@ pub enum SafetyProperty {
     /// borrow-stack — use-after-invalidation of `&mut`, two-live-`&mut` siblings, protectors —
     /// needs frontend retag events and derivation-tree tracking; recorded as future work.
     NoAliasingViolation,
+    /// A **loaded value is a valid instance of its type**: the classic Miri "invalid value" UB —
+    /// a `bool` that is not `0`/`1`, or an enum **discriminant** outside its declared set. The
+    /// frontend records the loaded value's valid range from the LLVM `!range` metadata rustc
+    /// emits on such loads (a half-open `[lo, hi)`, non-wrapping only — a wrapping range is left
+    /// unmodelled, hence sound). Refuted only when the value is **provably outside** the range on
+    /// an **exact** path (the stored byte pattern is a definite invalid instance), with a witness;
+    /// a value that merely *may* be out of range, or a load whose origin is uncertain, stays a
+    /// prove-only UNKNOWN — so this adds no false FAIL. Primarily a bug-finding obligation (an
+    /// uninitialised/corrupted `bool`/discriminant read); statically it also confirms in-range
+    /// loads that flow from a bounded source.
+    ValidValue,
 }
 
 impl SafetyProperty {
@@ -173,6 +184,7 @@ impl SafetyProperty {
             SafetyProperty::NoShiftOverflow => "no_shift_overflow",
             SafetyProperty::NoArithOverflow => "no_arith_overflow",
             SafetyProperty::NoAliasingViolation => "no_aliasing_violation",
+            SafetyProperty::ValidValue => "valid_value",
         }
     }
 
@@ -206,6 +218,7 @@ impl SafetyProperty {
             SafetyProperty::NoShiftOverflow => "shift amount is less than the bit width",
             SafetyProperty::NoArithOverflow => "nsw/nuw arithmetic does not overflow",
             SafetyProperty::NoAliasingViolation => "no write through a shared (&T) reference",
+            SafetyProperty::ValidValue => "loaded value is a valid instance of its type",
         }
     }
 
@@ -240,6 +253,7 @@ impl SafetyProperty {
             NoShiftOverflow,
             NoArithOverflow,
             NoAliasingViolation,
+            ValidValue,
         ]
     }
 }

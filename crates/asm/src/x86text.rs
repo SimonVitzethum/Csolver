@@ -358,6 +358,7 @@ fn operand_value(op: &TextOp, off: usize, width: u32) -> Result<OpVal> {
                 ptr: Operand::Reg(ptr),
                 align: 1,
                 volatile: false,
+                valid_range: None,
             });
             Ok(OpVal {
                 value: Operand::Reg(loaded),

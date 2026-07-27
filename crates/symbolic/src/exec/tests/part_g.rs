@@ -281,7 +281,7 @@ fn read_through_shared_ref_after_mut_write_invalidated_it_is_flagged() {
     bb0.insts.push(Inst::Assign { dst: s, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r1)) });
     bb0.insts.push(retag_shared(s, r1));
     bb0.insts.push(Inst::Store { ty: Type::int(64), ptr: Operand::Reg(r1), value: Operand::int(64, 6), align: 8, volatile: false });
-    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(64), ptr: Operand::Reg(s), align: 8, volatile: false });
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(64), ptr: Operand::Reg(s), align: 8, volatile: false, valid_range: None });
     let f = Function { id: FuncId(0), name: "shared_uaf".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) };
     let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
     let load = (BlockId(0), 6usize);
@@ -299,8 +299,8 @@ fn multiple_shared_borrows_are_not_flagged() {
     bb0.insts.push(retag_shared(s1, r0));
     bb0.insts.push(Inst::Assign { dst: s2, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
     bb0.insts.push(retag_shared(s2, r0));
-    bb0.insts.push(Inst::Load { dst: v1, ty: Type::int(64), ptr: Operand::Reg(s1), align: 8, volatile: false });
-    bb0.insts.push(Inst::Load { dst: v2, ty: Type::int(64), ptr: Operand::Reg(s2), align: 8, volatile: false });
+    bb0.insts.push(Inst::Load { dst: v1, ty: Type::int(64), ptr: Operand::Reg(s1), align: 8, volatile: false, valid_range: None });
+    bb0.insts.push(Inst::Load { dst: v2, ty: Type::int(64), ptr: Operand::Reg(s2), align: 8, volatile: false, valid_range: None });
     let f = Function { id: FuncId(0), name: "multi_shared".into(), params: vec![], ret_ty: Type::Unit, blocks: vec![bb0], entry: BlockId(0) };
     let on = discharge_with(&f, crate::ExecLimits { aliasing_model: true, ..Default::default() });
     for idx in [5usize, 6] {
@@ -479,7 +479,7 @@ fn borrow_tag_flows_through_memory_store_load() {
     // store the borrow pointer r1 into the slot
     bb.insts.push(Inst::Store { ty: Type::ptr(Type::int(64)), ptr: Operand::Reg(slot), value: Operand::Reg(r1), align: 8, volatile: false });
     // load it back into r2 (the tag must survive the round-trip through memory)
-    bb.insts.push(Inst::Load { dst: r2, ty: Type::ptr(Type::int(64)), ptr: Operand::Reg(slot), align: 8, volatile: false });
+    bb.insts.push(Inst::Load { dst: r2, ty: Type::ptr(Type::int(64)), ptr: Operand::Reg(slot), align: 8, volatile: false, valid_range: None });
     // a sibling reborrow r3 invalidates r1
     bb.insts.push(Inst::Assign { dst: r3, ty: Type::ptr(Type::int(64)), value: RValue::Use(Operand::Reg(r0)) });
     bb.insts.push(retag(r3, r0));

@@ -132,7 +132,7 @@ pub(crate) fn emit_inline_asm_mem_ops(
                 volatile: true,
             });
         } else {
-            insts.push(Inst::Load { dst: ctx.fresh(), ty: Type::int(8), ptr, align: 1, volatile: true });
+            insts.push(Inst::Load { dst: ctx.fresh(), ty: Type::int(8), ptr, align: 1, volatile: true, valid_range: None });
         }
     }
     Ok(())

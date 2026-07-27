@@ -297,7 +297,8 @@ impl Explorer<'_> {
                 };
                 state.env.insert(*dst, SymValue::Ptr(result));
             }
-            Inst::Load { dst, ty, ptr, align, volatile } => {
+            Inst::Load { dst, ty, ptr, align, volatile, valid_range } => {
+                let valid_range = *valid_range;
                 let p = self.eval_pointer(ptr, state);
                 let asize = ty.size_bytes(&LAYOUT).unwrap_or(1);
                 self.check_access((block, idx), &p, asize, *align as u64, SafetyProperty::ValidRead, state);
@@ -393,6 +394,16 @@ impl Explorer<'_> {
                     if !src_labels.is_empty() {
                         state.tainted.entry(*dst).or_default().extend(src_labels);
                     }
+                }
+                // Value-validity (`SafetyProperty::ValidValue`): a `!range`-annotated load — a
+                // `bool` or enum **discriminant** — must produce a value in `[lo, hi)`. Three-way,
+                // refutation-only: PASS when the value is provably in range; a **refuted** FAIL
+                // with a witness only when it is provably *outside* the range on an **exact** path
+                // (the stored byte pattern is a definite invalid instance — e.g. an uninitialised
+                // or corrupted `bool` read as `7`); otherwise UNKNOWN. No false FAIL: an off-exact
+                // or opaque value is never refuted.
+                if let (Some((lo, hi)), SymValue::Scalar(v)) = (valid_range, &value) {
+                    self.check_valid_value((block, idx), *v, lo, hi, state);
                 }
                 state.env.insert(*dst, value);
             }

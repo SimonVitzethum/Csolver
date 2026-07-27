@@ -111,7 +111,7 @@ fn indirect_store() -> Function {
         dst: p,
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
-        align: 8, volatile: false
+        align: 8, volatile: false, valid_range: None
     });
     bb0.insts.push(Inst::Store {
         ty: Type::int(8),

@@ -36,6 +36,7 @@ pub fn parse_module(src: &str) -> Result<LModule> {
         pos: 0,
         types: HashMap::new(),
         meta_ints: scan_meta_ints(src),
+        meta_ranges: scan_meta_ranges(src),
         deref_hints: HashMap::new(),
     };
     // Pre-scan for `%"name" = type <T>` definitions: a definition may lexically
@@ -99,6 +100,11 @@ pub(crate) struct Parser {
     /// instruction's `!align !N` reference can be resolved to its value `V` while
     /// the instruction is parsed (the node may lexically follow the use).
     pub(crate) meta_ints: HashMap<u32, u64>,
+    /// Two-integer range metadata nodes (`!N = !{iW lo, iW hi}`), pre-scanned so an
+    /// instruction's `!range !N` reference resolves to the pair while the instruction is
+    /// parsed. Only **non-wrapping** `0 <= lo < hi` pairs are kept (the `bool`/enum-discriminant
+    /// case); a wrapping range is dropped — a missing entry just omits the value-validity check.
+    pub(crate) meta_ranges: HashMap<u32, (i128, i128)>,
     /// Per global-symbol, the largest `dereferenceable(N)` any use asserts on a
     /// **bare** `@g` operand. Clang emits it from the operand's *type* size, so it is
     /// an authoritative lower bound on the global's byte size — used to correct a
@@ -140,6 +146,47 @@ fn scan_meta_ints(src: &str) -> HashMap<u32, u64> {
                 }
             }
             _ => {}
+        }
+    }
+    m
+}
+
+/// Pre-scan two-integer range metadata nodes (`!5 = !{i8 0, i8 2}`) into a map from
+/// node id to the **non-wrapping** half-open pair `(lo, hi)`. rustc emits these on
+/// `bool`/enum-discriminant loads (`!range`). Only a simple `!{iW lo, iW hi}` with
+/// `lo < hi` is recorded (the contiguous case); a wrapping range (`lo > hi`, meaning
+/// `[lo, 2^W) ∪ [0, hi)`) or a multi-interval node is left out — a missing entry just
+/// omits the value-validity check, which is sound.
+fn scan_meta_ranges(src: &str) -> HashMap<u32, (i128, i128)> {
+    let mut m = HashMap::new();
+    for line in src.lines() {
+        let Some((id, after)) = line.trim().strip_prefix('!').and_then(|r| r.split_once(" = ")) else {
+            continue;
+        };
+        let Ok(id) = id.trim().parse::<u32>() else { continue };
+        let Some(inner) = after.trim().strip_prefix("!{").and_then(|s| s.strip_suffix('}')) else {
+            continue;
+        };
+        // Split into comma-separated `iW V` elements; require exactly two.
+        let elems: Vec<&str> = inner.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if elems.len() != 2 {
+            continue;
+        }
+        let parse_elem = |e: &str| -> Option<i128> {
+            let mut it = e.split_whitespace();
+            let ty = it.next()?;
+            let val = it.next()?;
+            if !ty.starts_with('i') || it.next().is_some() {
+                return None;
+            }
+            val.parse::<i128>().ok()
+        };
+        if let (Some(lo), Some(hi)) = (parse_elem(elems[0]), parse_elem(elems[1])) {
+            // Non-wrapping, non-negative only (the bool/discriminant shape). A negative
+            // bound or a wrapping range is dropped — sound (omits the check).
+            if 0 <= lo && lo < hi {
+                m.insert(id, (lo, hi));
+            }
         }
     }
     m

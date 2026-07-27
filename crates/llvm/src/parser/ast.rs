@@ -253,6 +253,11 @@ pub enum LInst {
         ptr: LValue,
         align: u32,
         align_meta: Option<u32>,
+        /// The loaded value's valid range from `!range !N` metadata, as a **non-wrapping**
+        /// half-open `[lo, hi)` (rustc emits this on `bool`/enum-discriminant loads). Recorded
+        /// only when `0 <= lo < hi`; a wrapping range (`lo > hi`) is left `None` — sound, it
+        /// just omits the value-validity check. Drives [`SafetyProperty::ValidValue`].
+        range: Option<(i128, i128)>,
         /// `atomic`/`volatile` — a race-free access (excluded from the data-race pass).
         atomic: bool,
         /// The atomic memory-ordering (for the weak-memory fence lowering).

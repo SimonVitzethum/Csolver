@@ -1023,6 +1023,7 @@ mod tests {
             ptr: IrOp::Reg(field),
             align: 8,
             volatile: false,
+            valid_range: None,
         });
         let f = IrFunc {
             id: FuncId(0),
@@ -1076,6 +1077,7 @@ mod tests {
             ptr: IrOp::Reg(field),
             align: 8,
             volatile: false,
+            valid_range: None,
         });
         let f = IrFunc {
             id: FuncId(0),
@@ -1132,6 +1134,7 @@ mod tests {
         });
         bbb.insts.push(IrInst::Load {
             dst: p, ty: ptr_ty(), ptr: IrOp::Reg(field2), align: 8, volatile: false,
+            valid_range: None,
         });
         let usef = IrFunc {
             id: FuncId(0), name: "use".into(), params: vec![(o, ptr_ty())], ret_ty: IrTy::Unit,
@@ -1213,12 +1216,14 @@ mod tests {
         });
         bb.insts.push(IrInst::Load {
             dst: opsp, ty: ptr_ty(), ptr: IrOp::Reg(opsfield), align: 8, volatile: false,
+            valid_range: None,
         });
         bb.insts.push(IrInst::PtrOffset {
             dst: fnfield, base: IrOp::Reg(opsp), index: IrOp::int(64, 16), elem: IrTy::int(8),
         });
         bb.insts.push(IrInst::Load {
             dst: fnp, ty: ptr_ty(), ptr: IrOp::Reg(fnfield), align: 8, volatile: false,
+            valid_range: None,
         });
         let dispatch = IrFunc {
             id: FuncId(0), name: "dispatch".into(), params: vec![], ret_ty: IrTy::Unit,
@@ -1274,6 +1279,7 @@ mod tests {
         });
         bb.insts.push(IrInst::Load {
             dst: loaded, ty: ptr_ty(), ptr: IrOp::Reg(field), align: 8, volatile: false,
+            valid_range: None,
         });
         let f = IrFunc {
             id: FuncId(0), name: "reader".into(), params: vec![], ret_ty: IrTy::Unit,
@@ -1331,12 +1337,14 @@ mod tests {
         });
         bbb.insts.push(IrInst::Load {
             dst: opsp, ty: ptr_ty(), ptr: IrOp::Reg(field2), align: 8, volatile: false,
+            valid_range: None,
         });
         bbb.insts.push(IrInst::PtrOffset {
             dst: fnfield, base: IrOp::Reg(opsp), index: IrOp::int(64, 16), elem: IrTy::int(8),
         });
         bbb.insts.push(IrInst::Load {
             dst: fnp, ty: ptr_ty(), ptr: IrOp::Reg(fnfield), align: 8, volatile: false,
+            valid_range: None,
         });
         let usef = IrFunc {
             id: FuncId(0), name: "use".into(), params: vec![(o, ptr_ty())], ret_ty: IrTy::Unit,

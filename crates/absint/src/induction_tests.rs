@@ -175,7 +175,7 @@ fn ptr_walk_bottom() -> Function {
         dst: x,
         ty: Type::int(32),
         ptr: Operand::Reg(iter),
-        align: 4, volatile: false
+        align: 4, volatile: false, valid_range: None
     });
     bb1.insts.push(Inst::PtrOffset {
         dst: nx,

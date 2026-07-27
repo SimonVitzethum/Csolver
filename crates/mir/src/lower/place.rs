@@ -191,7 +191,7 @@ impl Ctx {
                             dst,
                             ty: elem.clone(),
                             ptr: IrOp::Reg(ptr),
-                            align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32, volatile: false
+                            align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32, volatile: false, valid_range: None
                         });
                         IrOp::Reg(dst)
                     } else {

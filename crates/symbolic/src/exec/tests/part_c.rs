@@ -19,7 +19,7 @@ fn init() -> Function {
         value: Operand::int(32, 7),
         align: 4, volatile: false
     });
-    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false});
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(buf), align: 4 , volatile: false, valid_range: None });
     Function {
         id: FuncId(0),
         name: "init".into(),
@@ -283,7 +283,7 @@ fn stack_uninit_read(count: Operand) -> Function {
     let v = RegId(2);
     let mut bb0 = BasicBlock::new(BlockId(0), Terminator::Return(None));
     bb0.insts.push(Inst::Alloc { dst: p, region: RegionKind::Stack, elem: Type::int(8), count, align: 16 });
-    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(p), align: 1, volatile: false });
+    bb0.insts.push(Inst::Load { dst: v, ty: Type::int(32), ptr: Operand::Reg(p), align: 1, volatile: false, valid_range: None });
     Function {
         id: FuncId(0),
         name: "frame".into(),

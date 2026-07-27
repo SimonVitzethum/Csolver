@@ -226,7 +226,7 @@ pub fn indirect_store() -> Function {
         dst: p,
         ty: Type::ptr(Type::int(8)),
         ptr: Operand::Reg(slot),
-        align: 8, volatile: false
+        align: 8, volatile: false, valid_range: None
     });
     bb0.insts.push(Inst::Store {
         ty: Type::int(8),
@@ -268,7 +268,7 @@ pub fn uninit_read() -> Function {
         dst: v,
         ty: Type::int(32),
         ptr: Operand::Reg(buf),
-        align: 4, volatile: false
+        align: 4, volatile: false, valid_range: None
     });
     Function {
         id: FuncId(0),
@@ -310,7 +310,7 @@ pub fn init_read() -> Function {
         dst: v,
         ty: Type::int(32),
         ptr: Operand::Reg(buf),
-        align: 4, volatile: false
+        align: 4, volatile: false, valid_range: None
     });
     Function {
         id: FuncId(0),

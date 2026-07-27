@@ -149,7 +149,7 @@ impl Ctx {
                                 dst,
                                 ty: elem.clone(),
                                 ptr: IrOp::Reg(ptr),
-                                align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32, volatile: false
+                                align: elem.align_bytes(&LAYOUT).unwrap_or(1) as u32, volatile: false, valid_range: None
                             });
                         } else {
                             out.push(assign(dst, RValue::Use(IrOp::Const(Const::Undef))));
@@ -313,7 +313,7 @@ impl Ctx {
                             dst: val,
                             ty: Type::int(8),
                             ptr: IrOp::Reg(ptr),
-                            align: 1, volatile: false
+                            align: 1, volatile: false, valid_range: None
                         });
                     }
                 }
