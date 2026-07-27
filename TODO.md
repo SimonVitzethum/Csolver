@@ -68,8 +68,14 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
   konsistent; TOP bleibt Knoten 0; Field-Cell-Key-Kollisionen via Copy-Kanten equalisiert; `obj_global`-Namens-
   kollision (praktisch unmöglich) droppt den Eintrag → Devirt lehnt ab statt zu raten (nie falsches Ziel).
   Läuft in `finalize` nach der Deferred-Auflösung (Copy-Graph vollständig), vor `solve`. Validiert: gesamte
-  absint-Suite (42) grün + 2 adversariale Zyklus-Tests (Singleton + Feld-durch-Zyklus-Zeiger). **Offen:**
-  Kernel-Skala-Rescan zur Messung des tatsächlichen Node-Rückgangs (10,3M → ?) und Devirt-Reaktivierung.
+  absint-Suite (42) grün + 2 adversariale Zyklus-Tests (Singleton + Feld-durch-Zyklus-Zeiger).
+  - **⚠️ EMPIRISCHER BEFUND (Kernel-Rescan 2026-07-27):** auf `allmodconfig` (37389 Dateien) **`14.190.344 → 14.190.302`
+    Knoten = 0,0 % Reduktion** — der Kernel-Relations-Graph ist praktisch **azyklisch** (SSA-Copies bilden einen
+    DAG), es gibt fast keine Copy-Zyklen. Der Collapse ist **korrekt und sound**, aber hier ein **No-op**; Devirt
+    bleibt übersprungen (14,2M > 10M Budget). Die frühere Hypothese „Zeiger-Register-Copy-Zyklen dominieren"
+    ist **widerlegt**. **Echter Hebel = HVN** (offline Hash-Value-Numbering: azyklisch-äquivalente Knoten mit
+    identischer Points-to-Signatur mergen — merged nur *vergrößert* Sets → sound-für-Devirt, verliert höchstens
+    Präzision). Alternativ Budget-Raise (speicher-riskant: 24 GB RSS bei 14M Knoten in diesem Lauf).
 
 **Deferred mit präzisem Befund (soundness-first: NICHT halb-validiert geschiffft):**
 - **[ ] Wide-Ints > 128 bit (C/G)** — **Befund:** der Kern-`csolver_core::BitVector` ist fundamental
@@ -158,9 +164,11 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
   Budget 2M→10M. Kernel (~3,4M Knoten) solved jetzt statt zu no-op-degradieren. (Frontier #1,
   commit `d70d921`; Kernel-Skala per Rescan validiert.)
 - [x] **Kompaktierender Copy-Cycle-Collapse** (`collapse_copy_cycles`, Session 3) — SCC-Zyklen-Elimination
-  mit Knoten-Renumerierung senkt `self.n`, damit eine sonst-über-Budget-Relation Devirt behält statt zu
-  skippen. Verlustfrei, absint-Suite + 2 adversariale Zyklus-Tests grün. Offen: HVN (Hash-Value-Numbering)
-  für Nicht-Zyklus-Äquivalenzen; Kernel-Rescan zur Node-Rückgang-Messung.
+  mit Knoten-Renumerierung, verlustfrei/sound (absint-Suite + 2 adversariale Zyklus-Tests grün). **Aber
+  Kernel-Rescan: 0,0 % Reduktion** (14,19M Knoten, praktisch azyklischer Copy-DAG) → auf dem Kernel ein No-op.
+- [ ] **HVN (Hash-Value-Numbering)** — der EIGENTLICHE Node-Reduktions-Hebel für den (azyklischen) Kernel:
+  Knoten mit identischer Points-to-Signatur (address-of-Quellen + eingehende Copy-Menge) offline mergen.
+  Sound-für-Devirt (Merge vergrößert Sets → Singleton kann nur verschwinden, nie falsch entstehen). Nächster Schritt.
 
 ## Frontier-Fortschritt (2026-07-23, vollständig-autonome Session)
 
