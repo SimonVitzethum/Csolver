@@ -129,16 +129,27 @@ pub enum SafetyProperty {
     /// bug-finding-only obligation. Refuted only when a spinlock is *definitely* held on
     /// every path reaching the sleeping call (no false FAIL under a partial hold).
     SleepInAtomic,
-    /// No **Rust aliasing (borrow-stack) violation**: the Stacked/Tree-Borrows discipline
-    /// the Rust reference model requires. Currently the soundly-decidable, unambiguous
-    /// subclass — a **write through a shared reference** (`&T`): a store whose pointer is
-    /// derived (through casts / field / index projections) from a genuine `&T` borrow, which
-    /// is always undefined behaviour (a `&T` grants read-only access; interior mutability
-    /// writes go through a raw pointer from `UnsafeCell::get`, so they carry no shared tag).
-    /// Opt-in behind `--aliasing-model` (the reference model is only partially reconstructed
-    /// from the current frontends). Refuted only on a feasible path (no false FAIL). The full
-    /// borrow-stack — use-after-invalidation of `&mut`, two-live-`&mut` siblings, protectors —
-    /// needs frontend retag events and derivation-tree tracking; recorded as future work.
+    /// No **Rust aliasing (borrow-stack) violation**: the Stacked/Tree-Borrows discipline the
+    /// Rust reference model requires. Opt-in behind `--aliasing-model` (the reference model is
+    /// only partially reconstructed from the current frontends), refuted only on a feasible path
+    /// (no false FAIL). The implemented, soundly-decidable subclasses are:
+    /// - a **write through a shared reference** (`&T`): a store whose pointer is derived (through
+    ///   casts / field / index projections) from a genuine `&T` borrow — always UB (a `&T` grants
+    ///   read-only access; interior-mutability writes go through a raw pointer from
+    ///   `UnsafeCell::get`, which carries no shared tag);
+    /// - **use of a `&mut` after an aliasing `&mut` invalidated it**: the borrow-stack pops a
+    ///   reborrow's siblings, and a later use of a popped tag is refuted (two-live-`&mut` siblings,
+    ///   root reborrow invalidation — see `step_retag` / `check_borrow_access`);
+    /// - **read through a shared borrow after a `&mut` write** to a lower tag invalidated it.
+    ///
+    /// Remaining future work (both need infrastructure the frontends do not yet supply, so they
+    /// are deliberately **not** shipped rather than approximated — approximating either risks a
+    /// false FAIL): (1) **cross-call protectors** — a `&mut` passed to a callee must stay valid
+    /// for the whole call even if never used again; enforcing this needs call-boundary borrow
+    /// tracking (calls are currently opaque havocs, so an intra-function protector check would be
+    /// inert). (2) The **Tree-Borrows `Reserved`/`Active`/`Frozen`/`Disabled` per-node lattice**,
+    /// which tolerates foreign reads of a not-yet-written `&mut` — a *false-FAIL-reduction* over
+    /// the current Stacked-Borrows-style pop, not new coverage.
     NoAliasingViolation,
     /// A **loaded value is a valid instance of its type**: the classic Miri "invalid value" UB —
     /// a `bool` that is not `0`/`1`, or an enum **discriminant** outside its declared set. The

@@ -10,6 +10,48 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
 
 ---
 
+## Autonome Session 3 (2026-07-27) — Value-Validity, inline-asm-Contracts, Aliasing-Doku; große Reste mit Befund
+
+**Geschiffft (sound, orakel-validiert — Miri RESULT: SOUND):**
+- **[x] Value-Validity (`SafetyProperty::ValidValue`)** — die klassische Miri-„invalid value"-UB: ein
+  `bool ∉ {0,1}` oder ein Enum-**Diskriminant** außerhalb seiner Menge. Frontend parst LLVM `!range !N`
+  (`scan_meta_ranges`/`peek_load_range_meta`), trägt es als `Inst::Load.valid_range = [lo, hi)`
+  (nicht-wrappend; wrapping/negativ → `None`, sound). Executor `check_valid_value`: drei-wege,
+  **refutation-only** — PASS bei beweisbar in-Range, refutierter FAIL mit Witness nur bei beweisbar
+  außerhalb auf exaktem Pfad, sonst UNKNOWN. Kann keinen false PASS erzeugen (additiv).
+- **[x] inline-asm via Contracts** — strukturierte-Operanden-Asm (`<inline asm…|w0>`) konsultiert jetzt
+  den Basisnamen-Contract; einheitlich mit plainer Asm (die schon oben im Loop matcht).
+- **[x] Aliasing-Doku korrigiert** (F/#4): der `NoAliasingViolation`-Kommentar war **stale** — Write-
+  durch-`&T`, `&mut`-Use-after-Invalidation und Sibling-Invalidierung sind **implementiert + getestet**
+  (part_g), nicht future work. Echte Restlücken jetzt präzise: Cross-Call-Protectors + Tree-Borrows-Gitter.
+
+**Deferred mit präzisem Befund (soundness-first: NICHT halb-validiert geschiffft):**
+- **[ ] Full-Kernel-Devirt-Node-Reduktion (H)** — **Befund:** der Budget-Check `n >= MAX_NODES` greift in
+  `ProgramPointsTo::finalize` **vor** `solve()`; die gemessenen 10,3M sind **Build-Zeit-Knoten**
+  (überwiegend Zeiger-**Register** `reg_node`, eins pro (Funktion, Reg) whole-program, plus Objekte/Cells).
+  Ein Copy-Cycle-Collapse hilft daher **nur mit Kompaktierung** (neue dichte Knoten-IDs, `self.n` senken) —
+  ein nicht-kompaktierender Collapse spart nur Solve-Arbeit, läuft aber nie (solve wird bei Überbudget
+  übersprungen). Eine korrekte kompaktierende Ganz-Relations-Renumerierung muss `pts` + alle 5 Constraint-
+  Vektoren + `field_cell`-**Kollisionen** + `poisoned`/`name` **und** die externen node-tragenden Maps
+  `ProgramPointsTo::reg_node` (Werte) / `obj_global` (Keys) konsistent übersetzen. Ihre Korrektheit steuert
+  echte Devirt-PASS/FAIL-Verdikte (ein einziger verlorener Constraint → Unterapproximation → falscher
+  Singleton → false PASS). Design steht; **nicht in einer Session sicher validierbar** → nicht geschiffft.
+  Sicherer Alt-Zustand: Budget-Skip verhindert OOM, Devirt entfällt (nur Präzisionsverlust, kein false PASS).
+- **[ ] Wide-Ints > 128 bit (C/G)** — **Befund:** der Kern-`csolver_core::BitVector` ist fundamental
+  `u128`-basiert (`words:[u64;2]` → immer als ein `u128` rekombiniert; `assert!(width<=128)`). Volle
+  Bignum-Unterstützung ist ein Rewrite des **Kern-Werttyps** (value.rs + expr.rs fold_bin/cmp + bitblast
+  MAX_WIDTH + lower.rs Konstanten-Clamp + lexer i128-Literale). Ein *halber* Bignum wäre ein Korrektheits-
+  risiko im Werttyp, auf dem der **gesamte** Solver ruht — **kein Flag macht einen buggy Kern sound**.
+  Aktueller Zustand ist sound: >128-bit-Konstanten → `Const::Undef`/top, Symbolik → linear-Abstraktion.
+- **[ ] Echte Inter-Thread-Data-Races (E)** — volles whole-program Happens-Before/Thread-Modell; eine
+  gerushte Version riskiert false FAILs. Aktuelle `DataRace`-Deckung: AA-Deadlock + Double-Fetch (sound).
+- **[ ] `ValidReference`/`StackIntegrity`/Return-Address (A)** — **Befund:** der Stack-Frame ist EINE
+  opake Region ohne unterschiedenen RA-Slot (`x86text::frame_insts`); ein dedizierter RA-Integritäts-Check
+  bräuchte einen Frontend-Frame-Umbau (Alloc splitten + neuer `RegionKind`), und die konkreten Korruptions-
+  pfade sind bereits durch `InBounds`-OOB / `ValidIndirectTarget` subsumiert (geringe Zusatzausbeute).
+
+---
+
 ## A. Genuinely ungeprüft (catalogue-only — echte Löcher)
 
 - [ ] **`ValidReference`** — kein Referenz-Validitäts-Check; die Variante ist zum „Frontend

@@ -93,10 +93,15 @@ forbidden region overlap · alignment · valid indirect branch targets ·
 write-capability (provenance: no write through a pointer to a read-only/foreign
 region) · no info-leak (no `copy_to_user` of uninitialized memory) · integer UB:
 no division/modulo by zero, no shift past the bit width, no `nsw`/`nuw`
-add/sub/mul overflow (signed mul included).
+add/sub/mul overflow (signed mul included) · **valid value** (Miri-parity: a loaded
+`bool ∉ {0,1}` or an out-of-set enum discriminant, from the LLVM `!range` metadata;
+refutation-only — a definite invalid instance on an exact path).
 
 Opt-in behind `--aliasing-model`: **no Rust aliasing (borrow-stack) violation** —
-currently the unambiguous *write through a shared `&T`* class.
+the write-through-shared-`&T` class, plus `&mut` use-after-invalidation and
+two-live-`&mut`-sibling invalidation (Stacked-Borrows pop). Cross-call protectors
+and the Tree-Borrows `Reserved`/`Active`/`Frozen` lattice remain future work
+(see `TODO.md` — both need infrastructure the frontends do not yet supply).
 
 Bug-finding mode (`--bugs`) adds recall-oriented obligations: **no allocation-size
 overflow** (`n * sizeof(T)` wrap), **no data race** (AA self-deadlock, Eraser
