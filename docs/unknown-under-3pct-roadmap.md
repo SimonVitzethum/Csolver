@@ -76,23 +76,46 @@ sie schlicht nicht interpretierbar. Deshalb steht AP-0.2 **vor** jeder Präzisio
 Jedes Paket: **Anker** (wo im Code), **Schritte**, **Akzeptanzkriterium** (woran Erfolg gemessen
 wird — nicht „fühlt sich besser an"), **Soundness**, **Abhängigkeit**.
 
-### AP-0.1 — Abgeschlossener Full-Kernel-Scan
+### AP-0.1 — Abgeschlossener Full-Kernel-Scan `[Werkzeugseite erledigt 2026-07-29]`
 
-- **Anker:** `cli/scan_dir.rs:308-320` (Checkpoint, opt-in via `CSOLVER_SCAN_CHECKPOINT`),
+- **Anker:** `cli/scan_dir.rs` (`scan_report`, Checkpoint-Automatik, `CKPT_*`-Konstanten),
   `cli/scan.rs:251-280` (`CSOLVER_MEM_TARGET_MB`, default ~70 % frei; `CSOLVER_MEM_FACTOR`),
   `cli/scan.rs:358-365` (`CSOLVER_MEM_RESERVE_MB`), `cli/scan_run.rs:396` (RSS-Sampling).
-- **Befund:** die Infrastruktur ist **vollständig vorhanden**. Exit 143 ist eine Lauf-, keine
-  Code-Frage. Wahrscheinlichster Grund, dass nichts gerettet wurde: der Checkpoint ist opt-in per
-  Env — wenn die gekillten Läufe die Variable nicht gesetzt hatten, gab es nichts zu resumen.
-- **Schritte:** (1) Rerun mit gesetztem `CSOLVER_SCAN_CHECKPOINT` und einem `CSOLVER_MEM_TARGET_MB`
-  unterhalb der Box-Grenze; Peak-RSS mitschreiben. (2) SIGTERM-Handler, der den Checkpoint flusht
-  **und** ein partielles `== coverage ==` samt Residual-Histogramm druckt — dann ist selbst ein
-  gekillter Lauf eine Messung. (3) Checkpoint ab einer Schwelle (z. B. > 5000 Units) per Default an,
-  statt opt-in. (4) Exit-Grund protokollieren (OOM-Killer via `dmesg`/`/proc/self/status` vs.
-  externer Timeout) — die Diagnose gehört ins Log, nicht in die Erinnerung.
-- **Akzeptanz:** ein 37k-Lauf druckt `== coverage ==` **und** das Residual-Histogramm. Diese Zahl
-  ist ab dann *die* Referenzzahl; alle pp-Angaben unten beziehen sich darauf.
-- **Soundness:** n/a (Messinfrastruktur). **Abhängigkeit:** keine. **Zuerst.**
+- **Befund:** die Infrastruktur war vollständig vorhanden — exit 143 ist eine Lauf-, keine
+  Code-Frage. Was fehlte, war ein Weg, einen *gekillten* Lauf trotzdem auszuwerten: der
+  Checkpoint ist opt-in, und ohne gesetzte Env-Variable hinterließen die 37k-Läufe nichts.
+
+**Der geplante SIGTERM-Handler wurde verworfen — aus zwei Gründen, der zweite ist der wichtige:**
+`unsafe_code = "forbid"` (Cargo.toml:56, per `allow` nicht aufhebbar) und null externe Crates
+schließen einen Handler ohnehin aus. Entscheidender: **der OOM-Killer schickt SIGKILL, und den
+fängt kein Handler.** Ein Handler hätte ausgerechnet den wahrscheinlichsten Fall nicht gerettet.
+
+**Stattdessen umgesetzt — der Checkpoint trägt den Report, nicht der Prozess:**
+
+- **`solver scan-report <ckpt>`** druckt den vollen Coverage-Report (Findings, Histogramm,
+  0d-Split, Attribution) aus der Checkpoint-Datei allein. Ein gekillter Lauf ist damit eine
+  Messung — bei TERM, bei KILL, bei Stromausfall.
+- **Checkpoint ab `CKPT_AUTO_UNITS = 5000` per Default an** (`./csolver-scan.ckpt`;
+  `CSOLVER_SCAN_CHECKPOINT=<file>` verschiebt, `CSOLVER_SCAN_CHECKPOINT=` schaltet ab). Das war
+  vermutlich die Ursache dafür, dass die bisherigen Läufe nichts hinterließen.
+- **Zeitgetriggertes Schreiben** (`CKPT_MAX_SECS = 120`) zusätzlich zum Alle-50-Units — 50 Units
+  eines schweren Teilbaums können viele Minuten sein, und dieses Fenster ginge sonst verloren.
+- **Peak-RSS im Checkpoint.** Das ist die Diagnose, die dieser Punkt verlangte: ein Wert an der
+  Maschinengrenze ist die Signatur des OOM-Killers (SIGKILL, exit 137), ein moderater deutet auf
+  einen externen Terminator (SIGTERM, exit 143 — `timeout`, Scheduler, Session-Abbau).
+
+- **Verifiziert am synthetischen 5100-Unit-Korpus:** Lauf bei 350/5100 Units mit `SIGKILL`
+  erschlagen, Prozess druckte **nichts** (0 `== coverage ==` im Log, exit 137); `scan-report` auf
+  dem hinterlassenen Checkpoint liefert den vollständigen Report über die 500 fertigen Units
+  inklusive Split und Peak-RSS. Genau der Fall, an dem AP-0.1 hing.
+- **Weiterhin offen — und nur auf echter Hardware zu erledigen:** der 37k-Lauf selbst. Der
+  Kernel-Korpus liegt nicht im Container. Nächster Schritt ist ein Rerun mit einem
+  `CSOLVER_MEM_TARGET_MB` unterhalb der Box-Grenze; wenn er wieder stirbt, sagt jetzt der
+  Peak-RSS im Checkpoint, ob es der Speicher war.
+- **Akzeptanz (unverändert):** eine abgeschlossene 37k-Zahl. Diese ist ab dann *die* Referenzzahl;
+  alle pp-Angaben unten beziehen sich darauf. Bis dahin gilt: ein abgebrochener Lauf liefert
+  jetzt wenigstens eine ehrlich als partiell ausgewiesene Teilmessung.
+- **Soundness:** n/a (Messinfrastruktur).
 
 ### AP-0.2 — Report-Split (sound / unter-Annahme / genuin-hart) ✅ **erledigt 2026-07-29**
 
@@ -279,8 +302,9 @@ multi-kausal (Befund 2), und Provenance ohne Größe verschiebt das Residual nur
 
 ## 4. Reihenfolge
 
-1. ~~**AP-0.2**~~ ✅ erledigt (2026-07-29). **AP-0.1** bleibt zuerst — ohne abgeschlossenen
-   Kernel-Lauf hat der Split keine belastbare Grundgesamtheit.
+1. ~~**AP-0.2**~~ ✅ und ~~**AP-0.1 (Werkzeugseite)**~~ ✅ erledigt (2026-07-29). Offen bleibt der
+   **37k-Lauf selbst** — er braucht echte Hardware, nicht mehr Code. Ohne ihn hat der Split keine
+   belastbare Grundgesamtheit.
 2. **AP-1.0** — eine Messung, potenziell der billigste Hebel im Plan.
 3. **AP-1.1 → 1.2 → 1.3**, jeweils erst nach bestandenem Akzeptanzkriterium des Vorgängers.
 4. **AP-3** früh (großer, provenance-**un**abhängiger Block).

@@ -6,3 +6,7 @@ DEEPSEEK_ASM_ELF_PROGRESS.md
 /FoundKernelBugs
 /Kerneltests
 /VmOutbreak
+# Scan checkpoints: written to the working directory by default above 5000 units
+# (see scan_dir::DEFAULT_CKPT_NAME), so a scan run from the repo root drops one here.
+csolver-scan.ckpt
+csolver-scan.tmp

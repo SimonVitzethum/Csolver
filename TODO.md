@@ -36,10 +36,13 @@ Eraser-Lockset, kein Thread-Kalkül).
 `--closed-world` — dort war die §3-Feld-Typ-Karte strukturell wirkungslos. Das ist als **AP-1.0**
 in `docs/unknown-under-3pct-roadmap.md` das erste Paket der Phase 1.
 
-Die Messinfrastruktur für 0c ist vollständig vorhanden (`CSOLVER_SCAN_CHECKPOINT`,
-`CSOLVER_MEM_TARGET_MB`, `CSOLVER_MEM_FACTOR`, `CSOLVER_MEM_RESERVE_MB`, RSS-Sampling) — exit 143
-ist eine Lauf-, keine Code-Frage. Der Checkpoint ist opt-in per Env; die gekillten Läufe hatten ihn
-vermutlich nicht gesetzt.
+Die Messinfrastruktur für 0c war vollständig vorhanden — exit 143 ist eine Lauf-, keine Code-Frage.
+**Am 2026-07-29 nachgerüstet (AP-0.1, Werkzeugseite):** `solver scan-report <ckpt>` rekonstruiert
+den vollen Coverage-Report aus einer Checkpoint-Datei, der Checkpoint schaltet sich ab 5000 Units
+selbst ein, schreibt auch zeitgetriggert und führt den Peak-RSS als OOM-Post-mortem mit. Ein
+gekillter Lauf ist damit eine Messung — auch bei SIGKILL, den ein Signal-Handler nicht abfangen
+könnte (und den `unsafe_code = "forbid"` ohnehin verbietet). **Offen bleibt der 37k-Lauf selbst;
+der braucht Hardware, keinen Code.**
 
 ---
 

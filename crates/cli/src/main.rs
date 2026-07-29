@@ -58,6 +58,18 @@ USAGE:
                                     (no_aliasing_violation);
                                     --pre <file>: apply parameter preconditions from
                                     a sidecar, e.g. `sum 0 elements 1 8`)
+    solver scan-report <checkpoint>
+                                    print the coverage report of an INTERRUPTED scan from its
+                                    checkpoint file, without re-running it. A whole-kernel scan
+                                    that is killed (OOM, timeout, reboot) otherwise produces no
+                                    number at all, however many hours it completed; this turns
+                                    the file it left behind into a finished measurement. Above
+                                    5000 units a scan checkpoints to ./csolver-scan.ckpt by
+                                    default (CSOLVER_SCAN_CHECKPOINT=<file> to move it, or
+                                    CSOLVER_SCAN_CHECKPOINT= to switch it off). The report also
+                                    prints the peak RSS the run reached — a value at the machine
+                                    limit is the OOM killer's signature, a modest one points at
+                                    an external terminator instead.
     solver scan <dir> [--no-bugs] [--no-assume-valid-params] [--no-closed-world] [--no-cross-file] [--no-whole-program] [--no-auto-entries] [--no-aliasing-model] [--attack-surface] [--entries <file>] [--reachable]
                                     verify EVERY .ll under <dir> without stopping, then
                                     report coverage (% of functions decided) and list
@@ -328,6 +340,14 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .find(|a| !a.starts_with("--"))
                 .ok_or("`gen-contracts` needs a directory argument")?;
             gen_contracts::gen_contracts(std::path::Path::new(dir))
+        }
+        "scan-report" => {
+            let path = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .ok_or("`scan-report` needs a checkpoint file argument")?;
+            scan_report(std::path::Path::new(path))
         }
         "report" => Err("`report` (re-rendering saved JSON) is not implemented yet (M0)".into()),
         other => Err(format!("unknown command `{other}` (try `solver --help`)")),

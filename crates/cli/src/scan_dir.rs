@@ -69,6 +69,12 @@ struct Agg {
     assumption_fns: std::collections::HashMap<String, u64>,
     /// Phase 0d: `assumption id → decided functions for which it is the SOLE assumption` (disjoint).
     assumption_sole_fns: std::collections::HashMap<String, u64>,
+    /// **Peak RSS (MiB) observed while this scan ran**, carried through the checkpoint. It is the
+    /// post-mortem for a killed run: a value pressed up against the machine's memory is the
+    /// signature of the OOM killer (SIGKILL, exit 137), whereas a modest peak points at an
+    /// external terminator (SIGTERM, exit 143 — a `timeout`, a scheduler, a session teardown).
+    /// Without it, "why did the 37k scan die" stays a guess, which is where AP-0.1 was stuck.
+    peak_rss_mb: u64,
 }
 
 impl Agg {
@@ -100,6 +106,7 @@ impl Agg {
             *self.residuals.entry(reason).or_default() += n;
         }
         self.sum_distinct_residuals += fs.sum_distinct_residuals;
+        self.peak_rss_mb = self.peak_rss_mb.max(crate::scan_run::rss_mb());
         self.sound_decided += fs.sound_decided;
         self.decided_under_assumption += fs.decided_under_assumption;
         for (id, n) in fs.assumption_fns {
@@ -121,6 +128,20 @@ fn ckpt_field(s: &str) -> String {
 /// Checkpoint format marker. Bumped to 2 by the Phase-0d split (records `S` and `A`); a
 /// version-1 file is refused, see [`read_checkpoint`].
 const CKPT_HEADER: &str = "CSOLVER-SCAN-CKPT 2";
+
+/// Unit count from which checkpointing turns itself on. A scan this size runs for hours, which
+/// is precisely when losing it to a kill costs the most — and the whole-kernel runs that AP-0.1
+/// is about (37k files) sit far above it. Below the threshold a re-run is cheaper than the file.
+const CKPT_AUTO_UNITS: usize = 5000;
+
+/// Where the automatic checkpoint lands (relative to the working directory, not to the scanned
+/// tree — a scan must never write into the corpus it is reading).
+const DEFAULT_CKPT_NAME: &str = "csolver-scan.ckpt";
+
+/// Wall-clock ceiling between checkpoint writes. The unit-count trigger alone is not enough on a
+/// whole-kernel scan: 50 units of `drivers/gpu` can be many minutes, and an interruption inside
+/// that window loses all of it. Whichever trigger fires first wins.
+const CKPT_MAX_SECS: u64 = 120;
 
 /// **Write the scan checkpoint** atomically (temp file + rename), so a crash/reboot mid-write
 /// never corrupts it. Records the coverage counts, every finished unit's label (the resume set),
@@ -155,6 +176,7 @@ fn write_checkpoint(path: &Path, agg: &Agg) {
     }
     let _ = writeln!(s, "M\t{}", agg.sum_distinct_residuals);
     let _ = writeln!(s, "S\t{}\t{}", agg.sound_decided, agg.decided_under_assumption);
+    let _ = writeln!(s, "P\t{}", agg.peak_rss_mb);
     for (id, n) in &agg.assumption_fns {
         let sole = agg.assumption_sole_fns.get(id).copied().unwrap_or(0);
         let _ = writeln!(s, "A\t{n}\t{sole}\t{}", ckpt_field(id));
@@ -216,6 +238,10 @@ fn read_checkpoint(path: &Path) -> Option<Agg> {
                 agg.sound_decided = n();
                 agg.decided_under_assumption = n();
             }
+            Some("P") => {
+                let peak = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                agg.peak_rss_mb = agg.peak_rss_mb.max(peak);
+            }
             Some("A") => {
                 let n = it.next().and_then(|v| v.parse::<u64>().ok());
                 let sole = it.next().and_then(|v| v.parse::<u64>().ok());
@@ -245,6 +271,62 @@ fn read_checkpoint(path: &Path) -> Option<Agg> {
         }
     }
     Some(agg)
+}
+
+/// **Print the coverage report of an interrupted scan, from its checkpoint alone.**
+///
+/// This is the answer to AP-0.1's actual problem. Every whole-kernel run so far died in pass 2
+/// before `== coverage ==` was reached, so hours of completed work produced *no number at all*.
+/// A signal handler cannot fix that in general: `unsafe_code = "forbid"` and a zero-dependency
+/// workspace rule one out anyway, but more to the point, the OOM killer sends **SIGKILL**, which
+/// no handler can catch. The durable fix is to make the on-disk checkpoint self-sufficient —
+/// it already carries the counts, the findings, the residual histogram and the Phase-0d split —
+/// and then simply read it back. A killed run is now a finished measurement whatever killed it,
+/// including a power cut.
+///
+/// The concurrency reports (lock cycles, races, atomicity) are deliberately absent: those live in
+/// program-wide graphs that are not checkpointed, and inventing an empty section would read as
+/// "no races found" rather than "not recorded".
+pub(crate) fn scan_report(path: &Path) -> Result<ExitCode, String> {
+    let Some(agg) = read_checkpoint(path) else {
+        return Err(format!(
+            "{}: not a `{CKPT_HEADER}` checkpoint (a scan writes one to {DEFAULT_CKPT_NAME} by \
+             default above {CKPT_AUTO_UNITS} units, or wherever CSOLVER_SCAN_CHECKPOINT points)",
+            path.display()
+        ));
+    };
+    let mut findings = agg.findings;
+    findings.sort_by_cached_key(finding_key);
+    println!(
+        "== scan checkpoint {} ==\n{} units completed{}",
+        path.display(),
+        agg.done.len(),
+        if agg.peak_rss_mb > 0 {
+            format!(", peak RSS {} MB while it ran", agg.peak_rss_mb)
+        } else {
+            String::new()
+        },
+    );
+    println!(
+        "  (partial if the run was interrupted — these are the units that finished, \
+         not necessarily the whole corpus)"
+    );
+    report_scan(
+        &findings,
+        &Coverage {
+            pass: agg.pass,
+            fail: agg.fail,
+            unknown: agg.unknown,
+            dropped: agg.dropped,
+            errored: agg.errored,
+            residuals: &agg.residuals,
+            sum_distinct_residuals: agg.sum_distinct_residuals,
+            sound_decided: agg.sound_decided,
+            decided_under_assumption: agg.decided_under_assumption,
+            assumption_fns: &agg.assumption_fns,
+            assumption_sole_fns: &agg.assumption_sole_fns,
+        },
+    )
 }
 
 pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_program: bool) -> Result<ExitCode, String> {
@@ -363,11 +445,28 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // Byte-identical units are verified once (see `scan_one_unit`): skips re-analysis of
     // literally duplicated files and keeps the coverage counts free of those duplicates.
     let content_seen: Mutex<std::collections::HashSet<u64>> = Mutex::new(std::collections::HashSet::new());
-    // **Restart safety** (opt-in `CSOLVER_SCAN_CHECKPOINT=<file>`): a long full-kernel scan that
-    // is interrupted (crash, reboot, OOM, kill) resumes from where it left off instead of redoing
-    // everything. The checkpoint records finished units + their counts + findings; on start it is
-    // loaded, its units are skipped, and it is rewritten periodically. Absent env ⇒ no checkpoint.
-    let checkpoint: Option<std::path::PathBuf> = std::env::var_os("CSOLVER_SCAN_CHECKPOINT").map(Into::into);
+    // **Restart safety**: a long full-kernel scan that is interrupted (crash, reboot, OOM, kill)
+    // resumes from where it left off instead of redoing everything — and, because the checkpoint
+    // carries the whole coverage payload, `solver scan-report <file>` turns even a *killed* run
+    // into a finished measurement. `CSOLVER_SCAN_CHECKPOINT=<file>` picks the path; above
+    // `CKPT_AUTO_UNITS` units it defaults on, because a run that large is exactly the one that
+    // must not come back empty-handed. `CSOLVER_SCAN_CHECKPOINT=` (empty) opts out.
+    let checkpoint: Option<std::path::PathBuf> = match std::env::var_os("CSOLVER_SCAN_CHECKPOINT") {
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(v.into()),
+        None if total_units >= CKPT_AUTO_UNITS => {
+            let p = std::path::PathBuf::from(DEFAULT_CKPT_NAME);
+            eprintln!(
+                "  {total_units} units (>= {CKPT_AUTO_UNITS}) — checkpointing to {} by default.\n  \
+                 If this run is killed, `solver scan-report {}` still prints its coverage.\n  \
+                 (CSOLVER_SCAN_CHECKPOINT=<file> to move it, CSOLVER_SCAN_CHECKPOINT= to disable.)",
+                p.display(),
+                p.display(),
+            );
+            Some(p)
+        }
+        None => None,
+    };
     let (initial_agg, resume_done) = match checkpoint.as_deref().and_then(read_checkpoint) {
         Some(a) => {
             eprintln!(
@@ -384,6 +483,8 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // Incremental de-duplicated aggregate (see `Agg`): folded per unit, so no per-unit
     // `FileScan` is retained — this is what bounds peak memory on a full-kernel scan.
     let agg: Mutex<Agg> = Mutex::new(initial_agg);
+    // When the checkpoint was last written — the wall-clock half of the write trigger.
+    let last_ckpt: Mutex<std::time::Instant> = Mutex::new(std::time::Instant::now());
     // Units whose exploration hit the budget: deferred to a full-effort serial phase
     // instead of being counted as Unknown now (A3 — "pause the file until the others
     // are done, then finish it with the whole machine").
@@ -427,10 +528,22 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
                     let mut g = agg.lock().unwrap_or_else(|p| p.into_inner());
                     g.fold(label, fs);
                     // Restart safety: persist progress periodically (atomic write), so an
-                    // interruption costs at most the last ~50 units, not the whole run.
+                    // interruption costs at most the last few units, not the whole run. Two
+                    // triggers, first-to-fire: every 50 units, or `CKPT_MAX_SECS` of wall clock —
+                    // 50 units of a heavy subtree can be many minutes, and that whole window
+                    // would otherwise be lost.
                     if let Some(cp) = &checkpoint {
-                        if d.is_multiple_of(50) {
+                        let due_by_count = d.is_multiple_of(50);
+                        let due_by_time = last_ckpt
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .elapsed()
+                            .as_secs()
+                            >= CKPT_MAX_SECS;
+                        if due_by_count || due_by_time {
+                            g.peak_rss_mb = g.peak_rss_mb.max(crate::scan_run::rss_mb());
                             write_checkpoint(cp, &g);
+                            *last_ckpt.lock().unwrap_or_else(|p| p.into_inner()) = std::time::Instant::now();
                         }
                     }
                 }
@@ -490,7 +603,11 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         decided_under_assumption,
         assumption_fns,
         assumption_sole_fns,
+        peak_rss_mb,
     } = agg.into_inner().unwrap_or_else(|p| p.into_inner());
+    if peak_rss_mb > 0 {
+        eprintln!("  peak RSS during verification: {peak_rss_mb} MB");
+    }
     findings.sort_by_cached_key(finding_key);
     let lock_edges: Vec<(String, String, String)> = lock_edges.into_iter().collect();
     let race_accesses: Vec<(String, String, bool, Vec<String>)> = race_accesses.into_iter().collect();
@@ -693,13 +810,16 @@ pub(crate) type FindingKey = (String, String, String);
 
 #[cfg(test)]
 mod tests {
-    use super::{is_init_lifecycle, read_checkpoint, write_checkpoint, Agg, CKPT_HEADER};
+    use super::{finding_key, is_init_lifecycle, read_checkpoint, write_checkpoint, Agg, Finding, CKPT_HEADER};
 
     /// The Phase-0d split must survive a checkpoint/resume, or a resumed long scan reports a
     /// sound bucket short by everything the interrupted run had already decided.
     #[test]
     fn checkpoint_round_trips_the_assumption_split() {
-        let mut agg = Agg { pass: 7, fail: 1, unknown: 2, sound_decided: 3, decided_under_assumption: 5, ..Default::default() };
+        let mut agg = Agg {
+            pass: 7, fail: 1, unknown: 2, sound_decided: 3, decided_under_assumption: 5,
+            peak_rss_mb: 24_576, ..Default::default()
+        };
         agg.assumption_fns.insert("param-valid".to_string(), 5);
         agg.assumption_fns.insert("alloc-succeeds".to_string(), 2);
         agg.assumption_sole_fns.insert("param-valid".to_string(), 4);
@@ -719,6 +839,40 @@ mod tests {
         // Sole counts are recorded per assumption, so an id that never stood alone must not
         // acquire a phantom entry on the way through the file.
         assert_eq!(back.assumption_sole_fns.get("alloc-succeeds"), None);
+        // The peak-RSS post-mortem: without it, "OOM killer or external terminator?" cannot be
+        // answered after the fact, which is the diagnosis AP-0.1 was blocked on.
+        assert_eq!(back.peak_rss_mb, 24_576);
+    }
+
+    /// The whole point of AP-0.1: a scan killed before it reaches `== coverage ==` must still be
+    /// a measurement. Everything the report needs therefore has to survive the round trip through
+    /// the file — not just the counts, but the findings and residual histogram behind them.
+    #[test]
+    fn a_checkpoint_carries_the_whole_coverage_payload() {
+        let mut agg = Agg { pass: 4, fail: 1, unknown: 3, dropped: 2, errored: 1, sum_distinct_residuals: 9, ..Default::default() };
+        agg.done.insert("units/a".to_string());
+        agg.residuals.insert("could not prove in bounds".to_string(), 12);
+        let f = Finding {
+            file: "drivers/x.ll".to_string(),
+            function: "x_probe".to_string(),
+            property: "in_bounds".to_string(),
+            witness: "i=64".to_string(),
+        };
+        agg.seen_find.insert(finding_key(&f));
+        agg.findings.push(f);
+
+        let path = std::env::temp_dir().join("csolver-ckpt-payload.ckpt");
+        write_checkpoint(&path, &agg);
+        let Some(back) = read_checkpoint(&path) else { panic!("must load") };
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!((back.pass, back.fail, back.unknown, back.dropped, back.errored), (4, 1, 3, 2, 1));
+        assert_eq!(back.sum_distinct_residuals, 9);
+        assert_eq!(back.residuals.get("could not prove in bounds"), Some(&12));
+        assert_eq!(back.done.len(), 1, "the resume set is what stops a restart redoing finished work");
+        assert_eq!(back.findings.len(), 1);
+        assert_eq!(back.findings[0].function, "x_probe");
+        assert_eq!(back.findings[0].witness, "i=64", "a bug without its witness is not a report");
     }
 
     /// A pre-0d checkpoint carries decided counts but no assumption footprint for them. Resuming
