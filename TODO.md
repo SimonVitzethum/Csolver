@@ -10,6 +10,33 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
 
 ---
 
+## Audit 2026-07-29 — jeder offene Punkt gegen den Quelltext geprüft
+
+Vier Einträge dieser Liste waren **stale** und sind unten korrigiert:
+`ValidReference` (§A — die Variante trägt *zwei* Bedeutungen, nicht nur die Marker-Rolle),
+Stacked-Borrows-**Protectors** (§F — seit `9231b06` gebaut), die **ARM64-ASM-Lücke** (§G — betrifft
+nur den Maschinencode-Decoder, nicht den Text-Decoder) und der **Taxonomie-Doku-Nit** (seit
+`cc2d270` erledigt).
+
+Bestätigt offen: HVN (null Treffer im Baum), `RetSummary::Field` (`summary.rs:91` kennt
+`Unknown`/`Scalar`/`PtrFromArg`/`DanglingStack`/`Alloc`/`ValidRef`), Report-Split 0d,
+`StackIntegrity`/`ValidStackFrame` (nur in `core/src/property.rs` deklariert, nirgends emittiert),
+Wide-Ints (`core/src/value.rs:27` + `MAX_WIDTH = 128`), `ValidPointerArith` (`RefuteMode::Off`,
+`checks.rs:343`), Inter-Thread-Races (HB-Pruning ist da, `datarace.rs:65-118` — aber es bleibt
+Eraser-Lockset, kein Thread-Kalkül).
+
+**Neuer, planrelevanter Befund:** `verifier/src/wholeprog.rs:119` befüllt `field_types`
+**ausschließlich unter `closed_world`**. Der `mm`-Lauf mit 72,6 % UNKNOWN lief ohne
+`--closed-world` — dort war die §3-Feld-Typ-Karte strukturell wirkungslos. Das ist als **AP-1.0**
+in `docs/unknown-under-3pct-roadmap.md` das erste Paket der Phase 1.
+
+Die Messinfrastruktur für 0c ist vollständig vorhanden (`CSOLVER_SCAN_CHECKPOINT`,
+`CSOLVER_MEM_TARGET_MB`, `CSOLVER_MEM_FACTOR`, `CSOLVER_MEM_RESERVE_MB`, RSS-Sampling) — exit 143
+ist eine Lauf-, keine Code-Frage. Der Checkpoint ist opt-in per Env; die gekillten Läufe hatten ihn
+vermutlich nicht gesetzt.
+
+---
+
 ## Autonome Session 3b (2026-07-27) — Coverage-Sektionen A–D
 
 **Geschiffft (sound, beide Orakel: 0 false PASS / 0 false FAIL):**
@@ -95,8 +122,12 @@ unsound-im-Allgemeinen hinter benannter Annahme; beide Orakel (Miri + C-ASan/UBS
 
 ## A. Genuinely ungeprüft (catalogue-only — echte Löcher)
 
-- [ ] **`ValidReference`** — kein Referenz-Validitäts-Check; die Variante ist zum „Frontend
-  konnte Funktion nicht lowern"-Marker umfunktioniert (`verifier/src/run.rs:56`).
+- [~] **`ValidReference`** — **präzisiert (Audit 2026-07-29):** die Variante wird an *zwei* Stellen
+  benutzt. `verifier/src/run.rs:62` missbraucht sie als „Frontend konnte Funktion nicht lowern"-
+  Marker; `memory/src/access.rs:145,156` emittiert sie aber als **echtes Residual** (opake
+  Provenance bzw. untracked region) — und `csolver-memory` hängt real an symbolic/verifier/solver/
+  absint. Offen bleibt: die Doppelnutzung entflechten (eigener `SafetyProperty` für den
+  Frontend-Drop) und ein dedizierter Referenz-Validitäts-Check.
 - [ ] **`StackIntegrity` / `ValidStackFrame`** — nie emittiert (deklariert als von `InBounds`/
   `ValidIndirectTarget` subsumiert). Return-Address-Integrität hat keinen dedizierten Check.
 
@@ -140,8 +171,15 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 
 ## F. Rust-Aliasing (opt-in `--aliasing-model`, Teilklasse) **← Hebel 4**
 
-- [ ] Nur „write-through-shared-`&T`" / „use-of-`&mut`-nach-Reborrow" (`checks.rs:466`). Offen:
-  vollständigeres Stacked/Tree-Borrows-Modell (Reborrow-Stacks, `&mut`-Uniqueness über Calls).
+- [x] **Protectors + `&mut`-Uniqueness über Call-Grenzen** — **geschiffft, der Eintrag war stale**
+  (Audit 2026-07-29, Commit `9231b06`): `mir/src/lower.rs:208` setzt für jeden `&mut`-Parameter
+  einen Protector-Retag in den Entry-Block; `symbolic/src/exec/step.rs:474-484` prüft an jedem
+  Call-Argument mit Borrow-Tag einen protected use (als **Read** — ein gültiger Tag wird von einem
+  Read nie gepoppt, also kein false FAIL); `mir/src/parser/expr.rs:148-155` modelliert `two_phase`
+  als **shared** Reborrow. Tests: `testsuite/tests/mir_frontend/part_c.rs` (`PROTECTOR_UAF`,
+  `two_phase_borrow_emits_a_shared_retag`).
+- [ ] **Rest der Klasse:** volles **Tree-Borrows-Gitter** (Retag-Derivation-Trees statt flacher
+  Reborrow-Stacks) und exaktes `UnsafeCell`. Hohes false-FAIL-Risiko → Miri-Orakel-getrieben.
 
 ## G. Frontend / Decoder — stille UNKNOWNs
 
@@ -154,8 +192,14 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
   (`0x80/0x81`, große `sub rsp`-Frames), Akkumulator-ALU, MUL/IMUL/DIV/IDIV (Div-by-Zero-Check),
   Shift-by-CL/Byte, IMUL 2/3-Operand, `leave`/`syscall`/`ud2`/Fences/Bit-Ops; ARM64: **LDP/STP**
   (Prolog/Epilog-Gate). Unbekannte Mnemonik → weiter `unanalyzed` (sound). **Offen (Breite):** x86
-  String-Ops (rep movs/stos), SSE/AVX-Semantik (nur Länge), x87 FPU, cmpxchg/xadd-Atomics; ARM64
-  Register-Form ADD/SUB/logical, CBZ/CBNZ/TBZ, ADRP/ADR, LDP-Register-Offset, MUL/UDIV/SDIV, BLR/BR.
+  String-Ops (rep movs/stos/scas/lods — in **beiden** Decodern), SSE/AVX-Semantik (nur Länge +
+  Disassembly-Namen), x87 FPU (gar nicht), cmpxchg/xadd-Atomics (nur der LOCK-Präfix-Fence ist
+  modelliert, `asm/src/x86/lower.rs:16`).
+  **ARM64 — präzisiert (Audit 2026-07-29): die beiden Decoder sind unterschiedlich weit.** Im
+  *Text*-Decoder (`asm/src/arm64_text.rs`) sind `cbz`/`cbnz` (:178), `adrp`/`adr` inkl.
+  `:lo12:`-Fixup (:204/:270) und `bl`/`blr` (:158) **vorhanden**. Offen dort: `tbz`/`tbnz`.
+  Im *Maschinencode*-Decoder (`asm/src/arm64.rs`, erklärtermaßen „small, growing subset") fehlen
+  sie alle, dazu Register-Form ADD/SUB/logical, LDP-Register-Offset, MUL/UDIV/SDIV.
 
 ## H. Skalierbarkeit
 
@@ -183,9 +227,9 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
   vollständig wie im Lockset-Ansatz sinnvoll.
 - **#4 Rust-Aliasing** — Modell ist bereits echte Stacked-Borrows-Under-Approximation
   (checks.rs:440–494: Reborrow-Stacks, unique/shared, pop-on-write, poison-on-lost-parent).
-  „Vervollständigen" = Protectors + `&mut`-Uniqueness über Call-Grenzen — subtil, hohes false-FAIL-
-  Risiko (bräche Miri-Orakel), eigener Miri-getriebener Task. **Nicht** als ungetesteter Flag-Patch
-  geschifft (soundness-first).
+  **Protectors + `&mut`-Uniqueness über Call-Grenzen sind inzwischen geschiffft** (`9231b06`,
+  siehe §F). Rest: Tree-Borrows-Gitter + exaktes `UnsafeCell` — subtil, hohes false-FAIL-Risiko
+  (bräche Miri-Orakel), eigener Miri-getriebener Task.
 
 ## Autonome Session 2 (2026-07-23) — Miri-Bewertung, Contract-Auto-Gen, P3
 
@@ -200,11 +244,11 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 
 ### Offene Miri-Parität (statisch sinnvoll) + große Reste — mit Design
 
-- [ ] **#4 Stacked/Tree-Borrows vervollständigen** (die größte Rust-Fidelity-Lücke): Retag-
-  Derivation-Trees, `&mut`-Use-after-Invalidation, 2-live-`&mut`, Protectors. Braucht Frontend-
-  Retag-Events (teils da: `csolver.retag.mut/shared`) + Ableitungsbaum-Tracking im Executor
-  (`region_borrows` erweitern). Hinter `--aliasing-model`; hohes false-FAIL-Risiko → Miri-Orakel-
-  getrieben validieren.
+- [~] **#4 Stacked/Tree-Borrows vervollständigen** (die größte Rust-Fidelity-Lücke): **Protectors
+  und `&mut`-Use-after-Invalidation über Call-Grenzen sind erledigt** (`9231b06`, siehe §F).
+  Offen bleiben Retag-**Derivation-Trees** (statt flacher Stacks), 2-live-`&mut` und exaktes
+  `UnsafeCell` — braucht Ableitungsbaum-Tracking im Executor (`region_borrows` erweitern).
+  Hinter `--aliasing-model`; hohes false-FAIL-Risiko → Miri-Orakel-getrieben validieren.
 - [ ] **Value-Validity-Invarianten** (`bool ∉ {0,1}`, ungültiger Enum-Diskriminant, `NonNull`=null):
   neue `ValidValue`-Obligation an getypten Loads (MIR-Frontend kennt die Typen). Statisch geringe
   Ausbeute (nur *beweisbar* ungültige Werte refutierbar), aber im Bug-Finding-Modus findet es
@@ -219,9 +263,10 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
 
 ## Doku-Diskrepanz
 
-- [ ] `docs/exploit-taxonomy.md` behauptet „jede Klasse ●" — die ●-Marks meinen *Mechanismus
-  existiert*, nicht *out-of-the-box Recall*. Zeilen-Marks an die ehrlichere „Assessment"-Sektion
-  angleichen.
+- [x] `docs/exploit-taxonomy.md` — **erledigt, der Eintrag war stale** (Audit 2026-07-29, Commit
+  `cc2d270`): das Dokument führt seit dem eine Reifegrad-Legende (Zeile 34, **●** solid ·
+  **◐** partial · **○** not modelled) und verteilt 40 ● / 16 ◐ / 6 ○. Die Behauptung „jede Klasse ●"
+  steht dort nicht mehr.
 
 ---
 
@@ -255,9 +300,9 @@ Geprüft: Div/Mod-0, Shift-über-Breite, signed/unsigned-Overflow **nur mit `nsw
      die Lockset-Relation (statt nur Concurrent-Membership).
 4. **[~] Rust-Aliasing** — **bereits substanzieller als der Audit sagte.** `checks.rs:440–494`
    implementiert echte Stacked-Borrows-Under-Approximation: Reborrow-Stacks (`region_borrows`),
-   Tags, unique/shared-Unterscheidung, pop-on-write, poison-on-lost-parent. „Vervollständigen"
-   heißt Protector/Two-Phase-Borrows + `&mut`-Uniqueness über Call-Grenzen — subtil, groß, und ein
-   falscher FAIL hier wäre unsound. Eigener fokussierter Task; kein Schnellpatch.
+   Tags, unique/shared-Unterscheidung, pop-on-write, poison-on-lost-parent. **Protector/Two-Phase-
+   Borrows + `&mut`-Uniqueness über Call-Grenzen sind seither geschiffft** (`9231b06`, §F); der
+   Rest (Tree-Borrows-Gitter, `UnsafeCell`) bleibt ein eigener Miri-getriebener Task.
 
 **Fazit:** 2 & 3 sind sound erledigt (+ der kritische P4-OOM-Fix `4c07ead`). 1 & 4 sind echte
 Mehr-Session-Komponenten (whole-program HB-Modell bzw. vollständige Borrow-Semantik); soundness-first

@@ -1,162 +1,296 @@
-# Roadmap: UNKNOWN unter 3 % (≥ 97 % decided, Kernel)
+# Konkreter Arbeitsplan: UNKNOWN ≤ 3 % (≥ 97 % decided)
 
-**Ziel:** den Anteil *entschiedener* Kernel-Funktionen (PASS ∨ FAIL) von aktuell **~30 %**
-(SCAN10-Teilstand: 28,7 % PASS / 1,0 % FAIL / **70,3 % UNKNOWN**) auf **≥ 97 %** heben —
-UNKNOWN **< 3 %** — ohne je einen false PASS zu erzeugen.
+**Stand:** 2026-07-29. Diese Fassung **ersetzt** die Prognostik-Roadmap vom 2026-07-23 vollständig.
+Die alte Fassung war eine Schätzung ohne Messgrundlage; drei ihrer tragenden Annahmen sind
+inzwischen empirisch widerlegt (siehe [`unknown-to-5pct-plan.md`], Befunde 1–3), und ihre
+Residual-Tabelle stammt aus einem Sample, dessen Auswertung nachweislich fehlerhaft war.
 
-Diese Roadmap ist die Fortsetzung von [`decided-rate-roadmap.md`] (Ziel ≥ 95 %). Sie beschreibt,
-was *zusätzlich* nötig ist, um die letzten Prozente bis unter 3 % zu schließen.
+Dieser Plan ist **nicht** ein zweiter, konkurrierender Weg neben [`unknown-to-5pct-plan.md`].
+Es ist derselbe Rumpf, zu Ende gedacht:
 
----
+> **≤ 5 % ist die Analyse-Arbeit. Die letzten 2 pp auf ≤ 3 % sind Scoping + Annahmen-Buchhaltung,
+> keine zusätzliche Analyse-Präzision.**
 
-## Die harte Wahrheit zuerst: zwei Bedeutungen von „decided"
+Wer nur eines von beiden liest: der 5-%-Plan enthält die Diagnose (*warum* steckt die Decided-Rate
+bei 28 %), dieser hier die Arbeitspakete (*was genau zu tun ist, woran man Erfolg misst*).
 
-`decided-rate-roadmap.md` misst eine **Soundness-Decke** von grob **3–7 %**: ein Restanteil ist
-*genuin unentscheidbar* ohne Soundness-Verlust (angreifer-beeinflusste indirekte Dispatch-Ziele,
-daten-abhängiges Aliasing, tiefe Provenance über opake Grenzen). **< 3 % UNKNOWN liegt an oder
-unter dieser Decke.** Das Ziel ist daher nur erreichbar, wenn man zwei Größen sauber trennt:
-
-1. **Sound-decided** (strikt): PASS/FAIL ohne jede Annahme. Realistische Decke ~93–95 % decided
-   (≈ 5–7 % UNKNOWN). Darunter geht es strikt **nicht**.
-2. **Decided-unter-benannten-Annahmen**: PASS/FAIL, das auf einer *ausgewiesenen, opt-in*
-   Annahme ruht (Kernel-Invariante, Closed-World-Caller, Container-Vertrag) — im Proof-Tree
-   sichtbar, auditierbar, per Flag steuerbar. **Nur so kommt UNKNOWN unter 3 %.**
-
-**Verdikt vorab:** < 3 % UNKNOWN ist erreichbar, aber **nicht als rein-sound-decided** — es
-erfordert eine umfassende, benannte Annahmen-Schicht für den unentscheidbaren Kern, plus das
-konsequente Schließen aller Modellierungs- und Frontend-Lücken darüber. „Decided" heißt dann
-„entschieden modulo explizit ausgewiesener Annahmen" — das ist legitim und nützlich, aber es ist
-eine andere (schwächere) Aussage als strikt-sound. Jede Zahl in dieser Roadmap ist an ihr
-Annahmen-Bundle gebunden.
+**Kardinalregel unverändert:** nie ein false PASS. Unsound-im-Allgemeinen nur hinter benannter, im
+Proof-Tree sichtbarer Annahme; beide Orakel (Miri + C-ASan/UBSan) pro Schritt.
 
 ---
 
-## Wo der Rest sitzt (Residual-Histogramm, ~89 % Zeiger-Provenance)
+## 0. Ausgangslage (gemessen, 2026-07-27)
 
-| Klasse | ~Residual | Status nach ValidRef-Batch |
-|---|---|---|
-| loaded value (kein store-load) | 3601 | teilw. (ValidRef interproz. + RefWitness intraproz.); Rest: void*/union/private_data |
-| uncontracted pointer parameter | 1990 | offen (Param ohne getypte Nutzung) |
-| non-null / opaque provenance | 1887 | *downstream* von Provenance |
-| in-object (valid-ptr-arith) | 1289 | *downstream* |
-| in-bounds (access in allocation) | 1103 | *downstream* |
-| scalar-as-ptr (intrinsic/asm/deep) | 1036 | teilw. (Ptr-Identity-Intrinsics); Rest: asm, tiefe Ketten |
-| alignment | 892 | *downstream* |
-| int-to-pointer | 851 | teilw. (getypt via size_hinted); Rest: untyped |
-| opaque call result | 786 | **geschlossen** (Alloc/ValidRef/valid-returns) |
-| null / integer-derived | 594 | *downstream* |
-| loop-body / unsupported op | ~1600 | teilw. (Induction + assume-valid-loop-ptrs) |
-| arithmetic overflow | 235 | teilw. (interval-facts + width-fix) |
-| concurrency-Heuristik | ~368 | schwer (bleibt evtl. UNKNOWN) |
+| Korpus | Funktionen | PASS | FAIL | UNKNOWN | decided |
+|---|---|---|---|---|---|
+| `mm` (offen) | 5782 | 25,2 % | 2,2 % | 72,6 % | 27,4 % |
+| `mm` + `--assume-inttoptr-valid` | 5782 | 25,2 % | 2,2 % | 72,7 % | 27,3 % |
+| `kernel` (`--closed-world`) | 15439 | 26,9 % | 1,9 % | 71,2 % | 28,8 % |
 
-**~89 %** aller Residuen sind Provenance (direkt) oder Provenance-*Folgen* (non-null, in-object,
-in-bounds, alignment resolven, sobald die Herkunft bekannt ist). Der Hebel ist eindeutig.
+Eine **abgeschlossene** Whole-Kernel-Zahl (37k) gibt es weiterhin nicht — jeder Lauf starb in Pass 2
+mit exit 143, bevor das `== coverage ==`-Summary gedruckt wurde. Das ist AP-0.1.
 
----
+## 0b. Was der Code-Audit vom 2026-07-29 an den Plänen korrigiert hat
 
-## Phase A — Interprozedurale Provenance-Vollständigung (70 % → ~20 % UNKNOWN)
+Ein Abgleich jedes offenen Punkts gegen den Quelltext ergab vier Einträge, die **stale** waren, und
+einen neuen, planrelevanten Befund:
 
-Der mit Abstand größte Sprung. Vier Bausteine, alle mit Multiplikator (Funktion-decided ist durch
-die schlechteste Obligation gedeckelt — eine geschlossene Klasse kippt viele Funktionen).
-
-- **A1 — Loaded-Value-Vollständigung.** Jeden geladenen Zeiger typisieren, auch die harten Fälle:
-  `void*`/`union`/`private_data`/`data`-Felder, deren echten Typ erst der **Closed-World-Caller**
-  (`--closed-world`, [`closed-world-member-provenance`]) festlegt. `RetSummary::Field { arg,
-  offset, pointee }` mit *beliebigem* Offset (nicht nur offset-0), transitive DWARF-Ketten
-  `a->b->c->d` durchgängig. **Soundness:** unter `--assume-valid-params`/`--closed-world` (benannt).
-- **A2 — Parameter-Contract-Summaries.** Aus den *eigenen Zugriffen* eines Callees ableiten,
-  welche Größe/Validität er für jeden Zeiger-Parameter voraussetzt, und diese Precondition an alle
-  sichtbaren Caller propagieren (Cross-Fn-Fixpunkt). Schließt „uncontracted parameter" (1990)
-  ohne getypte Nutzung. Unter `--closed-world` werden **alle** verbleibenden Raw-Pointer-Params
-  gegeben einen Caller geschlossen (heute für C/C++ validiert — auf Rust/Kernel ausweiten).
-- **A3 — `RetSummary::Global`/`NonNull` + int-to-ptr-Breite.** Funktionen, die eine Global-Adresse
-  oder einen definitiv-non-null-Zeiger zurückgeben; untypisierte `inttoptr` breiter recovern
-  (per-cpu/phys/container_of). Schließt „opaque call result"-Rest + „int-to-pointer" (851).
-- **A4 — Downstream-Kaskade (automatisch).** non-null (1887), in-object (1289), in-bounds (1103),
-  alignment (892), null/int (594) sind an Provenance gegated und lösen sich mit A1–A3 mit — **~5764
-  Residuen ohne eigene Arbeit.**
-
-**Aufwand:** groß (IR + Executor + Fixpunkt + Closed-World-Typenschluss). **Schätzung: −50 pp.**
-
-## Phase B — Loop- & Container-Vollständigkeit (~20 % → ~12 %)
-
-- **B1 — Container-Invarianten** für den *standardisierten* Kernel-Satz: `list_for_each_entry`,
-  `hlist`, `rb_node`, `xarray`/`radix_tree`, `llist`. Ein Iterator bleibt in gültigen Knoten des
-  deklarierten Typs (Vertrag, opt-in). Schließt „loop-havocked pointer".
-- **B2 — Induktions-Breite:** mehr Muster (mehrdimensionale Arrays, verschachtelte Loops,
-  `memchr`/`strlen`-Sentinel-Loops), damit „loop-body / unsupported op" (~1600) sinkt.
-- **B3 — Multi-Index/Vektor-`getelementptr`** (dokumentierte Frontend-Lücke, droppt Funktionen zu
-  `unanalyzed` → jede ist ein UNKNOWN). Vollständig lowern. **Schätzung: −8 pp.**
-
-## Phase C — Kernel-Idiom-Annahmen-Schicht (~12 % → ~7 %)
-
-Opt-in, als Annahme ausgewiesen (`--assume-kernel-idioms`):
-- **C1 — ERR_PTR/IS_ERR/PTR_ERR:** Fehlerzeiger-Wertebereich; auf dem `!IS_ERR`-Pfad ist der
-  Zeiger valide. (Zuvor zurückgestellt — hier bewusst als *benannte* Annahme, nicht im strikten
-  Pfad, mit branch-sensitiver Provenance-Verfeinerung auf der Erfolgskante.)
-- **C2 — `container_of`/`this_cpu_ptr`/`rcu_dereference`/`list_entry`** als Contract „returns valid
-  `T*`" flächendeckend (Contract-Sprache erweitern). **Schätzung: −5 pp.**
-
-## Phase D — Devirtualisierungs-Vollständigkeit (~7 % → ~4 %)
-
-Ein unaufgelöster indirekter Call havoct alles danach. Heute: konstante ops-Struct-Loads devirt.
-Ausbauen auf: vtable-/fnptr-Felder aus dem Closed-World-Initializer, `ops`-Register-Tabellen,
-`static const struct …_ops`. Jeder aufgelöste Dispatch entsperrt die ganze Kette dahinter (großer
-Multiplikator). **Soundness:** die Auflösung ist definit (konstante Tabelle) — sound, oder unter
-`--closed-world` benannt. **Schätzung: −3 pp.**
-
-## Phase E — Frontend-/Decoder-Lückenschluss (~4 % → ~2 %)
-
-Jede zu `unanalyzed` gedroppte Funktion ist ein UNKNOWN (SCAN10: „dropped" > 0). Restliche
-unsupported LLVM-Konstrukte, exotische Intrinsics, Inline-asm-Ausgänge (via Contracts), breite
-Integer (i256/i512 — bit-präzise-Domäne teilweise erweitern oder als word-weise Modell). **−2 pp.**
-
-## Phase F — Der unentscheidbare Kern (~2 % → < 1 %)
-
-Was strikt UNKNOWN bleibt, wird **nur** durch die benannte Annahmen-Schicht + Attack-Surface-
-Scoping decided:
-- **F1 — Attack-Surface-Skopierung** (`--attack-surface` + `--closed-world`): nur syscall/ioctl-
-  erreichbarer Code braucht adversariale Parameter; der Rest darf Caller-etablierte Invarianten
-  annehmen → decided-unter-Annahme. Das verschiebt den „genuin adversarialen" Kern auf die kleine,
-  tatsächlich erreichbare Angriffsfläche.
-- **F2 — „Decided-unter-Annahme"-Buchhaltung:** ein UNKNOWN, das unter einer *ausgewiesenen*
-  Annahme zu PASS/FAIL würde, wird als solches gezählt (getrennter Bucket, Annahme im Proof-Tree).
-  Der verbleibende *harte* Kern (kein Annahmen-Bundle schließt ihn) ist die ehrliche Rest-Zahl —
-  Ziel: **< 1 %** genuin, plus < 2 % decided-unter-Annahme = **< 3 % UNKNOWN gesamt.**
+- **Stacked-Borrows-Protectors sind gebaut** (`mir/lower.rs:208` Entry-Retag für `&mut`-Parameter,
+  `symbolic/exec/step.rs:474-484` interprozeduraler Protector an Call-Argumenten, `two_phase` als
+  shared Reborrow in `mir/parser/expr.rs:148`, Tests in `testsuite/tests/mir_frontend/part_c.rs`;
+  Commit `9231b06`). Offen ist nur noch das **volle Tree-Borrows-Gitter** und exaktes `UnsafeCell`.
+- **`docs/exploit-taxonomy.md` ist bereits ehrlich** (Legende Zeile 34; 40 ● / 16 ◐ / 6 ○,
+  Commit `cc2d270`). Der „behauptet jede Klasse ●"-Nit ist erledigt.
+- **ARM64 CBZ/ADRP/BLR existieren im Text-Decoder** (`asm/arm64_text.rs:178/204/158`). Die Lücke
+  betrifft **nur** den Maschinencode-Decoder (`asm/arm64.rs`, erklärtermaßen „small, growing
+  subset"). `tbz`/`tbnz` fehlt in beiden.
+- **`ValidReference` ist nicht bloß ein Frontend-Marker.** Ja, `verifier/run.rs:62` missbraucht die
+  Variante als Drop-Marker — aber `memory/access.rs:145,156` emittiert sie als echtes Residual
+  (opake Provenance, untracked region), und `csolver-memory` hängt real an symbolic/verifier/
+  solver/absint.
+- **NEU und planrelevant:** `verifier/wholeprog.rs:119` befüllt `field_types` **ausschließlich unter
+  `closed_world`** — sonst bleibt die Map leer. Der `mm`-Lauf mit 72,6 % UNKNOWN lief **ohne**
+  `--closed-world`; dort war die §3-Feld-Typ-Karte also strukturell wirkungslos. Das ist ein
+  billig prüfbarer Kandidat für „warum feuert 1a unterproportional" und wird als **AP-1.0 vor allen
+  anderen Phase-1-Paketen** gemessen.
 
 ---
 
-## Trajektorie & ehrliche Decke
+## 1. Warum ≤ 3 % ohne Annahmen-Schicht unerreichbar ist
 
-| Nach Phase | UNKNOWN (Schätzung) | decided | Rest ist… |
+Unverändert gültig aus der alten Fassung, jetzt aber mit Zahlen unterlegt:
+
+1. **Sound-decided** (PASS/FAIL ohne jede Annahme): realistische Decke **~80–88 %**. Das ist
+   deutlich pessimistischer als die alten „93–95 %" — Befund 1 (Funktions-decided ist durch die
+   *schlechteste* Obligation gedeckelt) macht die Decke zu einem Produkt, nicht zu einer Summe.
+2. **Decided-unter-benannter-Annahme**: PASS/FAIL auf einer ausgewiesenen, opt-in Annahme.
+
+≤ 3 % UNKNOWN heißt also konkret: **≥ 97 % decided, davon ~80–88 pp strikt-sound und ~9–17 pp unter
+benannten Annahmen.** Jede Zahl ist an ihr Annahmen-Bündel gebunden; ohne AP-0.2 (Report-Split) ist
+sie schlicht nicht interpretierbar. Deshalb steht AP-0.2 **vor** jeder Präzisionsarbeit.
+
+---
+
+## 2. Arbeitspakete
+
+Jedes Paket: **Anker** (wo im Code), **Schritte**, **Akzeptanzkriterium** (woran Erfolg gemessen
+wird — nicht „fühlt sich besser an"), **Soundness**, **Abhängigkeit**.
+
+### AP-0.1 — Abgeschlossener Full-Kernel-Scan
+
+- **Anker:** `cli/scan_dir.rs:308-320` (Checkpoint, opt-in via `CSOLVER_SCAN_CHECKPOINT`),
+  `cli/scan.rs:251-280` (`CSOLVER_MEM_TARGET_MB`, default ~70 % frei; `CSOLVER_MEM_FACTOR`),
+  `cli/scan.rs:358-365` (`CSOLVER_MEM_RESERVE_MB`), `cli/scan_run.rs:396` (RSS-Sampling).
+- **Befund:** die Infrastruktur ist **vollständig vorhanden**. Exit 143 ist eine Lauf-, keine
+  Code-Frage. Wahrscheinlichster Grund, dass nichts gerettet wurde: der Checkpoint ist opt-in per
+  Env — wenn die gekillten Läufe die Variable nicht gesetzt hatten, gab es nichts zu resumen.
+- **Schritte:** (1) Rerun mit gesetztem `CSOLVER_SCAN_CHECKPOINT` und einem `CSOLVER_MEM_TARGET_MB`
+  unterhalb der Box-Grenze; Peak-RSS mitschreiben. (2) SIGTERM-Handler, der den Checkpoint flusht
+  **und** ein partielles `== coverage ==` samt Residual-Histogramm druckt — dann ist selbst ein
+  gekillter Lauf eine Messung. (3) Checkpoint ab einer Schwelle (z. B. > 5000 Units) per Default an,
+  statt opt-in. (4) Exit-Grund protokollieren (OOM-Killer via `dmesg`/`/proc/self/status` vs.
+  externer Timeout) — die Diagnose gehört ins Log, nicht in die Erinnerung.
+- **Akzeptanz:** ein 37k-Lauf druckt `== coverage ==` **und** das Residual-Histogramm. Diese Zahl
+  ist ab dann *die* Referenzzahl; alle pp-Angaben unten beziehen sich darauf.
+- **Soundness:** n/a (Messinfrastruktur). **Abhängigkeit:** keine. **Zuerst.**
+
+### AP-0.2 — Report-Split (sound / unter-Annahme / genuin-hart)
+
+- **Anker:** `verifier/assumptions.rs` (15 benannte Assumptions: `param-valid`, `inttoptr-valid`,
+  `closed-world-devirt`, `alloc-succeeds`, `debuginfo`, …), `report/lib.rs:88` (`ByAssumption`
+  existiert bereits als Discharge-Grund), `cli/findings.rs:274-297` (Coverage-Ausgabe).
+- **Befund:** das Rohmaterial liegt vollständig vor. Das ist **Buchhaltung über vorhandene Daten**,
+  keine neue Analyse.
+- **Schritte:** (1) Verdikt einer Funktion trägt die Menge der Assumption-IDs, auf denen ihre
+  entschiedenen Obligations ruhen. (2) `Agg` bekommt drei Zähler: `sound_decided`,
+  `decided_under_assumption`, `genuinely_unknown`. (3) Ausgabe: die drei Buckets **plus** eine
+  Attribution — „welche Annahme trägt wie viele Funktionen allein". (4) Ein UNKNOWN, das unter
+  einem *nicht aktivierten* Bündel decided würde, wird als solches gezählt (Was-wäre-wenn-Spalte);
+  das ist die Steuergröße für AP-6.
+- **Akzeptanz:** jede Coverage-Ausgabe zeigt die drei Buckets; die Attribution nennt für jede
+  aktive Annahme ihren Alleinbeitrag in pp.
+- **Soundness:** der Split *verschärft* die Aussage (er entzieht der Gesamtzahl die Annahmen).
+  **Abhängigkeit:** keine — parallel zu AP-0.1 machbar.
+
+### AP-1.0 — Das `closed_world`-Gate der Feld-Typ-Karte messen `[neu, Audit 2026-07-29]`
+
+- **Anker:** `verifier/wholeprog.rs:119` (`field_types` nur unter `closed_world`, sonst leer),
+  `wholeprog.rs:36/222`, `verifier/run.rs:240-282` (Ketten-Fixpunkt),
+  `symbolic/exec/calls.rs:563` (`size_hinted_pointer`), verdrahtet in `exec/step.rs:21,316`.
+- **Schritte:** `mm` einmal **mit** `--closed-world` gegen den bekannten Lauf ohne rechnen. Zwei
+  mögliche Ausgänge, beide wertvoll: springt decided deutlich → §3 wirkt, und die 72,6-%-Zahl war
+  schlicht gegen die falsche Konfiguration gemessen. Springt es nicht → §3 hat ein echtes Loch,
+  und AP-1.1 wird pro-Residual-Debugging statt Vervollständigung.
+- **Akzeptanz:** eine Zahl, kein Eindruck. Dazu die Frage beantwortet, ob eine **open-world-taugliche
+  Teilmenge** der Feld-Evidenz (Feld-Typen aus demselben Modul, ohne Whole-Program-Overlay) sound
+  konstruierbar ist — wenn ja, ist das der billigste Hebel im ganzen Plan.
+- **Soundness:** reine Messung. **Abhängigkeit:** AP-0.1 wäre schöner, ist aber nicht nötig
+  (`mm` läuft durch). **Vor AP-1.1/1.2/1.3.**
+
+### AP-1.1 — Feld-Typ-Karte end-to-end vervollständigen
+
+- **Schritte:** pro dominanter Residual-Ursache prüfen, ob die `(struct, offset) → pointee`-Karte
+  für `void*`/`union`/`private_data`-Loads einen Typ liefert **und** ob `size_hinted_pointer` damit
+  greift. Bekannte Einschränkung: `size_hinted_pointer` feuert laut `verifier/run.rs:325` nur auf
+  `Prov::Unknown` — ein Zeiger, der schon eine schwache, größenlose Provenance trägt, wird nicht
+  nachträglich dimensioniert. Das ist zu prüfen und ggf. zu erweitern.
+- **Akzeptanz:** ein benanntes Residual-Muster verschwindet **und** die betroffenen Funktionen
+  kippen auf decided (Befund 2: Klassen-Reduktion ohne Funktions-Flip ist kein Fortschritt).
+- **Soundness:** `--closed-world` / `--assume-valid-params`, benannt. **Abhängigkeit:** AP-1.0.
+
+### AP-1.2 — `RetSummary::Field { arg, offset, pointee }`
+
+- **Anker:** `symbolic/summary.rs:91`. Bestand heute: `Unknown`, `Scalar`, `PtrFromArg`,
+  `DanglingStack`, `Alloc`, `ValidRef`. **`Field` fehlt** (verifiziert 2026-07-29).
+- **Schritte:** Variante ergänzen; Ableitung im Summary-Fixpunkt (Callee gibt auf jedem Pfad
+  `&arg->feld` bei beliebigem Offset zurück); Pointee-Typ aus AP-1.1; Anwendung an der Call-Site
+  analog zu `Alloc`/`ValidRef`, also **mit Größe**, damit die In-Bounds-Kaskade wirklich löst
+  (Befund 3).
+- **Akzeptanz:** Residual „loaded value (untyped, no store-load prov)" sinkt messbar **und** Feld-
+  Accessor-lastige Funktionen kippen. Regressionstests: Offset ≠ 0, Kette über zwei Hops.
+- **Soundness:** interprozedural unter denselben benannten Annahmen. **Abhängigkeit:** AP-1.1.
+
+### AP-1.3 — Param-Closure (P2) auf Kernel/Rust ausweiten
+
+- **Anker:** `symbolic/lib.rs:75-81`, `verifier/run.rs:124-127`, `symbolic/exec/step_mem.rs:10-12`,
+  `llvm/lower.rs:408`, `elf/dwarf.rs:3`.
+- **Schritte:** jeder rohe Pointer-Parameter bekommt die schwächste Caller-Garantie **inklusive
+  Größe** (aus dem getypten Argument, nicht nur aus `alloca`). Für C/C++ validiert; auf Kernel/Rust
+  ausdehnen. **Akzeptanz:** „uncontracted parameter" fällt, und zwar *mit* Größe.
+
+### AP-2.1 — Kernel-Idiom-Größen (`--assume-kernel-idioms`)
+
+`page` → `PAGE_SIZE`, per-cpu-Var → Typgröße, `phys_to_virt`/`__va` → Mapping-Größe, `container_of`
+→ Container-Typgröße, `ERR_PTR`/`IS_ERR` → auf der `!IS_ERR`-Kante valide. Als Contract-/Idiom-
+Tabelle, damit die materialisierte Region eine **Größe** trägt — genau der Grund, warum
+`--assume-inttoptr-valid` allein nichts brachte. **Soundness:** opt-in, benannt; die Idiome sind
+kernelspezifische Fakten, kein strikt-sound. **Akzeptanz:** die 22.551 in-bounds-Residuen aus dem
+inttoptr-Experiment sinken, und Funktionen kippen.
+
+### AP-2.2 — Guarded-Access-Beweis breiter
+
+Ein größenloser, aber durch `if (i < n)` beschränkter Zugriff PROVEt in-bounds auch ohne
+Region-Größe (bestehender `assume_guarded_index` / `--assume-field-invariants`, Muster auf
+Feld-Länge und Loop-Bound erweitern).
+
+### AP-3.1 — Container-Invarianten
+
+`list_for_each_entry`, `hlist`, `rb_node`, `xarray`, `llist`: der Iterator bleibt in gültigen,
+**dimensionierten** Knoten des deklarierten Typs (Contract, opt-in). Adressiert den zweitgrößten
+Block im Histogramm.
+
+### AP-3.2 — Induktions-Breite
+
+Mehrdimensionale Arrays, verschachtelte Loops, Sentinel-Loops (`strlen`/`memchr`).
+
+- **Anker/Messhinweis:** das Residual kommt aus `verifier/discharge.rs:315` („reached but not
+  decided by the symbolic memory model: loop body or unsupported op"). Wichtig: die
+  **Visit-Budget-Truncation ist ein eigener String** (`discharge.rs:313`) — die 11.230 sind also
+  echt Loop/unsupported und keine verkappte Budget-Abschneidung. Die Zahl ist sauber.
+- **Akzeptanz:** dieser eine String sinkt; getrennt ausweisen von `discharge.rs:313`.
+
+### AP-4.1 — HVN (Hash-Value-Numbering)
+
+- **Befund:** im ganzen Baum **null Treffer** für HVN/Value-Numbering — nicht angefangen
+  (verifiziert 2026-07-29).
+- **Warum es das Paket der Phase ist:** der Copy-Cycle-Collapse (`collapse_copy_cycles`) ist auf dem
+  Kernel empirisch ein **No-op** (14.190.344 → 14.190.302 Knoten, 0,0 %; der Copy-Graph ist ein
+  DAG). Damit bleibt Full-Kernel-Devirt budget-übersprungen (14,2M > 10M). Ohne HVN ist Phase 4
+  auf dem Kernel wirkungslos.
+- **Schritte:** offline Knoten mit identischer Points-to-Signatur (address-of-Quellen + eingehende
+  Copy-Menge) mergen, analog zur bestehenden Renumerierung.
+- **Soundness:** sound-für-Devirt — Merge *vergrößert* Sets nur, ein Singleton kann dadurch
+  verschwinden, aber nie falsch entstehen. **Akzeptanz:** Knotenzahl unter das 10M-Budget; Devirt
+  läuft auf dem Kernel überhaupt an. Adversariale Tests wie beim Cycle-Collapse.
+- **Alternative, dokumentiert verworfen:** Budget-Raise — 24 GB RSS bei 14M Knoten in diesem Lauf.
+
+### AP-4.2 — Devirt-Breite
+
+vtable-/fnptr-Felder aus dem Closed-World-Initializer, `ops`-Registertabellen,
+`static const struct …_ops`. Großer Ketten-Multiplikator: ein aufgelöster indirekter Call entsperrt
+viele Downstream-Obligations **in derselben Funktion** — genau, was Befund 2 verlangt.
+
+### AP-5.1 — Frontend-Drops
+
+Multi-Index-/Vektor-`getelementptr`, switch auf Nicht-Integer, Typ-Zyklen. Jeder Drop ist teuer
+(ganze Funktion = ein UNKNOWN), die Zahl ist aber klein (1–4 pro Subset).
+
+### AP-5.2 — Wide-Ints > 128 bit
+
+- **Anker:** `core/value.rs:27` (`words: [u64; 2]`), `solver/bitblast.rs:31` (`MAX_WIDTH = 128`),
+  `solver/blaster.rs:52` (alles darüber abgewiesen).
+- **Einordnung:** ein Rewrite des **zentralen Werttyps**, auf dem der gesamte Solver ruht. Der
+  aktuelle Zustand ist sound (> 128 bit → `Const::Undef`/top). **Ein halber Bignum wäre ein
+  Korrektheitsrisiko im Kern — kein Flag macht einen buggy Werttyp sound.** Dieses Paket ist
+  bewusst **spät** und wird nur angefasst, wenn AP-0.1 zeigt, dass Crypto/SIMD messbar wehtut.
+
+### AP-5.3 — ASM-Breite
+
+Offen und verifiziert: x86 String-Ops (`rep movs/stos/scas/lods`) fehlen in **beiden** Decodern;
+`cmpxchg`/`xadd` werden nicht dekodiert (nur der LOCK-Präfix-Fence ist modelliert,
+`asm/x86/lower.rs:16`); SSE/AVX nur Länge + Disassembly-Namen, keine Semantik; x87 gar nicht.
+ARM64: `tbz`/`tbnz` fehlen; Register-Form-ALU, LDP mit Register-Offset, `mul`/`udiv`/`sdiv`,
+`cbz`/`adrp`/`blr` fehlen **im Maschinencode-Decoder** (`asm/arm64.rs`) — im Text-Decoder sind sie
+da. Unbekannte Mnemonik → `unanalyzed`, also sound-degradiert.
+
+### AP-6.1 — Attack-Surface-Scoping (`--attack-surface` + `--closed-world`)
+
+Nur syscall/ioctl-erreichbarer Code braucht adversariale Parameter. Der Rest darf Caller-etablierte,
+**dimensionierte** Invarianten annehmen → decided-unter-Annahme. Verschiebt den genuin harten Kern
+auf die tatsächlich erreichbare Angriffsfläche.
+
+### AP-6.2 — Annahmen-Buchhaltung (hier entsteht die 3 %)
+
+Der Rest-*harte* Kern — kein Annahmen-Bündel schließt ihn — ist die ehrliche Zahl. Ziel: **< 1 %
+genuin hart, < 2 % decided-unter-Annahme.** Baut direkt auf AP-0.2 auf; ohne den Split ist AP-6.2
+nicht formulierbar.
+
+---
+
+## 3. Trajektorie (mit Bandbreite, nicht als Punktprognose)
+
+| Nach | UNKNOWN | decided | tragend |
 |---|---|---|---|
-| heute (SCAN10) | ~70 % | ~30 % | Provenance |
-| A (Provenance) | ~20 % | ~80 % | Loops/Container |
-| B (Loops/Container) | ~12 % | ~88 % | Idiome |
-| C (Kernel-Idiome) | ~7 % | ~93 % | Dispatch |
-| D (Devirt) | ~4 % | ~96 % | Frontend-Lücken |
-| E (Frontend) | ~2 % | ~98 % | genuin-adversarial |
-| F (Annahmen-Schicht) | **< 3 %** ✔ | **> 97 %** | genuin-hart (< 1 %) |
+| heute | ~72 % | ~28 % | — |
+| AP-0 | ~72 % | ~28 % | jetzt *steuerbar* |
+| AP-1 | 45–52 % | 48–55 % | **nur** wenn Größe geliefert wird (Befund 3) |
+| AP-2 | 35–42 % | 58–65 % | benannte Idiome |
+| AP-3 | 28–35 % | 65–72 % | Loops/Container |
+| AP-4 | 20–28 % | 72–80 % | HVN ist Voraussetzung |
+| AP-5 | 18–26 % | 74–82 % | Drops |
+| AP-6 | **≤ 3 %** | **≥ 97 %** | ~80–88 pp sound + ~9–17 pp unter Annahme |
 
-**A–B sind größtenteils sound** (Under-Approximation + `--assume-valid-params`/`--closed-world`).
-**C–D–F ruhen wesentlich auf benannten Annahmen** — hier entsteht die < 3 %, nicht als strikt-sound.
-Die **strikt-sound-decided-Rate** landet realistisch bei **~88–93 %**; die Lücke von dort auf > 97 %
-ist die Annahmen-Schicht.
+Die alte Fassung prognostizierte −50 pp allein aus Phase A. Das tritt nicht ein: Funktionen sind
+multi-kausal (Befund 2), und Provenance ohne Größe verschiebt das Residual nur (Befund 3). Es gibt
+**keinen** einzelnen −50-pp-Sprung; die Zahl entsteht aus allen Paketen zusammen.
 
-## Mess- & Soundness-Disziplin (jede Phase, unverhandelbar)
+## 4. Reihenfolge
 
-1. **Vor Merge:** Miri- + C-ASan/UBSan-Orakel SOUND (0 false PASS/FAIL), volle Testsuite, clippy.
-2. **Fortschritt** per vollem Kernel-Scan (Checkpoint, kein harter Timeout), decided auf
-   **Funktions**-Ebene; pro Phase ein frisches **Residual-Histogramm** (welche Klasse blieb).
-3. **Jede Annahme** als benannte Assumption im Proof-Tree (wie `param-valid`), plus ein
-   **Report-Split**: „sound-decided" vs. „decided-unter-Annahme X" vs. „genuin-UNKNOWN". Ohne
-   diesen Split ist die < 3 %-Zahl nicht interpretierbar.
-4. **Differential auch für die Annahmen:** ein Annahmen-Bundle, das einen Miri-/ASan-UB-Fall zu
-   PASS macht, ist ein Bug im Bundle — die Orakel testen das Bundle mit.
+1. **AP-0.1 + AP-0.2** — unverhandelbar zuerst, parallelisierbar.
+2. **AP-1.0** — eine Messung, potenziell der billigste Hebel im Plan.
+3. **AP-1.1 → 1.2 → 1.3**, jeweils erst nach bestandenem Akzeptanzkriterium des Vorgängers.
+4. **AP-3** früh (großer, provenance-**un**abhängiger Block).
+5. **AP-4.1 vor 4.2** — ohne HVN ist 4.2 auf dem Kernel wirkungslos.
+6. **AP-2, AP-5** parallelisierbar.
+7. **AP-6** zuletzt.
 
-## Priorität nach Hebel × Machbarkeit
+## 5. Wann dieser Plan sein Ziel verfehlt (ehrliche Abbruchkriterien)
 
-1. **Phase A** zuerst und mit Abstand — allein −50 pp, größtenteils sound, klarer Bauplan.
-2. **Phase D (Devirt)** früh vorziehen (kleiner Aufwand, großer Ketten-Multiplikator).
-3. **B, C, E** parallelisierbar, monoton.
-4. **F** zuletzt — es ist Buchhaltung + Scoping, keine Analyse-Präzision; ohne A–E bringt es nichts.
+- **AP-1.0 zeigt keinen Sprung und AP-1.1 findet kein Loch** → Befund 3 ist noch stärker als
+  angenommen; die Trajektorie ab AP-1 ist neu zu schätzen, bevor AP-1.2/1.3 gebaut werden.
+- **HVN bringt die Knotenzahl nicht unter das Budget** → Phase 4 ist auf dem Kernel tot, −3 bis
+  −5 pp entfallen ersatzlos, und ≤ 3 % braucht entsprechend mehr aus der Annahmen-Schicht.
+- **AP-0.2 zeigt, dass die Annahmen-Schicht > 17 pp tragen müsste** → dann ist „≥ 97 % decided"
+  zwar formal erreichbar, aber die Aussage so schwach, dass die 5-%-Zahl die ehrlichere Kennzahl
+  ist. Das ist explizit ein akzeptables Ergebnis; **die Zahl darf nicht das Ziel ersetzen.**
+
+## 6. Mess- & Soundness-Disziplin (jedes Paket)
+
+1. **Vor Merge:** Miri + C-ASan/UBSan SOUND (0 false PASS / 0 false FAIL), volle Testsuite, clippy.
+2. **Fortschritt** per abgeschlossenem Kernel-Scan (AP-0.1), decided auf **Funktions**-Ebene, plus
+   ein frisches Residual-Histogramm — und die Frage „kippten Funktionen wirklich?" (Befund 2).
+3. **Jede Annahme** als benannte Assumption im Proof-Tree; Report-Split sound/Annahme/hart (AP-0.2).
+4. **Differential testet die Annahmen-Bündel mit** — ein Bündel, das einen Orakel-UB-Fall zu PASS
+   macht, ist ein Bug im Bündel.
+
+[`unknown-to-5pct-plan.md`]: ./unknown-to-5pct-plan.md

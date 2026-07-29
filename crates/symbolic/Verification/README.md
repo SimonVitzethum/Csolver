@@ -163,7 +163,7 @@ an access through a tag no longer on the stack is the violation. A merge keeps a
 if all incoming paths agree, else poisons it (checks skipped — sound). Both classes are **record-only**:
 `discharge` queries the decision per Load/Store under the flag and raises a FAIL only on a found
 violation. Remaining (precision, not soundness): exact two-phase/`UnsafeCell`, interprocedural
-protectors — see `Todo.md`.
+protectors — see `TODO.md` (§F) and the archived review `docs/review-2026-07-15.md`.
 
 ## Interprocedural summaries (increment 5)
 Each function gets a [`Summary`] (`summary.rs`): its **effects** (`writes` /

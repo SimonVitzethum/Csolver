@@ -61,7 +61,7 @@ Each entry: **invariant — the check — where.**
   their stored SHA-1 (verified on the Win11 ISO; a self-contained chunk is embedded as a regression).
   Decompression is size-checked, so a decoder mistake is a clean failure, never garbage. —
   `wim_tests.rs`, `lzx` module. **LZMS stays a clean `Unsupported`** (no corpus to verify against —
-  see `Todo.md`).
+  see the archived review `docs/review-2026-07-15.md`).
 - **Every object/container read is bounds-checked.** A truncated/malformed image yields an error,
   never a panic or OOB read. — `elf_tests*.rs` (malformed-input cases).
 

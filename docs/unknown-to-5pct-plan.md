@@ -9,6 +9,18 @@ die letzten paar Prozentpunkte.
 **Kardinalregel unverändert:** nie ein false PASS. Unsound-im-Allgemeinen nur hinter benannter,
 im Proof-Tree sichtbarer Annahme; beide Orakel (Miri + C-ASan/UBSan) pro Schritt.
 
+> **Nachtrag 2026-07-29.** [`unknown-under-3pct-roadmap.md`](./unknown-under-3pct-roadmap.md) ist
+> keine konkurrierende Roadmap mehr, sondern die **Arbeitspaket-Fassung dieses Plans**: dieselben
+> Phasen mit Code-Ankern, Schritten und Akzeptanzkriterien, plus die letzten 2 pp (≤ 5 % → ≤ 3 %),
+> die reines Scoping + Annahmen-Buchhaltung sind. Dieses Dokument bleibt die **Diagnose**
+> (*warum* steckt decided bei 28 %), jenes die **Ausführung**.
+>
+> Ein Code-Audit am 2026-07-29 hat außerdem einen planrelevanten Befund für Phase 1 ergeben:
+> `verifier/src/wholeprog.rs:119` befüllt `field_types` **ausschließlich unter `closed_world`**.
+> Der `mm`-Lauf oben lief **ohne** `--closed-world`, dort war die §3-Feld-Typ-Karte also
+> strukturell wirkungslos — ein billig prüfbarer Kandidat für „warum feuert 1a unterproportional".
+> Als AP-1.0 vor allen anderen Phase-1-Paketen zu messen.
+
 ---
 
 ## 0. Gemessener Ist-Zustand (2026-07-27, aktuelles Binary)
