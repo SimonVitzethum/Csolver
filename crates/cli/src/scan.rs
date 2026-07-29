@@ -55,6 +55,22 @@ pub(crate) struct FileScan {
     /// Phase 0b: sum over this unit's UNKNOWN functions of their **distinct** residual-cause count.
     /// Divided by the UNKNOWN count → mean distinct causes per undecided function (Befund 2).
     pub(crate) sum_distinct_residuals: u64,
+    /// **Phase 0d — report split.** Decided (PASS ∨ FAIL) functions whose proofs rest on **no**
+    /// named assumption: the strictly-sound bucket. `decided − sound_decided` is the rest, so the
+    /// third bucket (genuinely-UNKNOWN) is just `unknown` — a decided count that needs an opt-in
+    /// assumption is a *weaker* claim than one that does not, and without this split the headline
+    /// decided-rate silently mixes the two.
+    pub(crate) sound_decided: u64,
+    /// Phase 0d: decided functions whose proofs rest on **at least one** named assumption.
+    pub(crate) decided_under_assumption: u64,
+    /// Phase 0d attribution: `assumption id → decided functions whose footprint contains it`.
+    /// A function with several assumptions is counted once under **each**, so these overlap and
+    /// do not sum to [`Self::decided_under_assumption`].
+    pub(crate) assumption_fns: std::collections::HashMap<String, u64>,
+    /// Phase 0d attribution: `assumption id → decided functions for which it is the **only**
+    /// assumption`. Disjoint across ids, and a *lower* bound on what dropping the assumption
+    /// would cost — a function resting on several assumptions may need every one of them.
+    pub(crate) assumption_sole_fns: std::collections::HashMap<String, u64>,
 }
 
 /// The syscall-wrapper name prefixes (SYSCALL_DEFINE* expands to these) — precise entry

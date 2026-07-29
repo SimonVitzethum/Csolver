@@ -61,6 +61,14 @@ struct Agg {
     residuals: std::collections::HashMap<String, u64>,
     /// Phase 0b: summed distinct-residual-cause count over UNKNOWN functions (mean via `unknown`).
     sum_distinct_residuals: u64,
+    /// Phase 0d: decided functions resting on **no** named assumption (strictly sound).
+    sound_decided: u64,
+    /// Phase 0d: decided functions resting on **≥1** named assumption.
+    decided_under_assumption: u64,
+    /// Phase 0d: `assumption id → decided functions touching it` (overlapping).
+    assumption_fns: std::collections::HashMap<String, u64>,
+    /// Phase 0d: `assumption id → decided functions for which it is the SOLE assumption` (disjoint).
+    assumption_sole_fns: std::collections::HashMap<String, u64>,
 }
 
 impl Agg {
@@ -92,6 +100,14 @@ impl Agg {
             *self.residuals.entry(reason).or_default() += n;
         }
         self.sum_distinct_residuals += fs.sum_distinct_residuals;
+        self.sound_decided += fs.sound_decided;
+        self.decided_under_assumption += fs.decided_under_assumption;
+        for (id, n) in fs.assumption_fns {
+            *self.assumption_fns.entry(id).or_default() += n;
+        }
+        for (id, n) in fs.assumption_sole_fns {
+            *self.assumption_sole_fns.entry(id).or_default() += n;
+        }
     }
 }
 
@@ -102,6 +118,10 @@ fn ckpt_field(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
 
+/// Checkpoint format marker. Bumped to 2 by the Phase-0d split (records `S` and `A`); a
+/// version-1 file is refused, see [`read_checkpoint`].
+const CKPT_HEADER: &str = "CSOLVER-SCAN-CKPT 2";
+
 /// **Write the scan checkpoint** atomically (temp file + rename), so a crash/reboot mid-write
 /// never corrupts it. Records the coverage counts, every finished unit's label (the resume set),
 /// and the de-duplicated findings — enough to reconstruct the coverage report and the full bug
@@ -109,10 +129,17 @@ fn ckpt_field(s: &str) -> String {
 /// checkpointed: those oracles re-run over whatever units the resumed pass covers, so their
 /// reports may be partial after a resume — an accepted trade-off, as the memory-safety findings
 /// and coverage (the payload) are fully recovered and the race report is intentionally capped.
+///
+/// **Format version 2** adds the Phase-0d split (`S`) and its per-assumption attribution (`A`).
+/// A version-1 checkpoint is *rejected* rather than resumed: it carries `pass`/`fail` counts but
+/// no assumption footprint for them, so resuming one would print a split whose sound bucket is
+/// silently short by every function the interrupted run had already decided. A wrong split is
+/// worse than no split — this feature exists to stop exactly that kind of quiet mis-measurement.
 fn write_checkpoint(path: &Path, agg: &Agg) {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(agg.findings.len() * 64 + agg.done.len() * 32);
-    s.push_str("CSOLVER-SCAN-CKPT 1\n");
+    s.push_str(CKPT_HEADER);
+    s.push('\n');
     let _ = writeln!(s, "C\t{}\t{}\t{}\t{}\t{}", agg.pass, agg.fail, agg.unknown, agg.dropped, agg.errored);
     for label in &agg.done {
         let _ = writeln!(s, "D\t{}", ckpt_field(label));
@@ -127,6 +154,11 @@ fn write_checkpoint(path: &Path, agg: &Agg) {
         let _ = writeln!(s, "R\t{n}\t{}", ckpt_field(reason));
     }
     let _ = writeln!(s, "M\t{}", agg.sum_distinct_residuals);
+    let _ = writeln!(s, "S\t{}\t{}", agg.sound_decided, agg.decided_under_assumption);
+    for (id, n) in &agg.assumption_fns {
+        let sole = agg.assumption_sole_fns.get(id).copied().unwrap_or(0);
+        let _ = writeln!(s, "A\t{n}\t{sole}\t{}", ckpt_field(id));
+    }
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, s.as_bytes()).is_ok() {
         let _ = std::fs::rename(&tmp, path);
@@ -140,7 +172,18 @@ fn write_checkpoint(path: &Path, agg: &Agg) {
 fn read_checkpoint(path: &Path) -> Option<Agg> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
-    if lines.next()? != "CSOLVER-SCAN-CKPT 1" {
+    let header = lines.next()?;
+    if header != CKPT_HEADER {
+        // Say so rather than silently restarting: a rejected checkpoint can cost hours, and the
+        // operator needs to know the run began from scratch (and why) to read the result.
+        if header.starts_with("CSOLVER-SCAN-CKPT ") {
+            eprintln!(
+                "  checkpoint {} is format `{header}`, this build writes `{CKPT_HEADER}` — starting fresh.\n  \
+                 (A pre-0d checkpoint has no assumption footprint for the functions it already decided, \
+                 so resuming it would print a sound/under-assumption split that is silently short.)",
+                path.display()
+            );
+        }
         return None;
     }
     let mut agg = Agg::default();
@@ -167,6 +210,21 @@ fn read_checkpoint(path: &Path) -> Option<Agg> {
             }
             Some("M") => {
                 agg.sum_distinct_residuals += it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            }
+            Some("S") => {
+                let mut n = || it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                agg.sound_decided = n();
+                agg.decided_under_assumption = n();
+            }
+            Some("A") => {
+                let n = it.next().and_then(|v| v.parse::<u64>().ok());
+                let sole = it.next().and_then(|v| v.parse::<u64>().ok());
+                if let (Some(n), Some(sole), Some(id)) = (n, sole, it.next()) {
+                    *agg.assumption_fns.entry(id.to_string()).or_default() += n;
+                    if sole > 0 {
+                        *agg.assumption_sole_fns.entry(id.to_string()).or_default() += sole;
+                    }
+                }
             }
             Some("F") => {
                 if let (Some(file), Some(function), Some(property), Some(witness)) =
@@ -428,6 +486,10 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
         done: _,
         residuals,
         sum_distinct_residuals,
+        sound_decided,
+        decided_under_assumption,
+        assumption_fns,
+        assumption_sole_fns,
     } = agg.into_inner().unwrap_or_else(|p| p.into_inner());
     findings.sort_by_cached_key(finding_key);
     let lock_edges: Vec<(String, String, String)> = lock_edges.into_iter().collect();
@@ -477,7 +539,11 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // a slow or capped concurrency pass never delays or blocks the result the scan exists to give.
     let code = report_scan(
         &findings,
-        &Coverage { pass, fail, unknown, dropped, errored, residuals: &residuals, sum_distinct_residuals },
+        &Coverage {
+            pass, fail, unknown, dropped, errored, residuals: &residuals, sum_distinct_residuals,
+            sound_decided, decided_under_assumption,
+            assumption_fns: &assumption_fns, assumption_sole_fns: &assumption_sole_fns,
+        },
     );
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses, concurrent.as_ref());
@@ -627,7 +693,48 @@ pub(crate) type FindingKey = (String, String, String);
 
 #[cfg(test)]
 mod tests {
-    use super::is_init_lifecycle;
+    use super::{is_init_lifecycle, read_checkpoint, write_checkpoint, Agg, CKPT_HEADER};
+
+    /// The Phase-0d split must survive a checkpoint/resume, or a resumed long scan reports a
+    /// sound bucket short by everything the interrupted run had already decided.
+    #[test]
+    fn checkpoint_round_trips_the_assumption_split() {
+        let mut agg = Agg { pass: 7, fail: 1, unknown: 2, sound_decided: 3, decided_under_assumption: 5, ..Default::default() };
+        agg.assumption_fns.insert("param-valid".to_string(), 5);
+        agg.assumption_fns.insert("alloc-succeeds".to_string(), 2);
+        agg.assumption_sole_fns.insert("param-valid".to_string(), 4);
+
+        let path = std::env::temp_dir().join("csolver-ckpt-split-roundtrip.ckpt");
+        write_checkpoint(&path, &agg);
+        let Some(back) = read_checkpoint(&path) else {
+            panic!("a checkpoint this build just wrote must load")
+        };
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(back.sound_decided, 3);
+        assert_eq!(back.decided_under_assumption, 5);
+        assert_eq!(back.assumption_fns.get("param-valid"), Some(&5));
+        assert_eq!(back.assumption_fns.get("alloc-succeeds"), Some(&2));
+        assert_eq!(back.assumption_sole_fns.get("param-valid"), Some(&4));
+        // Sole counts are recorded per assumption, so an id that never stood alone must not
+        // acquire a phantom entry on the way through the file.
+        assert_eq!(back.assumption_sole_fns.get("alloc-succeeds"), None);
+    }
+
+    /// A pre-0d checkpoint carries decided counts but no assumption footprint for them. Resuming
+    /// it would print a split that is silently wrong, so it must be refused outright.
+    #[test]
+    fn a_pre_split_checkpoint_is_refused_not_resumed() {
+        let path = std::env::temp_dir().join("csolver-ckpt-v1-refused.ckpt");
+        let old = "CSOLVER-SCAN-CKPT 1\nC\t7\t1\t2\t0\t0\nD\tunit-a\n";
+        assert_ne!(old.lines().next(), Some(CKPT_HEADER), "the v1 header must differ from ours");
+        if std::fs::write(&path, old).is_err() {
+            return;
+        }
+        let loaded = read_checkpoint(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_none(), "a version-1 checkpoint must not be resumed");
+    }
 
     #[test]
     fn init_lifecycle_classification() {

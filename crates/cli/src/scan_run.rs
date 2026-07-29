@@ -122,6 +122,9 @@ pub(crate) fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[Stri
     let mut race_traces: Vec<(String, Vec<(u8, String)>)> = Vec::new();
     let mut residuals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut sum_distinct_residuals = 0u64;
+    let (mut sound_decided, mut decided_under_assumption) = (0u64, 0u64);
+    let mut assumption_fns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut assumption_sole_fns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for fs in all {
         pass += fs.pass;
         fail += fs.fail;
@@ -134,6 +137,10 @@ pub(crate) fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[Stri
         race_traces.extend(fs.race_traces);
         for (reason, n) in fs.residuals { *residuals.entry(reason).or_default() += n; }
         sum_distinct_residuals += fs.sum_distinct_residuals;
+        sound_decided += fs.sound_decided;
+        decided_under_assumption += fs.decided_under_assumption;
+        for (id, n) in fs.assumption_fns { *assumption_fns.entry(id).or_default() += n; }
+        for (id, n) in fs.assumption_sole_fns { *assumption_sole_fns.entry(id).or_default() += n; }
     }
     let mut seen_find = HashSet::new();
     findings.retain(|f| seen_find.insert(finding_key(f)));
@@ -182,7 +189,11 @@ pub(crate) fn scan_reachable(dir: &Path, config: &Config, entry_patterns: &[Stri
     report_atomicity(&race_traces, entry_patterns, Some(&concurrent_fns));
     report_scan(
         &findings,
-        &Coverage { pass, fail, unknown, dropped, errored, residuals: &residuals, sum_distinct_residuals },
+        &Coverage {
+            pass, fail, unknown, dropped, errored, residuals: &residuals, sum_distinct_residuals,
+            sound_decided, decided_under_assumption,
+            assumption_fns: &assumption_fns, assumption_sole_fns: &assumption_sole_fns,
+        },
     )
 }
 
@@ -207,16 +218,41 @@ pub(crate) fn tally_residuals(fs: &mut FileScan, f: &csolver_verifier::FunctionR
     fs.sum_distinct_residuals += distinct.len() as u64;
 }
 
+/// **Phase 0d — report split.** Bucket one *decided* (PASS ∨ FAIL) function as strictly-sound or
+/// decided-under-assumption, and record which assumptions carried it.
+///
+/// Two attributions are kept because together they **bracket** an assumption's contribution.
+/// `assumption_fns` counts every decided function naming it (overlapping — a function with three
+/// assumptions is counted under each), an upper bound that over-credits a mere co-occurrence.
+/// `assumption_sole_fns` counts the functions where it stands alone (disjoint), a lower bound —
+/// a function resting on three assumptions can still need all three, so dropping this one would
+/// cost more than the sole count suggests. Neither is the exact figure; see `report_assumption_split`.
+pub(crate) fn tally_assumptions(fs: &mut FileScan, f: &csolver_verifier::FunctionReport) {
+    let ids = f.assumption_footprint();
+    if ids.is_empty() {
+        fs.sound_decided += 1;
+        return;
+    }
+    fs.decided_under_assumption += 1;
+    if let [only] = ids.as_slice() {
+        *fs.assumption_sole_fns.entry(only.clone()).or_default() += 1;
+    }
+    for id in ids {
+        *fs.assumption_fns.entry(id).or_default() += 1;
+    }
+}
+
 pub(crate) fn scan_linked_module(module: &csolver_ir::Module, label: &str, cfg: &Config) -> FileScan {
     use csolver_core::ObligationResult;
     let mut fs = FileScan { dropped: module.unanalyzed.len() as u64, ..Default::default() };
     let report = verify_module_with_threads(module, cfg, 1);
     for f in &report.functions {
         match f.verdict {
-            Verdict::Pass => fs.pass += 1,
+            Verdict::Pass => { fs.pass += 1; tally_assumptions(&mut fs, f); }
             Verdict::Unknown => { fs.unknown += 1; tally_residuals(&mut fs, f); }
             Verdict::Fail => {
                 fs.fail += 1;
+                tally_assumptions(&mut fs, f);
                 for o in &f.outcomes {
                     if let ObligationResult::Refuted(cx) = &o.result {
                         let witness = cx
@@ -357,10 +393,11 @@ pub(crate) fn scan_one_unit(
     fs.truncated = report.any_truncated();
     for f in &report.functions {
         match f.verdict {
-            Verdict::Pass => fs.pass += 1,
+            Verdict::Pass => { fs.pass += 1; tally_assumptions(&mut fs, f); }
             Verdict::Unknown => { fs.unknown += 1; tally_residuals(&mut fs, f); }
             Verdict::Fail => {
                 fs.fail += 1;
+                tally_assumptions(&mut fs, f);
                 for o in &f.outcomes {
                     if let ObligationResult::Refuted(cx) = &o.result {
                         let witness = cx

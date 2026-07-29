@@ -18,8 +18,14 @@ Stacked-Borrows-**Protectors** (§F — seit `9231b06` gebaut), die **ARM64-ASM-
 nur den Maschinencode-Decoder, nicht den Text-Decoder) und der **Taxonomie-Doku-Nit** (seit
 `cc2d270` erledigt).
 
+**Nachtrag: der Report-Split (0d / AP-0.2) ist am 2026-07-29 geschiffft.** `scan` bricht die
+decided-Rate jetzt in sound-decided / decided-unter-Annahme / genuin-UNKNOWN auf und attribuiert
+den mittleren Bucket. Erste Messung auf `tests/dwarf-corpus`: 27 decided, davon **11 sound** —
+knapp 60 % der decided-Rate ruhten auf einer Annahme. Details und der Klammer-Befund zur
+Attribution in `docs/unknown-under-3pct-roadmap.md`.
+
 Bestätigt offen: HVN (null Treffer im Baum), `RetSummary::Field` (`summary.rs:91` kennt
-`Unknown`/`Scalar`/`PtrFromArg`/`DanglingStack`/`Alloc`/`ValidRef`), Report-Split 0d,
+`Unknown`/`Scalar`/`PtrFromArg`/`DanglingStack`/`Alloc`/`ValidRef`),
 `StackIntegrity`/`ValidStackFrame` (nur in `core/src/property.rs` deklariert, nirgends emittiert),
 Wide-Ints (`core/src/value.rs:27` + `MAX_WIDTH = 128`), `ValidPointerArith` (`RefuteMode::Off`,
 `checks.rs:343`), Inter-Thread-Races (HB-Pruning ist da, `datarace.rs:65-118` — aber es bleibt

@@ -94,23 +94,36 @@ wird — nicht „fühlt sich besser an"), **Soundness**, **Abhängigkeit**.
   ist ab dann *die* Referenzzahl; alle pp-Angaben unten beziehen sich darauf.
 - **Soundness:** n/a (Messinfrastruktur). **Abhängigkeit:** keine. **Zuerst.**
 
-### AP-0.2 — Report-Split (sound / unter-Annahme / genuin-hart)
+### AP-0.2 — Report-Split (sound / unter-Annahme / genuin-hart) ✅ **erledigt 2026-07-29**
 
-- **Anker:** `verifier/assumptions.rs` (15 benannte Assumptions: `param-valid`, `inttoptr-valid`,
-  `closed-world-devirt`, `alloc-succeeds`, `debuginfo`, …), `report/lib.rs:88` (`ByAssumption`
-  existiert bereits als Discharge-Grund), `cli/findings.rs:274-297` (Coverage-Ausgabe).
-- **Befund:** das Rohmaterial liegt vollständig vor. Das ist **Buchhaltung über vorhandene Daten**,
-  keine neue Analyse.
-- **Schritte:** (1) Verdikt einer Funktion trägt die Menge der Assumption-IDs, auf denen ihre
-  entschiedenen Obligations ruhen. (2) `Agg` bekommt drei Zähler: `sound_decided`,
-  `decided_under_assumption`, `genuinely_unknown`. (3) Ausgabe: die drei Buckets **plus** eine
-  Attribution — „welche Annahme trägt wie viele Funktionen allein". (4) Ein UNKNOWN, das unter
-  einem *nicht aktivierten* Bündel decided würde, wird als solches gezählt (Was-wäre-wenn-Spalte);
-  das ist die Steuergröße für AP-6.
-- **Akzeptanz:** jede Coverage-Ausgabe zeigt die drei Buckets; die Attribution nennt für jede
-  aktive Annahme ihren Alleinbeitrag in pp.
+- **Anker:** `verifier/report.rs` (`FunctionReport::assumption_footprint` / `is_sound_decided`),
+  `cli/scan_run.rs` (`tally_assumptions`), `cli/findings.rs` (`report_assumption_split`),
+  `cli/scan_dir.rs` (Aggregation + Checkpoint-Format 2).
+- **Befund bei der Umsetzung:** das Rohmaterial lag vollständig vor — `ProofTree.assumptions`
+  trägt die IDs seit jeher, `run.rs` sammelte sie nur modulweit ein, ohne Zuordnung zur Funktion.
+  Es war reine Buchhaltung, keine neue Analyse.
+- **Umgesetzt:** jede *entschiedene* Funktion bekommt ihren Assumption-Fußabdruck (Vereinigung
+  über alle ihre Obligations — bei FAIL bewusst auch über die nicht-refutierten, denn der Zustand,
+  in dem der Zeuge gefunden wurde, kann von einer Annahme geformt sein). Leerer Fußabdruck →
+  sound-decided. Die Ausgabe zeigt die drei Buckets plus eine Attributionstabelle, und der
+  Checkpoint trägt beides über einen Resume (Format-Version 2; eine Version-1-Datei wird
+  **abgelehnt** statt fortgesetzt — sie hätte Decided-Zähler ohne Fußabdruck und würde einen
+  stillschweigend zu kleinen Sound-Bucket drucken).
+- **Erste Messung** (`tests/dwarf-corpus`, 38 Funktionen, Standardflags): 27 decided, davon
+  **11 sound** und 16 unter Annahme. Also ~59 % der decided-Rate ruhen auf einer Annahme.
+- **Wichtiger Befund aus dem Differential — die Attribution ist eine Klammer, kein Wert.**
+  `param-valid` stand mit `touching 10 / sole 3` in der Tabelle. Ein Rerun mit
+  `--no-assume-valid-params` kostete **10** entschiedene Funktionen, nicht 3: der Sole-Wert ist
+  eine **untere** Schranke (eine Funktion mit drei Annahmen kann alle drei brauchen), der
+  Touching-Wert eine **obere**. Die exakte Zahl liefert nur ein Differential-Rerun mit
+  abgeschalteter Annahme. Der Report sagt das jetzt selbst dazu, statt eine Spalte zu wählen und
+  Präzision zu suggerieren, die sie nicht hat. Kontrollpunkt derselben Messung: sound-decided
+  blieb bei genau 11, während decided von 27 auf 17 fiel — der Split misst also das Richtige.
 - **Soundness:** der Split *verschärft* die Aussage (er entzieht der Gesamtzahl die Annahmen).
-  **Abhängigkeit:** keine — parallel zu AP-0.1 machbar.
+- **Noch offen aus dem ursprünglichen Zuschnitt:** die Was-wäre-wenn-Spalte („dieses UNKNOWN
+  würde unter einem *nicht aktivierten* Bündel decided") fehlt. Sie braucht einen Mehrfachlauf
+  oder eine Annahmen-Gegenrechnung im Executor und ist damit kein Buchhaltungsposten mehr —
+  sie wandert zu **AP-6.2**, wo sie ohnehin gebraucht wird.
 
 ### AP-1.0 — Das `closed_world`-Gate der Feld-Typ-Karte messen `[neu, Audit 2026-07-29]`
 
@@ -266,7 +279,8 @@ multi-kausal (Befund 2), und Provenance ohne Größe verschiebt das Residual nur
 
 ## 4. Reihenfolge
 
-1. **AP-0.1 + AP-0.2** — unverhandelbar zuerst, parallelisierbar.
+1. ~~**AP-0.2**~~ ✅ erledigt (2026-07-29). **AP-0.1** bleibt zuerst — ohne abgeschlossenen
+   Kernel-Lauf hat der Split keine belastbare Grundgesamtheit.
 2. **AP-1.0** — eine Messung, potenziell der billigste Hebel im Plan.
 3. **AP-1.1 → 1.2 → 1.3**, jeweils erst nach bestandenem Akzeptanzkriterium des Vorgängers.
 4. **AP-3** früh (großer, provenance-**un**abhängiger Block).

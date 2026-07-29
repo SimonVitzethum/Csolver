@@ -253,11 +253,10 @@ pub(crate) fn report_atomicity(
 /// A scan's coverage tally: the per-verdict function counts plus the residual data that
 /// explains the UNKNOWNs.
 ///
-/// Passed as one value rather than as positional arguments because the set **grows**: the
-/// Phase-0d report split adds sound-decided / decided-under-assumption / genuinely-hard
-/// counters on top of these. A widening positional signature is exactly where transposed-
-/// argument bugs come from, and every field here is a bare `u64`, so the compiler would not
-/// catch the transposition.
+/// Passed as one value rather than as positional arguments because the set **grows** — the
+/// Phase-0d split below is the first such growth. A widening positional signature is exactly
+/// where transposed-argument bugs come from, and nearly every field here is a bare `u64`, so
+/// the compiler would not catch the transposition.
 pub(crate) struct Coverage<'a> {
     /// Functions proven safe.
     pub(crate) pass: u64,
@@ -274,11 +273,84 @@ pub(crate) struct Coverage<'a> {
     /// Phase 0b: summed distinct-residual-cause count over UNKNOWN functions (mean via
     /// [`Coverage::unknown`]).
     pub(crate) sum_distinct_residuals: u64,
+    /// **Phase 0d:** decided functions resting on **no** named assumption (strictly sound).
+    pub(crate) sound_decided: u64,
+    /// Phase 0d: decided functions resting on **≥1** named assumption.
+    pub(crate) decided_under_assumption: u64,
+    /// Phase 0d attribution: `assumption id → decided functions touching it` (overlapping;
+    /// an **upper** bound on its contribution).
+    pub(crate) assumption_fns: &'a std::collections::HashMap<String, u64>,
+    /// Phase 0d attribution: `assumption id → decided functions for which it is the SOLE
+    /// assumption` (disjoint; a **lower** bound on its contribution).
+    pub(crate) assumption_sole_fns: &'a std::collections::HashMap<String, u64>,
+}
+
+/// **Phase 0d — the report split.** Break the headline decided-rate into *strictly sound*,
+/// *decided under a named assumption* and *genuinely UNKNOWN*, and attribute the middle bucket
+/// to the assumptions that carry it.
+///
+/// Without this, "decided" silently mixes two claims of very different strength: "proven, full
+/// stop" and "proven, provided you accept that every raw pointer parameter is valid". A target
+/// like ≤ 5 % UNKNOWN is not interpretable until the two are separated — which bucket moved
+/// decides whether the number means more analysis or merely more assuming.
+///
+/// The two attribution columns **bracket** an assumption's contribution; neither one is it.
+/// `functions` counts every decided function whose footprint mentions the assumption — an upper
+/// bound, since an assumption that merely rides along with a load-bearing one is credited the
+/// same. `sole` counts the functions where it is the *only* assumption — a lower bound, since a
+/// function resting on three assumptions may well need all three.
+///
+/// Measured on `tests/dwarf-corpus`: `param-valid` showed `functions 10 / sole 3`, and re-running
+/// with `--no-assume-valid-params` cost **10** decided functions. The true contribution sat at the
+/// top of the bracket, not at `sole`. Only a differential re-run pins it down exactly, which a
+/// single pass cannot do — so the report brackets it and says so rather than picking a column and
+/// implying precision it does not have.
+fn report_assumption_split(cov: &Coverage<'_>, pct: &dyn Fn(u64) -> f64) {
+    let decided = cov.pass + cov.fail;
+    println!("\n== decided, split by soundness (Phase 0d) ==");
+    println!(
+        "  sound-decided        : {}  ({:.1}%)   no named assumption in the proof",
+        cov.sound_decided,
+        pct(cov.sound_decided)
+    );
+    println!(
+        "  decided-under-assump.: {}  ({:.1}%)   rests on >=1 opt-in assumption",
+        cov.decided_under_assumption,
+        pct(cov.decided_under_assumption)
+    );
+    println!(
+        "  genuinely UNKNOWN    : {}  ({:.1}%)   no assumption bundle closed it",
+        cov.unknown,
+        pct(cov.unknown)
+    );
+    // A mismatch means a decided function reached the report without passing through the split —
+    // say so instead of printing three numbers that quietly fail to add up.
+    let bucketed = cov.sound_decided + cov.decided_under_assumption;
+    if bucketed != decided {
+        println!("  !! {bucketed} functions bucketed but {decided} decided — split is incomplete");
+    }
+    if cov.assumption_fns.is_empty() {
+        return;
+    }
+    let mut ranked: Vec<(&String, &u64)> = cov.assumption_fns.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    println!("\n== which assumption carries the decided rate ==");
+    println!("  {:>9}  {:>9}   assumption", "touching", "sole");
+    for (id, n) in ranked {
+        let sole = cov.assumption_sole_fns.get(id).copied().unwrap_or(0);
+        println!("  {n:>9}  {sole:>9}   {id}");
+    }
+    println!(
+        "  (touching = decided functions naming it at all, an UPPER bound on its contribution;\n   \
+         sole = those where it is the only assumption, a LOWER bound. The exact cost of dropping\n   \
+         one is a differential re-run with it disabled — these two bracket it.)"
+    );
 }
 
 /// Render a scan's findings + coverage and pick the exit code.
 pub(crate) fn report_scan(findings: &[Finding], cov: &Coverage<'_>) -> Result<ExitCode, String> {
-    let &Coverage { pass, fail, unknown, dropped, errored, residuals, sum_distinct_residuals } = cov;
+    // The Phase-0d fields are read straight off `cov` by `report_assumption_split`.
+    let &Coverage { pass, fail, unknown, dropped, errored, residuals, sum_distinct_residuals, .. } = cov;
     let total = pass + fail + unknown;
     let pct = |x: u64| if total == 0 { 0.0 } else { 100.0 * x as f64 / total as f64 };
     println!("\n== memory-safety violations found ({}) ==", findings.len());
@@ -297,6 +369,7 @@ pub(crate) fn report_scan(findings: &[Finding], cov: &Coverage<'_>) -> Result<Ex
     println!("decided (PASS+FAIL)  : {}  ({:.1}%)", pass + fail, pct(pass + fail));
     println!("dropped (unanalyzed) : {dropped}   (functions the frontend could not lower)");
     println!("files with tool error: {errored}");
+    report_assumption_split(cov, &pct);
     // Residual histogram (Phase 0a): why functions were left UNKNOWN. The single measurement that
     // drives the UNKNOWN-reduction plan — it shows which residual CLASS dominates, and (across
     // runs) whether closing a class actually flips functions or just moves the residual elsewhere.

@@ -52,6 +52,115 @@ impl FunctionReport {
             .filter(|o| o.verdict() == verdict)
             .count()
     }
+
+    /// **Assumption footprint** (Phase 0d): the ids of every named assumption this function's
+    /// proofs rest on, sorted and deduplicated. Empty ⇒ the function is decided **strictly
+    /// soundly**, with no opt-in assumption in the chain.
+    ///
+    /// Deliberately collected over **all** of the function's obligations, not only over the ones
+    /// carrying its verdict. A `Fail` is witnessed by a `Refuted` counterexample, which holds no
+    /// assumption record of its own — but the symbolic state that counterexample was found in may
+    /// have been *shaped* by one (`param-valid` is what materialises a parameter's region in the
+    /// first place). Attributing the whole function is therefore the conservative reading: it can
+    /// only move a function out of the sound bucket, never into it.
+    pub fn assumption_footprint(&self) -> Vec<String> {
+        let mut ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for o in &self.outcomes {
+            if let csolver_core::ObligationResult::Proven(tree) = &o.result {
+                ids.extend(tree.assumptions.iter().map(String::as_str));
+            }
+        }
+        ids.into_iter().map(str::to_string).collect()
+    }
+
+    /// Whether this function is **decided strictly soundly**: a `Pass`/`Fail` verdict with an
+    /// empty [`assumption_footprint`](Self::assumption_footprint). An `Unknown` is never
+    /// sound-decided — it is not decided at all.
+    pub fn is_sound_decided(&self) -> bool {
+        self.verdict != Verdict::Unknown && self.assumption_footprint().is_empty()
+    }
+}
+
+#[cfg(test)]
+mod footprint_tests {
+    use super::{FunctionReport, ObligationOutcome};
+    use csolver_core::proof::{Justification, ProofStep, ProofTree};
+    use csolver_core::{Location, ObligationId, ObligationResult, ProofObligation, SafetyProperty, Verdict};
+
+    fn proven(assumptions: &[&str]) -> ObligationResult {
+        let step = ProofStep {
+            conclusion: "c".to_string(),
+            justification: Justification::Axiom { name: "test".to_string() },
+            premises: Vec::new(),
+        };
+        ObligationResult::Proven(
+            ProofTree::new(step).with_assumptions(assumptions.iter().map(|s| (*s).to_string()).collect()),
+        )
+    }
+
+    fn func(verdict: Verdict, results: Vec<ObligationResult>) -> FunctionReport {
+        let outcomes = results
+            .into_iter()
+            .map(|result| ObligationOutcome {
+                obligation: ProofObligation::new(
+                    ObligationId(0),
+                    SafetyProperty::InBounds,
+                    Location::level_only(csolver_core::SourceLevel::Llvm),
+                    "p",
+                ),
+                result,
+            })
+            .collect();
+        FunctionReport {
+            function: "f".to_string(),
+            verdict,
+            outcomes,
+            truncated: false,
+            lock_edges: Vec::new(),
+            race_accesses: Vec::new(),
+            race_trace: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_proof_with_no_assumption_is_sound_decided() {
+        let f = func(Verdict::Pass, vec![proven(&[])]);
+        assert!(f.assumption_footprint().is_empty());
+        assert!(f.is_sound_decided());
+    }
+
+    #[test]
+    fn the_footprint_is_deduplicated_and_sorted() {
+        let f = func(
+            Verdict::Pass,
+            vec![proven(&["param-valid", "alloc-succeeds"]), proven(&["param-valid"])],
+        );
+        assert_eq!(f.assumption_footprint(), vec!["alloc-succeeds", "param-valid"]);
+        assert!(!f.is_sound_decided(), "an assumption in the chain rules out the sound bucket");
+    }
+
+    /// An UNKNOWN is not decided at all, so it can never be sound-decided — even though its
+    /// (absent) footprint is empty, which is the trap a naive `footprint.is_empty()` would fall into.
+    #[test]
+    fn an_undecided_function_is_never_sound_decided() {
+        let open = ObligationResult::Open { residual: Vec::new(), suggested: Vec::new() };
+        let f = func(Verdict::Unknown, vec![open]);
+        assert!(f.assumption_footprint().is_empty());
+        assert!(!f.is_sound_decided());
+    }
+
+    /// A FAIL is witnessed by a `Refuted`, which carries no assumption of its own — but the state
+    /// the witness was found in may have been shaped by one, so the whole function is attributed.
+    #[test]
+    fn a_fail_inherits_the_assumptions_of_its_other_obligations() {
+        let refuted = ObligationResult::Refuted(csolver_core::CounterExample::new(
+            "oob",
+            csolver_core::Model { assignments: Vec::new() },
+        ));
+        let f = func(Verdict::Fail, vec![refuted, proven(&["param-valid"])]);
+        assert_eq!(f.assumption_footprint(), vec!["param-valid"]);
+        assert!(!f.is_sound_decided(), "a FAIL found under an assumption is not sound-decided");
+    }
 }
 
 /// The verification result for a whole module.
