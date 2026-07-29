@@ -475,7 +475,10 @@ pub(crate) fn scan_dir(dir: &Path, config: &Config, cross_file: bool, whole_prog
     // the `--attack-surface` subset) — then the concurrency heuristics. At whole-kernel scale the
     // concurrency reports are large and their pairwise search is expensive; running them last means
     // a slow or capped concurrency pass never delays or blocks the result the scan exists to give.
-    let code = report_scan(&findings, pass, fail, unknown, dropped, errored, &residuals, sum_distinct_residuals);
+    let code = report_scan(
+        &findings,
+        &Coverage { pass, fail, unknown, dropped, errored, residuals: &residuals, sum_distinct_residuals },
+    );
     report_lock_cycles(&lock_edges);
     report_data_races(&race_accesses, concurrent.as_ref());
     report_atomicity(&race_traces, entry_patterns, concurrent.as_ref());

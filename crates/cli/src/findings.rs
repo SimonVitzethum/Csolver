@@ -250,17 +250,35 @@ pub(crate) fn report_atomicity(
     }
 }
 
+/// A scan's coverage tally: the per-verdict function counts plus the residual data that
+/// explains the UNKNOWNs.
+///
+/// Passed as one value rather than as positional arguments because the set **grows**: the
+/// Phase-0d report split adds sound-decided / decided-under-assumption / genuinely-hard
+/// counters on top of these. A widening positional signature is exactly where transposed-
+/// argument bugs come from, and every field here is a bare `u64`, so the compiler would not
+/// catch the transposition.
+pub(crate) struct Coverage<'a> {
+    /// Functions proven safe.
+    pub(crate) pass: u64,
+    /// Functions with a refuted obligation (a bug with a witness).
+    pub(crate) fail: u64,
+    /// Functions left undecided.
+    pub(crate) unknown: u64,
+    /// Functions the frontend could not lower (each one is itself an UNKNOWN).
+    pub(crate) dropped: u64,
+    /// Files that failed with a tool error.
+    pub(crate) errored: u64,
+    /// **Residual histogram** `reason → count` over all UNKNOWN functions (Phase 0a).
+    pub(crate) residuals: &'a std::collections::HashMap<String, u64>,
+    /// Phase 0b: summed distinct-residual-cause count over UNKNOWN functions (mean via
+    /// [`Coverage::unknown`]).
+    pub(crate) sum_distinct_residuals: u64,
+}
+
 /// Render a scan's findings + coverage and pick the exit code.
-pub(crate) fn report_scan(
-    findings: &[Finding],
-    pass: u64,
-    fail: u64,
-    unknown: u64,
-    dropped: u64,
-    errored: u64,
-    residuals: &std::collections::HashMap<String, u64>,
-    sum_distinct_residuals: u64,
-) -> Result<ExitCode, String> {
+pub(crate) fn report_scan(findings: &[Finding], cov: &Coverage<'_>) -> Result<ExitCode, String> {
+    let &Coverage { pass, fail, unknown, dropped, errored, residuals, sum_distinct_residuals } = cov;
     let total = pass + fail + unknown;
     let pct = |x: u64| if total == 0 { 0.0 } else { 100.0 * x as f64 / total as f64 };
     println!("\n== memory-safety violations found ({}) ==", findings.len());

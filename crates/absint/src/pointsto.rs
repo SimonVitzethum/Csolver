@@ -914,7 +914,12 @@ impl ProgramPointsTo {
                 }
                 if ci < adj[v as usize].len() {
                     let w = adj[v as usize][ci];
-                    dfs.last_mut().unwrap().1 += 1;
+                    // Advance this frame's child cursor before descending. The `dfs.last()`
+                    // above just succeeded, so the frame is there; `if let` rather than an
+                    // unwrap keeps the loop panic-free by construction.
+                    if let Some(top) = dfs.last_mut() {
+                        top.1 = ci + 1;
+                    }
                     if index[w as usize] == u32::MAX {
                         dfs.push((w, 0));
                     } else if on_stack[w as usize] {
@@ -923,8 +928,11 @@ impl ProgramPointsTo {
                 } else {
                     // Finished v: if it roots an SCC, pop the component.
                     if low[v as usize] == index[v as usize] {
-                        loop {
-                            let w = stack.pop().unwrap();
+                        // Pop the component down to and including its root `v`. Tarjan
+                        // guarantees `v` is on the stack, so the loop always breaks at it;
+                        // draining on `None` instead of unwrapping means a hypothetical
+                        // invariant break degrades to a terminating loop, not a panic.
+                        while let Some(w) = stack.pop() {
                             on_stack[w as usize] = false;
                             comp[w as usize] = ncomp;
                             if w == v {
